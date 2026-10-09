@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed `llm-test --provider anthropic-oauth` reporting Anthropic's refusal of a
+  `claude setup-token` token as a plain rate limit: that 429 now carries a hint
+  that it is not a real rate limit and names the alternatives, and
+  `docs/llm-providers.md` documents the behavior. (#1170)
 - Fixed Cursor tool calls being stored with no title or content: Cursor's own
   hooks, and the Claude Code hooks Cursor also runs, send Claude's
   `tool_name`/`tool_input` fields, but Cursor was missing from the tool-capture
