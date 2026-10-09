@@ -6247,7 +6247,7 @@ fn hook_source_candidates(
     exe_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(5);
+    let mut candidates = Vec::with_capacity(6);
     // Cargo-run from the repo.
     if let Some(root) = repo_root {
         candidates.push(root.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
@@ -6255,8 +6255,24 @@ fn hook_source_candidates(
     // Release tarball (macOS/Windows/Linux archive): the `hooks/` bundle
     // ships in the same directory as the binary, so it's reachable without
     // `--source` (issue #107).
-    if let Some(dir) = exe_dir {
+    if let Some(dir) = exe_dir.as_ref() {
         candidates.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
+    }
+    // Standard Unix prefix layout: binary at `<prefix>/bin/ai-memory`,
+    // hooks installed under `<prefix>/share/ai-memory/hooks/<sub>` (Nix,
+    // Homebrew, /opt/local, custom prefix installs).
+    if let Some(dir) = exe_dir.as_ref() {
+        if dir.file_name().is_some_and(|name| name == "bin") {
+            if let Some(prefix) = dir.parent() {
+                candidates.push(
+                    prefix
+                        .join("share")
+                        .join("ai-memory")
+                        .join(crate::install_layout::HOOKS_DIR_NAME)
+                        .join(sub),
+                );
+            }
+        }
     }
     // Docker image lays them out under /usr/local/share/ai-memory/.
     candidates.push(PathBuf::from(format!(
@@ -10760,6 +10776,40 @@ model = "gpt-5"
         assert_eq!(
             candidates[4],
             PathBuf::from("/home/alice/.local/share/ai-memory/hooks/claude-code")
+        );
+    }
+
+    #[test]
+    fn hook_source_candidates_include_standard_prefix_share_dir() {
+        let candidates = hook_source_candidates(
+            "claude-code",
+            None,
+            Some(PathBuf::from("/nix/store/pkg/bin")),
+            None,
+        );
+
+        assert!(
+            candidates.contains(&PathBuf::from(
+                "/nix/store/pkg/share/ai-memory/hooks/claude-code"
+            )),
+            "standard prefix share hooks/ dir must be probed; got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn hook_source_candidates_ignores_non_bin_parent_for_prefix_share() {
+        let candidates = hook_source_candidates(
+            "claude-code",
+            None,
+            Some(PathBuf::from("/opt/ai-memory")),
+            None,
+        );
+
+        assert!(
+            !candidates.contains(&PathBuf::from(
+                "/opt/share/ai-memory/hooks/claude-code"
+            )),
+            "non-bin exe dir must not probe parent share dir; got {candidates:?}"
         );
     }
 
