@@ -367,6 +367,10 @@ should be proposed from a completed session, or at explicit wrap-up \
   admission chain so mirrors/backups stay consistent. Follow the client-aware \
   project-scope rule above; missing explicit sibling scopes fail closed \
   instead of falling back.\n\
+- `memory_restore_page` — when the user asks to undo a page change or \
+  bring back a deleted page. Without `rev` it lists the page's checkpoints; \
+  with `rev` it writes that version back through `memory_write_page`. \
+  Follow the client-aware project-scope rule above.\n\
 - `memory_feedback` — right after a `memory_query` / `memory_read_page` \
   hit proves useful or misleading, and whenever the user says a recalled \
   page is out of date or wrong. Pass the exact `path` from the hit plus \
@@ -1585,6 +1589,27 @@ struct DeletePageArgs {
     /// `workspace`/`project`.
     #[serde(default)]
     scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct RestorePageArgs {
+    /// Exact wiki path to restore or inspect (e.g. `notes/foo.md`).
+    path: String,
+    /// Checkpoint commit to restore from, as listed by a call without `rev`
+    /// (the newest one is the change being undone). Omit it to
+    /// list the checkpoints that changed this page.
+    #[serde(default)]
+    rev: Option<String>,
+    /// Maximum checkpoints to list when `rev` is omitted (default 20, max 100).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Project of the page. Static MCP clients must pass it together with
+    /// `workspace` on every project-scoped call.
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace of the page, together with `project`.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// Write one durable wiki page. Optional metadata (`kind`, `entities`,
@@ -4964,6 +4989,123 @@ impl AiMemoryServer {
         }))
     }
 
+    /// List a page's checkpoints, or restore it from one through the
+    /// normal write path.
+    #[tool(
+        annotations(
+            title = "Restore memory page",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        description = "Bring back an earlier version of a wiki page, \
+        including a deleted one. Without `rev`, lists the checkpoints that \
+        changed `path` (newest first): `{ path, checkpoints: [{ rev, summary, \
+        time }] }` — read-only. With `rev` (a listed checkpoint, or the \
+        checkpoint before a `memory_delete_page`), writes that \
+        version back as a new current version through `memory_write_page`, \
+        so sanitization, admission, attribution and supersession apply; the \
+        version it replaces stays reachable. Pass `workspace` + `project` \
+        together on static clients. Use only when the user asks to restore \
+        or undo a page change."
+    )]
+    async fn memory_restore_page(
+        &self,
+        Parameters(args): Parameters<RestorePageArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_restore_page requires the server to be built with a wiki handle",
+                None,
+            ));
+        };
+        let path = PagePath::new(args.path.clone())
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
+        let (ws, proj) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
+            )
+            .await?;
+
+        let Some(rev) = args.rev.as_deref().map(str::trim).filter(|r| !r.is_empty()) else {
+            let limit = args.limit.unwrap_or(20).clamp(1, 100);
+            let checkpoints = wiki
+                .page_checkpoints(ws, proj, &path, limit)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let checkpoints: Vec<_> = checkpoints
+                .into_iter()
+                .map(|c| serde_json::json!({ "rev": c.oid, "summary": c.summary, "time": c.time }))
+                .collect();
+            return ok_json(&serde_json::json!({
+                "path": path.to_string(),
+                "checkpoints": checkpoints,
+            }));
+        };
+
+        let md = wiki.page_at_checkpoint(ws, proj, &path, rev).map_err(|e| {
+            McpError::invalid_params(format!("cannot read {path} at {rev}: {e}"), None)
+        })?;
+        let fm = &md.frontmatter;
+        let text = |key: &str| {
+            fm.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let tags = fm
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let write = WritePageArgs {
+            metadata: Default::default(),
+            path: path.to_string(),
+            body: md.body,
+            title: text("title"),
+            tier: text("tier"),
+            tags,
+            pinned: fm
+                .get("pinned")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            project: args.project,
+            workspace: args.workspace,
+            scope: None,
+            expires_at: text("expires_at"),
+            session_id: None,
+        };
+        let result = self
+            .memory_write_page(Parameters(write), OptionalParts(parts))
+            .await?;
+        if result.is_error.unwrap_or(false) {
+            return Ok(result);
+        }
+        let written = serde_json::to_value(&result.content)
+            .ok()
+            .and_then(|content| content.get(0)?.get("text")?.as_str().map(str::to_owned))
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        match written {
+            Some(serde_json::Value::Object(mut map)) => {
+                map.insert(
+                    "restored_from".into(),
+                    serde_json::Value::String(rev.to_owned()),
+                );
+                ok_json(&map)
+            }
+            _ => Ok(result),
+        }
+    }
+
     /// Delete a single wiki page by exact path.
     #[tool(
         annotations(
@@ -7873,6 +8015,7 @@ mod tests {
         "memory_read_page",
         "memory_read_session_observations",
         "memory_delete_page",
+        "memory_restore_page",
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
@@ -7899,6 +8042,7 @@ mod tests {
         "memory_read_page",
         "memory_read_session_observations",
         "memory_delete_page",
+        "memory_restore_page",
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
@@ -16110,6 +16254,171 @@ mod tests {
             !recent_text.contains("notes/temp.md"),
             "deleted page must not linger in the index; got {recent_text}"
         );
+    }
+
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn restore_args(path: &str, rev: Option<&str>, project: Option<&str>) -> RestorePageArgs {
+        RestorePageArgs {
+            path: path.into(),
+            rev: rev.map(str::to_owned),
+            limit: None,
+            project: project.map(str::to_owned),
+            workspace: project.map(|_| "default".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_lists_checkpoints_and_brings_back_a_deleted_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/retries.md".into(),
+                    body: "# Retries\n\nKeep the same event id.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec!["delivery".into()],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "notes/retries.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let listed = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args("notes/retries.md", None, None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let revs: Vec<String> = listed["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["rev"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            revs.len() >= 2,
+            "the write and the delete both changed the page: {listed}"
+        );
+        let pre = revs[1].clone();
+
+        let restored = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args("notes/retries.md", Some(&pre), None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(restored["restored_from"], pre.as_str());
+
+        let read = result_json(
+            &server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some("notes/retries.md".into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            read["body"]
+                .as_str()
+                .unwrap()
+                .contains("Keep the same event id.")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_refuses_unknown_explicit_scope_and_bad_rev() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        let foreign = server
+            .memory_restore_page(
+                Parameters(restore_args("notes/x.md", None, Some("typo"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(
+            foreign.is_err(),
+            "an unknown explicit project must fail closed"
+        );
+
+        let bad_rev = server
+            .memory_restore_page(
+                Parameters(restore_args("notes/x.md", Some("deadbeef"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(bad_rev.is_err(), "an unknown rev must not write anything");
     }
 
     #[tokio::test]

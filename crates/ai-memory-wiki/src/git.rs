@@ -678,6 +678,56 @@ impl GitAdapter {
         Ok(out)
     }
 
+    /// Return up to `limit` commits, newest first, that changed the file at
+    /// `path` (relative to the repo root), including the commit that deleted
+    /// it.
+    ///
+    /// # Errors
+    /// Propagates any underlying libgit2 error.
+    pub fn path_checkpoints(&self, path: &Path, limit: usize) -> WikiResult<Vec<Checkpoint>> {
+        let repo = open_validated_repository(&self.root).map_err(|error| match error {
+            OpenRepositoryError::Git(error) => map_git_err(error),
+            OpenRepositoryError::Wiki(error) => error,
+        })?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut walk = repo.revwalk().map_err(map_git_err)?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+        let blob_at = |commit: &git2::Commit<'_>| {
+            commit
+                .tree()
+                .ok()
+                .and_then(|tree| tree.get_path(path).ok())
+                .map(|entry| entry.id())
+        };
+        let mut out = Vec::new();
+        for oid in walk {
+            let oid = oid.map_err(map_git_err)?;
+            let commit = repo.find_commit(oid).map_err(map_git_err)?;
+            let parent_blob = commit.parent(0).ok().and_then(|p| blob_at(&p));
+            if blob_at(&commit) == parent_blob {
+                continue;
+            }
+            out.push(Checkpoint {
+                oid: oid.to_string(),
+                summary: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or("(no summary)")
+                    .to_string(),
+                time: commit.time().seconds(),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Read `path` as it existed at `rev`.
     ///
     /// `path` is relative to the wiki repo root. The returned bytes are the
