@@ -6149,6 +6149,7 @@ fn same_canonical_dir(a: &Path, b: &Path) -> bool {
 /// rules without duplicating permission-handling.
 fn copy_hook_file(from: &Path, dest_root: &Path) -> Result<()> {
     let to = dest_root.join(from.file_name().context("bad source file name")?);
+    let _ = fs::remove_file(&to);
     fs::copy(from, &to)
         .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
     #[cfg(unix)]
@@ -6187,8 +6188,16 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
             continue;
         }
         let to = dest_lib.join(from.file_name().context("bad support file name")?);
+        let _ = fs::remove_file(&to);
         fs::copy(&from, &to)
             .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&to)?.permissions();
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(&to, perms);
+        }
     }
     Ok(())
 }
