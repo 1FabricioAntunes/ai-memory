@@ -2953,7 +2953,9 @@ async fn require_same_origin_browser(req: Request<Body>, next: Next) -> Response
     if !is_cross_origin_browser_request(req.headers()) {
         return next.run(req).await;
     }
-    tracing::warn!(
+    // Any page the operator opens can trigger this at will, so it stays out
+    // of the default log level.
+    tracing::debug!(
         path = req.uri().path(),
         origin = ?req.headers().get(header::ORIGIN),
         "rejected cross-origin browser request to an unauthenticated server"
