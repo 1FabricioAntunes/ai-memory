@@ -12168,9 +12168,14 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
             .unwrap()
             .with_store_reader(store.reader.clone());
-        // No `stage_pending_write` call: the DB is empty, the id is
-        // brand-new. Approve must surface it as a 404, not a 500.
+        // The requested scope must exist, or the scope lookup itself 404s
+        // and the test never reaches the proposal lookup this regression
+        // is about. Stage an unrelated write so `default/scratch` resolves.
+        let (_ws, _proj, _staged_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/other.md", "# Other\n").await;
         let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        // The requested id is brand-new: no proposal carries it. Approve
+        // must surface that as a 404, not a 500.
         let unknown_id = AutoImproveProposalId::new();
 
         let resp = router
@@ -12205,6 +12210,10 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
             .unwrap()
             .with_store_reader(store.reader.clone());
+        // Same fixture need as approve: the requested scope must exist so
+        // the request reaches the proposal lookup.
+        let (_ws, _proj, _staged_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/other.md", "# Other\n").await;
         let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
         let unknown_id = AutoImproveProposalId::new();
 
@@ -12255,6 +12264,11 @@ mod tests {
 ",
         )
         .await;
+        // The requested scope must also exist: without it the scope lookup
+        // 404s first and the test never reaches the proposal lookup that
+        // #1205 is about.
+        let (_ws_default, _proj_default, _own_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/own.md", "# Own\n").await;
         let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
 
         // Try to approve it as if it lived in `default`. The lookup must
@@ -12299,6 +12313,11 @@ mod tests {
             "# Foreign\n",
         )
         .await;
+        // The requested scope must also exist: without it the scope lookup
+        // 404s first and the test never reaches the proposal lookup that
+        // #1205 is about.
+        let (_ws_default, _proj_default, _own_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/own.md", "# Own\n").await;
         let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
 
         let resp = router
@@ -12321,9 +12340,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Note: a reject that targets the *real* workspace must be 404 too
-        // for symmetry (no reject of a foreign id via the foreign scope
-        // either). This exercises the same lookup path from the other side.
+        // Legitimate control: rejecting the id through its own scope must
+        // still succeed, so the 404 below cannot be a blanket deny.
         assert_eq!(
             resp.status(),
             StatusCode::OK,
