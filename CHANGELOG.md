@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workdir` points at another project, is no longer judged only by the
   destination's policy. (#1199)
 
+- `POST /admin/pending-writes/{id}/approve` and `/reject` now answer
+  `404 Not Found` when the id does not exist or belongs to a
+  different workspace, matching the `/detail` and `/diff` routes.
+  Previously an unknown id surfaced as `500 Internal Server Error`
+  because the routes skipped the lookup and let the wiki method
+  surface a generic error. Approve and reject now share the same
+  `pending_detail` helper the detail and diff routes use, so all
+  four routes agree on `400` for an unparsable id, `404` for an
+  unknown or foreign-scope id, and `500` only for unexpected
+  internal errors. Six new tests in `admin::tests` cover the
+  four unknown / foreign / unparsable / happy-path combinations
+  for both `approve` and `reject`. (#1205)
+
 ## [2.6.3] - 2026-10-09
 
 ### Fixed
