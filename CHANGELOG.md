@@ -50,6 +50,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests in `workstream.rs::tests` cover the unknown-id (404),
   unknown-workspace (404), ambiguous-name (400), and forbidden
   (403, regression guard) cases. (#1209)
+- `POST /admin/pending-writes/{id}/approve` and `/reject` answered
+  `500 Internal Server Error` for an id that did not exist or belonged
+  to a different workspace, because the routes skipped the lookup and
+  let the wiki method surface a generic error. They now share the same
+  `pending_detail` helper the `/detail` and `/diff` routes already used,
+  so all four routes agree on `400` for an unparsable id, `404` for an
+  unknown or foreign-scope id, and `500` only for unexpected internal
+  errors. New tests in `admin::tests` cover the unknown, foreign-scope,
+  and unparsable cases for both `approve` and `reject`. (#1205)
 
 ## [2.6.3] - 2026-10-09
 
