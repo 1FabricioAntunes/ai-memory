@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assistant messages are imported as before, and under allowlist capture
   mode a checkout without a marker imports nothing. Results recorded without an id
   linking them to their call take the strictest decision of their turn.
+  A call the transcript names differently from the hook (Codex's shell tool) is
+  judged under the hook's name, each event is judged from the working directory
+  its own record names, and a call or event the live hook would deliver to
+  another checkout is imported only when that checkout would capture it and
+  sends to the same server. The output of a Claude Code `!` shell command,
+  which live capture never receives, is no longer imported.
   (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a
