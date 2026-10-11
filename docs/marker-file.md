@@ -538,11 +538,23 @@ whether it is an argument vector element, a quoted script (`bash -c '…'`,
 backquotes), so a script is read like any command line, up to four quoting
 levels; a script nested deeper is **metadata-only**. A quoted message that
 mentions an ignored path (`git commit -m "…docs/adr/…"`) therefore drops the
-event too. An ANSI-C string (`$'…'`) is decoded and a backslash before an
-ordinary letter is dropped, as the shell does. Each
+event too. An ANSI-C string (`$'…'`) is decoded, a backslash before an
+ordinary letter is dropped, and a backslash-newline outside single quotes
+joins the two lines, as the shell does. A word with a parameter default
+(`${X:-docs/x.md}`, also `:=`, `:+` and the forms without `:`) is also read
+with the operand in its place. Under the `PowerShell` tool, or on a Windows
+host, the command is also read without PowerShell's backquote and cmd's caret
+escape characters. Each
 argument that is not a flag, plus the value of a `--flag=value`, `NAME=value`,
-or PowerShell `-Param:value` word, is resolved like a file-tool path: from the tool's own
+or PowerShell `-Param:value` word, plus a value glued to a short flag
+(`-fdocs/x.md`), plus the local path of a `file:` URL in any case (ASCII
+percent-escapes decoded), is resolved like a file-tool path: from the tool's own
 `workdir` argument (Gemini CLI's `dir_path`, Antigravity's `Cwd`) when it has one, otherwise from the event's `cwd`.
+`~/` (and PowerShell's `~\`) is the home directory and `~+` the working
+directory. An argument under `~-`, `~N` or `~name` (the previous directory,
+the directory stack, another account's home) names a directory only the
+running shell knows, so the command is **metadata-only** under an active
+policy.
 The path in a git object name (`HEAD:docs/x.md`, `:docs/x.md`) is resolved
 from both the `cwd` and the marker directory, because git reads it from the
 repository root. If
@@ -555,13 +567,16 @@ the match budget is dropped. A command that no argument matches outright is
 unquoted brace expansion (`docs/{adr,x}/1.md`, `{1..3}`), a bracket class
 (`docs/ad[r]/1.md`, including one that starts with `]`), a zsh glob group or
 extglob (`docs/(a|b)/1.md`, `@(…)`), or a numeric or control escape in an
-ANSI-C string. The same holds for those inside a script run by `sh -c`,
-`eval` or a command substitution, but not inside a quoted message or pattern
+ANSI-C string. The same holds for those inside a script run by `sh -c`
+(also past shell options and their values, as in `bash -o pipefail -c`),
+`su -c`, `script -c`, `eval` or a command substitution, but not inside a quoted message or pattern
 (`git log --format='%h {a,b}'`). Quoted or escaped braces and brackets,
 `${…}`, `{}`, `[ -f x ]`, `$(…)`, `<(…)` and a `( … )` subshell are
 unaffected; a word glued to a parenthesis (`f()`, `(a|b)x`) also counts as a
 glob group. Inline interpreter code (`python3 -c`, `node -e`, `ruby -e`,
-`perl -e`, `php -r`, `deno eval`) is **metadata-only** under an active policy
+`perl -e`, `php -r`, `lua -e`, `Rscript -e`, `osascript -e`, `deno eval`,
+also after options that take a value, as in `python3 -W ignore -c`) is
+**metadata-only** under an active policy
 unless one of its words names an ignored path outright, which drops it:
 code can build a path at run time (`'docs/' + name`), so no lexical match can
 rule one out. Running a script file or a module (`python3 -m pytest`,
@@ -570,7 +585,10 @@ commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
 their output is still captured. An invalid policy makes a shell command
 **metadata-only**, like a file tool, because a broken marker cannot prove its
 arguments miss every ignored path; this holds even when the command cannot be
-read. An older server drops these metadata-only shell and output-reader
+read. On macOS, whose default filesystem ignores case, the native hook and the
+generated integrations match file-tool and shell paths without regard to case
+(`NOTES/X.md` matches `notes/**`); other POSIX hosts compare case-sensitively,
+and Windows paths always ignore case. An older server drops these metadata-only shell and output-reader
 events, so upgrade the server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
@@ -600,7 +618,15 @@ can be mentioned.
   and a heredoc fed to an interpreter (`python3 - <<EOF`) is read only for the
   words it spells out;
 - git resolves `REV:path` from the repository root, which is approximated by
-  the marker directory and the `cwd`;
+  the marker directory and the `cwd`, and a tool's own directory option
+  (`git -C dir`, `make -C dir`) is not followed;
+- script runners and interpreters the matcher does not list (`awk` with
+  `getline`, `watch`, `flock … -c`, `su user -c`) are read only for the words
+  they spell out: an ignored path named there still drops the event, but
+  brace expansion or inline code inside them is not recognized;
+- a value glued to a short flag is read after the flag's first letter only,
+  not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
+  are not decoded;
 - tools the matcher does not list keep their current behavior.
 
 For a project whose content must never be captured, use allowlist capture mode
