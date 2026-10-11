@@ -814,6 +814,11 @@ pub fn metadata_only_body(
 /// `ai-memory run` ledger — so the import applies the live decision table
 /// rather than a second matcher. `args: None` means the arguments could not be
 /// recovered, which a file tool treats as malformed.
+///
+/// A transcript can name a tool differently from the hook: Codex records its
+/// shell tool as `exec_command` with `{cmd, workdir}`, which reaches hooks as
+/// `Bash`. Such a call is rebuilt under the hook's name and fields, so the
+/// import classifies it as the live hook does.
 #[must_use]
 pub fn tool_call_payload(
     agent: AgentKind,
@@ -822,6 +827,7 @@ pub fn tool_call_payload(
     call_id: Option<&str>,
 ) -> Value {
     let args = args.cloned().unwrap_or(Value::Null);
+    let (name, args) = hook_tool_call(agent, name, args);
     let mut payload = match agent {
         AgentKind::AntigravityCli => json!({"toolCall": {"name": name, "args": args}}),
         AgentKind::Zero => json!({"toolName": name, "input": args}),
@@ -834,6 +840,24 @@ pub fn tool_call_payload(
         object.insert("tool_use_id".into(), Value::String(id.into()));
     }
     payload
+}
+
+/// The name and arguments the live hook receives for a call a transcript
+/// records under its own name. Unreadable arguments stay unreadable.
+fn hook_tool_call(agent: AgentKind, name: &str, args: Value) -> (&str, Value) {
+    if agent == AgentKind::Codex && name.eq_ignore_ascii_case("exec_command") {
+        let Value::Object(recorded) = args else {
+            return ("Bash", args);
+        };
+        let mut input = Map::new();
+        for (from, to) in [("cmd", "command"), ("workdir", "workdir")] {
+            if let Some(value) = recorded.get(from) {
+                input.insert(to.into(), value.clone());
+            }
+        }
+        return ("Bash", Value::Object(input));
+    }
+    (name, args)
 }
 
 #[derive(Default)]
@@ -2459,6 +2483,57 @@ mod tests {
                 "{agent:?}: unrecoverable file arguments fail closed"
             );
         }
+    }
+
+    /// Codex transcripts record the shell tool as `exec_command` with
+    /// `{cmd, workdir}`; hooks receive it as `Bash`. The rebuilt call must be a
+    /// shell call resolved from its `workdir`, not an unknown tool whose output
+    /// is kept.
+    #[test]
+    fn codex_transcript_exec_command_is_inspected_as_the_hook_bash_call() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let decide = |agent: AgentKind, args: Value| {
+            let raw = tool_call_payload(agent, "exec_command", Some(&args), Some("call-1"));
+            policy.inspect(agent, &raw, "/repo").protocol().clone()
+        };
+        for args in [
+            json!({"cmd": "cat adr/x.md", "workdir": "/repo/docs"}),
+            json!({"cmd": "cat adr/x.md", "workdir": "docs"}),
+            json!({"cmd": "cat docs/adr/x.md"}),
+            json!({"cmd": ["bash", "-lc", "cat docs/adr/x.md"], "yield_time_ms": 1000}),
+        ] {
+            let protocol = decide(AgentKind::Codex, args.clone());
+            assert_eq!(protocol.tool_family(), ToolFamily::NonFile, "{args}");
+            assert_eq!(protocol.disposition(), CaptureDisposition::Drop, "{args}");
+        }
+        let public = decide(
+            AgentKind::Codex,
+            json!({"cmd": "cat adr/x.md", "workdir": "/repo/src"}),
+        );
+        assert_eq!(public.tool_family(), ToolFamily::NonFile);
+        assert_eq!(public.disposition(), CaptureDisposition::Keep);
+        let raw = tool_call_payload(
+            AgentKind::Codex,
+            "exec_command",
+            Some(&json!({"cmd": "ls", "workdir": "/other/repo"})),
+            None,
+        );
+        assert_eq!(
+            absolute_tool_location_paths(AgentKind::Codex, &raw, "/repo"),
+            Some(vec!["/other/repo".to_owned()]),
+            "the workdir locates the call like a live shell workdir"
+        );
+        // Only Codex records its shell under this name.
+        assert_eq!(
+            decide(AgentKind::ClaudeCode, json!({"cmd": "cat docs/adr/x.md"})).tool_family(),
+            ToolFamily::Unknown
+        );
     }
 
     #[test]

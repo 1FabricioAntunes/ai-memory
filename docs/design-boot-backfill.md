@@ -184,9 +184,21 @@ Retroactive text is exactly as untrusted as live hook text, since it is old mode
   `.ai-memory.toml` applies to the backfill path too, not just live hooks.
   As built (`commands/transcript_capture.rs`), each imported tool call is rebuilt in
   its agent's hook shape (`ai_memory_hooks::tool_call_payload`) and inspected by the
-  checkout's `CapturePolicy`, the same decision table the live hook uses; a call the
-  live hook would reroute to another marked checkout also answers to that checkout's
-  policy. A Drop removes both the call and its result before anything is posted; a
+  checkout's `CapturePolicy`, the same decision table the live hook uses. A tool the
+  transcript names differently from the hook is rebuilt under the hook's name and
+  fields (Codex `exec_command` with `{cmd, workdir}` becomes `Bash`). Claude Code and
+  Codex record a working directory per record (each line, each turn context); the
+  adapters label every event with it, and the import resolves relative arguments and
+  the policy from it, falling back to the session cwd. A call the live hook would
+  reroute to another checkout, and an event whose record cwd lies outside this
+  checkout, must pass that checkout's admission gate (`checkout_admits_capture`) and
+  resolve to the same server-profile route as this checkout
+  (`delivers_to_same_server`), or it is dropped; a rerouted call also answers to the
+  destination's policy. A Claude Code `!` command's output, recorded as user messages
+  made only of `<bash-stdout>`/`<bash-stderr>` or `<local-command-stdout>` blocks, is
+  dropped, since live capture never receives it. A tool the matcher does not recognize
+  (unknown family) keeps only its family with or without a policy, as the live server
+  stores for it, and so does a result with no call to inherit from. A Drop removes both the call and its result before anything is posted; a
   metadata-only decision posts the hook's metadata-only body with its
   `_ai_memory_capture` protocol, which the server validates and rebuilds from its
   allowlist. A result is paired with its call by native id; without one it takes the

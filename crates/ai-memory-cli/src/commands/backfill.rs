@@ -659,6 +659,8 @@ struct MappedEvent {
 /// the native tool payload the server's re-inspection reads, so a claim would
 /// be judged against the wrong schema and stripped; the server never receives
 /// the ignore patterns, so the client's decision is the only one possible.
+/// An unrecognized tool's event carries only its family, as the live server
+/// stores for an unknown-family tool, never its arguments or output.
 fn map_event(
     session_id: &str,
     event: &NewWorkstreamEvent,
@@ -672,7 +674,7 @@ fn map_event(
     let decision = match capture {
         EventCapture::Drop => return None,
         EventCapture::MetadataOnly(decision) => Some(decision),
-        EventCapture::Keep => None,
+        EventCapture::Keep | EventCapture::Unrecognized => None,
     };
     let role = event.role.as_deref().unwrap_or("");
     let ingest_key = format!("{session_id}:{}", event.event_id);
@@ -703,6 +705,19 @@ fn map_event(
                         object.insert("occurred_at".into(), occurred_at.into());
                     }
                     body
+                }
+                None if matches!(capture, EventCapture::Unrecognized) => {
+                    let outcome = if event.kind == WorkstreamEventKind::ToolResult {
+                        "\noutcome: unknown"
+                    } else {
+                        ""
+                    };
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "title": "tool unknown",
+                        "message": format!("tool_family: unknown{outcome}"),
+                        "occurred_at": occurred_at,
+                    })
                 }
                 None => serde_json::json!({
                     "session_id": session_id,
@@ -1397,6 +1412,454 @@ mod tests {
             "control: denylist (default) is unchanged"
         );
         server.abort();
+    }
+
+    /// Plant `lines` as one native session and backfill it from `repo`,
+    /// returning everything posted to `/hook/batch` as one JSON string.
+    #[cfg(unix)]
+    async fn backfill_posted(
+        harness: ManagedHarness,
+        home: &Path,
+        data_dir: &Path,
+        repo: &Path,
+        sid: &str,
+        lines: &[serde_json::Value],
+    ) -> String {
+        use axum::{Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let session_file = match harness {
+            ManagedHarness::Claude => home
+                .join(".claude/projects")
+                .join(repo.to_string_lossy().replace('/', "-"))
+                .join(format!("{sid}.jsonl")),
+            ManagedHarness::Codex => home
+                .join(".codex/sessions/2026/09/01")
+                .join(format!("rollout-2026-09-01T10-00-00-{sid}.jsonl")),
+            other => panic!("no fixture layout for {}", other.as_str()),
+        };
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(&session_file, body).unwrap();
+
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        let app = Router::new().route(
+            "/hook/batch",
+            post(
+                move |axum::Json(items): axum::Json<Vec<serde_json::Value>>| {
+                    let captured = captured.clone();
+                    async move {
+                        let accepted = items.len();
+                        captured.lock().unwrap().extend(items);
+                        axum::Json(serde_json::json!({ "accepted": accepted }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = ServerEndpoint::for_hook_target(format!("http://{address}"), None);
+        let session = SessionRef {
+            harness,
+            native_session_id: sid.into(),
+            updated_at: SystemTime::now(),
+        };
+        let capture = TranscriptCapture::for_checkout(data_dir, repo);
+        import_one(&endpoint, "ws", "proj", home, repo, &capture, &session)
+            .await
+            .unwrap();
+        server.abort();
+        serde_json::to_string(&*posted.lock().unwrap()).unwrap()
+    }
+
+    fn marked_checkout(marker: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".ai-memory.toml"), marker).unwrap();
+        dir
+    }
+
+    /// Codex records its shell tool as `exec_command` with `{cmd, workdir}`;
+    /// the live hook receives it as `Bash`. A command whose `workdir`-relative
+    /// argument names an ignored path never reaches `/hook/batch`, call or
+    /// output; the same command run from a public directory does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_inspects_codex_exec_command_as_the_hook_shell_call() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = marked_checkout("[capture]\nignore_paths = [\"docs/adr/**\"]\n");
+        for dir in ["docs/adr", "src/adr"] {
+            std::fs::create_dir_all(repo.path().join(dir)).unwrap();
+        }
+        let sid = "019a0000-0000-7000-8000-000000000001";
+        let item = |payload: serde_json::Value| {
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-09-01T10:00:00Z", "payload": payload,
+            })
+        };
+        let exec = |id: &str, workdir: &str| {
+            item(serde_json::json!({
+                "type": "function_call", "name": "exec_command", "call_id": id,
+                "arguments": serde_json::json!({
+                    "cmd": "cat adr/x.md", "workdir": repo.path().join(workdir),
+                }).to_string(),
+            }))
+        };
+        let output = |id: &str, text: &str| {
+            item(serde_json::json!({"type": "function_call_output", "call_id": id, "output": text}))
+        };
+        let lines = [
+            serde_json::json!({"type": "session_meta", "payload": {"id": sid, "cwd": repo.path()}}),
+            item(serde_json::json!({
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "show both adr notes"}],
+            })),
+            exec("call_adr", "docs"),
+            output("call_adr", "ADRSENTINEL private decision"),
+            exec("call_pub", "src"),
+            output("call_pub", "PUBLICCONTROL public note"),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Codex,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(!posted.contains("/docs\\\""), "excluded call: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "public output: {posted}");
+        assert!(posted.contains("/src"), "public call: {posted}");
+    }
+
+    /// A Claude Code transcript record: `content` is the message content.
+    fn claude_record(
+        sid: &str,
+        uuid: &str,
+        cwd: &Path,
+        role: &str,
+        content: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": role, "uuid": uuid, "sessionId": sid, "cwd": cwd,
+            "timestamp": "2026-09-01T10:00:00Z",
+            "message": {"role": role, "content": content},
+        })
+    }
+
+    fn claude_tool(name: &str, id: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+    }
+
+    fn claude_output(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": text})
+    }
+
+    /// Claude Code records each line's `cwd`, which follows the session as it
+    /// moves. The live hook resolves a relative argument from that cwd, so an
+    /// import must too: `cat adr/x.md` run from `docs/` reads an ignored file
+    /// and is never posted, while the same command run from the checkout root
+    /// names a public path and is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_resolves_each_call_from_its_record_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = marked_checkout("[capture]\nignore_paths = [\"docs/adr/**\"]\n");
+        let docs = repo.path().join("docs");
+        std::fs::create_dir_all(docs.join("adr")).unwrap();
+        let sid = "11111111-2222-3333-4444-555555555556";
+        let cat = |id| claude_tool("Bash", id, serde_json::json!({"command": "cat adr/x.md"}));
+        let lines = [
+            claude_record(sid, "u1", repo.path(), "user", "read the adr".into()),
+            claude_record(
+                sid,
+                "a1",
+                &docs,
+                "assistant",
+                serde_json::json!([cat("toolu_docs")]),
+            ),
+            claude_record(
+                sid,
+                "u2",
+                &docs,
+                "user",
+                serde_json::json!([claude_output("toolu_docs", "ADRSENTINEL private decision")]),
+            ),
+            claude_record(
+                sid,
+                "a2",
+                repo.path(),
+                "assistant",
+                serde_json::json!([cat("toolu_root")]),
+            ),
+            claude_record(
+                sid,
+                "u3",
+                repo.path(),
+                "user",
+                serde_json::json!([claude_output("toolu_root", "PUBLICCONTROL root note")]),
+            ),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "control output: {posted}");
+        assert_eq!(
+            posted.matches("cat adr/x.md").count(),
+            2,
+            "only the root call, as title and message: {posted}"
+        );
+    }
+
+    /// A call the live hook would reroute to another checkout must pass that
+    /// checkout's admission gate and reach the same server, or it is never
+    /// posted: under allowlist mode an unmarked repository admits nothing, a
+    /// marker selecting an unregistered profile emits nothing, and a marker
+    /// selecting a registered profile sends to another server. Control: a read
+    /// in a marked checkout with no server selection is posted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_drops_reroutes_the_live_hook_would_not_deliver_here() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data_dir.path().join(super::super::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        let name = crate::server_profiles::ProfileName::parse("team-e").unwrap();
+        crate::server_profiles::add(data_dir.path(), &name, "https://e.example", &[], Some("E"))
+            .unwrap();
+        let source = marked_checkout("[capture]\n");
+        let unmarked = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(unmarked.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let unknown_profile = marked_checkout("server = \"team-b\"\n");
+        let other_server = marked_checkout("server = \"team-e\"\n");
+        let same_server = marked_checkout("[capture]\n");
+        let sid = "11111111-2222-3333-4444-555555555557";
+        let reads = [
+            (&unmarked, "UNMARKEDSENTINEL"),
+            (&unknown_profile, "UNKNOWNPROFILESENTINEL"),
+            (&other_server, "OTHERSERVERSENTINEL"),
+            (&same_server, "SAMESERVERCONTROL"),
+        ];
+        let mut lines = vec![claude_record(
+            sid,
+            "u0",
+            source.path(),
+            "user",
+            "read the notes".into(),
+        )];
+        for (index, (repo, text)) in reads.iter().enumerate() {
+            let file = repo.path().join(format!("{text}.txt"));
+            std::fs::write(&file, text).unwrap();
+            let id = format!("toolu_{index}");
+            lines.push(claude_record(
+                sid,
+                &format!("a{index}"),
+                source.path(),
+                "assistant",
+                serde_json::json!([claude_tool(
+                    "Read",
+                    &id,
+                    serde_json::json!({"file_path": file})
+                )]),
+            ));
+            lines.push(claude_record(
+                sid,
+                &format!("u{}", index + 1),
+                source.path(),
+                "user",
+                serde_json::json!([claude_output(&id, &format!("{text} content"))]),
+            ));
+        }
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            data_dir.path(),
+            source.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        for sentinel in [
+            "UNMARKEDSENTINEL",
+            "UNKNOWNPROFILESENTINEL",
+            "OTHERSERVERSENTINEL",
+        ] {
+            assert!(
+                !posted.contains(sentinel),
+                "{sentinel} was posted: {posted}"
+            );
+        }
+        assert!(
+            posted.contains("SAMESERVERCONTROL content"),
+            "control: {posted}"
+        );
+        assert!(posted.contains("read the notes"), "prompt kept: {posted}");
+    }
+
+    /// The live server stores only the family of an unknown-family tool, with
+    /// no policy at all. A backfilled Codex MCP call and its output therefore
+    /// post only `tool_family: unknown`, never their arguments or output, while
+    /// a recognized shell call's output is posted as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_posts_no_content_for_unrecognized_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sid = "019a0000-0000-7000-8000-000000000002";
+        let item = |payload: serde_json::Value| {
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-09-01T10:00:00Z", "payload": payload,
+            })
+        };
+        let call = |id: &str, name: &str, arguments: serde_json::Value| {
+            item(serde_json::json!({
+                "type": "function_call", "name": name, "call_id": id,
+                "arguments": arguments.to_string(),
+            }))
+        };
+        let output = |id: &str, text: &str| {
+            item(serde_json::json!({"type": "function_call_output", "call_id": id, "output": text}))
+        };
+        let lines = [
+            serde_json::json!({"type": "session_meta", "payload": {"id": sid, "cwd": repo.path()}}),
+            call(
+                "call_mcp",
+                "mcp__vault__fetch",
+                serde_json::json!({"query": "ARGSENTINEL"}),
+            ),
+            output("call_mcp", "MCPSENTINEL private record"),
+            call(
+                "call_pub",
+                "exec_command",
+                serde_json::json!({"cmd": "cargo test"}),
+            ),
+            output("call_pub", "PUBLICCONTROL test result"),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Codex,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        for sentinel in ["ARGSENTINEL", "MCPSENTINEL", "mcp__vault"] {
+            assert!(
+                !posted.contains(sentinel),
+                "{sentinel} was posted: {posted}"
+            );
+        }
+        assert_eq!(
+            posted.matches("\"title\":\"tool unknown\"").count(),
+            2,
+            "the call and its output are still recorded: {posted}"
+        );
+        assert!(posted.contains("PUBLICCONTROL"), "control: {posted}");
+    }
+
+    /// A reroute is delivered when the destination's marker selects the same
+    /// registered server profile as the source, and dropped when it selects a
+    /// different registered profile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_keeps_reroutes_to_the_same_server_profile_only() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let checkout = |name: &str, profile: &str| {
+            let dir = base.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(".ai-memory.toml"),
+                format!("server = \"{profile}\"\n"),
+            )
+            .unwrap();
+            dir
+        };
+        let source = checkout("source", "team-a");
+        let same = checkout("same", "team-a");
+        let other = checkout("other", "team-e");
+        let root = |dir: &Path| dir.to_string_lossy().into_owned();
+        for (name, roots) in [
+            ("team-a", vec![root(&source), root(&same)]),
+            ("team-e", vec![root(&other)]),
+        ] {
+            let name = crate::server_profiles::ProfileName::parse(name).unwrap();
+            crate::server_profiles::add(
+                data_dir.path(),
+                &name,
+                "https://a.example",
+                &roots,
+                Some("T"),
+            )
+            .unwrap();
+        }
+        let sid = "11111111-2222-3333-4444-555555555558";
+        let mut lines = vec![claude_record(sid, "u0", &source, "user", "read".into())];
+        for (index, (repo, text)) in [
+            (&same, "SAMEPROFILECONTROL"),
+            (&other, "OTHERPROFILESENTINEL"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = repo.join(format!("{text}.txt"));
+            let id = format!("toolu_{index}");
+            lines.push(claude_record(
+                sid,
+                &format!("a{index}"),
+                &source,
+                "assistant",
+                serde_json::json!([claude_tool(
+                    "Read",
+                    &id,
+                    serde_json::json!({"file_path": file})
+                )]),
+            ));
+            lines.push(claude_record(
+                sid,
+                &format!("u{}", index + 1),
+                &source,
+                "user",
+                serde_json::json!([claude_output(&id, &format!("{text} content"))]),
+            ));
+        }
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            data_dir.path(),
+            &source,
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(
+            posted.contains("SAMEPROFILECONTROL content"),
+            "same profile: {posted}"
+        );
+        assert!(
+            !posted.contains("OTHERPROFILESENTINEL"),
+            "different profile: {posted}"
+        );
     }
 
     fn spawned_args(

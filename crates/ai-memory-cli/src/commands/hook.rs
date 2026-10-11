@@ -1366,6 +1366,22 @@ fn resolve_hook_route(
     }
 }
 
+/// Whether the live hook would deliver events from `destination` to the same
+/// server as events from `source`, resolving each like [`resolve_hook_route`].
+/// A refused selection on either side delivers nowhere, so it never matches.
+/// A transcript import posts everything to one endpoint, so an event the hook
+/// would send elsewhere must not ride along.
+pub(crate) fn delivers_to_same_server(data_dir: &Path, source: &str, destination: &str) -> bool {
+    match (
+        resolve_hook_route(data_dir, Some(source), || None),
+        resolve_hook_route(data_dir, Some(destination), || None),
+    ) {
+        (HookRoute::InstallDefault, HookRoute::InstallDefault) => true,
+        (HookRoute::Profile(source), HookRoute::Profile(destination)) => source == destination,
+        _ => false,
+    }
+}
+
 /// Normalize the raw hook `cwd` into the base `policy.inspect` joins a tool
 /// event's relative candidate path onto — lexically, via
 /// `marker::absolute_normalized`, NOT `fs::canonicalize` (#671).
