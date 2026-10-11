@@ -19,8 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `list_directory` and the legacy `search_file_content` name are now search
   tools, dropped under an active policy like `grep_search` and `glob`. A shell
   command whose `**` glob could recurse into an ignored directory (zsh, or bash
-  with `globstar`) is now dropped too. This applies to the native hook, the
-  server, and the generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
+  with `globstar`) is now dropped too. A `read_many_files` entry naming a
+  directory above an ignored path (`docs`, `.`), which Gemini reads
+  recursively, is dropped as well. GitHub Copilot CLI's `view`, `create` and
+  `str_replace_editor` are now file tools, checked against `ignore_paths` like
+  `Read` and `Write`. Under an active or invalid policy, tools that read back
+  output of an earlier command (Claude Code `BashOutput`/`TaskOutput`, Codex
+  `write_stdin`, Hermes and OpenClaw `process`, Copilot CLI `read_bash` and
+  `write_bash`) and shell commands using brace expansion or a bracket class
+  are now metadata-only, since the matcher cannot prove they miss an ignored
+  path; upgrade the server before the clients, because an older server drops
+  those events. This applies to the native hook, the server, and the
+  generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a
   project's pending handoff or starting admin jobs. With auth off, the machine
@@ -33,7 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allowlist (a LAN address or name, or `host.docker.internal`), where browsers
   do not send the request metadata the check relies on, the session-start
   handoff fetch now also requires an `X-AI-Memory-Client` header that every
-  ai-memory hook, CLI command and generated integration sends. Hooks on such a
+  ai-memory hook, CLI command and generated integration sends; the same holds
+  for a request that arrives through a forwarding proxy, even one that rewrites
+  the host to the loopback address. Hooks on such a
   server must be re-staged with `ai-memory install-hooks` (or
   `ai-memory upgrade`); loopback installs need nothing.
   (GHSA-6mc4-46pr-w82w)
