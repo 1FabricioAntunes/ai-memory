@@ -61,6 +61,17 @@ pub use router::{
 pub use synth::synthesize_session_page;
 pub use workstream::{WorkstreamState, workstream_router};
 
+/// Request header every first-party client (native hook and CLI, the shell and
+/// PowerShell hook bundles, the generated TypeScript integrations) sends to the
+/// server's machine routes. The value names the client kind and is
+/// informational; the server only checks that the header is present.
+///
+/// A web page cannot attach a custom header to a cross-site request without a
+/// CORS preflight, and the machine routes answer no preflight, so the header
+/// separates a first-party client from a page in the operator's browser where
+/// fetch metadata is absent (see `serve`'s browser guard).
+pub const CLIENT_MARKER_HEADER: &str = "x-ai-memory-client";
+
 // Integration tests compile into this crate's test harness instead of a
 // separate binary: every test binary is another link and, on macOS and
 // Windows, another first-run malware scan. They still exercise only the

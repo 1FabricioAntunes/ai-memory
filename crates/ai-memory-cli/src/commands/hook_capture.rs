@@ -17,7 +17,8 @@ use crate::marker::{
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{
-    CaptureConfig, CapturePolicy, CaptureSource, PolicyState, describe_invalid_capture_config,
+    CLIENT_MARKER_HEADER, CaptureConfig, CapturePolicy, CaptureSource, PolicyState,
+    describe_invalid_capture_config,
 };
 
 /// Resolve the nearest marker's capture policy without changing routing parsing.
@@ -717,6 +718,12 @@ fn repository_identity(
     .filter(|identity| identity.source.routes_by_identity())
 }
 
+/// [`CLIENT_MARKER_HEADER`] value the native hook sends on
+/// every request to the server. Set per request rather than as a client
+/// default because the same client also refreshes OIDC tokens with a third
+/// party, which has no use for it.
+const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
+
 /// Build a reqwest client for the hook's one-shot requests. `no_proxy`
 /// skips Windows proxy auto-detection (registry / WinINET lookups), which
 /// is pure overhead for a loopback/LAN POST. Built once per invocation and
@@ -786,6 +793,7 @@ pub async fn post_hook(
     let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
+        .header(CLIENT_MARKER_HEADER, NATIVE_HOOK_CLIENT_KIND)
         .timeout(timeout)
         .body(body.to_owned());
     if let Some(t) = token {
@@ -861,6 +869,7 @@ pub async fn post_batch(
     let mut req = client
         .post(batch_url)
         .header("Content-Type", "application/json")
+        .header(CLIENT_MARKER_HEADER, NATIVE_HOOK_CLIENT_KIND)
         .timeout(timeout)
         .body(payload.to_owned());
     if let Some(t) = token {
@@ -938,7 +947,10 @@ pub async fn get_handoff(
     token: Option<&str>,
     timeout: Duration,
 ) -> Option<String> {
-    let mut req = client.get(url).timeout(timeout);
+    let mut req = client
+        .get(url)
+        .header(CLIENT_MARKER_HEADER, NATIVE_HOOK_CLIENT_KIND)
+        .timeout(timeout);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -1160,6 +1172,73 @@ mod tests {
         let url = serve_once("401 Unauthorized", "unauthorized").await;
         let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
         assert!(got.is_none(), "non-2xx body must not become context");
+    }
+
+    /// Like `serve_once`, but answers 200 and hands back the raw request.
+    async fn capture_once() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read until the end of the headers; the body is irrelevant.
+            let mut head = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn every_native_hook_request_carries_the_client_marker() {
+        // An unauthenticated server reached by a LAN name refuses a handoff
+        // fetch without it, and hook events ride the same contract.
+        let marker = format!("{CLIENT_MARKER_HEADER}: hook\r\n");
+        let (base, request) = capture_once().await;
+        get_handoff(
+            &build_client(),
+            &format!("{base}/handoff?agent=claude-code"),
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        let request = request.await.unwrap();
+        assert!(request.starts_with("get /handoff?"), "{request}");
+        assert!(request.contains(&marker), "handoff GET: {request}");
+
+        let (base, request) = capture_once().await;
+        post_hook(
+            &build_client(),
+            &format!("{base}/hook?event=stop"),
+            "{}",
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(request.await.unwrap().contains(&marker), "hook POST");
+
+        let (base, request) = capture_once().await;
+        post_batch(
+            &build_client(),
+            &format!("{base}/hook/batch"),
+            "[]",
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(request.await.unwrap().contains(&marker), "batch POST");
     }
 
     // The marker parser's own tests (`parse_toml_key`, `find_marker`) moved to

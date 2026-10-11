@@ -63,11 +63,27 @@ machine and admin routes: a request the browser marks as cross-site
 (`Sec-Fetch-Dest` other than `empty`): a link, image or navigation is refused
 even when it comes from the server's own pages or from another application.
 Hooks, the CLI and MCP clients never send those headers, and the web UI's own
-admin calls use `fetch()`. A browser without fetch metadata (Safari before
-16.4) only gets the `Origin` check, which an image or link does not trigger;
-set a bearer token if you use one. The `Host`
+admin calls use `fetch()`.
+
+Browsers send that fetch metadata over plain HTTP only to `localhost`,
+`*.localhost`, `127.0.0.0/8` and `[::1]`. When an unauthenticated server is
+reached through any other name in the `Host` allowlist (a LAN address or name
+with `--allow-insecure-no-auth`, or `host.docker.internal` in the Docker
+image's default list), an image request carries neither fetch metadata nor
+`Origin`. There the session-start handoff fetch, the only state-changing `GET`,
+must also carry the `X-AI-Memory-Client` header that every ai-memory hook,
+CLI command and generated integration sends; a web page cannot add it without
+a CORS preflight, which these routes never answer. Hooks staged before this
+header existed get a 403 on such a server until you re-run
+`ai-memory install-hooks` (or `ai-memory upgrade`); on a loopback host they
+keep working unchanged. A browser that sends no fetch metadata even to loopback
+(Safari before 16.4) only gets the `Origin` check there, which an image or link
+does not trigger; set a bearer token if you use one. The `Host`
 allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
-content types a browser can send without a CORS preflight. Images in wiki pages
+content types a browser can send without a CORS preflight. The public sign-in
+routes (`POST /auth/login`, `POST /auth/recovery`) accept only
+`application/json` bodies too, so a page on another site cannot sign your
+browser in or try passwords. Images in wiki pages
 rendered by the web UI may only use relative paths that stay inside the UI, so
 viewing a stored page cannot make your browser call those routes either.
 

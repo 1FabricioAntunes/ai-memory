@@ -2060,7 +2060,7 @@ fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
 /// TypeScript runtime shared by every generated integration that must
 /// survive an unreachable server (#580): a spool writer emitting the CLI
 /// `hook-spool` on-disk contract (same filenames, same `SpoolEntry` JSON,
-/// same permissions) plus a self-drain. Callers only need `TOKEN`,
+/// same permissions) plus a self-drain. Callers only need `TOKEN`, `AGENT`,
 /// `timeoutSignal`, and the node `join`/`homedir`/fs imports in scope.
 /// Runtime credential fallback shared by every generated TypeScript
 /// integration. #552 moved the bearer out of generated files into a 0600
@@ -2098,6 +2098,25 @@ function resolveToken(): string | null {
     // Best effort: an unreadable token file leaves auth absent.
   }
   return null;
+}
+"#
+}
+
+/// `authHeaders()`, shared by every generated TypeScript integration: the
+/// headers every request to the server carries. Besides the bearer (resolved
+/// per request by `ts_resolve_token_fn`), that is
+/// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] naming the integration: an
+/// unauthenticated server reached through a non-loopback host name refuses a
+/// handoff fetch without it. Needs `AGENT` and `resolveToken` in scope.
+pub(crate) fn ts_auth_headers_fn() -> &'static str {
+    r#"// Every request names this client: an unauthenticated server reached through
+// a non-loopback host name refuses a handoff fetch without X-AI-Memory-Client,
+// because a web page cannot add that header to a request it makes.
+function authHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "X-AI-Memory-Client": AGENT };
+  const token = resolveToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
 }
 "#
 }
@@ -2212,7 +2231,10 @@ async function drainHookSpool(): Promise<void> {
     }
     if (!entry.url || typeof entry.body !== "string") continue;
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "X-AI-Memory-Client": AGENT,
+      };
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
       const resp = await fetch(entry.url, {
         method: "POST",
@@ -2298,6 +2320,56 @@ pub(crate) fn assert_shared_ts_delivery_runtime(name: &str, source: &str) {
     assert!(
         source.contains("resp.status < 500 && !hookStatusRetryable(resp.status)"),
         "{name}: the drain must keep an entry the server only asked to retry"
+    );
+    assert_every_ts_request_carries_client_marker(name, source);
+}
+
+/// An unauthenticated server reached through a non-loopback host name refuses
+/// a handoff fetch without the client marker, so every `fetch` a generated
+/// integration makes must send it: through `authHeaders()` (hook POSTs, the
+/// handoff GET), `mcpHeaders()` (which spreads `authHeaders()`), or the spool
+/// drain's own header table.
+#[cfg(test)]
+fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
+    assert_eq!(
+        source.matches(ts_auth_headers_fn()).count(),
+        1,
+        "{name}: exactly one shared authHeaders()"
+    );
+    assert!(
+        source.contains(
+            "\"Content-Type\": \"application/json\",\n        \"X-AI-Memory-Client\": AGENT,"
+        ),
+        "{name}: the spool drain must send the client marker"
+    );
+    if source.contains("function mcpHeaders(") {
+        assert!(
+            source.contains("    ...authHeaders(),\n"),
+            "{name}: mcpHeaders"
+        );
+    }
+    let mut requests = 0;
+    for (at, _) in source.match_indices("fetch(") {
+        // Skip identifiers that merely end in `fetch(`, e.g. `prefetch(`.
+        if source[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        requests += 1;
+        let call: String = source[at..].chars().take(240).collect();
+        assert!(
+            call.contains("authHeaders()")
+                || call.contains("mcpHeaders(")
+                || call.contains("        headers,\n"),
+            "{name}: a fetch without the client marker:\n{call}"
+        );
+    }
+    assert!(
+        requests >= 3,
+        "{name}: expected the hook, handoff and drain requests"
     );
 }
 
