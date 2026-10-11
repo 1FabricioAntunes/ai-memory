@@ -2959,6 +2959,30 @@ mod tests {
     }
 
     #[test]
+    fn consolidation_system_prompts_limit_cross_scope_links_to_input_targets() {
+        // Lint reports a missing `project:` / `_global:` target as
+        // `broken_link`, so the prompts must not license inventing one.
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(
+                prompt.contains("Never invent project names or page paths"),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("only when that\n  exact path appears in the input"),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt"
+            );
+            assert!(
+                !prompt.contains("A link whose target does not exist yet is acceptable"),
+                "{name} prompt must scope the pending-link allowance to the same project"
+            );
+        }
+    }
+
+    #[test]
     fn build_request_elides_raw_observations_from_current_body() {
         let raw_dump = (0..2_000)
             .map(|i| format!("- `other` @ 1970-01-01T00:00:00Z — raw-entry-{i}"))

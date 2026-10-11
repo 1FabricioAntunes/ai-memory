@@ -75,17 +75,20 @@ input — reference it inline with a wikilink:
   page *path* relative to the project root
   (e.g. `[[decisions/0003-no-vector-db]]`), not the display title.
 - `[[project:page-path]]` — a page in a sibling project. Use it
-  when the work clearly concerns another project that is named in
-  the input — e.g. a fix in this project whose root cause lives in
-  the sibling project `billing` links `[[billing:audio-pipeline]]`.
-  Never invent project names.
+  only when the input names both that project and that page path
+  — e.g. a fix in this project whose root cause lives in the
+  sibling project `billing` links `[[billing:audio-pipeline]]`.
+  Never invent project names or page paths.
 - `[[_global:page-path]]` — a cross-cutting principle, convention,
-  or trap that applies to every project.
+  or trap that applies to every project. Use it only when that
+  exact path appears in the input.
 
-A link whose target does not exist yet is acceptable — it is
-recorded as a pending link and resolves automatically when the
-page appears. 2-5 well-chosen links per page beat exhaustive
-linking; zero links should be rare.
+A same-project link whose target does not exist yet is acceptable
+— it is recorded as a pending link and resolves automatically when
+the page appears. A `project:` or `_global:` link is not: lint
+reports a missing cross-scope target as broken. 2-5 well-chosen
+links per page beat exhaustive linking; zero links should be rare,
+but never pad with a cross-scope link you cannot see in the input.
 
 ## OUTPUT LANGUAGE
 
