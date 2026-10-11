@@ -792,6 +792,34 @@ pub fn metadata_only_body(
     Value::Object(body)
 }
 
+/// Rebuilds the payload shape [`CapturePolicy::inspect`] and
+/// [`absolute_tool_location_paths`] read for `agent` from a tool call recorded
+/// outside a hook — a native transcript event replayed by `backfill` or the
+/// `ai-memory run` ledger — so the import applies the live decision table
+/// rather than a second matcher. `args: None` means the arguments could not be
+/// recovered, which a file tool treats as malformed.
+#[must_use]
+pub fn tool_call_payload(
+    agent: AgentKind,
+    name: &str,
+    args: Option<&Value>,
+    call_id: Option<&str>,
+) -> Value {
+    let args = args.cloned().unwrap_or(Value::Null);
+    let mut payload = match agent {
+        AgentKind::AntigravityCli => json!({"toolCall": {"name": name, "args": args}}),
+        AgentKind::Zero => json!({"toolName": name, "input": args}),
+        AgentKind::OpenCode | AgentKind::Omp | AgentKind::Pi | AgentKind::OpenClaw => {
+            json!({"tool": name, "args": args})
+        }
+        _ => json!({"tool_name": name, "tool_input": args}),
+    };
+    if let (Some(id), Some(object)) = (call_id, payload.as_object_mut()) {
+        object.insert("tool_use_id".into(), Value::String(id.into()));
+    }
+    payload
+}
+
 #[derive(Default)]
 struct Extracted<'a> {
     family: ToolFamily,
@@ -2106,6 +2134,72 @@ mod tests {
             ExtractionState::UnsupportedSchema
         );
         assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    /// A transcript import rebuilds each recorded tool call with
+    /// `tool_call_payload`; for every agent whose hook schema `extract`
+    /// supports, that rebuilt call must reach the same decision a live hook
+    /// gets, or `backfill` and the run ledger would store excluded content.
+    #[test]
+    fn tool_call_payload_reaches_the_live_decision_for_every_supported_agent() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        for agent in [
+            AgentKind::AntigravityCli,
+            AgentKind::Grok,
+            AgentKind::Zero,
+            AgentKind::ClaudeCode,
+            AgentKind::CommandCode,
+            AgentKind::Codex,
+            AgentKind::Cursor,
+            AgentKind::GeminiCli,
+            AgentKind::Devin,
+            AgentKind::Hermes,
+            AgentKind::KiroCli,
+            AgentKind::Pool,
+            AgentKind::Grizzybot,
+            AgentKind::Zcode,
+            AgentKind::CopilotCli,
+            AgentKind::OpenCode,
+            AgentKind::Omp,
+            AgentKind::Pi,
+            AgentKind::OpenClaw,
+        ] {
+            let decide = |name: &str, args: Option<&Value>| {
+                let raw = tool_call_payload(agent, name, args, Some("call-1"));
+                policy.inspect(agent, &raw, "/repo")
+            };
+            let excluded = decide("read", Some(&json!({"file_path": "docs/adr/1.md"})));
+            assert_eq!(
+                excluded.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "{agent:?}: excluded read"
+            );
+            assert_eq!(excluded.call_id.as_deref(), Some("call-1"), "{agent:?}");
+            let public = decide("read", Some(&json!({"file_path": "src/lib.rs"})));
+            assert_eq!(
+                public.protocol().disposition(),
+                CaptureDisposition::Keep,
+                "{agent:?}: public read"
+            );
+            assert_eq!(public.protocol().tool_family(), ToolFamily::File);
+            let shell = decide("bash", Some(&json!({"command": "cat docs/adr/1.md"})));
+            assert_eq!(
+                shell.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "{agent:?}: shell naming an excluded path"
+            );
+            assert_eq!(
+                decide("read", None).protocol().disposition(),
+                CaptureDisposition::MetadataOnly,
+                "{agent:?}: unrecoverable file arguments fail closed"
+            );
+        }
     }
 
     #[test]

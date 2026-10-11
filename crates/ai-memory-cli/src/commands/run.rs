@@ -33,6 +33,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{RunArgs, RunHarnessChoice};
+use crate::commands::transcript_capture::TranscriptCapture;
 use crate::commands::{path_util, resolve_scope_noting_marker_project};
 use crate::config::Config;
 use crate::http_client::{
@@ -1250,6 +1251,7 @@ async fn run_once_with_wiring(
         checkpoint,
         Some(exit_code),
         &privacy,
+        &TranscriptCapture::for_checkout(&repository.cwd),
     )
     .await
     {
@@ -3337,6 +3339,10 @@ async fn export_after_flush(
     }
 }
 
+/// Upload the exported transcript as the run's ledger segments. `capture`
+/// applies the checkout's `[capture] ignore_paths` first, so an excluded tool
+/// call and its output never reach a segment; a result whose call was imported
+/// by an earlier run has no call here and is dropped under a policy.
 async fn import_batches(
     endpoint: &ServerEndpoint,
     run_path: &str,
@@ -3344,6 +3350,7 @@ async fn import_batches(
     checkpoint: ai_memory_core::WorkstreamCheckpoint,
     exit_code: Option<i32>,
     sanitizer: &Sanitizer,
+    capture: &TranscriptCapture,
 ) -> Result<usize> {
     let native_identity = nonempty_session(&transcript.native_session_id)
         .map(|id| NativeSessionIdentity::parse(&id, sanitizer))
@@ -3351,8 +3358,9 @@ async fn import_batches(
     for event in &transcript.events {
         NativeSessionIdentity::parse(&event.native_session_id, sanitizer)?;
     }
+    let events = capture.filter_ledger_events(transcript.events);
     let mut imported = 0;
-    let mut batches = event_batches(transcript.events).into_iter().peekable();
+    let mut batches = event_batches(events).into_iter().peekable();
     while let Some(batch) = batches.next() {
         let complete = batches.peek().is_none();
         let request = FinishManagedRunRequest {
@@ -8767,6 +8775,7 @@ mod tests {
                     Default::default(),
                     Some(0),
                     &sanitizer,
+                    &TranscriptCapture::for_checkout(home.path()),
                 )
                 .await
                 .is_err(),
@@ -8793,6 +8802,7 @@ mod tests {
                     Default::default(),
                     Some(0),
                     &sanitizer,
+                    &TranscriptCapture::for_checkout(home.path()),
                 )
                 .await
                 .is_err(),
@@ -8808,6 +8818,7 @@ mod tests {
                 Default::default(),
                 Some(0),
                 &sanitizer,
+                &TranscriptCapture::for_checkout(home.path()),
             )
             .await
             .unwrap(),
@@ -8822,6 +8833,108 @@ mod tests {
             Some("cursor")
         );
         server.abort();
+    }
+
+    /// GHSA-gcpc-88hm-3xqr: the ledger upload applies the checkout's
+    /// `[capture] ignore_paths`. An excluded read's call and output never reach
+    /// the finish request (and so never a raw segment); a public read in the
+    /// same transcript still does.
+    #[tokio::test]
+    async fn ledger_upload_drops_tool_content_the_capture_policy_excludes() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let event = |kind, content: String, metadata: serde_json::Value| {
+            ai_memory_core::NewWorkstreamEvent {
+                event_id: format!("e-{}", content.len()),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "sid-1".into(),
+                source_record_id: None,
+                kind,
+                role: None,
+                content,
+                occurred_at: None,
+                metadata,
+            }
+        };
+        let read = |path: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolCall,
+                format!(
+                    "Read: {}",
+                    serde_json::json!({"file_path": repo.path().join(path)})
+                ),
+                serde_json::json!({"tool": "Read", "tool_use_id": id}),
+            )
+        };
+        let output = |text: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolResult,
+                text.into(),
+                serde_json::json!({"tool_use_id": id}),
+            )
+        };
+        let transcript = ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                read("docs/adr/1.md", "adr"),
+                read("src/lib.rs", "pub"),
+                output("ADRSENTINEL private decision", "adr"),
+                output("PUBLICCONTROL code", "pub"),
+            ],
+            losses: Vec::new(),
+        };
+        let imported = import_batches(
+            &endpoint,
+            "/workstream/runs/test",
+            transcript,
+            Default::default(),
+            Some(0),
+            &Sanitizer::builtin(),
+            &TranscriptCapture::for_checkout(repo.path()),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let posted = serde_json::to_string(&*requests.lock().unwrap()).unwrap();
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(!posted.contains("docs/adr"), "excluded call: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "public control: {posted}");
+        assert!(posted.contains("src/lib.rs"), "public call: {posted}");
+        assert_eq!(imported, 2);
+        assert_eq!(
+            requests.lock().unwrap()[0].source_cursor.as_deref(),
+            Some("cursor"),
+            "the cursor still advances past the excluded events"
+        );
     }
 
     #[tokio::test]

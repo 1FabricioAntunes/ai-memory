@@ -99,6 +99,7 @@ pub mod server;
 pub mod setup_agent;
 pub mod show;
 pub mod status;
+pub mod transcript_capture;
 pub mod uninstall;
 pub mod upgrade;
 pub mod user;

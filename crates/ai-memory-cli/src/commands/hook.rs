@@ -1266,7 +1266,7 @@ fn file_route_anchor(cwd: &Path) -> FileRouteAnchor {
 /// source files while its `workdir` points elsewhere. Without a reroute the
 /// event stays with the payload cwd, whose policy then drops it exactly as it
 /// would have before any rerouting existed.
-fn tool_location_routing_cwd(
+pub(crate) fn tool_location_routing_cwd(
     agent: AgentKind,
     raw: &serde_json::Value,
     payload_cwd: &str,
@@ -1389,7 +1389,7 @@ fn resolve_hook_route(
 /// including for a candidate file that doesn't exist on disk (canonicalize
 /// would `Err` on that and silently fall back to the raw, un-normalized
 /// cwd).
-fn lexical_capture_cwd(cwd: &str) -> String {
+pub(crate) fn lexical_capture_cwd(cwd: &str) -> String {
     crate::marker::absolute_normalized(Path::new(cwd))
         .into_os_string()
         .into_string()

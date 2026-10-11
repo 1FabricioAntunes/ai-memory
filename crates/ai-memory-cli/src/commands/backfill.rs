@@ -39,6 +39,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
+use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_workstream::{
     LaunchRoots, ManagedHarness, build_launch_plan_with_env, export_transcript,
     list_native_sessions, wait_for_transcript_flush,
@@ -46,6 +47,7 @@ use ai_memory_workstream::{
 
 use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
 use super::run;
+use super::transcript_capture::{EventCapture, TranscriptCapture};
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json};
 
@@ -236,6 +238,10 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
         return finish(&args, &report);
     }
 
+    // The checkout's `[capture] ignore_paths`, applied to every imported tool
+    // call as the live hook applies it.
+    let capture = TranscriptCapture::for_checkout(&cwd);
+
     // Import each selected session, oldest-first so the imported history reads
     // chronologically, until the total-events circuit breaker trips.
     for session in selected.into_iter().rev() {
@@ -243,7 +249,11 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
             report.skipped_for_cap += 1;
             continue;
         }
-        match import_one(&endpoint, &workspace, &project, &home, &cwd, &session).await {
+        match import_one(
+            &endpoint, &workspace, &project, &home, &cwd, &capture, &session,
+        )
+        .await
+        {
             Ok(events) => {
                 report.imported_sessions += 1;
                 report.imported_events += events;
@@ -449,13 +459,15 @@ struct HookBatchAck {
 /// the original harness and its native session id. Returns the number of
 /// content events (messages/tools) imported. The server sanitizes and bounds
 /// every event, so retroactive text crosses the same trust boundary as live
-/// capture.
+/// capture, and `capture` drops or strips tool events the checkout's
+/// `[capture] ignore_paths` excludes before anything is posted.
 async fn import_one(
     endpoint: &ServerEndpoint,
     workspace: &str,
     project: &str,
     home: &Path,
     cwd: &Path,
+    capture: &TranscriptCapture,
     session: &SessionRef,
 ) -> Result<usize> {
     let roots = LaunchRoots { home, cwd };
@@ -500,8 +512,14 @@ async fn import_one(
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.earliest }),
     )?);
     let mut content = 0usize;
-    for (event, occurred_at) in transcript.events.iter().zip(&resolved.per_event) {
-        if let Some(mapped) = map_event(sid, event, occurred_at.as_deref()) {
+    let captures = capture.decide(&transcript.events);
+    for ((event, occurred_at), capture) in transcript
+        .events
+        .iter()
+        .zip(&resolved.per_event)
+        .zip(&captures)
+    {
+        if let Some(mapped) = map_event(sid, event, occurred_at.as_deref(), capture) {
             items.push(hook_item(
                 endpoint,
                 workspace,
@@ -620,15 +638,30 @@ struct MappedEvent {
 /// `occurred_at` (RFC 3339), already resolved by the caller, rides in the hook
 /// body so the imported observation is dated at the transcript's own event
 /// time rather than at import time.
+///
+/// `capture` is the checkout's capture decision for this event: a dropped
+/// event maps to nothing, and a metadata-only one carries the hook's
+/// metadata-only body with its `_ai_memory_capture` protocol, which the server
+/// validates and rebuilds from its allowlist exactly as for a live hook. A kept
+/// event carries no protocol: its body is a normalized transcript record, not
+/// the native tool payload the server's re-inspection reads, so a claim would
+/// be judged against the wrong schema and stripped; the server never receives
+/// the ignore patterns, so the client's decision is the only one possible.
 fn map_event(
     session_id: &str,
     event: &NewWorkstreamEvent,
     occurred_at: Option<&str>,
+    capture: &EventCapture,
 ) -> Option<MappedEvent> {
     let content = event.content.trim();
     if content.is_empty() {
         return None;
     }
+    let decision = match capture {
+        EventCapture::Drop => return None,
+        EventCapture::MetadataOnly(decision) => Some(decision),
+        EventCapture::Keep => None,
+    };
     let role = event.role.as_deref().unwrap_or("");
     let ingest_key = format!("{session_id}:{}", event.event_id);
     match event.kind {
@@ -651,16 +684,26 @@ fn map_event(
                 _ if role.is_empty() => "message".to_string(),
                 _ => format!("{role}-message"),
             };
-            Some(MappedEvent {
-                event: format!("backfill.{source_event}"),
-                source_event: Some(source_event),
-                ingest_key,
-                body: serde_json::json!({
+            let body = match decision {
+                Some(decision) => {
+                    let mut body = metadata_only_body(Some(session_id), None, decision);
+                    if let Some(object) = body.as_object_mut() {
+                        object.insert("occurred_at".into(), occurred_at.into());
+                    }
+                    body
+                }
+                None => serde_json::json!({
                     "session_id": session_id,
                     "title": first_line(content),
                     "message": event.content,
                     "occurred_at": occurred_at,
                 }),
+            };
+            Some(MappedEvent {
+                event: format!("backfill.{source_event}"),
+                source_event: Some(source_event),
+                ingest_key,
+                body,
             })
         }
         WorkstreamEventKind::Compaction
@@ -891,6 +934,7 @@ mod tests {
             "sid",
             &event(WorkstreamEventKind::Message, Some("user"), "do the thing"),
             Some("2026-09-10T12:00:00Z"),
+            &EventCapture::Keep,
         )
         .expect("user message maps");
         assert_eq!(m.event, "user-prompt");
@@ -916,6 +960,7 @@ mod tests {
                 "here is the plan\nline2",
             ),
             None,
+            &EventCapture::Keep,
         )
         .expect("assistant maps");
         assert_eq!(a.event, "backfill.assistant-message");
@@ -934,6 +979,7 @@ mod tests {
             "sid",
             &event(WorkstreamEventKind::ToolCall, None, "grep foo"),
             None,
+            &EventCapture::Keep,
         )
         .expect("tool call maps");
         assert_eq!(t.event, "backfill.tool_call");
@@ -1053,6 +1099,7 @@ mod tests {
                 "sid",
                 &event(WorkstreamEventKind::Message, Some("user"), "   "),
                 None,
+                &EventCapture::Keep,
             )
             .is_none(),
             "whitespace-only content is not an observation"
@@ -1063,7 +1110,13 @@ mod tests {
             WorkstreamEventKind::Annotation,
         ] {
             assert!(
-                map_event("sid", &event(kind, None, "boundary"), None).is_none(),
+                map_event(
+                    "sid",
+                    &event(kind, None, "boundary"),
+                    None,
+                    &EventCapture::Keep
+                )
+                .is_none(),
                 "{kind:?} is not session content"
             );
         }
@@ -1117,6 +1170,142 @@ mod tests {
         let (only, _limit_hit) =
             collect_local_sessions_with(home.path(), cwd.path(), Some("nope"), |_| None).await;
         assert!(only.is_empty(), "no session matches the filter: {only:?}");
+    }
+
+    /// GHSA-gcpc-88hm-3xqr: a planted Claude transcript reads one file under
+    /// the checkout's `[capture] ignore_paths` and one outside it. The
+    /// excluded read's call and output never reach `/hook/batch`; the public
+    /// read's do. A malformed read is posted as the hook's metadata-only body.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_never_posts_tool_content_the_capture_policy_excludes() {
+        use axum::{Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        let app = Router::new().route(
+            "/hook/batch",
+            post(
+                move |axum::Json(items): axum::Json<Vec<serde_json::Value>>| {
+                    let captured = captured.clone();
+                    async move {
+                        let accepted = items.len();
+                        captured.lock().unwrap().extend(items);
+                        axum::Json(serde_json::json!({ "accepted": accepted }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let session_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(repo.path().to_string_lossy().replace('/', "-"));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let cwd = repo.path().to_string_lossy();
+        let record = |uuid: &str, kind: &str, content: serde_json::Value| {
+            serde_json::json!({
+                "type": kind, "uuid": uuid, "sessionId": sid, "cwd": cwd,
+                "timestamp": "2026-09-01T10:00:00Z",
+                "message": {"role": kind, "content": content},
+            })
+            .to_string()
+        };
+        let read = |id: &str, input: serde_json::Value| serde_json::json!({"type": "tool_use", "id": id, "name": "Read", "input": input});
+        let output = |id: &str, text: &str| serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": text});
+        let lines = [
+            record("u1", "user", serde_json::json!("read the adr and lib")),
+            record(
+                "a1",
+                "assistant",
+                serde_json::json!([
+                    read(
+                        "toolu_adr",
+                        serde_json::json!({"file_path": repo.path().join("docs/adr/1.md")})
+                    ),
+                    read(
+                        "toolu_pub",
+                        serde_json::json!({"file_path": repo.path().join("src/lib.rs")})
+                    ),
+                    read(
+                        "toolu_bad",
+                        serde_json::json!({"file_path": 7, "note": "ARGSENTINEL"})
+                    ),
+                ]),
+            ),
+            record(
+                "u2",
+                "user",
+                serde_json::json!([
+                    output("toolu_adr", "ADRSENTINEL private decision"),
+                    output("toolu_pub", "PUBLICCONTROL public code"),
+                    output("toolu_bad", "BADSENTINEL unprovable output"),
+                ]),
+            ),
+        ];
+        std::fs::write(
+            session_dir.join(format!("{sid}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+
+        let endpoint = ServerEndpoint::for_hook_target(format!("http://{address}"), None);
+        let session = SessionRef {
+            harness: ManagedHarness::Claude,
+            native_session_id: sid.into(),
+            updated_at: SystemTime::now(),
+        };
+        let capture = TranscriptCapture::for_checkout(repo.path());
+        import_one(
+            &endpoint,
+            "ws",
+            "proj",
+            home.path(),
+            repo.path(),
+            &capture,
+            &session,
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let posted = posted.lock().unwrap();
+        let text = serde_json::to_string(&*posted).unwrap();
+        for sentinel in ["ADRSENTINEL", "docs/adr", "ARGSENTINEL", "BADSENTINEL"] {
+            assert!(!text.contains(sentinel), "{sentinel} was posted: {text}");
+        }
+        assert!(text.contains("PUBLICCONTROL"), "public output: {text}");
+        assert!(text.contains("src/lib.rs"), "public call: {text}");
+        let stripped: Vec<_> = posted
+            .iter()
+            .filter(|item| item["body"].get("_ai_memory_capture").is_some())
+            .collect();
+        assert_eq!(
+            stripped.len(),
+            2,
+            "the malformed call and its output: {text}"
+        );
+        for item in stripped {
+            assert_eq!(
+                item["body"]["_ai_memory_capture"]["disposition"],
+                "metadata-only"
+            );
+            assert_eq!(item["body"]["tool_family"], "file");
+            assert_eq!(item["body"]["tool_call_id"], "toolu_bad");
+        }
     }
 
     fn spawned_args(

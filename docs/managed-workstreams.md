@@ -440,7 +440,12 @@ resume, continue, session, or fork selector.
    there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
-   excluded and recorded as extraction-loss annotations. Each delivered
+   excluded and recorded as extraction-loss annotations. The checkout's
+   `[capture] ignore_paths` applies before upload, with the live hook's
+   decision table: an excluded tool call and its result never enter the
+   ledger, one the policy cannot prove safe keeps only its tool family, and a
+   result whose call was imported by an earlier run is dropped under a
+   policy. Messages are unaffected. Each delivered
    workstream packet begins with a versioned origin marker. If Claude Code
    persists that packet and its `Read` tool returns it, the Claude transcript
    normalizer excludes the marked result instead of feeding delivered history

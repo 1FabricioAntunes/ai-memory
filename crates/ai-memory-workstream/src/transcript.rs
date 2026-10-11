@@ -933,7 +933,7 @@ fn parse_codex(
                 Some("assistant"),
                 &format!("{name}: {body}"),
                 timestamp(value),
-                json!({"tool": name}),
+                with_tool_use_id(json!({"tool": name}), first_string(payload, &["call_id"])),
             );
         }
         "function_call_output" | "custom_tool_call_output" | "tool_result" => {
@@ -948,7 +948,7 @@ fn parse_codex(
                 Some("tool"),
                 body,
                 timestamp(value),
-                json!({}),
+                with_tool_use_id(json!({}), first_string(payload, &["call_id"])),
             );
         }
         "web_search_call" => {
@@ -1029,10 +1029,13 @@ fn parse_pi_family(
                         Some("tool"),
                         &body,
                         timestamp(value),
-                        json!({
-                            "tool": tool,
-                            "is_error": message.get("isError").or_else(|| message.get("is_error")).and_then(Value::as_bool).unwrap_or(false)
-                        }),
+                        with_tool_use_id(
+                            json!({
+                                "tool": tool,
+                                "is_error": message.get("isError").or_else(|| message.get("is_error")).and_then(Value::as_bool).unwrap_or(false)
+                            }),
+                            first_string(message, &["toolCallId", "tool_call_id"]),
+                        ),
                     );
                 }
                 _ => losses.push(format!(
@@ -2100,7 +2103,10 @@ fn parse_content_blocks(
                     Some("assistant"),
                     &format!("{name}: {input}"),
                     occurred_at.clone(),
-                    json!({"tool": name}),
+                    with_tool_use_id(
+                        json!({"tool": name}),
+                        first_string(block, &["id", "toolCallId", "tool_call_id", "call_id"]),
+                    ),
                 );
             }
             "tool_result" | "toolResult" => {
@@ -2122,7 +2128,13 @@ fn parse_content_blocks(
                     Some("tool"),
                     &body,
                     occurred_at.clone(),
-                    json!({"is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false)}),
+                    with_tool_use_id(
+                        json!({"is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false)}),
+                        first_string(
+                            block,
+                            &["tool_use_id", "toolCallId", "tool_call_id", "call_id"],
+                        ),
+                    ),
                 );
             }
             "thinking" | "reasoning" | "redacted_thinking" => {
@@ -4241,6 +4253,16 @@ fn value_text(value: &Value) -> String {
         Value::Null => String::new(),
         _ => value.to_string(),
     }
+}
+
+/// Record the native id pairing a tool call with its result, so a transcript
+/// import can apply one capture decision to both halves (`backfill`, the
+/// `ai-memory run` ledger).
+fn with_tool_use_id(mut metadata: Value, id: Option<&str>) -> Value {
+    if let (Some(id), Some(object)) = (id, metadata.as_object_mut()) {
+        object.insert("tool_use_id".into(), Value::String(id.to_owned()));
+    }
+    metadata
 }
 
 fn compact_json(value: &Value) -> String {
