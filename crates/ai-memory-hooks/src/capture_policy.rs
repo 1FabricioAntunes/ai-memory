@@ -438,6 +438,9 @@ pub struct CapturePolicy {
     /// The marker directory, where git resolves a `REV:path` object name
     /// when the repository root holds the marker.
     root: Option<String>,
+    /// POSIX paths compare without regard to ASCII case, as on macOS, whose
+    /// default filesystem reads `NOTES/X.md` as `notes/x.md`.
+    fold_case: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -508,6 +511,17 @@ impl CapturePolicy {
     /// `home_dir` is required only when at least one pattern starts with `~/`.
     #[must_use]
     pub fn resolve(source: CaptureSource<'_>, marker_dir: &str, home_dir: Option<&str>) -> Self {
+        Self::resolve_for_host(source, marker_dir, home_dir, cfg!(target_os = "macos"))
+    }
+    /// [`Self::resolve`] for a host whose filesystem does (`fold_case`) or
+    /// does not ignore case. Only the client holds the patterns, so the
+    /// server's re-inspection never depends on this.
+    fn resolve_for_host(
+        source: CaptureSource<'_>,
+        marker_dir: &str,
+        home_dir: Option<&str>,
+        fold_case: bool,
+    ) -> Self {
         let config = match source {
             CaptureSource::Absent => return Self::inactive(),
             CaptureSource::Invalid => {
@@ -516,6 +530,7 @@ impl CapturePolicy {
                     patterns: Vec::new(),
                     home: None,
                     root: None,
+                    fold_case,
                 };
             }
             CaptureSource::Parsed(config) => config,
@@ -530,12 +545,14 @@ impl CapturePolicy {
                 patterns,
                 home: home_dir.and_then(|dir| normalize_root(dir).ok()),
                 root: normalize_root(marker_dir).ok(),
+                fold_case,
             },
             Err(_) => Self {
                 state: PolicyState::Invalid,
                 patterns: Vec::new(),
                 home: None,
                 root: None,
+                fold_case,
             },
         }
     }
@@ -545,6 +562,7 @@ impl CapturePolicy {
             patterns: Vec::new(),
             home: None,
             root: None,
+            fold_case: false,
         }
     }
     /// Evaluates every policy state using only direct fixture-backed schemas.
@@ -616,7 +634,11 @@ impl CapturePolicy {
                         Some(dir) if is_absolute(cwd) => join(cwd, dir),
                         _ => cwd.to_owned(),
                     };
-                    let split = command.split();
+                    // PowerShell's backquote and cmd's caret escape the next
+                    // character, so their commands also get a reading
+                    // without them.
+                    let split =
+                        command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
                     self.match_command(&split.words, &base)
                         .map(|matched| (matched, split.opaque))
                 }) {
@@ -668,7 +690,7 @@ impl CapturePolicy {
                     &pattern.path,
                     &candidate.path,
                     pattern.directory_base.as_deref(),
-                    pattern.flavor == Flavor::Windows,
+                    pattern.flavor == Flavor::Windows || self.fold_case,
                 ) {
                     return Ok(true);
                 }
@@ -683,9 +705,18 @@ impl CapturePolicy {
         let mut work = 0_usize;
         for word in words {
             for (argument, from_root) in shell_arguments(word) {
-                let expanded = match (argument.strip_prefix("~/"), self.home.as_deref()) {
-                    (Some(rest), Some(home)) => join(home, rest),
-                    _ => argument.to_owned(),
+                let home = argument
+                    .strip_prefix("~/")
+                    .or_else(|| argument.strip_prefix("~\\"));
+                // `~+` is the working directory.
+                let expanded = if let (Some(rest), Some(home)) = (home, self.home.as_deref()) {
+                    join(home, rest)
+                } else if argument == "~+" {
+                    cwd.to_owned()
+                } else if let Some(rest) = argument.strip_prefix("~+/") {
+                    join(cwd, rest)
+                } else {
+                    argument
                 };
                 // Git reads `REV:path` from the repository root, which only
                 // the marker directory approximates; try the cwd as well.
@@ -726,15 +757,15 @@ impl CapturePolicy {
     }
     /// Whether one normalized candidate, literal or glob, names or can expand
     /// into an ignored path. `tool_glob` selects `read_many_files` expansion
-    /// (case-insensitive, recursive `**`) over a shell's; Windows always
-    /// ignores case.
+    /// (case-insensitive, recursive `**`) over a shell's; Windows, and a
+    /// case-folding host, always ignore case.
     fn match_pattern_candidate(
         &self,
         candidate: &Normalized,
         tool_glob: bool,
         work: &mut usize,
     ) -> Result<bool, ()> {
-        let insensitive = tool_glob || candidate.flavor == Flavor::Windows;
+        let insensitive = tool_glob || candidate.flavor == Flavor::Windows || self.fold_case;
         let is_glob = candidate.path.contains(['*', '?']);
         // `read_many_files` reads a directory entry (`docs`, `.`) as
         // `entry/**`, and nothing here can tell a directory from a file.
@@ -878,6 +909,8 @@ struct Extracted<'a> {
     globs: bool,
     /// The tool reads back output of an earlier command (`BashOutput`).
     output_reader: bool,
+    /// Claude Code's `PowerShell` tool.
+    powershell: bool,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -994,6 +1027,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         search_paths,
         globs: name.eq_ignore_ascii_case("read_many_files"),
         output_reader: reads_earlier_output(name),
+        powershell: name.eq_ignore_ascii_case("powershell"),
         call_id,
         state,
     }
@@ -1256,7 +1290,7 @@ struct ShellWords {
 impl ShellCommand<'_> {
     #[cfg(test)]
     fn words(&self) -> Vec<String> {
-        self.split().words
+        self.split(false).words
     }
 
     /// Every word, and again every word inside a word that holds more than
@@ -1267,12 +1301,18 @@ impl ShellCommand<'_> {
     /// (`private notes/x.md`) and also tokenizes it, so a `bash -lc "<script>"`
     /// element is read like any script. Joining the elements instead would
     /// re-split paths with spaces and let one stray quote swallow the rest.
-    fn split(&self) -> ShellWords {
+    ///
+    /// `windows` also reads the command without PowerShell and cmd escapes
+    /// ([`without_windows_escapes`]).
+    fn split(&self, windows: bool) -> ShellWords {
         let mut split = ShellWords::default();
         match self {
             Self::Line(command) => {
                 split.opaque = has_unevaluated_expansion(command);
                 push_nested_words(&shell_words(command), MAX_SHELL_NESTING, &mut split);
+                if let Some(plain) = windows.then(|| without_windows_escapes(command)).flatten() {
+                    push_nested_words(&shell_words(&plain), MAX_SHELL_NESTING, &mut split);
+                }
             }
             Self::Argv(items) => {
                 // Each element is scanned as a script too, the same
@@ -1280,21 +1320,65 @@ impl ShellCommand<'_> {
                 split.opaque = items.iter().any(|item| has_unevaluated_expansion(item))
                     || runs_inline_code(items);
                 for item in items {
-                    let tokens = shell_words(item);
-                    if tokens.len() == 1 && tokens[0] == *item {
-                        push_word(item, &mut split);
-                        continue;
+                    push_argv_item(item, &mut split);
+                    if let Some(plain) = windows.then(|| without_windows_escapes(item)).flatten() {
+                        push_argv_item(&plain, &mut split);
                     }
-                    // Kept whole, a long script would exhaust the match budget.
-                    if item.chars().count() <= MAX_ARGV_PATH_CHARS {
-                        split.words.push((*item).to_owned());
-                    }
-                    push_nested_words(&tokens, MAX_SHELL_NESTING - 1, &mut split);
                 }
             }
         }
+        // `~-`, `~N` and `~name` name a directory only the running shell
+        // knows, so a path under one proves nothing either way.
+        split.opaque |= split.words.iter().any(|word| {
+            shell_arguments(word)
+                .iter()
+                .any(|(argument, _)| names_unknown_directory(argument))
+        });
         split
     }
+}
+
+fn push_argv_item(item: &str, split: &mut ShellWords) {
+    let tokens = shell_words(item);
+    if tokens.len() == 1 && tokens[0] == item {
+        push_word(item, split);
+        return;
+    }
+    // Kept whole, a long script would exhaust the match budget.
+    if item.chars().count() <= MAX_ARGV_PATH_CHARS {
+        split.words.push(item.to_owned());
+    }
+    push_nested_words(&tokens, MAX_SHELL_NESTING - 1, split);
+}
+
+/// `command` without PowerShell's backquote and cmd's caret escapes, each of
+/// which stands for the character after it (`secr`et.md`, `secr^et.md`).
+fn without_windows_escapes(command: &str) -> Option<String> {
+    if !command.contains(['`', '^']) {
+        return None;
+    }
+    let mut plain = String::with_capacity(command.len());
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        if matches!(c, '`' | '^') {
+            plain.extend(chars.next());
+        } else {
+            plain.push(c);
+        }
+    }
+    Some(plain)
+}
+
+/// Whether an argument starts with a tilde prefix whose directory only the
+/// running shell knows: `~-` (the previous directory), `~N`/`~+N` (the
+/// directory stack) or `~name` (another account's home). `~`, `~/` and `~+`
+/// (the working directory) are resolved instead.
+fn names_unknown_directory(argument: &str) -> bool {
+    let Some(rest) = argument.strip_prefix('~') else {
+        return false;
+    };
+    let prefix = rest.split(['/', '\\']).next().unwrap_or(rest);
+    !prefix.is_empty() && prefix != "+"
 }
 
 /// How many quoting levels a script inside a word is re-split.
@@ -1327,9 +1411,13 @@ fn push_nested_words(words: &[String], depth: usize, split: &mut ShellWords) {
 
 /// Adds a word, and its POSIX reading when it differs: outside quotes a
 /// shell drops the backslash of `\o`, but [`shell_words`] keeps it so a
-/// Windows path keeps its separators.
+/// Windows path keeps its separators. A word with a parameter default
+/// (`${X:-docs/x.md}`) also adds the reading with the operand in its place.
 fn push_word(word: &str, split: &mut ShellWords) {
     split.words.push(word.to_owned());
+    if let Some(operands) = parameter_operands(word) {
+        split.words.push(operands);
+    }
     if word.contains('\\') {
         let mut plain = String::with_capacity(word.len());
         let mut chars = word.chars();
@@ -1346,6 +1434,70 @@ fn push_word(word: &str, split: &mut ShellWords) {
     }
 }
 
+/// `word` with each `${NAME:-word}`, `${NAME:=word}` or `${NAME:+word}`
+/// (or the form without `:`) replaced by its operand, which the shell
+/// substitutes when `NAME` is unset (set, for `+`). Nested operands are
+/// replaced down to [`MAX_SHELL_NESTING`] levels.
+fn parameter_operands(word: &str) -> Option<String> {
+    let mut current = replace_parameter_operands(word)?;
+    for _ in 1..MAX_SHELL_NESTING {
+        match replace_parameter_operands(&current) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    Some(current)
+}
+
+fn replace_parameter_operands(word: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut rest = word;
+    let mut changed = false;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let body = &rest[start + 2..];
+        let name = body
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len());
+        let after = &body[name..];
+        let operator =
+            if after.starts_with(":-") || after.starts_with(":=") || after.starts_with(":+") {
+                2
+            } else if after.starts_with(['-', '=', '+']) {
+                1
+            } else {
+                0
+            };
+        let operand = &after[operator..];
+        let mut depth = 0_usize;
+        let end = operand.char_indices().find_map(|(index, c)| match c {
+            '{' => {
+                depth += 1;
+                None
+            }
+            '}' if depth == 0 => Some(index),
+            '}' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        });
+        match end {
+            Some(end) if name > 0 && operator > 0 => {
+                output.push_str(&operand[..end]);
+                changed = true;
+                rest = &operand[end + 1..];
+            }
+            _ => {
+                output.push_str("${");
+                rest = body;
+            }
+        }
+    }
+    output.push_str(rest);
+    changed.then_some(output)
+}
+
 /// A command word's program name: its last path segment, lowercased,
 /// without `.exe`.
 fn command_name(word: &str) -> String {
@@ -1358,7 +1510,9 @@ fn command_name(word: &str) -> String {
 }
 
 /// Whether `words[index]` is a script a shell runs: the argument after
-/// `sh -c` (any flag cluster with `c`, as in `bash -lc`) or after `eval`.
+/// `sh -c` (any flag cluster with `c`, as in `bash -lc`, past other options
+/// and their values, as in `bash -o pipefail -c`), after `su -c` or
+/// `script -c`, which hand it to a shell, or after `eval`.
 fn is_shell_script<S: AsRef<str>>(words: &[S], index: usize) -> bool {
     let mut script_flag = false;
     for previous in (0..index).rev() {
@@ -1367,19 +1521,46 @@ fn is_shell_script<S: AsRef<str>>(words: &[S], index: usize) -> bool {
             script_flag |= !flag.starts_with('-') && flag.contains('c');
             continue;
         }
+        // `+o pipefail`, `+x`.
+        if word.len() > 1 && word.starts_with('+') {
+            continue;
+        }
+        if previous > 0 && takes_shell_value(words[previous - 1].as_ref()) {
+            continue;
+        }
         let name = command_name(word);
         return (script_flag
             && matches!(
                 name.as_str(),
-                "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "yash" | "fish"
+                "sh" | "bash"
+                    | "zsh"
+                    | "dash"
+                    | "ksh"
+                    | "mksh"
+                    | "ash"
+                    | "yash"
+                    | "fish"
+                    | "su"
+                    | "script"
             ))
             || (previous + 1 == index && name == "eval");
     }
     false
 }
 
+/// Whether a shell option consumes the next word as its value: `-o`/`+o`
+/// and `-O`/`+O` (also ending a flag cluster, as in `-eo`), `--rcfile`,
+/// `--init-file`, and fish's `-C`/`--init-command`.
+fn takes_shell_value(flag: &str) -> bool {
+    matches!(flag, "--rcfile" | "--init-file" | "--init-command" | "-C")
+        || (flag.len() > 1
+            && (flag.starts_with('+') || (flag.starts_with('-') && !flag.starts_with("--")))
+            && flag.ends_with(['o', 'O']))
+}
+
 /// Whether the words run inline interpreter code (`python3 -c`, `node -e`,
-/// `ruby -e`, `perl -e`, `php -r`, `deno eval`). Code builds paths at run
+/// `ruby -e`, `perl -e`, `php -r`, `lua -e`, `Rscript -e`, `osascript -e`,
+/// `deno eval`). Code builds paths at run
 /// time (`'docs/' + name`), so no lexical match can rule an ignored path out.
 fn runs_inline_code<S: AsRef<str>>(words: &[S]) -> bool {
     (0..words.len()).any(|index| {
@@ -1388,33 +1569,59 @@ fn runs_inline_code<S: AsRef<str>>(words: &[S]) -> bool {
             name.strip_prefix(prefix)
                 .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
         };
-        let letters: &[char] = if versioned("python") || versioned("pypy") || name == "py" {
-            &['c']
-        } else if versioned("perl") {
-            &['e', 'E']
-        } else if versioned("ruby") {
-            &['e']
-        } else if matches!(name.as_str(), "node" | "nodejs" | "bun") {
-            &['e', 'p']
-        } else if versioned("php") {
-            &['r']
-        } else if name == "deno" {
-            return words
-                .get(index + 1)
-                .is_some_and(|next| next.as_ref() == "eval");
-        } else {
-            return false;
-        };
-        words[index + 1..]
-            .iter()
-            .map(AsRef::as_ref)
-            .take_while(|word| word.starts_with('-'))
-            .any(|flag| {
-                matches!(flag, "--eval" | "--print")
-                    || flag.starts_with("--eval=")
-                    || flag.starts_with("--print=")
-                    || (!flag.starts_with("--") && flag[1..].contains(letters))
-            })
+        // The inline-code flag letters, and the options that take the
+        // next word as their value (`python3 -W ignore -c …`).
+        let (letters, values): (&[char], &[&str]) =
+            if versioned("python") || versioned("pypy") || name == "py" {
+                (&['c'], &["-W", "-X", "--check-hash-based-pycs"])
+            } else if versioned("perl") {
+                (&['e', 'E'], &["-I", "-M", "-m"])
+            } else if versioned("ruby") {
+                (&['e'], &["-I", "-r", "-C", "-E"])
+            } else if matches!(name.as_str(), "node" | "nodejs" | "bun") {
+                (
+                    &['e', 'p'],
+                    &[
+                        "-r",
+                        "--require",
+                        "--import",
+                        "--loader",
+                        "--experimental-loader",
+                        "-C",
+                        "--conditions",
+                        "--input-type",
+                        "--title",
+                        "--env-file",
+                    ],
+                )
+            } else if versioned("php") {
+                (&['r'], &["-d", "-c", "-z"])
+            } else if matches!(name.as_str(), "lua" | "luajit" | "rscript" | "osascript") {
+                (&['e'], &["-l"])
+            } else if name == "deno" {
+                return words
+                    .get(index + 1)
+                    .is_some_and(|next| next.as_ref() == "eval");
+            } else {
+                return false;
+            };
+        let mut rest = words[index + 1..].iter().map(AsRef::as_ref);
+        while let Some(flag) = rest.next() {
+            if !flag.starts_with('-') {
+                return false;
+            }
+            if matches!(flag, "--eval" | "--print")
+                || flag.starts_with("--eval=")
+                || flag.starts_with("--print=")
+                || (!flag.starts_with("--") && flag[1..].contains(letters))
+            {
+                return true;
+            }
+            if values.contains(&flag) {
+                rest.next();
+            }
+        }
+        false
     })
 }
 
@@ -1550,6 +1757,10 @@ fn shell_words(command: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Some('\'' | '$'), '\'') | (Some('"'), '"') => quote = None,
+            // A backslash-newline outside single quotes continues the line.
+            (Some('"') | None, '\\') if chars.peek() == Some(&'\n') => {
+                chars.next();
+            }
             (Some('"'), '\\') if matches!(chars.peek(), Some('"' | '\\')) => {
                 word.extend(chars.next());
             }
@@ -1621,22 +1832,75 @@ fn ansi_c_escape(escape: char) -> Option<char> {
 
 /// Path-like values carried by one shell word: the word itself unless it is
 /// a flag, plus the value of a `--flag=value`, `NAME=value`, or PowerShell
-/// `-Param:value` word, plus the path of a git `REV:path` object name. The
-/// flag is set for that last one, which git resolves from the repository
-/// root.
-fn shell_arguments(word: &str) -> impl Iterator<Item = (&str, bool)> {
+/// `-Param:value` word, plus a value glued to a short flag (`-fFILE`), plus
+/// the path of a git `REV:path` object name, plus the path of any of these
+/// that is a `file:` URL. The flag is set for the object name's path, which
+/// git resolves from the repository root.
+fn shell_arguments(word: &str) -> Vec<(String, bool)> {
     let flag = word.starts_with('-');
-    let whole = (!flag).then_some((word, false));
-    let value = word
+    let mut arguments: Vec<(String, bool)> = Vec::new();
+    if !flag {
+        arguments.push((word.to_owned(), false));
+    }
+    if let Some((_, value)) = word
         .split_once('=')
         .or_else(|| flag.then(|| word.split_once(':')).flatten())
-        .map(|(_, value)| (value, false));
-    let object = git_object_path(word).map(|path| (path, true));
-    whole
-        .into_iter()
-        .chain(value)
-        .chain(object)
-        .filter(|(argument, _)| !argument.trim().is_empty())
+    {
+        arguments.push((value.to_owned(), false));
+    }
+    if let Some(cluster) = word.strip_prefix('-').filter(|rest| !rest.starts_with('-')) {
+        let mut chars = cluster.chars();
+        chars.next();
+        if !chars.as_str().is_empty() {
+            arguments.push((chars.as_str().to_owned(), false));
+        }
+    }
+    if let Some(path) = git_object_path(word) {
+        arguments.push((path.to_owned(), true));
+    }
+    let urls: Vec<_> = arguments
+        .iter()
+        .filter_map(|(argument, _)| file_url_path(argument))
+        .map(|path| (path, false))
+        .collect();
+    arguments.extend(urls);
+    arguments.retain(|(argument, _)| !argument.trim().is_empty());
+    arguments
+}
+
+/// The local path a `file:` URL names (`file:///x`, `file://host/x`,
+/// `file:/x`, any case), with ASCII percent-escapes decoded.
+fn file_url_path(argument: &str) -> Option<String> {
+    if !argument.get(..5)?.eq_ignore_ascii_case("file:") {
+        return None;
+    }
+    let rest = &argument[5..];
+    let path = match rest.strip_prefix("//") {
+        Some(authority) => &authority[authority.find('/')?..],
+        None => rest,
+    };
+    // `file:///C:/x` names the drive path `C:/x`.
+    let path = path
+        .strip_prefix('/')
+        .filter(|drive| valid_drive_prefix(drive))
+        .unwrap_or(path);
+    let mut decoded = String::with_capacity(path.len());
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        let escape = chars.as_str().get(..2).and_then(|hex| {
+            u8::from_str_radix(hex, 16)
+                .ok()
+                .filter(|byte| byte.is_ascii() && hex.chars().all(|d| d.is_ascii_hexdigit()))
+        });
+        match escape {
+            Some(byte) if c == '%' => {
+                decoded.push(char::from(byte));
+                chars.nth(1);
+            }
+            _ => decoded.push(c),
+        }
+    }
+    Some(decoded)
 }
 
 /// The path of a git object name such as `HEAD:docs/x.md`, `v1.2~3:x`,
@@ -2997,12 +3261,19 @@ mod tests {
             .iter()
             .map(|pattern| pattern.as_str().unwrap().to_owned())
             .collect();
-        let policy = CapturePolicy::resolve(
-            CaptureSource::Parsed(&CaptureConfig { ignore_paths }),
-            "/repo",
-            Some("/home/me"),
-        );
+        let config = CaptureConfig { ignore_paths };
+        // The host's case folding is pinned per vector, so the table means
+        // the same on every CI OS.
+        let policy = |fold_case| {
+            CapturePolicy::resolve_for_host(
+                CaptureSource::Parsed(&config),
+                "/repo",
+                Some("/home/me"),
+                fold_case,
+            )
+        };
         for vector in shell["vectors"].as_array().unwrap() {
+            let policy = policy(vector["fold_case"].as_bool().unwrap_or(false));
             let payload = vector
                 .get("payload")
                 .cloned()
@@ -4029,6 +4300,103 @@ mod tests {
             Some(vec!["/other/repo".to_owned()])
         );
     }
+    /// On a Windows host cmd's caret and PowerShell's backquote escape the
+    /// next character whatever the shell tool, so their readings without the
+    /// escape are matched; a POSIX shell reads both literally (control).
+    #[test]
+    fn windows_escape_characters_are_read_on_a_windows_host() {
+        let windows = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            r"C:\repo",
+            None,
+        );
+        for (command, expected) in [
+            (r"type docs\ad^r\x.md", CaptureDisposition::Drop),
+            (r"Get-Content docs\ad`r\x.md", CaptureDisposition::Drop),
+            (r"type C:\repo\DOCS\A^DR\x.md", CaptureDisposition::Drop),
+            (r"type src\ma^in.rs", CaptureDisposition::Keep),
+            ("echo a^b", CaptureDisposition::Keep),
+        ] {
+            let decision = windows.inspect(AgentKind::ClaudeCode, &bash(command), r"C:\repo");
+            assert_eq!(decision.protocol().disposition(), expected, "{command}");
+        }
+        let posix = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        for command in ["cat docs/ad^r/x.md", "cat docs/ad`r`/x.md"] {
+            assert_eq!(
+                posix
+                    .inspect(AgentKind::ClaudeCode, &bash(command), "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::Keep,
+                "{command}"
+            );
+        }
+    }
+
+    /// A macOS host reads `DOCS/ADR/x.md` as `docs/adr/x.md`, so file tools
+    /// and shell arguments match without regard to case there, and only
+    /// there (control: the same host-independent policy elsewhere).
+    #[test]
+    fn a_case_folding_host_matches_paths_without_regard_to_case() {
+        let policy = |fold_case| {
+            CapturePolicy::resolve_for_host(
+                CaptureSource::Parsed(&CaptureConfig {
+                    ignore_paths: vec!["docs/adr/**".into()],
+                }),
+                "/repo",
+                None,
+                fold_case,
+            )
+        };
+        let read = json!({"tool_name": "Read", "tool_input": {"file_path": "DOCS/Adr/x.md"}});
+        for (raw, label) in [(read, "read"), (bash("cat DOCS/Adr/x.md"), "bash")] {
+            for (fold_case, expected) in [
+                (true, CaptureDisposition::Drop),
+                (false, CaptureDisposition::Keep),
+            ] {
+                assert_eq!(
+                    policy(fold_case)
+                        .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                        .protocol()
+                        .disposition(),
+                    expected,
+                    "{label} fold_case={fold_case}"
+                );
+            }
+        }
+        let public = json!({"tool_name": "Read", "tool_input": {"file_path": "SRC/x.md"}});
+        assert_eq!(
+            policy(true)
+                .inspect(AgentKind::ClaudeCode, &public, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert!(
+            !CapturePolicy::resolve(CaptureSource::Absent, "/repo", None).fold_case,
+            "an inactive policy never folds"
+        );
+        assert_eq!(
+            CapturePolicy::resolve(
+                CaptureSource::Parsed(&CaptureConfig {
+                    ignore_paths: vec!["x/**".into()],
+                }),
+                "/repo",
+                None,
+            )
+            .fold_case,
+            cfg!(target_os = "macos")
+        );
+    }
+
     /// Reading nested words and the new fail-closed syntax must not strip
     /// everyday commands that name no ignored path.
     #[test]
@@ -4064,6 +4432,25 @@ mod tests {
             "(cd src && cargo test)",
             "docker compose up -d",
             "curl -s http://localhost:8080/health",
+            // Near misses of the continuation, option-value, glued-flag,
+            // URL, tilde and parameter-default readings.
+            "cargo test \\\n  --workspace",
+            "bash -o pipefail -c 'cargo test'",
+            "set -o pipefail; cargo test",
+            "python3 -W ignore -m pytest",
+            "node -r ts-node/register scripts/build.ts",
+            "grep -fpatterns.txt src",
+            "cargo build -j4",
+            "tar -czf out.tgz src",
+            "gcc -Isrc -o build/app src/main.c",
+            "make -C src",
+            "curl -s file:///tmp/report.txt",
+            "cat ~+/src/main.rs",
+            "ls -la ~",
+            "echo ${HOME:-/tmp} ${PWD}",
+            "git log --oneline HEAD~3..HEAD",
+            "git rebase -i HEAD~2",
+            "echo a^b",
         ] {
             assert_eq!(
                 policy

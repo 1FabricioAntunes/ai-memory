@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads them. Inline interpreter code (`python3 -c`, `node -e` and similar)
   and further glob syntax the matcher does not evaluate (zsh glob groups,
   extglobs, encoded escapes) are now metadata-only under an active policy.
+  Line continuations, parameter defaults, values glued to short flags,
+  `file:` URLs, `~+`, PowerShell and cmd escape characters, and shell or
+  interpreter options placed before the script or code are now read too, and
+  more script runners and interpreters are recognized. A path under a
+  directory only the running shell knows (`~-`, `~name`) makes the call
+  metadata-only, and on macOS paths match without regard to case, as its
+  default filesystem does.
   This applies to the native hook, the server, and the
   generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
 - Fixed `ai-memory backfill`, including the automatic first-boot import, and
