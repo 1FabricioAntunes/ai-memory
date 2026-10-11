@@ -7,8 +7,9 @@
 //! agent's hook shape (`tool_call_payload`) and inspected by the checkout's
 //! `CapturePolicy`, resolved from the working directory its own record names
 //! when the adapter keeps one; a call the live hook would reroute to another
-//! checkout also answers to that checkout's admission gate, server route and
-//! policy; and each tool result inherits the decision of the call it answers.
+//! checkout also answers to that checkout's admission gate, server route,
+//! project scope and policy; and each tool result inherits the decision of the
+//! call it answers.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,12 +17,13 @@ use std::path::{Path, PathBuf};
 use ai_memory_core::{AgentKind, NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_hooks::{
     CaptureDecision, CaptureDisposition, CapturePolicy, PolicyState, ToolFamily, tool_call_payload,
+    valid_call_id,
 };
 use ai_memory_workstream::RECORD_CWD_KEY;
 use serde_json::Value;
 
 use super::hook::{
-    checkout_admits_capture, delivers_to_same_server, lexical_capture_cwd,
+    checkout_admits_capture, delivers_to_same_server, lexical_capture_cwd, routes_to_same_project,
     tool_location_routing_cwd,
 };
 use super::hook_capture::capture_policy;
@@ -107,16 +109,18 @@ impl TranscriptCapture {
     ///
     /// An event whose record names its own working directory is judged from
     /// there, as the live hook judges an event by its own `cwd`: that
-    /// directory must pass the same admission gate and deliver to the same
-    /// server as this checkout, or the event is dropped.
+    /// directory must pass the same admission gate, deliver to the same server
+    /// and resolve to the same project as this checkout, or the event is
+    /// dropped.
     ///
     /// A result answers the call with the same native id. Some adapters record
-    /// no id, so a result without a matching call takes the strictest decision
-    /// of every call since the last user message: parallel calls may answer
-    /// out of order, and a positional guess could hand an excluded read's
-    /// output the decision of a public one. A result with no call at all is
-    /// dropped under a policy, since nothing proves it missed every ignored
-    /// path.
+    /// no id, so a result without one takes the strictest decision of every
+    /// call since the last user message: parallel calls may answer out of
+    /// order, and a positional guess could hand an excluded read's output the
+    /// decision of a public one. A result whose id matches no recorded call,
+    /// or with no call at all, is an orphan: dropped under a policy, since
+    /// nothing proves it missed every ignored path, and content-free without
+    /// one.
     pub(crate) fn decide(&self, events: &[NewWorkstreamEvent]) -> Vec<EventCapture> {
         if !self.admitted {
             return vec![EventCapture::Drop; events.len()];
@@ -142,16 +146,17 @@ impl TranscriptCapture {
                     capture
                 }
                 WorkstreamEventKind::ToolResult if !admitted => EventCapture::Drop,
-                WorkstreamEventKind::ToolResult => {
-                    match call_id(event).and_then(|id| by_id.get(id)) {
-                        Some(capture) => capture.clone(),
-                        None => turn
-                            .iter()
-                            .cloned()
-                            .reduce(EventCapture::stricter)
-                            .unwrap_or_else(|| self.orphan_result()),
-                    }
-                }
+                WorkstreamEventKind::ToolResult => match call_id(event) {
+                    Some(id) => by_id
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| self.orphan_result()),
+                    None => turn
+                        .iter()
+                        .cloned()
+                        .reduce(EventCapture::stricter)
+                        .unwrap_or_else(|| self.orphan_result()),
+                },
                 WorkstreamEventKind::Message => {
                     if matches!(event.role.as_deref(), Some("user" | "human")) {
                         turn.clear();
@@ -164,7 +169,13 @@ impl TranscriptCapture {
                 }
                 WorkstreamEventKind::Compaction
                 | WorkstreamEventKind::Checkpoint
-                | WorkstreamEventKind::Annotation => EventCapture::Keep,
+                | WorkstreamEventKind::Annotation => {
+                    if admitted {
+                        EventCapture::Keep
+                    } else {
+                        EventCapture::Drop
+                    }
+                }
             };
             out.push(capture);
         }
@@ -210,13 +221,17 @@ impl TranscriptCapture {
     }
 
     /// Whether the live hook would deliver an event reported from `cwd`, a
-    /// directory other than this checkout's, to this import's server at all:
-    /// the hook's admission gate there (capture mode, marker opt-in, readable
-    /// routing marker) and the same server-profile route.
+    /// directory other than this checkout's, to this import's server and
+    /// project at all: the hook's admission gate there (capture mode, marker
+    /// opt-in, readable routing marker), the same server-profile route, and
+    /// the same project scope. The import files everything under this
+    /// checkout's project, so an event the hook would file under another one
+    /// is left out rather than misfiled.
     fn admits_elsewhere(&self, cwd: &str, seen: &mut HashMap<String, bool>) -> bool {
         *seen.entry(cwd.to_owned()).or_insert_with(|| {
             checkout_admits_capture(&self.data_dir, cwd)
                 && delivers_to_same_server(&self.data_dir, &self.cwd, cwd)
+                && routes_to_same_project(&self.cwd, cwd)
         })
     }
 
@@ -304,38 +319,22 @@ fn record_cwd(event: &NewWorkstreamEvent) -> Option<&str> {
         .filter(|cwd| Path::new(cwd).is_absolute())
 }
 
-/// Claude Code records a `!` shell command's output as user messages made
-/// only of these blocks. Live capture never receives that output.
+/// Claude Code records a `!` shell command's output as a user message that
+/// opens with one of these blocks. Live capture never receives that output.
+/// The opening tag decides alone: the output is arbitrary text, so it can
+/// hold a closing tag of its own, and no reading of where a block ends is
+/// safe.
 fn shell_mode_output(event: &NewWorkstreamEvent) -> bool {
     const TAGS: [&str; 4] = [
-        "bash-stdout",
-        "bash-stderr",
-        "local-command-stdout",
-        "local-command-stderr",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
     ];
-    if event.agent != AgentKind::ClaudeCode {
-        return false;
-    }
-    let mut rest = event.content.trim_start();
-    if rest.is_empty() {
-        return false;
-    }
-    while !rest.is_empty() {
-        let Some(tag) = TAGS.iter().find(|tag| {
-            rest.strip_prefix('<')
-                .and_then(|rest| rest.strip_prefix(**tag))
-                .is_some_and(|rest| rest.starts_with('>'))
-        }) else {
-            return false;
-        };
-        let close = format!("</{tag}>");
-        // A block cut by the adapter's size cap has no closing tag.
-        rest = rest
-            .find(&close)
-            .map_or("", |end| &rest[end + close.len()..])
-            .trim_start();
-    }
-    true
+    event.agent == AgentKind::ClaudeCode
+        && TAGS
+            .iter()
+            .any(|tag| event.content.trim_start().starts_with(tag))
 }
 
 /// The native id linking a tool call and its result, when the adapter kept one.
@@ -373,7 +372,8 @@ fn recorded_call(event: &NewWorkstreamEvent) -> (&str, Option<Value>) {
 }
 
 /// A ledger event with its content replaced by the tool family, keeping only
-/// the labels that pair it with the other half of the call.
+/// what the live server keeps for such an event: the family and a call id
+/// that passes its validation, never the tool's own name.
 fn withheld(mut event: NewWorkstreamEvent, family: ToolFamily) -> NewWorkstreamEvent {
     let family = serde_json::to_value(family)
         .ok()
@@ -386,8 +386,12 @@ fn withheld(mut event: NewWorkstreamEvent, family: ToolFamily) -> NewWorkstreamE
     };
     event.content = format!("[{family} tool {half} withheld by the capture policy]");
     let mut metadata = serde_json::Map::new();
-    for key in ["tool", "tool_use_id", "tool_call_id", "parent_id"] {
-        if let Some(value) = event.metadata.get(key).filter(|value| value.is_string()) {
+    for key in ["tool_use_id", "tool_call_id"] {
+        if let Some(value) = event
+            .metadata
+            .get(key)
+            .filter(|value| value.as_str().is_some_and(valid_call_id))
+        {
             metadata.insert(key.into(), value.clone());
         }
     }
@@ -532,7 +536,8 @@ mod tests {
         );
     }
 
-    /// No marker: nothing changes, including id-less and orphan results.
+    /// No marker: a recognized call and its id-less result are kept; a result
+    /// whose id answers no recorded call is an orphan and keeps no content.
     #[test]
     fn without_a_policy_every_event_is_kept() {
         let repo = checkout(None);
@@ -542,20 +547,55 @@ mod tests {
             result("ADR text", None),
             result("orphan", Some("missing")),
         ];
-        assert_eq!(kinds(&capture.decide(&events)), ["keep", "keep", "keep"]);
+        assert_eq!(
+            kinds(&capture.decide(&events)),
+            ["keep", "keep", "unrecognized"]
+        );
     }
 
-    /// A read whose absolute target is another marked checkout answers to that
-    /// checkout's `ignore_paths` too, as the live hook's reroute would.
+    /// A result carrying an id that matches no recorded call follows the
+    /// orphan rule, not the turn's decision: a public read in the same turn
+    /// must not lend it a keep. Control: the read's own result is kept.
+    #[test]
+    fn a_result_whose_id_matches_no_call_is_an_orphan() {
+        for (marker, orphan) in [(Some("docs/adr/**"), "drop"), (None, "unrecognized")] {
+            let repo = checkout(marker);
+            let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+            let events = [
+                event(WorkstreamEventKind::Message, "user", "read", json!({})),
+                read_call(&repo.path().join("src/lib.rs"), Some("pub")),
+                result("public code", Some("pub")),
+                result("ORPHANSENTINEL", Some("never-called")),
+            ];
+            assert_eq!(
+                kinds(&capture.decide(&events)),
+                ["keep", "keep", "keep", orphan],
+                "{marker:?}"
+            );
+            let uploaded =
+                serde_json::to_string(&capture.filter_ledger_events(events.into())).unwrap();
+            assert!(!uploaded.contains("ORPHANSENTINEL"), "{uploaded}");
+            assert!(uploaded.contains("public code"), "{uploaded}");
+        }
+    }
+
+    /// A read whose absolute target is another marked checkout of the same
+    /// project answers to that checkout's `ignore_paths` too, as the live
+    /// hook's reroute would.
     #[test]
     fn a_call_into_another_checkout_honors_its_policy() {
-        let source = checkout(None);
-        let other = checkout(Some("private/**"));
-        let capture = TranscriptCapture::for_checkout(source.path(), source.path());
+        let base = tempfile::tempdir().unwrap();
+        let scope = "workspace = \"w\"\nproject = \"p\"\n";
+        let source = marked(&base.path().join("source"), scope);
+        let other = marked(
+            &base.path().join("other"),
+            &format!("{scope}[capture]\nignore_paths = [\"private/**\"]\n"),
+        );
+        let capture = TranscriptCapture::for_checkout(base.path(), &source);
         let events = [
-            read_call(&other.path().join("private/key.txt"), Some("a")),
+            read_call(&other.join("private/key.txt"), Some("a")),
             result("private", Some("a")),
-            read_call(&other.path().join("open.txt"), Some("b")),
+            read_call(&other.join("open.txt"), Some("b")),
             result("open", Some("b")),
         ];
         assert_eq!(
@@ -670,11 +710,11 @@ mod tests {
         );
     }
 
-    /// A Claude Code `!` command's output is recorded as user messages made
-    /// only of `<bash-stdout>`/`<bash-stderr>` (or `<local-command-stdout>`)
-    /// blocks, which live capture never receives. The typed command and an
-    /// ordinary prompt quoting such a tag are kept, as is another agent's
-    /// message.
+    /// A Claude Code `!` command's output is recorded as user messages that
+    /// open with a `<bash-stdout>`/`<bash-stderr>` (or `<local-command-stdout>`)
+    /// block, which live capture never receives — even when the output itself
+    /// holds a closing tag. The typed command and an ordinary prompt quoting
+    /// such a tag are kept, as is another agent's message.
     #[test]
     fn claude_shell_mode_output_is_not_imported() {
         let repo = checkout(None);
@@ -688,12 +728,16 @@ mod tests {
             user("<local-command-stdout>output</local-command-stdout>"),
             user("<bash-stdout>cut by the size cap"),
             user("why does <bash-stdout>x</bash-stdout> appear?"),
-            user("<bash-stdout>x</bash-stdout> and then a question"),
+            user("<bash-stdout>x</bash-stdout> and then more output"),
+            user("<bash-stdout>printf '</bash-stdout>' SHELLSENTINEL</bash-stdout>"),
+            user("  <bash-stderr>e</bash-stderr><bash-stdout>a</bash-stdout>"),
             codex,
         ];
         assert_eq!(
             kinds(&capture.decide(&events)),
-            ["keep", "drop", "drop", "drop", "keep", "keep", "keep"]
+            [
+                "keep", "drop", "drop", "drop", "keep", "drop", "drop", "drop", "keep"
+            ]
         );
     }
 
@@ -727,6 +771,8 @@ mod tests {
             );
             let uploaded = serde_json::to_string(&capture.filter_ledger_events(events)).unwrap();
             assert!(!uploaded.contains("SENTINEL"), "{uploaded}");
+            assert!(!uploaded.contains("mcp__vault"), "tool name: {uploaded}");
+            assert!(uploaded.contains("\"tool_use_id\":\"u\""), "{uploaded}");
             assert!(uploaded.contains("public code"), "{uploaded}");
             assert!(
                 uploaded.contains("[unknown tool output withheld by the capture policy]"),
@@ -739,6 +785,11 @@ mod tests {
             kinds(&capture.decide(&[result("orphan output", Some("gone"))])),
             ["unrecognized"]
         );
+        // The server keeps a call id only when it passes its validation.
+        let mut odd = unknown("u");
+        odd.metadata["tool_use_id"] = "not a valid/id".into();
+        let kept = capture.filter_ledger_events(vec![odd]);
+        assert_eq!(kept[0].metadata, json!({}), "{kept:?}");
     }
 
     #[test]
@@ -772,5 +823,141 @@ mod tests {
             "[file tool output withheld by the capture policy]"
         );
         assert_eq!(kept[1].metadata, json!({"tool_use_id": "m"}));
+    }
+
+    fn marked(dir: &Path, marker: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(".ai-memory.toml"), marker).unwrap();
+        dir.to_path_buf()
+    }
+
+    /// A compaction or annotation recorded in a directory the hook would not
+    /// capture is dropped like every other event there; recorded in the
+    /// opted-in checkout it is kept.
+    #[test]
+    fn boundary_events_answer_to_the_record_cwd_admission_gate() {
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data_dir.path().join(super::super::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        let repo = checkout(Some("docs/adr/**"));
+        let unmarked = checkout(None);
+        let capture = TranscriptCapture::for_checkout(data_dir.path(), repo.path());
+        let boundary = |cwd: &Path| {
+            vec![
+                at(
+                    event(
+                        WorkstreamEventKind::Compaction,
+                        "assistant",
+                        "COMPACTSENTINEL",
+                        json!({}),
+                    ),
+                    cwd,
+                ),
+                at(
+                    event(
+                        WorkstreamEventKind::Annotation,
+                        "assistant",
+                        "NOTESENTINEL",
+                        json!({}),
+                    ),
+                    cwd,
+                ),
+            ]
+        };
+        assert_eq!(
+            kinds(&capture.decide(&boundary(unmarked.path()))),
+            ["drop", "drop"]
+        );
+        assert!(
+            capture
+                .filter_ledger_events(boundary(unmarked.path()))
+                .is_empty()
+        );
+        assert_eq!(
+            kinds(&capture.decide(&boundary(repo.path()))),
+            ["keep", "keep"]
+        );
+    }
+
+    /// The hook files an event under the project its own cwd resolves to. An
+    /// import files everything under the importing checkout's project, so
+    /// records written in a checkout of another project on the same server
+    /// are dropped, prompts included; a checkout declaring the same project
+    /// is kept.
+    #[test]
+    fn a_record_cwd_in_another_project_is_dropped() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let source = marked(
+            &base.path().join("source"),
+            "workspace = \"w\"\nproject = \"p\"\n",
+        );
+        let same = marked(
+            &base.path().join("same"),
+            "workspace = \"w\"\nproject = \"p\"\n",
+        );
+        let other = marked(
+            &base.path().join("other"),
+            "workspace = \"w\"\nproject = \"q\"\n",
+        );
+        let capture = TranscriptCapture::for_checkout(data_dir.path(), &source);
+        let events = |cwd: &Path| {
+            vec![
+                at(
+                    event(
+                        WorkstreamEventKind::Message,
+                        "user",
+                        "PROMPTSENTINEL",
+                        json!({}),
+                    ),
+                    cwd,
+                ),
+                at(read_call(&cwd.join("lib.rs"), Some("r")), cwd),
+                at(result("CODESENTINEL", Some("r")), cwd),
+            ]
+        };
+        assert_eq!(
+            kinds(&capture.decide(&events(&other))),
+            ["drop", "drop", "drop"]
+        );
+        assert!(capture.filter_ledger_events(events(&other)).is_empty());
+        assert_eq!(
+            kinds(&capture.decide(&events(&same))),
+            ["keep", "keep", "keep"]
+        );
+    }
+
+    /// The same for a call the hook would reroute by its absolute target: a
+    /// read inside a checkout of another project is dropped, call and result.
+    #[test]
+    fn a_reroute_into_another_project_is_dropped() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let source = marked(
+            &base.path().join("source"),
+            "workspace = \"w\"\nproject = \"p\"\n",
+        );
+        let other = marked(
+            &base.path().join("other"),
+            "workspace = \"w\"\nproject = \"q\"\n",
+        );
+        let same = marked(
+            &base.path().join("same"),
+            "workspace = \"w\"\nproject = \"p\"\n",
+        );
+        let capture = TranscriptCapture::for_checkout(data_dir.path(), &source);
+        let events = [
+            read_call(&other.join("x.txt"), Some("o")),
+            result("OTHERSENTINEL", Some("o")),
+            read_call(&same.join("y.txt"), Some("s")),
+            result("same project", Some("s")),
+        ];
+        assert_eq!(
+            kinds(&capture.decide(&events)),
+            ["drop", "drop", "keep", "keep"]
+        );
     }
 }

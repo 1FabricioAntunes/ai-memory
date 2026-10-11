@@ -1382,6 +1382,29 @@ pub(crate) fn delivers_to_same_server(data_dir: &Path, source: &str, destination
     }
 }
 
+/// Whether the live hook would file events from `destination` under the same
+/// project as events from `source`. Both must send the same routing hints
+/// ([`hook_scope`]). When those hints name no project or identity, the server
+/// derives one from the cwd itself, matching it to the project that owns the
+/// enclosing repository: the two then agree only inside one repository and
+/// marker boundary, or, outside any repository, in the same directory.
+/// A transcript import posts every event under one project, so an event the
+/// hook would file under another project must not ride along.
+pub(crate) fn routes_to_same_project(source: &str, destination: &str) -> bool {
+    let scope = hook_scope(source, None);
+    if scope != hook_scope(destination, None) {
+        return false;
+    }
+    if scope.names_the_project() {
+        return true;
+    }
+    let anchor = |cwd: &str| existing_target_dir(Path::new(cwd)).map(|dir| file_route_anchor(&dir));
+    match (anchor(source), anchor(destination)) {
+        (Some(source), Some(destination)) if source.repository.is_some() => source == destination,
+        _ => lexical_capture_cwd(source) == lexical_capture_cwd(destination),
+    }
+}
+
 /// Normalize the raw hook `cwd` into the base `policy.inspect` joins a tool
 /// event's relative candidate path onto — lexically, via
 /// `marker::absolute_normalized`, NOT `fs::canonicalize` (#671).

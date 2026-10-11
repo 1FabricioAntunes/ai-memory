@@ -317,7 +317,7 @@ pub fn marker_requests_briefing(cwd: &str) -> bool {
 
 /// Host-side routing hints sent with native lifecycle events.
 /// Missing names are left to the server; this inspection creates no scope.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct HookScope {
     #[serde(serialize_with = "serialize_scope_hint")]
     workspace: Option<String>,
@@ -386,6 +386,13 @@ impl HookScope {
     #[must_use]
     pub fn is_partial(&self) -> bool {
         (self.workspace.is_some() || self.project_src == Some("marker")) && !self.is_explicit()
+    }
+
+    /// Whether these hints alone decide the server's project: a project name,
+    /// or an identity the server routes by. Otherwise the server derives the
+    /// project from the event's cwd.
+    pub(crate) const fn names_the_project(&self) -> bool {
+        self.project.is_some() || self.identity.is_some()
     }
 
     /// Whether both names were resolved on the host.
