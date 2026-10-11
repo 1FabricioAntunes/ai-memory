@@ -54,7 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own record names, and a call or event the live hook would deliver to
   another checkout is imported only when that checkout would capture it and
   sends to the same server. The output of a Claude Code `!` shell command,
-  which live capture never receives, is no longer imported.
+  which live capture never receives, is no longer imported. A tool ai-memory
+  does not recognize, such as an MCP tool, is imported as a record that it ran
+  without its arguments or output, which is all live capture stores for it.
   (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a

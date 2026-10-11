@@ -196,7 +196,9 @@ Retroactive text is exactly as untrusted as live hook text, since it is old mode
   (`delivers_to_same_server`), or it is dropped; a rerouted call also answers to the
   destination's policy. A Claude Code `!` command's output, recorded as user messages
   made only of `<bash-stdout>`/`<bash-stderr>` or `<local-command-stdout>` blocks, is
-  dropped, since live capture never receives it. A Drop removes both the call and its result before anything is posted; a
+  dropped, since live capture never receives it. A tool the matcher does not recognize
+  (unknown family) keeps only its family with or without a policy, as the live server
+  stores for it, and so does a result with no call to inherit from. A Drop removes both the call and its result before anything is posted; a
   metadata-only decision posts the hook's metadata-only body with its
   `_ai_memory_capture` protocol, which the server validates and rebuilds from its
   allowlist. A result is paired with its call by native id; without one it takes the

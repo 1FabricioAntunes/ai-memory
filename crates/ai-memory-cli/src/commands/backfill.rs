@@ -659,6 +659,8 @@ struct MappedEvent {
 /// the native tool payload the server's re-inspection reads, so a claim would
 /// be judged against the wrong schema and stripped; the server never receives
 /// the ignore patterns, so the client's decision is the only one possible.
+/// An unrecognized tool's event carries only its family, as the live server
+/// stores for an unknown-family tool, never its arguments or output.
 fn map_event(
     session_id: &str,
     event: &NewWorkstreamEvent,
@@ -672,7 +674,7 @@ fn map_event(
     let decision = match capture {
         EventCapture::Drop => return None,
         EventCapture::MetadataOnly(decision) => Some(decision),
-        EventCapture::Keep => None,
+        EventCapture::Keep | EventCapture::Unrecognized => None,
     };
     let role = event.role.as_deref().unwrap_or("");
     let ingest_key = format!("{session_id}:{}", event.event_id);
@@ -703,6 +705,19 @@ fn map_event(
                         object.insert("occurred_at".into(), occurred_at.into());
                     }
                     body
+                }
+                None if matches!(capture, EventCapture::Unrecognized) => {
+                    let outcome = if event.kind == WorkstreamEventKind::ToolResult {
+                        "\noutcome: unknown"
+                    } else {
+                        ""
+                    };
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "title": "tool unknown",
+                        "message": format!("tool_family: unknown{outcome}"),
+                        "occurred_at": occurred_at,
+                    })
                 }
                 None => serde_json::json!({
                     "session_id": session_id,
@@ -1697,6 +1712,68 @@ mod tests {
             "control: {posted}"
         );
         assert!(posted.contains("read the notes"), "prompt kept: {posted}");
+    }
+
+    /// The live server stores only the family of an unknown-family tool, with
+    /// no policy at all. A backfilled Codex MCP call and its output therefore
+    /// post only `tool_family: unknown`, never their arguments or output, while
+    /// a recognized shell call's output is posted as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_posts_no_content_for_unrecognized_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sid = "019a0000-0000-7000-8000-000000000002";
+        let item = |payload: serde_json::Value| {
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-09-01T10:00:00Z", "payload": payload,
+            })
+        };
+        let call = |id: &str, name: &str, arguments: serde_json::Value| {
+            item(serde_json::json!({
+                "type": "function_call", "name": name, "call_id": id,
+                "arguments": arguments.to_string(),
+            }))
+        };
+        let output = |id: &str, text: &str| {
+            item(serde_json::json!({"type": "function_call_output", "call_id": id, "output": text}))
+        };
+        let lines = [
+            serde_json::json!({"type": "session_meta", "payload": {"id": sid, "cwd": repo.path()}}),
+            call(
+                "call_mcp",
+                "mcp__vault__fetch",
+                serde_json::json!({"query": "ARGSENTINEL"}),
+            ),
+            output("call_mcp", "MCPSENTINEL private record"),
+            call(
+                "call_pub",
+                "exec_command",
+                serde_json::json!({"cmd": "cargo test"}),
+            ),
+            output("call_pub", "PUBLICCONTROL test result"),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Codex,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        for sentinel in ["ARGSENTINEL", "MCPSENTINEL", "mcp__vault"] {
+            assert!(
+                !posted.contains(sentinel),
+                "{sentinel} was posted: {posted}"
+            );
+        }
+        assert_eq!(
+            posted.matches("\"title\":\"tool unknown\"").count(),
+            2,
+            "the call and its output are still recorded: {posted}"
+        );
+        assert!(posted.contains("PUBLICCONTROL"), "control: {posted}");
     }
 
     fn spawned_args(

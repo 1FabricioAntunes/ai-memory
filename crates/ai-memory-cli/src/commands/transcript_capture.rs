@@ -33,6 +33,11 @@ pub(crate) enum EventCapture {
     Keep,
     /// Import nothing for this event.
     Drop,
+    /// A tool the capture policy does not recognize: record that it ran,
+    /// never its arguments or output. The live server stores only the family
+    /// for an unknown-family tool, whatever the policy, so an import must not
+    /// store more.
+    Unrecognized,
     /// Record that the tool ran, never its arguments or output.
     MetadataOnly(CaptureDecision),
 }
@@ -41,8 +46,9 @@ impl EventCapture {
     const fn rank(&self) -> u8 {
         match self {
             Self::Keep => 0,
-            Self::MetadataOnly(_) => 1,
-            Self::Drop => 2,
+            Self::Unrecognized => 1,
+            Self::MetadataOnly(_) => 2,
+            Self::Drop => 3,
         }
     }
 
@@ -178,7 +184,10 @@ impl TranscriptCapture {
             .filter_map(|(event, capture)| match capture {
                 EventCapture::Keep => Some(event),
                 EventCapture::Drop => None,
-                EventCapture::MetadataOnly(decision) => Some(withheld(event, &decision)),
+                EventCapture::Unrecognized => Some(withheld(event, ToolFamily::Unknown)),
+                EventCapture::MetadataOnly(decision) => {
+                    Some(withheld(event, decision.protocol().tool_family()))
+                }
             })
             .map(|mut event| {
                 // The record's cwd only steers the decision above.
@@ -190,9 +199,11 @@ impl TranscriptCapture {
             .collect()
     }
 
+    /// A result with no call to inherit from. Nothing proves its tool was
+    /// recognized, so even without a policy it keeps no output.
     fn orphan_result(&self) -> EventCapture {
         if self.policy.state() == PolicyState::Inactive {
-            EventCapture::Keep
+            EventCapture::Unrecognized
         } else {
             EventCapture::Drop
         }
@@ -220,6 +231,12 @@ impl TranscriptCapture {
         let (name, args) = recorded_call(event);
         let unreadable = args.is_none();
         let raw = tool_call_payload(event.agent, name, args.as_ref(), call_id(event));
+        let recognized = self
+            .policy
+            .inspect(event.agent, &raw, &self.inspection_cwd)
+            .protocol()
+            .tool_family()
+            != ToolFamily::Unknown;
         let inspect = |policy: &CapturePolicy, cwd: &str| {
             inspect_call(
                 policy,
@@ -250,7 +267,11 @@ impl TranscriptCapture {
             }
             capture = capture.stricter(inspect(&capture_policy(&destination), &destination));
         }
-        capture
+        if recognized {
+            capture
+        } else {
+            capture.stricter(EventCapture::Unrecognized)
+        }
     }
 }
 
@@ -353,8 +374,8 @@ fn recorded_call(event: &NewWorkstreamEvent) -> (&str, Option<Value>) {
 
 /// A ledger event with its content replaced by the tool family, keeping only
 /// the labels that pair it with the other half of the call.
-fn withheld(mut event: NewWorkstreamEvent, decision: &CaptureDecision) -> NewWorkstreamEvent {
-    let family = serde_json::to_value(decision.protocol().tool_family())
+fn withheld(mut event: NewWorkstreamEvent, family: ToolFamily) -> NewWorkstreamEvent {
+    let family = serde_json::to_value(family)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
@@ -434,6 +455,7 @@ mod tests {
             .map(|capture| match capture {
                 EventCapture::Keep => "keep",
                 EventCapture::Drop => "drop",
+                EventCapture::Unrecognized => "unrecognized",
                 EventCapture::MetadataOnly(_) => "metadata",
             })
             .collect()
@@ -672,6 +694,50 @@ mod tests {
         assert_eq!(
             kinds(&capture.decide(&events)),
             ["keep", "drop", "drop", "drop", "keep", "keep", "keep"]
+        );
+    }
+
+    /// Live capture stores no arguments or output for a tool the policy does
+    /// not recognize, with or without a policy, so neither does an import: a
+    /// call and its result keep only the family, as does a result with no
+    /// call to inherit from. A recognized public read is kept.
+    #[test]
+    fn unrecognized_tools_keep_no_content_with_or_without_a_policy() {
+        let unknown = |id: &str| {
+            event(
+                WorkstreamEventKind::ToolCall,
+                "assistant",
+                "mcp__vault__fetch: {\"query\":\"ARGSENTINEL\"}",
+                json!({"tool": "mcp__vault__fetch", "tool_use_id": id}),
+            )
+        };
+        for marker in [None, Some("docs/adr/**")] {
+            let repo = checkout(marker);
+            let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+            let events = vec![
+                unknown("u"),
+                result("OUTSENTINEL", Some("u")),
+                read_call(&repo.path().join("src/lib.rs"), Some("p")),
+                result("public code", Some("p")),
+            ];
+            assert_eq!(
+                kinds(&capture.decide(&events)),
+                ["unrecognized", "unrecognized", "keep", "keep"],
+                "{marker:?}"
+            );
+            let uploaded = serde_json::to_string(&capture.filter_ledger_events(events)).unwrap();
+            assert!(!uploaded.contains("SENTINEL"), "{uploaded}");
+            assert!(uploaded.contains("public code"), "{uploaded}");
+            assert!(
+                uploaded.contains("[unknown tool output withheld by the capture policy]"),
+                "{uploaded}"
+            );
+        }
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        assert_eq!(
+            kinds(&capture.decide(&[result("orphan output", Some("gone"))])),
+            ["unrecognized"]
         );
     }
 
