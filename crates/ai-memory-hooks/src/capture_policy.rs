@@ -247,7 +247,7 @@ pub(crate) fn tool_observation_metadata(
                 .is_some(),
         };
     has_args.then(|| ToolObservationMetadata {
-        tool_family: family(name),
+        tool_family: agent_family(agent, name),
         tool_call_id: id.filter(|id| valid_call_id(id)).map(str::to_owned),
     })
 }
@@ -549,10 +549,20 @@ impl CapturePolicy {
             // A broken marker cannot prove a shell command's arguments miss
             // every ignored path, so it fails closed like a file tool, readable
             // or not.
-            PolicyState::Invalid if extracted.family == ToolFamily::File || extracted.shell => {
+            PolicyState::Invalid
+                if extracted.family == ToolFamily::File
+                    || extracted.shell
+                    || extracted.output_reader =>
+            {
                 (CaptureDisposition::MetadataOnly, extracted.state)
             }
             PolicyState::Invalid => (CaptureDisposition::Keep, extracted.state),
+            // A tool that reads back an earlier command's output names no
+            // path of its own, so nothing proves that command missed every
+            // ignored path.
+            PolicyState::Active if extracted.output_reader => {
+                (CaptureDisposition::MetadataOnly, extracted.state)
+            }
             PolicyState::Active => match extracted.family {
                 ToolFamily::SearchList => {
                     (CaptureDisposition::Drop, ExtractionState::NotApplicable)
@@ -600,9 +610,13 @@ impl CapturePolicy {
                         _ => cwd.to_owned(),
                     };
                     self.match_command(&command.words(), &base)
+                        .map(|matched| (matched, command.has_unevaluated_expansion()))
                 }) {
-                    Some(Ok(true) | Err(())) => (CaptureDisposition::Drop, extracted.state),
-                    Some(Ok(false)) | None => (CaptureDisposition::Keep, extracted.state),
+                    Some(Ok((true, _)) | Err(())) => (CaptureDisposition::Drop, extracted.state),
+                    // Brace expansion and bracket classes are not evaluated,
+                    // so such a word proves nothing either way.
+                    Some(Ok((false, true))) => (CaptureDisposition::MetadataOnly, extracted.state),
+                    Some(Ok((false, false))) | None => (CaptureDisposition::Keep, extracted.state),
                 },
                 _ => (CaptureDisposition::Keep, extracted.state),
             },
@@ -706,6 +720,9 @@ impl CapturePolicy {
     ) -> Result<bool, ()> {
         let insensitive = tool_glob || candidate.flavor == Flavor::Windows;
         let is_glob = candidate.path.contains(['*', '?']);
+        // `read_many_files` reads a directory entry (`docs`, `.`) as
+        // `entry/**`, and nothing here can tell a directory from a file.
+        let directory = tool_glob && !is_glob;
         for pattern in self
             .patterns
             .iter()
@@ -715,11 +732,18 @@ impl CapturePolicy {
             // quadratic matches below are charged to the budget.
             let under_prefix =
                 starts_with_chars(&candidate.path, &pattern.literal_prefix, insensitive);
-            if !under_prefix && !is_glob {
+            if !under_prefix && !is_glob && !directory {
                 continue;
             }
             *work = work
                 .checked_add(pattern.match_cost(&candidate.path))
+                .and_then(|work| {
+                    work.checked_add(if directory {
+                        pattern.match_cost(&candidate.path)
+                    } else {
+                        0
+                    })
+                })
                 .ok_or(())?;
             if *work > MAX_MATCH_WORK {
                 return Err(());
@@ -736,6 +760,7 @@ impl CapturePolicy {
                     insensitive,
                 ))
                 || (is_glob && reaches(&candidate.path, &pattern.literal_prefix, insensitive))
+                || (directory && glob_matches_below(&pattern.path, &candidate.path, insensitive))
             {
                 return Ok(true);
             }
@@ -783,6 +808,8 @@ struct Extracted<'a> {
     search_paths: Option<Vec<String>>,
     /// The paths are globs (Gemini CLI `read_many_files`), not literal files.
     globs: bool,
+    /// The tool reads back output of an earlier command (`BashOutput`).
+    output_reader: bool,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -840,7 +867,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     let Some((name, args)) = extracted else {
         return Extracted::default();
     };
-    let family = family(name);
+    let family = agent_family(agent, name);
     let paths = (family == ToolFamily::File)
         .then(|| args.and_then(|value| extract_paths(name, value)))
         .flatten();
@@ -895,9 +922,45 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         workdir,
         search_paths,
         globs: name.eq_ignore_ascii_case("read_many_files"),
+        output_reader: reads_earlier_output(name),
         call_id,
         state,
     }
+}
+
+/// [`family`] plus tool names only one agent is documented to use, so a
+/// same-named tool of another agent keeps its current classification.
+fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
+    if agent == AgentKind::CopilotCli {
+        // GitHub Copilot CLI's runtime tool names: `view` reads a file or
+        // directory, `create` writes one, `str_replace_editor` edits, each
+        // naming its target in `path`; `rg` is its `grep` alias.
+        match name.to_ascii_lowercase().as_str() {
+            "view" | "create" | "str_replace_editor" => return ToolFamily::File,
+            "rg" => return ToolFamily::SearchList,
+            _ => {}
+        }
+    }
+    family(name)
+}
+
+/// Tools that return output of a command started by an earlier call: Claude
+/// Code `BashOutput`/`TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw
+/// `process`, Copilot CLI `read_bash`/`write_bash` and their PowerShell twins.
+/// That command's own event may have been dropped, so its output must not
+/// come back through these.
+fn reads_earlier_output(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "bashoutput"
+            | "taskoutput"
+            | "write_stdin"
+            | "process"
+            | "read_bash"
+            | "write_bash"
+            | "read_powershell"
+            | "write_powershell"
+    )
 }
 
 fn family(name: &str) -> ToolFamily {
@@ -1135,6 +1198,78 @@ impl ShellCommand<'_> {
             }
         }
     }
+
+    /// Whether any word uses brace expansion or a bracket class, which the
+    /// lexical matcher does not evaluate. Each argv element is scanned as a
+    /// script too, the same over-approximation [`Self::words`] makes.
+    fn has_unevaluated_expansion(&self) -> bool {
+        match self {
+            Self::Line(command) => has_unevaluated_expansion(command),
+            Self::Argv(items) => items.iter().any(|item| has_unevaluated_expansion(item)),
+        }
+    }
+}
+
+/// Whether an unquoted word of `command` holds a brace expansion (`{a,b}`,
+/// `{1..3}`) or a bracket class (`[ab]`). Quoted or escaped braces and
+/// brackets are literal, `${…}` is a parameter expansion, and `{}` or a
+/// lone `[` (`find -exec … {}`, `[ -f x ]`) expands nothing.
+fn has_unevaluated_expansion(command: &str) -> bool {
+    let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')');
+    let mut quote = None;
+    let mut previous = None;
+    let mut parameter = false;
+    let mut brace = None::<bool>;
+    let mut class = None::<usize>;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            } else if open == '"' && c == '\\' {
+                chars.next();
+            }
+            class = class.map(|len| len + 1);
+            previous = None;
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => {
+                chars.next();
+                class = class.map(|len| len + 1);
+                previous = None;
+                continue;
+            }
+            c if c.is_whitespace() || is_operator(c) => {
+                parameter = false;
+                brace = None;
+                class = None;
+            }
+            '{' if previous == Some('$') => parameter = true,
+            '}' if parameter => parameter = false,
+            _ if parameter => {}
+            '{' => brace = Some(false),
+            ',' if brace.is_some() => brace = Some(true),
+            '.' if brace.is_some() && previous == Some('.') => brace = Some(true),
+            '}' if brace.is_some() => {
+                if brace == Some(true) {
+                    return true;
+                }
+                brace = None;
+            }
+            '[' if class.is_none() => class = Some(0),
+            ']' if class.is_some() => {
+                if class > Some(0) {
+                    return true;
+                }
+                class = None;
+            }
+            _ => class = class.map(|len| len + 1),
+        }
+        previous = Some(c);
+    }
+    false
 }
 
 fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
@@ -1452,6 +1587,27 @@ fn glob_match(
     if directory_base.is_some_and(|base| glob_match(base, candidate, None, insensitive)) {
         return true;
     }
+    glob_states(pattern, candidate, insensitive)
+        .last()
+        .copied()
+        .unwrap_or(false)
+}
+/// Whether `pattern` matches some path strictly below `directory`. A pattern
+/// prefix still alive after `directory/` can always be completed by spelling
+/// out its remaining literals.
+fn glob_matches_below(pattern: &str, directory: &str, insensitive: bool) -> bool {
+    let directory = if directory.ends_with('/') {
+        directory.to_owned()
+    } else {
+        format!("{directory}/")
+    };
+    glob_states(pattern, &directory, insensitive)
+        .iter()
+        .any(|alive| *alive)
+}
+/// For each prefix length of `pattern`, whether that prefix matches all of
+/// `candidate`.
+fn glob_states(pattern: &str, candidate: &str, insensitive: bool) -> Vec<bool> {
     let pattern: Vec<char> = pattern.chars().collect();
     let candidate: Vec<char> = candidate.chars().collect();
     let mut previous = vec![false; pattern.len() + 1];
@@ -1478,7 +1634,7 @@ fn glob_match(
         }
         previous = current;
     }
-    previous[pattern.len()]
+    previous
 }
 /// The whole leading segments of a normalized pattern that contain no glob.
 fn literal_prefix(path: &str) -> &str {
@@ -2750,6 +2906,157 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Gemini CLI reads a directory entry of `read_many_files` as
+    /// `entry/**`, so an entry naming an ancestor of an ignored directory
+    /// (`docs`, `.`) reads the ignored files. The shared vectors attempt it
+    /// through both payload shapes; `src` and `README.md` are the controls.
+    #[test]
+    fn read_many_files_directory_entries_cannot_reach_ignored_paths() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
+        let section = &fixture["read_many_files_directories"];
+        let ignore_paths = section["ignore_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pattern| pattern.as_str().unwrap().to_owned())
+            .collect();
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig { ignore_paths }),
+            "/repo",
+            None,
+        );
+        for vector in section["vectors"].as_array().unwrap() {
+            let include = &vector["include"];
+            for (agent, raw) in [
+                (
+                    AgentKind::GeminiCli,
+                    json!({"tool_name": "read_many_files", "tool_input": {"include": include}}),
+                ),
+                (
+                    AgentKind::OpenCode,
+                    json!({"tool": "read_many_files", "args": {"include": include}}),
+                ),
+            ] {
+                let protocol = policy.inspect(agent, &raw, "/repo").protocol().clone();
+                assert_eq!(
+                    serde_json::to_value(protocol.disposition()).unwrap(),
+                    vector["disposition"],
+                    "{raw}"
+                );
+                assert_eq!(protocol.tool_family(), ToolFamily::File);
+            }
+        }
+        assert!(glob_matches_below("/repo/docs/adr/**", "/repo", false));
+        assert!(glob_matches_below("/**", "/", false));
+        assert!(glob_matches_below("/repo/**/*.md", "/repo/src", false));
+        assert!(!glob_matches_below("/repo/*.md", "/repo/README.md", false));
+        assert!(!glob_matches_below("/repo/docs/adr/**", "/repo/src", false));
+        assert!(glob_matches_below("C:/Docs/**", "c:/docs", true));
+    }
+
+    /// Tools that read back an earlier command's output are stripped to
+    /// metadata under an active or invalid policy, since the command they
+    /// read may have been dropped; with no policy they are untouched.
+    #[test]
+    fn output_reader_tools_are_metadata_only_only_under_a_policy() {
+        let reader = json!({
+            "tool_name": "BashOutput", "tool_input": {"bash_id": "b1"},
+            "tool_response": "PRIVATE_BODY_SENTINEL",
+        });
+        let active = shell_policy();
+        let invalid = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        let inactive = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
+        for policy in [&active, &invalid] {
+            let decision = policy.inspect(AgentKind::ClaudeCode, &reader, "/repo");
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::MetadataOnly
+            );
+            let body = metadata_only_body(Some("s"), Some("/repo"), &decision).to_string();
+            assert!(!body.contains("PRIVATE_BODY_SENTINEL"), "{body}");
+        }
+        assert_eq!(
+            inactive
+                .inspect(AgentKind::ClaudeCode, &reader, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        // Control: an unrelated unknown tool keeps today's behavior.
+        let other = json!({"tool_name": "FutureTool", "tool_input": {"bash_id": "b1"}});
+        assert_eq!(
+            active
+                .inspect(AgentKind::ClaudeCode, &other, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
+    /// Copilot CLI's runtime `view`/`create` names are file tools for that
+    /// agent only; another agent's same-named tool stays unknown.
+    #[test]
+    fn copilot_cli_runtime_file_tools_are_scoped_to_copilot() {
+        assert_eq!(
+            agent_family(AgentKind::CopilotCli, "view"),
+            ToolFamily::File
+        );
+        assert_eq!(
+            agent_family(AgentKind::CopilotCli, "create"),
+            ToolFamily::File
+        );
+        assert_eq!(
+            agent_family(AgentKind::CopilotCli, "str_replace_editor"),
+            ToolFamily::File
+        );
+        assert_eq!(
+            agent_family(AgentKind::CopilotCli, "rg"),
+            ToolFamily::SearchList
+        );
+        assert_eq!(
+            agent_family(AgentKind::CopilotCli, "edit"),
+            ToolFamily::File
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "view"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::OpenCode, "create"),
+            ToolFamily::Unknown
+        );
+        let metadata = tool_observation_metadata(
+            AgentKind::CopilotCli,
+            &json!({"tool_name": "view", "tool_input": {"path": "src/lib.rs"}}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+    }
+
+    #[test]
+    fn unevaluated_shell_expansions_respect_quoting() {
+        for (command, expected) in [
+            ("cat docs/{adr,x}/1.md", true),
+            ("cat docs/ad[r]/1.md", true),
+            ("echo {1..3}", true),
+            ("cat 'docs/{adr,x}'", false),
+            ("cat \"docs/[ab]\"", false),
+            ("cat docs/\\{a,b}", false),
+            ("cat docs/\\[ab]", false),
+            ("echo ${a,b} ${arr[0]}", false),
+            ("find . -exec cat {} ;", false),
+            ("[ -f x ]", false),
+            ("[[ -d x ]]", false),
+            ("git diff HEAD@{1}..HEAD", false),
+            ("echo a, b} {c", false),
+            ("cat [] x", false),
+        ] {
+            assert_eq!(has_unevaluated_expansion(command), expected, "{command}");
+        }
     }
 
     #[test]

@@ -73,8 +73,41 @@
     {"agent":"open-code","payload":{"tool":"run_shell_command","args":{"command":"cat public/a"}},"disposition":"keep","tool_family":"non-file","extraction_state":"extracted","path_count":0},
     {"agent":"open-code","payload":{"tool":"list_directory","args":{"dir_path":"secret"}},"disposition":"drop","tool_family":"search-list","extraction_state":"not-applicable","path_count":0},
     {"agent":"open-code","payload":{"tool":"search_file_content","args":{"pattern":"x"}},"disposition":"drop","tool_family":"search-list","extraction_state":"not-applicable","path_count":0},
-    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["public/a","secret/[ab]"]}},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":2}
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["public/a","secret/[ab]"]}},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":2},
+    {"agent":"copilot-cli","payload":{"tool_name":"view","tool_input":{"path":"secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"copilot-cli","payload":{"tool_name":"create","tool_input":{"path":"secret/a","file_text":"x"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"copilot-cli","payload":{"tool_name":"str_replace_editor","tool_input":{"command":"view","path":"secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"copilot-cli","payload":{"tool_name":"view","tool_input":{"path":"public/a"}},"disposition":"keep","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"copilot-cli","payload":{"tool_name":"view","tool_input":{}},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":0},
+    {"agent":"copilot-cli","payload":{"tool_name":"rg","tool_input":{"pattern":"x"}},"disposition":"drop","tool_family":"search-list","extraction_state":"not-applicable","path_count":0},
+    {"agent":"claude-code","payload":{"tool_name":"view","tool_input":{"path":"secret/a"}},"disposition":"keep","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"claude-code","payload":{"tool_name":"BashOutput","tool_input":{"bash_id":"b1"}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"claude-code","payload":{"tool_name":"TaskOutput","tool_input":{"task_id":"b1"}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"codex","payload":{"tool_name":"write_stdin","tool_input":{"session_id":1,"chars":""}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"hermes","payload":{"tool_name":"process","tool_input":{"action":"poll","session_id":"p1"}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"copilot-cli","payload":{"tool_name":"read_bash","tool_input":{"shellId":"s1"}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"copilot-cli","payload":{"tool_name":"write_powershell","tool_input":{"shellId":"s1","input":"x"}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"openclaw","payload":{"tool":"process","args":{"action":"log","sessionId":"p1"}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"open-code","payload":{"tool":"process","args":{"action":"log"}},"disposition":"metadata-only","tool_family":"unknown","extraction_state":"extracted","path_count":0},
+    {"agent":"openclaw","payload":{"tool":"future_tool","args":{"action":"log"}},"disposition":"keep","tool_family":"unknown","extraction_state":"extracted","path_count":0}
   ],
+  "read_many_files_directories": {
+    "note": "Gemini CLI reads a directory entry as `entry/**`; both matchers run these as `read_many_files` `include` lists from the marker directory.",
+    "ignore_paths": ["docs/adr/**"],
+    "vectors": [
+      {"include":["docs"],"disposition":"drop"},
+      {"include":["."],"disposition":"drop"},
+      {"include":["./"],"disposition":"drop"},
+      {"include":["docs/"],"disposition":"drop"},
+      {"include":["Docs"],"disposition":"drop"},
+      {"include":["src/../docs"],"disposition":"drop"},
+      {"include":["src","docs"],"disposition":"drop"},
+      {"include":["src"],"disposition":"keep"},
+      {"include":["README.md"],"disposition":"keep"},
+      {"include":["docs/adrx"],"disposition":"keep"},
+      {"include":["docs/notes"],"disposition":"keep"}
+    ]
+  },
   "shell": {
     "note": "Shell-tool vectors run by both matchers. `{root}` is the marker directory, `cwd` is relative to it, and `command` is shorthand for a `bash` payload.",
     "ignore_paths": ["docs/adr/**","~/notes/**","docs/n?tes/**","C:/Secret/**","private notes/**"],
@@ -141,7 +174,22 @@
       {"payload":{"tool":"bash","args":{"command":"cat 0001.md","workdir":7}},"disposition":"keep"},
       {"payload":{"tool":"run_shell_command","args":{"command":"cat adr/x.md","dir_path":"docs"}},"disposition":"drop"},
       {"payload":{"tool":"run_shell_command","args":{"command":"cat 0001.md","directory":"docs/adr"}},"disposition":"drop"},
-      {"payload":{"tool":"run_shell_command","args":{"command":"cat x.md","dir_path":"src"}},"disposition":"keep"}
+      {"payload":{"tool":"run_shell_command","args":{"command":"cat x.md","dir_path":"src"}},"disposition":"keep"},
+      {"command":"cat docs/{adr,x}/1.md","disposition":"metadata-only"},
+      {"command":"cat docs/ad[r]/1.md","disposition":"metadata-only"},
+      {"command":"ls docs/ad{1..3}/x.md","disposition":"metadata-only"},
+      {"command":"cat src/main.rs && cat {docs,src}/adr/1.md","disposition":"metadata-only"},
+      {"payload":{"tool":"shell","args":{"command":["bash","-lc","cat docs/{adr,x}/1.md"]}},"disposition":"metadata-only"},
+      {"command":"cat docs/adr/x.md {a,b}","disposition":"drop"},
+      {"command":"cat 'docs/{adr,x}/1.md'","disposition":"keep"},
+      {"command":"cat \"docs/ad[r]/1.md\"","disposition":"keep"},
+      {"command":"cat docs/\\{adr,x}/1.md","disposition":"keep"},
+      {"command":"git log --format='%h {a,b}'","disposition":"keep"},
+      {"command":"find . -name '*.rs' -exec wc -l {} ;","disposition":"keep"},
+      {"command":"echo ${HOME} ${arr[0]}","disposition":"keep"},
+      {"command":"[ -f src/main.rs ] && [[ -d src ]]","disposition":"keep"},
+      {"command":"git diff HEAD@{1}..HEAD","disposition":"keep"},
+      {"command":"ls src/*.rs","disposition":"keep"}
     ]
   },
   "protocol": {"accept":{"version":1,"disposition":"drop","policy_state":"active","tool_family":"file","path_count":1,"extraction_state":"extracted"},"reject":{"version":1,"disposition":"drop","policy_state":"active","tool_family":"file","path_count":1,"extraction_state":"extracted","paths":["SENTINEL"]}}

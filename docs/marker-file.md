@@ -491,8 +491,14 @@ logs, or server storage. With an active policy, recognized search/list tools are
 dropped conservatively; missing or malformed recognized file candidates, an
 unsupported recognized schema, or an invalid policy become **metadata-only**.
 That form contains only bounded routing/tool/decision metadata, never paths,
-patterns, arguments, output, errors, titles, or nested payload. Unknown tools
-retain current behavior.
+patterns, arguments, output, errors, titles, or nested payload. Tools that read
+back output of a command started by an earlier call (Claude Code `BashOutput`
+and `TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw `process`, GitHub
+Copilot CLI `read_bash`/`write_bash` and their PowerShell twins) become
+metadata-only under an active or invalid policy, because nothing proves the
+command they read missed every ignored path. Other unknown tools retain current
+behavior. GitHub Copilot CLI's runtime `view`, `create` and
+`str_replace_editor` names are file tools read from their `path` argument.
 
 Gemini CLI's `read_many_files` is a file tool whose `include` entries (`paths`
 in older releases) are globs that Gemini expands case-insensitively, with `**`
@@ -500,7 +506,11 @@ reaching any depth. ai-memory reads every entry and drops the whole call when
 any one names an ignored path or could expand into one, matching case-insensitively
 like Gemini: `docs/adr/x.md`, `docs/*/x.md`, `docs/**` and `**/*.md` are
 all dropped under `docs/adr/**`, while `src/**/*.rs` and a root-level `*.md`
-are not. Its `exclude` list never subtracts an ignored path. An entry using glob
+are not. Gemini reads an entry that names a directory recursively, and the
+matcher cannot tell a directory from a file, so an entry that could contain an
+ignored path drops the call too: `docs`, `.` and `docs/` are dropped under
+`docs/adr/**`, while `src` and `README.md` are not. Its `exclude` list never
+subtracts an ignored path. An entry using glob
 syntax the matcher cannot evaluate (`[…]`, `{…}`, `(…)`, `!`) makes the call
 **metadata-only**.
 
@@ -519,13 +529,17 @@ one matches a pattern, the whole event is **dropped**, exactly like a matching
 file read. An argument containing `*` or `?` also matches when its glob can
 reach a pattern's directory: `cat docs/*/0001.md` is dropped under
 `docs/adr/**`, `cat *.md` at the repository root is not. A command that exceeds
-the match budget is dropped. Variables, command substitution, `cd` state, and
+the match budget is dropped. A command with an unquoted brace expansion
+(`docs/{adr,x}/1.md`, `{1..3}`) or bracket class (`docs/ad[r]/1.md`) that no
+argument matches outright is **metadata-only**, because those are not
+evaluated; quoted or escaped braces and brackets, `${…}`, `{}` and `[ -f x ]`
+are unaffected. Variables, command substitution, `cd` state, and
 commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
 their output is still captured. An invalid policy makes a shell command
 **metadata-only**, like a file tool, because a broken marker cannot prove its
 arguments miss every ignored path; this holds even when the command cannot be
-read. An older server drops that metadata-only shell event, so upgrade the
-server before the clients. Excluding content before transport
+read. An older server drops these metadata-only shell and output-reader
+events, so upgrade the server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
 
@@ -541,6 +555,18 @@ with its file tool, and that read no longer matches the original path. Add
 re-reads too (for every file, not only the ignored ones). Add each relevant visible alias
 explicitly, and do not rely on this feature to detect every way private content
 can be mentioned.
+
+These gaps are inherent to lexical matching and stay open:
+
+- shell variables (`$VAR`) and command substitution are not expanded;
+- a `cd` inside a command is not followed (the tool's own `workdir` is);
+- symlinks are not resolved, by design;
+- a recursive search of a parent directory through a shell (`grep -r x docs`,
+  `rg x`) names no ignored path, so its output is kept;
+- tools the matcher does not list keep their current behavior.
+
+For a project whose content must never be captured, use allowlist capture mode
+(above) and leave that repository without a marker.
 
 ### Supported integrations and refresh
 

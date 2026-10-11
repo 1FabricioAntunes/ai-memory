@@ -3164,6 +3164,123 @@ mod tests {
         }
     }
 
+    /// Calls that used to carry an excluded file's content into the spool: a
+    /// Gemini `read_many_files` directory entry (read as `entry/**`), Copilot
+    /// CLI's runtime `view`/`create`, tools reading back an earlier command's
+    /// output, and a shell word with brace expansion or a bracket class. Each
+    /// attempt is dropped or stripped to metadata before the spool; the
+    /// public controls still spool with their content.
+    #[tokio::test]
+    async fn excluded_content_cannot_reach_the_spool_through_unevaluated_tool_shapes() {
+        let cases = [
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["docs"]}),
+                None,
+            ),
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["."]}),
+                None,
+            ),
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["src"]}),
+                Some("keep"),
+            ),
+            (
+                "copilot-cli",
+                "view",
+                serde_json::json!({"path": "docs/adr/0001.md"}),
+                None,
+            ),
+            (
+                "copilot-cli",
+                "create",
+                serde_json::json!({"path": "docs/adr/0002.md", "file_text": "x"}),
+                None,
+            ),
+            (
+                "copilot-cli",
+                "view",
+                serde_json::json!({"path": "src/lib.rs"}),
+                Some("keep"),
+            ),
+            (
+                "copilot-cli",
+                "read_bash",
+                serde_json::json!({"shellId": "s1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "BashOutput",
+                serde_json::json!({"bash_id": "b1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "TaskOutput",
+                serde_json::json!({"task_id": "b1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat docs/{adr,x}/0001.md"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat docs/ad[r]/0001.md"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat 'docs/{adr,x}/0001.md'"}),
+                Some("keep"),
+            ),
+        ];
+        for (agent, tool, input, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join(".ai-memory.toml"),
+                "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+            )
+            .unwrap();
+            let data_dir = tmp.path().join("data");
+            let raw = serde_json::json!({
+                "session_id": "gaps", "cwd": tmp.path(),
+                "tool_name": tool, "tool_input": input,
+                "tool_response": {"content": "SENTINEL_CONTENT"},
+                "tool_result": {"result_type": "success", "text_result_for_llm": "SENTINEL_CONTENT"},
+            });
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            let label = format!("{agent} {tool} {input}");
+            match expected {
+                None => assert!(entries.is_empty(), "{label}: must not spool"),
+                Some(disposition) => {
+                    assert_eq!(entries.len(), 1, "{label}");
+                    let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+                    assert_eq!(
+                        body["_ai_memory_capture"]["disposition"], disposition,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        entries[0].body.contains("SENTINEL_CONTENT"),
+                        disposition == "keep",
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn codex_native_capture_policy_runs_before_spool_and_preserves_identity() {
         for (tool, input, disposition) in [

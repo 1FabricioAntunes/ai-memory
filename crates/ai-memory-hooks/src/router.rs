@@ -1178,12 +1178,14 @@ fn metadata_only_protocol_envelope(
 }
 
 /// An invalid marker also strips shell commands, which it cannot prove miss
-/// every ignored path; an active policy decides them outright (keep/drop).
-/// A stripped shell body carries no paths and an extracted command.
+/// every ignored path; an active policy strips one whose words use brace
+/// expansion or a bracket class. Either policy strips a tool that reads back
+/// an earlier command's output, whose family is unknown. A stripped shell or
+/// output-reader body carries no paths and an extracted command.
 const fn metadata_protocol_is_legal(protocol: &CaptureProtocol) -> bool {
     match (protocol.policy_state(), protocol.tool_family()) {
         (PolicyState::Active | PolicyState::Invalid, ToolFamily::File) => true,
-        (PolicyState::Invalid, ToolFamily::NonFile) => {
+        (PolicyState::Active | PolicyState::Invalid, ToolFamily::NonFile | ToolFamily::Unknown) => {
             protocol.path_count() == 0
                 && matches!(protocol.extraction_state(), ExtractionState::Extracted)
         }
@@ -17539,12 +17541,20 @@ mod tests {
         );
         assert_eq!(env.raw["tool_family"], "non-file");
 
-        // An active policy decides a shell call outright, so a metadata-only
-        // claim for one is impossible and refused.
+        // An active policy strips a shell call whose words it cannot
+        // evaluate (brace expansion, a bracket class); an inactive one never
+        // strips anything, so that claim is refused.
         assert!(
             inspect_capture_envelope(HookEnvelope::from_query_and_body(
                 query(),
                 stripped("active")
+            ))
+            .is_some()
+        );
+        assert!(
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(
+                query(),
+                stripped("inactive")
             ))
             .is_none()
         );
@@ -17576,6 +17586,94 @@ mod tests {
             inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), search.clone()))
                 .unwrap();
         assert_eq!(env.raw, search);
+    }
+
+    /// A client that predates these rules keeps a shell call with an
+    /// unevaluated brace expansion, or a tool reading back an earlier
+    /// command's output; the server's own re-inspection strips both under an
+    /// active policy, and keeps a plain command and an unrelated unknown tool
+    /// (controls).
+    #[test]
+    fn capture_protocol_active_keep_of_unprovable_output_is_stripped() {
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let kept = |tool: &str, input: serde_json::Value, family: &str| {
+            serde_json::json!({
+                "session_id": "active-keep", "cwd": "/repo",
+                "tool_name": tool, "tool_input": input,
+                "tool_response": "SENTINEL_SECRET",
+                "_ai_memory_capture": capture_protocol("keep", "active", family, 0, "extracted"),
+            })
+        };
+        for (raw, family) in [
+            (
+                kept(
+                    "Bash",
+                    serde_json::json!({"command": "cat docs/{adr,x}/1.md"}),
+                    "non-file",
+                ),
+                "non-file",
+            ),
+            (
+                kept(
+                    "Bash",
+                    serde_json::json!({"command": "cat docs/ad[r]/1.md"}),
+                    "non-file",
+                ),
+                "non-file",
+            ),
+            (
+                kept(
+                    "BashOutput",
+                    serde_json::json!({"bash_id": "b1"}),
+                    "unknown",
+                ),
+                "unknown",
+            ),
+            (
+                kept(
+                    "TaskOutput",
+                    serde_json::json!({"task_id": "b1"}),
+                    "unknown",
+                ),
+                "unknown",
+            ),
+        ] {
+            let env =
+                inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), raw.clone()))
+                    .unwrap();
+            assert_eq!(
+                env.raw["_ai_memory_capture"]["disposition"], "metadata-only",
+                "{raw}"
+            );
+            assert_eq!(env.raw["tool_family"], family, "{raw}");
+            let stored = serde_json::to_string(&env).unwrap();
+            assert!(!stored.contains("SENTINEL"), "{stored}");
+        }
+        for raw in [
+            kept(
+                "Bash",
+                serde_json::json!({"command": "git log --format='%h {a,b}'"}),
+                "non-file",
+            ),
+            kept("FutureTool", serde_json::json!({"x": 1}), "unknown"),
+        ] {
+            let env = HookEnvelope::from_query_and_body(query(), raw.clone());
+            assert_eq!(inspect_capture_envelope(env).unwrap().raw, raw);
+        }
+        // A current client's stripped output-reader body is accepted.
+        let stripped = serde_json::json!({
+            "session_id": "reader", "cwd": "/repo",
+            "tool_family": "unknown", "tool_name": "unknown",
+            "_ai_memory_capture": capture_protocol("metadata-only", "active", "unknown", 0, "extracted"),
+        });
+        assert!(
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), stripped))
+                .is_some()
+        );
     }
 
     #[test]
