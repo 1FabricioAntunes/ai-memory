@@ -8937,6 +8937,100 @@ mod tests {
         );
     }
 
+    /// Codex records its shell tool as `exec_command` with `{cmd, workdir}`,
+    /// which hooks receive as `Bash`. The ledger upload inspects it as that
+    /// shell call: a command whose `workdir`-relative argument names an ignored
+    /// path never reaches the finish request, while the same command run from
+    /// a public directory does.
+    #[tokio::test]
+    async fn ledger_upload_inspects_codex_exec_command_as_the_hook_shell_call() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let event = |kind, content: String, id: &str| ai_memory_core::NewWorkstreamEvent {
+            event_id: format!("e-{id}-{}", content.len()),
+            agent: AgentKind::Codex,
+            native_session_id: "sid-1".into(),
+            source_record_id: None,
+            kind,
+            role: None,
+            content,
+            occurred_at: None,
+            metadata: serde_json::json!({"tool": "exec_command", "tool_use_id": id}),
+        };
+        let exec = |workdir: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolCall,
+                format!(
+                    "exec_command: {}",
+                    serde_json::json!({"cmd": "cat adr/x.md", "workdir": repo.path().join(workdir)})
+                ),
+                id,
+            )
+        };
+        let output = |text: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolResult,
+                text.into(),
+                id,
+            )
+        };
+        let transcript = ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                exec("docs", "adr"),
+                output("ADRSENTINEL private decision", "adr"),
+                exec("src", "pub"),
+                output("PUBLICCONTROL public note", "pub"),
+            ],
+            losses: Vec::new(),
+        };
+        let imported = import_batches(
+            &endpoint,
+            "/workstream/runs/test",
+            transcript,
+            Default::default(),
+            Some(0),
+            &Sanitizer::builtin(),
+            &TranscriptCapture::for_checkout(home.path(), repo.path()),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let posted = serde_json::to_string(&*requests.lock().unwrap()).unwrap();
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "public output: {posted}");
+        assert_eq!(imported, 2, "only the public call and its output: {posted}");
+    }
+
     /// Allowlist capture mode (#446): the live hook emits nothing from an
     /// unmarked checkout, so its run ledger upload carries no events — no
     /// prompt, no tool content — while still finishing the run. A marked

@@ -1399,6 +1399,127 @@ mod tests {
         server.abort();
     }
 
+    /// Plant `lines` as one native session and backfill it from `repo`,
+    /// returning everything posted to `/hook/batch` as one JSON string.
+    #[cfg(unix)]
+    async fn backfill_posted(
+        harness: ManagedHarness,
+        home: &Path,
+        data_dir: &Path,
+        repo: &Path,
+        sid: &str,
+        lines: &[serde_json::Value],
+    ) -> String {
+        use axum::{Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let session_file = match harness {
+            ManagedHarness::Claude => home
+                .join(".claude/projects")
+                .join(repo.to_string_lossy().replace('/', "-"))
+                .join(format!("{sid}.jsonl")),
+            ManagedHarness::Codex => home
+                .join(".codex/sessions/2026/09/01")
+                .join(format!("rollout-2026-09-01T10-00-00-{sid}.jsonl")),
+            other => panic!("no fixture layout for {}", other.as_str()),
+        };
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(&session_file, body).unwrap();
+
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        let app = Router::new().route(
+            "/hook/batch",
+            post(
+                move |axum::Json(items): axum::Json<Vec<serde_json::Value>>| {
+                    let captured = captured.clone();
+                    async move {
+                        let accepted = items.len();
+                        captured.lock().unwrap().extend(items);
+                        axum::Json(serde_json::json!({ "accepted": accepted }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = ServerEndpoint::for_hook_target(format!("http://{address}"), None);
+        let session = SessionRef {
+            harness,
+            native_session_id: sid.into(),
+            updated_at: SystemTime::now(),
+        };
+        let capture = TranscriptCapture::for_checkout(data_dir, repo);
+        import_one(&endpoint, "ws", "proj", home, repo, &capture, &session)
+            .await
+            .unwrap();
+        server.abort();
+        serde_json::to_string(&*posted.lock().unwrap()).unwrap()
+    }
+
+    fn marked_checkout(marker: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".ai-memory.toml"), marker).unwrap();
+        dir
+    }
+
+    /// Codex records its shell tool as `exec_command` with `{cmd, workdir}`;
+    /// the live hook receives it as `Bash`. A command whose `workdir`-relative
+    /// argument names an ignored path never reaches `/hook/batch`, call or
+    /// output; the same command run from a public directory does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_inspects_codex_exec_command_as_the_hook_shell_call() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = marked_checkout("[capture]\nignore_paths = [\"docs/adr/**\"]\n");
+        for dir in ["docs/adr", "src/adr"] {
+            std::fs::create_dir_all(repo.path().join(dir)).unwrap();
+        }
+        let sid = "019a0000-0000-7000-8000-000000000001";
+        let item = |payload: serde_json::Value| {
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-09-01T10:00:00Z", "payload": payload,
+            })
+        };
+        let exec = |id: &str, workdir: &str| {
+            item(serde_json::json!({
+                "type": "function_call", "name": "exec_command", "call_id": id,
+                "arguments": serde_json::json!({
+                    "cmd": "cat adr/x.md", "workdir": repo.path().join(workdir),
+                }).to_string(),
+            }))
+        };
+        let output = |id: &str, text: &str| {
+            item(serde_json::json!({"type": "function_call_output", "call_id": id, "output": text}))
+        };
+        let lines = [
+            serde_json::json!({"type": "session_meta", "payload": {"id": sid, "cwd": repo.path()}}),
+            item(serde_json::json!({
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "show both adr notes"}],
+            })),
+            exec("call_adr", "docs"),
+            output("call_adr", "ADRSENTINEL private decision"),
+            exec("call_pub", "src"),
+            output("call_pub", "PUBLICCONTROL public note"),
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Codex,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(!posted.contains("/docs\\\""), "excluded call: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "public output: {posted}");
+        assert!(posted.contains("/src"), "public call: {posted}");
+    }
+
     fn spawned_args(
         server_url: Option<&str>,
         server_profile: Option<&str>,
