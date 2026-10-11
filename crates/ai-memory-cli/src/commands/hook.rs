@@ -3069,6 +3069,101 @@ mod tests {
         }
     }
 
+    /// Gemini CLI's `run_shell_command` and `read_many_files` were unknown
+    /// tools, so the native hook spooled their raw output even when they read
+    /// an ignored path. Both events of each call are now dropped before the
+    /// spool; public calls are still spooled with their family recorded.
+    #[tokio::test]
+    async fn gemini_cli_shell_and_read_many_files_exclusions_drop_before_spool() {
+        let cases = [
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat secret/token.txt"}),
+                0,
+            ),
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat token.txt", "dir_path": "secret"}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["secret/token.txt"]}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["README.md", "secret/token.txt"]}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["**/*.txt"]}),
+                0,
+            ),
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat README.md"}),
+                1,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["README.md", "src/**/*.rs"]}),
+                1,
+            ),
+        ];
+        for (tool, input, spooled) in cases {
+            for event in ["pre-tool-use", "post-tool-use"] {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    tmp.path().join(".ai-memory.toml"),
+                    "[capture]\nignore_paths = [\"secret/**\"]\n",
+                )
+                .unwrap();
+                let data_dir = tmp.path().join("data");
+                let mut args = devin_hook_args(event);
+                args.agent = "gemini-cli".into();
+                let raw = serde_json::json!({
+                    "session_id": "gemini", "cwd": tmp.path(),
+                    "tool_name": tool, "tool_input": input,
+                    "tool_response": {"llmContent": "SENTINEL_CONTENT"},
+                });
+                run_with_payload(
+                    Some(data_dir.clone()),
+                    args,
+                    raw.to_string(),
+                    &mut Vec::new(),
+                    |_, _| panic!("tool events below the threshold must only spool"),
+                )
+                .await
+                .unwrap();
+                let spool = hook_spool::spool_dir(&data_dir);
+                let entries = if spool.exists() {
+                    read_spooled_entries(&spool)
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(entries.len(), spooled, "{event}: {tool} {input}");
+                for entry in &entries {
+                    let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                    let family = if tool == "read_many_files" {
+                        "file"
+                    } else {
+                        "non-file"
+                    };
+                    assert_eq!(
+                        body["_ai_memory_capture"]["tool_family"], family,
+                        "{event}: {tool}"
+                    );
+                    assert_eq!(
+                        body["_ai_memory_capture"]["disposition"], "keep",
+                        "{event}: {tool}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn codex_native_capture_policy_runs_before_spool_and_preserves_identity() {
         for (tool, input, disposition) in [

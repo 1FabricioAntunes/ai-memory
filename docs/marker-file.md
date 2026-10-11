@@ -494,8 +494,18 @@ That form contains only bounded routing/tool/decision metadata, never paths,
 patterns, arguments, output, errors, titles, or nested payload. Unknown tools
 retain current behavior.
 
+Gemini CLI's `read_many_files` is a file tool whose `include` entries (`paths`
+in older releases) are globs that Gemini expands case-insensitively, with `**`
+reaching any depth. ai-memory reads every entry and drops the whole call when
+any one names an ignored path or could expand into one, matching case-insensitively
+like Gemini: `docs/adr/x.md`, `docs/*/x.md`, `docs/**` and `**/*.md` are
+all dropped under `docs/adr/**`, while `src/**/*.rs` and a root-level `*.md`
+are not. Its `exclude` list never subtracts an ignored path. An entry using glob
+syntax the matcher cannot evaluate (`[…]`, `{…}`, `(…)`, `!`) makes the call
+**metadata-only**.
+
 Recognized shell tools (`Bash`, `PowerShell`, `shell`, `exec`, `execute_bash`,
-`terminal`, …) have no path field, so the command line is split into words lexically, the way
+`terminal`, Gemini CLI's `run_shell_command`, …) have no path field, so the command line is split into words lexically, the way
 a POSIX shell quotes and separates them, without expanding or running anything.
 Codex shell calls, including its `exec_command` path, reach hooks as `Bash`
 with the command in `tool_input.command`.
@@ -504,7 +514,7 @@ with spaces stays whole, up to 256 characters) and also splits each element on
 its own, so a `bash -lc "<script>"` script is read like any command line. Each
 argument that is not a flag, plus the value of a `--flag=value`, `NAME=value`,
 or PowerShell `-Param:value` word, is resolved like a file-tool path: from the tool's own
-`workdir` argument when it has one, otherwise from the event's `cwd`. If
+`workdir` argument (Gemini CLI's `dir_path`) when it has one, otherwise from the event's `cwd`. If
 one matches a pattern, the whole event is **dropped**, exactly like a matching
 file read. An argument containing `*` or `?` also matches when its glob can
 reach a pattern's directory: `cat docs/*/0001.md` is dropped under
