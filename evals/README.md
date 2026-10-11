@@ -288,6 +288,49 @@ cargo run -p ai-memory-eval -- retrieval --sample 3 \
     --qa --qa-provider gemini --qa-model gemini-2.5-flash
 ```
 
+### `retrieval` decomposition instruments (M1)
+
+These flags split a hit@k number into evidence the index never saw and
+ranking on evidence it did. All are opt-in; the defaults reproduce the
+published baselines.
+
+- `--reachability` reads every evidence session back after the query and
+  reports, per slice, how many answer-bearing turns (the dataset's
+  `has_answer` flag) survive into the session page, the observation bodies,
+  and the first 512 tokens the local embedder reads. A turn counts as
+  reachable when at least half of its distinctive tokens (content words that
+  occur in at most 3 sessions of the haystack) are on that surface. The
+  module docs in `src/retrieval/reachability.rs` give the exact definition.
+  It needs the local model's tokenizer, which it fetches into
+  `evals/models/` if missing.
+- `--engine grep` ranks each question's raw sessions by query-term overlap
+  in-process, with no server. It follows agentmemory's grep adapter exactly
+  and matches its archived per-question results.
+- `--ingest whole-session` writes each raw session as one page through
+  `POST /admin/write-page` and then queries as usual: ranking on full
+  evidence. `--ingest captured-session` writes one page per session holding
+  only the text capture keeps (user turns up to 16 KiB, assistant excerpts up
+  to 2 KB).
+- `--date-prefix turn|session-start|none` moves the session date off every
+  turn (`turn` is the default).
+- `--stratify N` scores the first N questions of each type, so a cheap run
+  covers every slice (`--sample` takes a prefix, which is all one type).
+- `--dataset-variant s-cleaned` runs on the cleaned LongMemEval-S
+  re-release (pinned by sha256) that other systems report on.
+
+`--candidate-ingest` and `--candidate-date-prefix` put either knob into an
+A/B run. The A/B delta table also counts per-question flips (`+gained/-lost`),
+which shows whether a net delta is many changes cancelling out or a few in
+one direction.
+
+```bash
+cargo run --release -p ai-memory-eval -- retrieval --engine grep
+cargo run --release -p ai-memory-eval -- retrieval --reachability \
+    --ingest hooks --candidate-ingest whole-session
+cargo run --release -p ai-memory-eval -- retrieval --stratify 5 \
+    --date-prefix turn --candidate-date-prefix session-start
+```
+
 Honest-numbers notes:
 
 - capture is production-shaped: excerpts are bounded at the 2 KB
