@@ -96,7 +96,8 @@ impl TranscriptCapture {
     /// One decision per event, in transcript order. A checkout the hook's
     /// admission gate refuses drops every event, prompts included, as the
     /// live hook emits none. Otherwise messages are kept, as live prompt
-    /// capture keeps them.
+    /// capture keeps them, except the output of a Claude Code `!` shell
+    /// command, which live capture never receives.
     ///
     /// An event whose record names its own working directory is judged from
     /// there, as the live hook judges an event by its own `cwd`: that
@@ -149,7 +150,7 @@ impl TranscriptCapture {
                     if matches!(event.role.as_deref(), Some("user" | "human")) {
                         turn.clear();
                     }
-                    if admitted {
+                    if admitted && !shell_mode_output(event) {
                         EventCapture::Keep
                     } else {
                         EventCapture::Drop
@@ -280,6 +281,40 @@ fn record_cwd(event: &NewWorkstreamEvent) -> Option<&str> {
         .get(RECORD_CWD_KEY)
         .and_then(Value::as_str)
         .filter(|cwd| Path::new(cwd).is_absolute())
+}
+
+/// Claude Code records a `!` shell command's output as user messages made
+/// only of these blocks. Live capture never receives that output.
+fn shell_mode_output(event: &NewWorkstreamEvent) -> bool {
+    const TAGS: [&str; 4] = [
+        "bash-stdout",
+        "bash-stderr",
+        "local-command-stdout",
+        "local-command-stderr",
+    ];
+    if event.agent != AgentKind::ClaudeCode {
+        return false;
+    }
+    let mut rest = event.content.trim_start();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(tag) = TAGS.iter().find(|tag| {
+            rest.strip_prefix('<')
+                .and_then(|rest| rest.strip_prefix(**tag))
+                .is_some_and(|rest| rest.starts_with('>'))
+        }) else {
+            return false;
+        };
+        let close = format!("</{tag}>");
+        // A block cut by the adapter's size cap has no closing tag.
+        rest = rest
+            .find(&close)
+            .map_or("", |end| &rest[end + close.len()..])
+            .trim_start();
+    }
+    true
 }
 
 /// The native id linking a tool call and its result, when the adapter kept one.
@@ -610,6 +645,33 @@ mod tests {
                 .iter()
                 .all(|event| event.metadata.get(RECORD_CWD_KEY).is_none()),
             "{uploaded:?}"
+        );
+    }
+
+    /// A Claude Code `!` command's output is recorded as user messages made
+    /// only of `<bash-stdout>`/`<bash-stderr>` (or `<local-command-stdout>`)
+    /// blocks, which live capture never receives. The typed command and an
+    /// ordinary prompt quoting such a tag are kept, as is another agent's
+    /// message.
+    #[test]
+    fn claude_shell_mode_output_is_not_imported() {
+        let repo = checkout(None);
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let user = |text: &str| event(WorkstreamEventKind::Message, "user", text, json!({}));
+        let mut codex = user("<bash-stdout>codex text</bash-stdout>");
+        codex.agent = AgentKind::Codex;
+        let events = [
+            user("<bash-input>cat notes.txt</bash-input>"),
+            user("<bash-stdout>SECRET</bash-stdout><bash-stderr></bash-stderr>"),
+            user("<local-command-stdout>output</local-command-stdout>"),
+            user("<bash-stdout>cut by the size cap"),
+            user("why does <bash-stdout>x</bash-stdout> appear?"),
+            user("<bash-stdout>x</bash-stdout> and then a question"),
+            codex,
+        ];
+        assert_eq!(
+            kinds(&capture.decide(&events)),
+            ["keep", "drop", "drop", "drop", "keep", "keep", "keep"]
         );
     }
 
