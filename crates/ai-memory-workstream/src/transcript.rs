@@ -892,6 +892,30 @@ fn parse_claude(
         losses.push("Claude non-conversation message records were intentionally excluded".into());
         return;
     }
+    if role == "user" && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+        // The summary Claude Code writes after compacting the conversation,
+        // recorded as a user turn the operator never typed.
+        let text = message.get("content").map(value_text).unwrap_or_default();
+        if !text.is_empty() {
+            push_event(
+                events,
+                AgentKind::ClaudeCode,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::Compaction,
+                Some("assistant"),
+                &text,
+                timestamp(value),
+                json!({}),
+            );
+        }
+        return;
+    }
+    if role == "user" && claude_task_notification(value, message) {
+        losses.push("Claude task notifications were intentionally excluded".into());
+        return;
+    }
     parse_content_blocks(
         AgentKind::ClaudeCode,
         session,
@@ -902,6 +926,34 @@ fn parse_claude(
         events,
         losses,
     );
+}
+
+/// A user turn Claude Code writes itself to report a background task: a
+/// monitored command's streamed output, a finished background command or
+/// agent and its result. No prompt hook fires for it, so live capture never
+/// stores it as a prompt.
+fn claude_task_notification(record: &Value, message: &Value) -> bool {
+    let origin = |value: &Value| {
+        value
+            .pointer("/origin/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "task-notification")
+    };
+    if origin(record) || origin(message) {
+        return true;
+    }
+    let first_text = match message.get("content") {
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(Value::Array(blocks)) => blocks.first().and_then(|block| {
+            block.as_str().or_else(|| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| first_string(block, &["text"]))
+                    .flatten()
+            })
+        }),
+        _ => None,
+    };
+    first_text.is_some_and(|text| text.trim_start().starts_with("<task-notification>"))
 }
 
 fn parse_codex(
@@ -5617,6 +5669,79 @@ mod tests {
         assert_eq!(
             losses,
             ["Claude synthetic/meta records were intentionally excluded"]
+        );
+    }
+
+    /// Claude Code writes background-task reports (a monitored command's
+    /// streamed output, a finished background agent's result) and its compact
+    /// summary as user turns. Neither is a prompt: the reports are excluded,
+    /// with or without the `origin` tag, and the summary becomes a compaction
+    /// event. A typed prompt, including one quoting the tag, stays a message.
+    #[test]
+    fn claude_adapter_keeps_task_notifications_and_compact_summaries_out_of_prompts() {
+        let user = |uuid: &str, extra: Value, content: Value| {
+            let mut record = json!({
+                "type":"user", "uuid":uuid,
+                "message":{"role":"user","content":content},
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                record[key] = value.clone();
+            }
+            record
+        };
+        let records = [
+            user(
+                "monitor",
+                json!({"origin":{"kind":"task-notification"}}),
+                "<task-notification>\n<event>MONITORSENTINEL line</event>\n</task-notification>"
+                    .into(),
+            ),
+            user(
+                "agent",
+                json!({}),
+                json!([{"type":"text","text":"<task-notification>\n<result>AGENTSENTINEL</result>\n</task-notification>"}]),
+            ),
+            user(
+                "tagged",
+                json!({"origin":{"kind":"task-notification","producer":"session-task"}}),
+                "[SYSTEM NOTIFICATION - TAGSENTINEL]".into(),
+            ),
+            user(
+                "summary",
+                json!({"isCompactSummary":true,"isVisibleInTranscriptOnly":true}),
+                "This session is being continued. SUMMARYSENTINEL".into(),
+            ),
+            user(
+                "typed",
+                json!({"origin":{"kind":"human"}}),
+                "why does <task-notification> show up?".into(),
+            ),
+        ];
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        for record in &records {
+            let id = record["uuid"].as_str().unwrap();
+            parse_claude(record, "session", id, &mut events, &mut losses);
+        }
+        let messages: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::Message)
+            .map(|event| event.content.as_str())
+            .collect();
+        assert_eq!(messages, ["why does <task-notification> show up?"]);
+        let compactions: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::Compaction)
+            .map(|event| event.content.as_str())
+            .collect();
+        assert_eq!(
+            compactions,
+            ["This session is being continued. SUMMARYSENTINEL"]
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            losses,
+            ["Claude task notifications were intentionally excluded"; 3]
         );
     }
 
