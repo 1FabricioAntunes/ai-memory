@@ -507,7 +507,13 @@ back output of a command started by an earlier call (Claude Code `BashOutput`
 and `TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw `process`, GitHub
 Copilot CLI `read_bash`/`write_bash` and their PowerShell twins) become
 metadata-only under an active or invalid policy, because nothing proves the
-command they read missed every ignored path. Other unknown tools retain current
+command they read missed every ignored path. For the same reason, a file or
+shell tool that reads a file the harness saved an earlier tool's output to is
+metadata-only under an active or invalid policy: Claude Code's saved large
+results (`~/.claude/projects/<project>/<session>/tool-results/…`) and
+background task output (`<tmp>/claude-<uid>/<project>/<session>/tasks/<id>.output`),
+OpenCode's truncated output (`<data>/opencode/tool-output/…`) and Pi's
+(`<tmp>/pi-bash-<id>.log`). Other unknown tools retain current
 behavior. GitHub Copilot CLI's runtime `view`, `create` and
 `str_replace_editor` names are file tools read from their `path` argument.
 
@@ -547,14 +553,21 @@ host, the command is also read without PowerShell's backquote and cmd's caret
 escape characters. Each
 argument that is not a flag, plus the value of a `--flag=value`, `NAME=value`,
 or PowerShell `-Param:value` word, plus a value glued to a short flag
-(`-fdocs/x.md`), plus the local path of a `file:` URL in any case (ASCII
-percent-escapes decoded), is resolved like a file-tool path: from the tool's own
+(`-fdocs/x.md`), plus the local path of a `file:` URL in any case (cut at its
+`?` query or `#` fragment, then ASCII percent-escapes decoded), is resolved like a file-tool path: from the tool's own
 `workdir` argument (Gemini CLI's `dir_path`, Antigravity's `Cwd`) when it has one, otherwise from the event's `cwd`.
 `~/` (and PowerShell's `~\`) is the home directory and `~+` the working
 directory. An argument under `~-`, `~N` or `~name` (the previous directory,
 the directory stack, another account's home) names a directory only the
 running shell knows, so the command is **metadata-only** under an active
-policy.
+policy. Only a tilde the shell expands counts: a quoted one
+(`git commit -m "fix ~approx"`, `grep '~[a-z]+'`), one inside an argument
+vector element, or one in a quoted message is literal; one in a script run by
+`sh -c` or a command substitution is read. PowerShell resolves `~` itself, so
+under the `PowerShell` tool or on a Windows host every tilde counts. A
+parameter default nested deeper than four levels makes the command
+**metadata-only**, and a backslash escape inside a default
+(`${X:-d\ocs/x.md}`) is read as the shell reads it.
 The path in a git object name (`HEAD:docs/x.md`, `:docs/x.md`) is resolved
 from both the `cwd` and the marker directory, because git reads it from the
 repository root. If
@@ -587,8 +600,21 @@ their output is still captured. An invalid policy makes a shell command
 arguments miss every ignored path; this holds even when the command cannot be
 read. On macOS, whose default filesystem ignores case, the native hook and the
 generated integrations match file-tool and shell paths without regard to case
-(`NOTES/X.md` matches `notes/**`); other POSIX hosts compare case-sensitively,
-and Windows paths always ignore case. An older server drops these metadata-only shell and output-reader
+(`NOTES/X.md` matches `notes/**`, `ÄRGER/x.md` matches `ärger/**`) and treat a
+decomposed accent like the composed letter, as its filesystem does; other POSIX
+hosts compare case-sensitively, and Windows paths always ignore ASCII case.
+
+A checkout's exclusions protect its files wherever a call is made from. For
+every file-tool target, and every shell argument that spells a path (one with a
+separator, after `~/` expansion) plus the tool's `workdir`, the native hook and
+the generated integrations find the marker that governs that location, by the
+same lexical walk as the event's own, and when it is another checkout's (or the
+event's directory has none) apply that marker's policy as well: `cat
+../other/secrets.env` from a sibling checkout, or a Hermes terminal call from an
+unmarked directory, is dropped when `other` ignores `secrets.env`, and a broken
+marker there makes the call metadata-only. Each directory is looked up once; a
+call naming more than 4,096 path locations, 256 directories or 16 other markers
+is metadata-only. An older server drops these metadata-only shell and output-reader
 events, so upgrade the server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
@@ -597,12 +623,11 @@ This is a lexical capture boundary, **not complete DLP**. It does not resolve
 symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands are
 matched only lexically (above), and free-form patches are not parsed; prompts,
 assistant text, notifications, and quoted content are not path-attributable.
-A copy of a file's content under another path is not linked back to it either:
-Claude Code saves a large tool result to
-`~/.claude/projects/<project>/<session>/tool-results/<id>.txt` and reads it back
-with its file tool, and that read no longer matches the original path. Add
-`"~/.claude/projects/**/tool-results/**"` to `ignore_paths` to exclude those
-re-reads too (for every file, not only the ignored ones). Add each relevant visible alias
+A copy of a file's content under another path is not linked back to it either.
+The harness output files listed above are read back metadata-only under a
+policy; to drop those re-reads entirely, add for example
+`"~/.claude/projects/**/tool-results/**"` to `ignore_paths` (for every file,
+not only the ignored ones). Add each relevant visible alias
 explicitly, and do not rely on this feature to detect every way private content
 can be mentioned.
 
@@ -624,6 +649,11 @@ can be mentioned.
   `getline`, `watch`, `flock … -c`, `su user -c`) are read only for the words
   they spell out: an ignored path named there still drops the event, but
   brace expansion or inline code inside them is not recognized;
+- a bare word naming another checkout's directory (`grep -r x other`) is not
+  looked up for that checkout's marker, only arguments that spell a path
+  separator are, and a harness output file kept at a location other than the
+  defaults listed above (a Claude Code config directory whose name lacks
+  `claude`) is read as an ordinary file;
 - a value glued to a short flag is read after the flag's first letter only,
   not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
   are not decoded;

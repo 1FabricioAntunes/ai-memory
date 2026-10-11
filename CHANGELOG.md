@@ -43,7 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more script runners and interpreters are recognized. A path under a
   directory only the running shell knows (`~-`, `~name`) makes the call
   metadata-only, and on macOS paths match without regard to case, as its
-  default filesystem does.
+  default filesystem does, including non-ASCII letters and decomposed accents.
+  A checkout's `ignore_paths` now also hold for a file or shell tool call made
+  from another checkout or from an unmarked directory that names one of its
+  files. Reading back a file a harness saved an earlier tool's output to
+  (Claude Code's saved large results and background task output, OpenCode's
+  and Pi's truncated output files) is metadata-only under an active or invalid
+  policy, like `BashOutput`. A `file:` URL's query or fragment is no longer
+  read as part of its path, a parameter default nested deeper than the matcher
+  reads is metadata-only, and a backslash escape inside a default is read. A
+  quoted `~` (`git commit -m "fix ~approx"`) is no longer treated as a home
+  or user directory, so such commands are kept again.
   This applies to the native hook, the server, and the
   generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
 - Fixed `ai-memory backfill`, including the automatic first-boot import, and
@@ -78,7 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do not send the request metadata the check relies on, the session-start
   handoff fetch now also requires an `X-AI-Memory-Client` header that every
   ai-memory hook, CLI command and generated integration sends; the same holds
-  for a request that arrives through a forwarding proxy, even one that rewrites
+  for a request that arrives through a forwarding proxy or CDN (any of the
+  common forwarding headers, including `CF-Connecting-IP`, `True-Client-IP`
+  and `X-Forwarded-Proto`), even one that rewrites
   the host to the loopback address. Hooks on such a
   server must be re-staged with `ai-memory install-hooks` (or
   `ai-memory upgrade`); loopback installs need nothing.
