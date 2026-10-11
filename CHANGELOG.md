@@ -44,12 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory only the running shell knows (`~-`, `~name`) makes the call
   metadata-only, and on macOS paths match without regard to case, as its
   default filesystem does, including non-ASCII letters and decomposed accents.
-  A checkout's `ignore_paths` now also hold for a file or shell tool call made
-  from another checkout or from an unmarked directory that names one of its
-  files. Reading back a file a harness saved an earlier tool's output to
+  A checkout's `ignore_paths` now also hold for a file, search/list or shell
+  tool call made from another checkout or from an unmarked directory that
+  reaches one of its files, including through glob syntax in a directory
+  name, a search's path or file filter, or the files an `apply_patch` names.
+  Glob directories are followed through the directories on disk within fixed
+  bounds; past them, or for glob syntax that cannot be followed, the call is
+  metadata-only, and so is a file tool whose target cannot be read. A broken
+  marker makes a search metadata-only, as it does a file or shell call.
+  Reading back a file a harness saved an earlier tool's output to
   (Claude Code's saved large results and background task output, OpenCode's
-  and Pi's truncated output files) is metadata-only under an active or invalid
-  policy, like `BashOutput`. A `file:` URL's query or fragment is no longer
+  and Pi's truncated output files), or a glob that could match one, is
+  metadata-only under an active or invalid policy, like `BashOutput`. A `file:` URL's query or fragment is no longer
   read as part of its path, a parameter default nested deeper than the matcher
   reads is metadata-only, and a backslash escape inside a default is read. A
   quoted `~` (`git commit -m "fix ~approx"`) is no longer treated as a home
@@ -72,11 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another checkout is imported only when that checkout would capture it and
   sends to the same server and project; events recorded in, or calls reaching
   into, a checkout of another project are left out instead of being filed
-  under the importing project. The output of a Claude Code `!` shell command,
+  under the importing project, and so are events from a different
+  subdirectory of the same repository, which the server files under a
+  project of their own. The output of a Claude Code `!` shell command,
   which live capture never receives, is no longer imported. Claude Code's
   background-task notifications (a monitored command's output, a finished
-  background command or agent) are no longer imported as prompts, and its
-  compaction summary is imported as a compaction record instead of a prompt.
+  background command or agent) are no longer imported as prompts, whatever the
+  case or spacing of their opening tag, and its compaction summary is
+  imported as a compaction record instead of a prompt.
   A tool ai-memory does not recognize, such as an MCP tool, is imported as a
   record that it ran without its arguments, output or name, which is all live
   capture stores for it, and so is a result whose call is not in the

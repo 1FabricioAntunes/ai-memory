@@ -500,7 +500,8 @@ and documented direct arrays for multi-file calls. If any candidate matches, the
 entire event is **dropped locally** before spool, queue, network, transport
 logs, or server storage. With an active policy, recognized search/list tools are
 dropped conservatively; missing or malformed recognized file candidates, an
-unsupported recognized schema, or an invalid policy become **metadata-only**.
+unsupported recognized schema, or an invalid policy (for file, search/list and
+shell tools) become **metadata-only**.
 That form contains only bounded routing/tool/decision metadata, never paths,
 patterns, arguments, output, errors, titles, or nested payload. Tools that read
 back output of a command started by an earlier call (Claude Code `BashOutput`
@@ -513,8 +514,11 @@ metadata-only under an active or invalid policy: Claude Code's saved large
 results (`~/.claude/projects/<project>/<session>/tool-results/…`) and
 background task output (`<tmp>/claude-<uid>/<project>/<session>/tasks/<id>.output`),
 OpenCode's truncated output (`<data>/opencode/tool-output/…`) and Pi's
-(`<tmp>/pi-bash-<id>.log`). Other unknown tools retain current
-behavior. GitHub Copilot CLI's runtime `view`, `create` and
+(`<tmp>/pi-bash-<id>.log`). A glob that could match such a file counts too
+(`cat ~/.claude/projects/*/*/tool-results/*`): each glob segment fits a
+directory or file name it shares a match with, and at least one fitting segment
+must spell literal text, so `ls src/*` is not read as one. Other unknown tools
+retain current behavior. GitHub Copilot CLI's runtime `view`, `create` and
 `str_replace_editor` names are file tools read from their `path` argument.
 
 Gemini CLI's `read_many_files` is a file tool whose `include` entries (`paths`
@@ -605,16 +609,34 @@ decomposed accent like the composed letter, as its filesystem does; other POSIX
 hosts compare case-sensitively, and Windows paths always ignore ASCII case.
 
 A checkout's exclusions protect its files wherever a call is made from. For
-every file-tool target, and every shell argument that spells a path (one with a
-separator, after `~/` expansion) plus the tool's `workdir`, the native hook and
-the generated integrations find the marker that governs that location, by the
+every file-tool target (for `apply_patch`, the files its patch headers name),
+every directory, file and path-like glob argument of a search/list tool (Grep,
+Glob, LS, `grep_search`, `glob`, `list_directory`, `search_file_content` and
+the other agents' equivalents; a grep `pattern` is a regular expression and is
+not read), and every shell argument that spells a path (one with a separator,
+after `~/` expansion) plus the tool's `workdir`, the native hook and the
+generated integrations find the marker that governs that location, by the
 same lexical walk as the event's own, and when it is another checkout's (or the
 event's directory has none) apply that marker's policy as well: `cat
-../other/secrets.env` from a sibling checkout, or a Hermes terminal call from an
-unmarked directory, is dropped when `other` ignores `secrets.env`, and a broken
-marker there makes the call metadata-only. Each directory is looked up once; a
-call naming more than 4,096 path locations, 256 directories or 16 other markers
-is metadata-only. An older server drops these metadata-only shell and output-reader
+../other/secrets.env` or a Grep of `../other/secrets.env` from a sibling
+checkout, or a Hermes terminal call from an unmarked directory, is dropped when
+`other` ignores `secrets.env` (a search reaching a checkout with an active
+policy is dropped, as in its own checkout), and a broken marker there makes the
+call metadata-only. Each directory is looked up once; a call naming more than
+4,096 path locations, 256 directories or 16 other markers is metadata-only, and
+so is a file tool whose target cannot be read or resolved.
+
+A location with glob syntax in a directory name (`cat ../*/secrets.env`, `cat
+*/secrets.env` from a parent folder, `../{a,b}/x`, `../[ab]/x`) is looked up
+from its literal leading directories, and every directory the glob could pass
+through is checked for a marker of its own: a `*`/`?` segment lists the child
+directories whose names it matches (ignoring ASCII case), a class, brace or
+group segment lists every child, and a `**` lists the whole subtree unless it
+starts inside the event's own checkout (the directory holding `.git`). Symlinks
+are never followed. The walk reads at most 65,536 directory entries and visits
+at most 256 directories per call; past either bound, or for glob syntax that
+can leave its leading directories (a brace or group spanning a separator, a
+`..` or `~` alternative), the call is metadata-only. An older server drops these metadata-only shell and output-reader
 events, so upgrade the server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
@@ -651,9 +673,13 @@ can be mentioned.
   brace expansion or inline code inside them is not recognized;
 - a bare word naming another checkout's directory (`grep -r x other`) is not
   looked up for that checkout's marker, only arguments that spell a path
-  separator are, and a harness output file kept at a location other than the
-  defaults listed above (a Claude Code config directory whose name lacks
-  `claude`) is read as an ordinary file;
+  separator are; a recursive search of a literal directory (a Grep whose
+  `path` is `..`) does not walk into the checkouts below it, a `**` that
+  starts inside the event's own checkout is not walked, so a checkout nested
+  inside it is reached only by a path or one-level glob that names it, and a
+  glob is not followed through a symlinked directory; a harness output file kept at a
+  location other than the defaults listed above (a Claude Code config
+  directory whose name lacks `claude`) is read as an ordinary file;
 - a value glued to a short flag is read after the flag's first letter only,
   not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
   are not decoded;
