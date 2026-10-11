@@ -103,6 +103,12 @@ pub struct RetrievalArgs {
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
 
+    /// Per-request HTTP timeout, seconds. Hook batches slow down as the
+    /// store grows, and a timed-out batch cannot be retried safely (the
+    /// server may have applied it), so long full runs need headroom.
+    #[arg(long, default_value_t = 120)]
+    http_timeout_secs: u64,
+
     /// Output root; a timestamped run dir is created under it.
     #[arg(long, default_value = "evals/runs")]
     out: PathBuf,
@@ -613,7 +619,7 @@ async fn run_config(run: &RunContext<'_>, knobs: &Knobs) -> Result<report::Repor
     );
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(args.http_timeout_secs))
         .build()?;
     let max_k = args.ks.iter().copied().max().unwrap_or(10);
     let ks = Arc::new(args.ks.clone());
