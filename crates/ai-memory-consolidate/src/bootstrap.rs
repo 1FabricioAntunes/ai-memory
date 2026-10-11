@@ -1805,7 +1805,7 @@ mod tests {
     #[test]
     fn bootstrap_system_prompt_limits_cross_scope_links_to_input_targets() {
         assert!(SYSTEM_PROMPT.contains("Never invent project names or page paths"));
-        assert!(SYSTEM_PROMPT.contains("only when that\n  exact path appears in the input"));
+        assert!(SYSTEM_PROMPT.contains("only when that\n  exact path appears in the observations"));
         assert!(SYSTEM_PROMPT.contains("never pad with a cross-scope link"));
         assert!(!SYSTEM_PROMPT.contains("A link whose target does not exist yet is acceptable"));
     }

@@ -2968,7 +2968,7 @@ mod tests {
                 "{name} prompt"
             );
             assert!(
-                prompt.contains("only when that\n  exact path appears in the input"),
+                prompt.contains("only when that\n  exact path appears in the observations"),
                 "{name} prompt"
             );
             assert!(
