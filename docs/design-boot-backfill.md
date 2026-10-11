@@ -181,8 +181,24 @@ Retroactive text is exactly as untrusted as live hook text, since it is old mode
   `Sanitized<NewObservation>` / workstream sanitize boundary and the same caps. The e2e
   canary secret must be scrubbed from a backfilled body just as from a live one.
 - **Capture exclusions honored.** `[capture] ignore_paths` from the nearest
-  `.ai-memory.toml` must drop matching file-tool events in the backfill path too, not just
-  live hooks.
+  `.ai-memory.toml` applies to the backfill path too, not just live hooks.
+  As built (`commands/transcript_capture.rs`), each imported tool call is rebuilt in
+  its agent's hook shape (`ai_memory_hooks::tool_call_payload`) and inspected by the
+  checkout's `CapturePolicy`, the same decision table the live hook uses; a call the
+  live hook would reroute to another marked checkout also answers to that checkout's
+  policy. A Drop removes both the call and its result before anything is posted; a
+  metadata-only decision posts the hook's metadata-only body with its
+  `_ai_memory_capture` protocol, which the server validates and rebuilds from its
+  allowlist. A result is paired with its call by native id; without one it takes the
+  strictest decision of every call since the last user message, and a result with no
+  call is dropped under a policy. Kept events carry no protocol: their body is a
+  normalized transcript record, not the native payload the server's re-inspection
+  reads, and the server never receives the ignore patterns. The `ai-memory run` ledger
+  applies the same decisions before its segments are uploaded. Both also apply the
+  hook's repository admission gate (`checkout_admits_capture`): under allowlist capture
+  mode a checkout without a marker imports nothing, prompts included, exactly as the
+  live hook emits nothing there; a manual `ai-memory backfill` says so and stops before
+  contacting the server.
 - **Emptiness + lease** prevent a backfill from overwriting or racing an established
   project's real history.
 - **Multi-user posture.** On a shared server, default-on retro-import of a long local

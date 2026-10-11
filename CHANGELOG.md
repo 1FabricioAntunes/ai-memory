@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path; upgrade the server before the clients, because an older server drops
   those events. This applies to the native hook, the server, and the
   generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
+- Fixed `ai-memory backfill`, including the automatic first-boot import, and
+  the `ai-memory run` workstream ledger not applying `[capture] ignore_paths`
+  to the harness transcripts they import, so the arguments and output of a
+  tool call on an ignored file could be stored even though live hooks drop
+  them. Both now apply the same decision as the live hook to every imported
+  tool call and its result: an excluded call is not imported at all, one the
+  policy cannot prove safe keeps only its tool family, and prompts and
+  assistant messages are imported as before, and under allowlist capture
+  mode a checkout without a marker imports nothing. Results recorded without an id
+  linking them to their call take the strictest decision of their turn.
+  (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a
   project's pending handoff or starting admin jobs. With auth off, the machine
