@@ -1776,6 +1776,92 @@ mod tests {
         assert!(posted.contains("PUBLICCONTROL"), "control: {posted}");
     }
 
+    /// A reroute is delivered when the destination's marker selects the same
+    /// registered server profile as the source, and dropped when it selects a
+    /// different registered profile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_keeps_reroutes_to_the_same_server_profile_only() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let checkout = |name: &str, profile: &str| {
+            let dir = base.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(".ai-memory.toml"),
+                format!("server = \"{profile}\"\n"),
+            )
+            .unwrap();
+            dir
+        };
+        let source = checkout("source", "team-a");
+        let same = checkout("same", "team-a");
+        let other = checkout("other", "team-e");
+        let root = |dir: &Path| dir.to_string_lossy().into_owned();
+        for (name, roots) in [
+            ("team-a", vec![root(&source), root(&same)]),
+            ("team-e", vec![root(&other)]),
+        ] {
+            let name = crate::server_profiles::ProfileName::parse(name).unwrap();
+            crate::server_profiles::add(
+                data_dir.path(),
+                &name,
+                "https://a.example",
+                &roots,
+                Some("T"),
+            )
+            .unwrap();
+        }
+        let sid = "11111111-2222-3333-4444-555555555558";
+        let mut lines = vec![claude_record(sid, "u0", &source, "user", "read".into())];
+        for (index, (repo, text)) in [
+            (&same, "SAMEPROFILECONTROL"),
+            (&other, "OTHERPROFILESENTINEL"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = repo.join(format!("{text}.txt"));
+            let id = format!("toolu_{index}");
+            lines.push(claude_record(
+                sid,
+                &format!("a{index}"),
+                &source,
+                "assistant",
+                serde_json::json!([claude_tool(
+                    "Read",
+                    &id,
+                    serde_json::json!({"file_path": file})
+                )]),
+            ));
+            lines.push(claude_record(
+                sid,
+                &format!("u{}", index + 1),
+                &source,
+                "user",
+                serde_json::json!([claude_output(&id, &format!("{text} content"))]),
+            ));
+        }
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            data_dir.path(),
+            &source,
+            sid,
+            &lines,
+        )
+        .await;
+        assert!(
+            posted.contains("SAMEPROFILECONTROL content"),
+            "same profile: {posted}"
+        );
+        assert!(
+            !posted.contains("OTHERPROFILESENTINEL"),
+            "different profile: {posted}"
+        );
+    }
+
     fn spawned_args(
         server_url: Option<&str>,
         server_profile: Option<&str>,
