@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed approving or rejecting an unknown pending write
   (`POST /admin/pending-writes/{id}/approve` or `/reject`) answering 500 instead
   of 404. An id outside the given workspace and project now answers 404 too.
+  (#1205)
 - Fixed the Jev choice reranker adapter silently fabricating scores from a
   malformed judge response: `docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`
   defaulted missing or misnamed `probabilities` entries to `0.0`, so an HTTP
