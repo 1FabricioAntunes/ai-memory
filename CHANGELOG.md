@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workdir` points at another project, is no longer judged only by the
   destination's policy. (#1199)
 
+- `scope_refusal` (the hooks-side mirror of the web surfaces
+  `refusal_response` mapped in #1204) now answers `404 Not Found`
+  for typed not-found `ScopeResolutionError` variants and `400
+  Bad Request` for typed bad-request variants. Previously every
+  refusal that was not `Forbidden` fell through to `500 Internal
+  Server Error`, hiding a missing-id mistake from the caller and
+  making it indistinguishable from a real fault. The four-branch
+  shape (forbidden / not_found / bad_request / fallback) matches
+  the web mapping from #1204; the typed `is_*` predicates the
+  store already exposes carry the classification, so the fix is
+  purely a branch reshuffle with no new predicate. Four unit
+  tests in `workstream.rs::tests` cover the unknown-id (404),
+  unknown-workspace (404), ambiguous-name (400), and forbidden
+  (403, regression guard) cases. (#1209)
+
 ## [2.6.3] - 2026-10-09
 
 ### Fixed
