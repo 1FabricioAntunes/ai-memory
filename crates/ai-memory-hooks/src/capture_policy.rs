@@ -1125,7 +1125,11 @@ fn canonical(family: ToolFamily) -> CanonicalTool {
         ToolFamily::Unknown => CanonicalTool::Unknown,
     }
 }
-pub(crate) fn valid_call_id(id: &str) -> bool {
+
+/// Whether a native tool call id may be stored: the only call id the server
+/// keeps beside a metadata-only tool observation.
+#[must_use]
+pub fn valid_call_id(id: &str) -> bool {
     !id.is_empty()
         && id.chars().count() <= MAX_CALL_ID_CHARS
         && id

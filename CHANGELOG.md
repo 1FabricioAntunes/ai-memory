@@ -60,11 +60,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   judged under the hook's name, each event is judged from the working directory
   its own record names, and a call or event the live hook would deliver to
   another checkout is imported only when that checkout would capture it and
-  sends to the same server. The output of a Claude Code `!` shell command,
-  which live capture never receives, is no longer imported. A tool ai-memory
-  does not recognize, such as an MCP tool, is imported as a record that it ran
-  without its arguments or output, which is all live capture stores for it.
-  (GHSA-gcpc-88hm-3xqr)
+  sends to the same server and project; events recorded in, or calls reaching
+  into, a checkout of another project are left out instead of being filed
+  under the importing project. The output of a Claude Code `!` shell command,
+  which live capture never receives, is no longer imported. Claude Code's
+  background-task notifications (a monitored command's output, a finished
+  background command or agent) are no longer imported as prompts, and its
+  compaction summary is imported as a compaction record instead of a prompt.
+  A tool ai-memory does not recognize, such as an MCP tool, is imported as a
+  record that it ran without its arguments, output or name, which is all live
+  capture stores for it, and so is a result whose call is not in the
+  transcript. (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a
   project's pending handoff or starting admin jobs. With auth off, the machine

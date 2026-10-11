@@ -1626,7 +1626,8 @@ mod tests {
     /// posted: under allowlist mode an unmarked repository admits nothing, a
     /// marker selecting an unregistered profile emits nothing, and a marker
     /// selecting a registered profile sends to another server. Control: a read
-    /// in a marked checkout with no server selection is posted.
+    /// in a marked checkout of the same project with no server selection is
+    /// posted.
     #[cfg(unix)]
     #[tokio::test]
     async fn backfill_drops_reroutes_the_live_hook_would_not_deliver_here() {
@@ -1640,7 +1641,7 @@ mod tests {
         let name = crate::server_profiles::ProfileName::parse("team-e").unwrap();
         crate::server_profiles::add(data_dir.path(), &name, "https://e.example", &[], Some("E"))
             .unwrap();
-        let source = marked_checkout("[capture]\n");
+        let source = marked_checkout("workspace = \"w\"\nproject = \"p\"\n");
         let unmarked = tempfile::tempdir().unwrap();
         let init = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1650,7 +1651,7 @@ mod tests {
         assert!(init.success());
         let unknown_profile = marked_checkout("server = \"team-b\"\n");
         let other_server = marked_checkout("server = \"team-e\"\n");
-        let same_server = marked_checkout("[capture]\n");
+        let same_server = marked_checkout("workspace = \"w\"\nproject = \"p\"\n");
         let sid = "11111111-2222-3333-4444-555555555557";
         let reads = [
             (&unmarked, "UNMARKEDSENTINEL"),
@@ -1776,31 +1777,35 @@ mod tests {
         assert!(posted.contains("PUBLICCONTROL"), "control: {posted}");
     }
 
-    /// A reroute is delivered when the destination's marker selects the same
-    /// registered server profile as the source, and dropped when it selects a
-    /// different registered profile.
+    /// A reroute is delivered only when the destination's marker selects the
+    /// same registered server profile as the source and the same project: a
+    /// different registered profile is dropped, and so is a checkout of
+    /// another project on the same profile, whose events the live hook files
+    /// under that project. The same holds for records written in such a
+    /// checkout, whatever their tool calls name.
     #[cfg(unix)]
     #[tokio::test]
     async fn backfill_keeps_reroutes_to_the_same_server_profile_only() {
         let home = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
-        let checkout = |name: &str, profile: &str| {
+        let checkout = |name: &str, profile: &str, project: &str| {
             let dir = base.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join(".ai-memory.toml"),
-                format!("server = \"{profile}\"\n"),
+                format!("server = \"{profile}\"\nworkspace = \"w\"\nproject = \"{project}\"\n"),
             )
             .unwrap();
             dir
         };
-        let source = checkout("source", "team-a");
-        let same = checkout("same", "team-a");
-        let other = checkout("other", "team-e");
+        let source = checkout("source", "team-a", "p");
+        let same = checkout("same", "team-a", "p");
+        let other = checkout("other", "team-e", "p");
+        let sibling = checkout("sibling", "team-a", "q");
         let root = |dir: &Path| dir.to_string_lossy().into_owned();
         for (name, roots) in [
-            ("team-a", vec![root(&source), root(&same)]),
+            ("team-a", vec![root(&source), root(&same), root(&sibling)]),
             ("team-e", vec![root(&other)]),
         ] {
             let name = crate::server_profiles::ProfileName::parse(name).unwrap();
@@ -1818,6 +1823,7 @@ mod tests {
         for (index, (repo, text)) in [
             (&same, "SAMEPROFILECONTROL"),
             (&other, "OTHERPROFILESENTINEL"),
+            (&sibling, "OTHERPROJECTSENTINEL"),
         ]
         .into_iter()
         .enumerate()
@@ -1843,6 +1849,13 @@ mod tests {
                 serde_json::json!([claude_output(&id, &format!("{text} content"))]),
             ));
         }
+        lines.push(claude_record(
+            sid,
+            "moved",
+            &sibling,
+            "user",
+            "SIBLINGPROMPTSENTINEL".into(),
+        ));
         let posted = backfill_posted(
             ManagedHarness::Claude,
             home.path(),
@@ -1856,10 +1869,69 @@ mod tests {
             posted.contains("SAMEPROFILECONTROL content"),
             "same profile: {posted}"
         );
-        assert!(
-            !posted.contains("OTHERPROFILESENTINEL"),
-            "different profile: {posted}"
+        for sentinel in [
+            "OTHERPROFILESENTINEL",
+            "OTHERPROJECTSENTINEL",
+            "SIBLINGPROMPTSENTINEL",
+        ] {
+            assert!(!posted.contains(sentinel), "{sentinel}: {posted}");
+        }
+    }
+
+    /// Claude Code writes a monitored command's streamed output and a
+    /// background agent's report as user turns, and its compact summary too;
+    /// no prompt hook fires for any of them, so none is posted as a prompt.
+    /// Control: the operator's own prompt is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backfill_posts_no_task_notification_or_compact_summary_as_a_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555559";
+        let mut monitor = claude_record(
+            sid,
+            "n1",
+            repo.path(),
+            "user",
+            "<task-notification>\n<event>MONITORSENTINEL stdout line</event>\n</task-notification>"
+                .into(),
         );
+        monitor["origin"] = serde_json::json!({"kind": "task-notification"});
+        let report = claude_record(
+            sid,
+            "n2",
+            repo.path(),
+            "user",
+            "<task-notification>\n<result>AGENTSENTINEL report</result>\n</task-notification>"
+                .into(),
+        );
+        let mut summary = claude_record(
+            sid,
+            "c1",
+            repo.path(),
+            "user",
+            "This session is being continued. SUMMARYSENTINEL".into(),
+        );
+        summary["isCompactSummary"] = true.into();
+        let lines = [
+            claude_record(sid, "u1", repo.path(), "user", "PROMPTCONTROL".into()),
+            monitor,
+            report,
+            summary,
+        ];
+        let posted = backfill_posted(
+            ManagedHarness::Claude,
+            home.path(),
+            home.path(),
+            repo.path(),
+            sid,
+            &lines,
+        )
+        .await;
+        for sentinel in ["MONITORSENTINEL", "AGENTSENTINEL", "SUMMARYSENTINEL"] {
+            assert!(!posted.contains(sentinel), "{sentinel}: {posted}");
+        }
+        assert!(posted.contains("PROMPTCONTROL"), "control: {posted}");
     }
 
     fn spawned_args(
