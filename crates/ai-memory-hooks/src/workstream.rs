@@ -208,10 +208,25 @@ async fn authorize_run_owner(
     Ok(authority)
 }
 
-/// A refusal as a response: 403 for an access problem, 500 otherwise.
+/// A refusal as a response, mapped to the right HTTP shape.
+///
+/// `Forbidden` is the only branch the pre-existing code handled; every
+/// other `ScopeResolutionError` variant was leaking as a `500`, which hid a
+/// missing-id mistake from the caller and made it indistinguishable from a
+/// real server fault. #1204 added the same four-branch shape to the
+/// `refusal_response` in `crates/ai-memory-web/src/routes/page.rs`; this
+/// function is the hooks-side mirror (`scope_refusal` is used by the
+/// generic `authorize_run_admission` helper and the
+/// `search_workstream_events` route, both at workstream.rs:174 and :881).
+/// The typed `is_*` predicates the store already exposes carry the
+/// classification, so the fix is purely a branch reshuffle.
 fn scope_refusal(failure: ScopeResolutionError) -> Response {
     if failure.is_forbidden() {
         error(StatusCode::FORBIDDEN, failure.to_string())
+    } else if failure.is_not_found() {
+        error(StatusCode::NOT_FOUND, failure.to_string())
+    } else if failure.is_bad_request() {
+        error(StatusCode::BAD_REQUEST, failure.to_string())
     } else {
         error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string())
     }
@@ -5124,5 +5139,71 @@ mod tests {
         assert_eq!(run_project(&store, first).await, (workspace_id, legacy));
         assert_eq!(run_project(&store, second).await, (workspace_id, legacy));
         assert_eq!(project_names(&store).await, ["victorcesc-unknown-system"]);
+    }
+
+    /// #1209: `scope_refusal` must answer `404 Not Found` for a typed
+    /// "not found" refusal, not `500 Internal Server Error`. The pre-fix
+    /// behaviour hid a missing-id mistake from the caller and made it
+    /// indistinguishable from a real server fault.
+    #[test]
+    fn scope_refusal_project_not_found_in_workspace_answers_404() {
+        let resp = scope_refusal(ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: "default".into(),
+            project: "ghost".into(),
+        });
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "ProjectNotFoundInWorkspace must be 404, not 500 (regression for #1209)",
+        );
+    }
+
+    /// #1209: `WorkspaceNotFound` is the other typed-not-found variant
+    /// the store's `is_not_found` predicate covers; it was leaking as
+    /// `500` too.
+    #[test]
+    fn scope_refusal_workspace_not_found_answers_404() {
+        let resp = scope_refusal(ScopeResolutionError::WorkspaceNotFound {
+            workspace: "ghost".into(),
+        });
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "WorkspaceNotFound must be 404, not 500 (regression for #1209)",
+        );
+    }
+
+    /// #1209: `ProjectNameAmbiguous` is the same shape of caller
+    /// ambiguity that #1204 fixed for the web surface; here it was
+    /// leaking as `500` from the hooks side too.
+    #[test]
+    fn scope_refusal_project_name_ambiguous_answers_400() {
+        let resp = scope_refusal(ScopeResolutionError::ProjectNameAmbiguous {
+            workspace: "default".into(),
+            project: "widget".into(),
+            holders: ai_memory_store::AmbiguousProjectHolders::default(),
+        });
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "ProjectNameAmbiguous must be 400, not 500 (regression for #1209)",
+        );
+    }
+
+    /// #1209: regression guard for the one branch the pre-fix code
+    /// already handled. The branch order (most-specific first, fallback
+    /// `500` last) is not load-bearing today, but a future refactor
+    /// that swaps `is_forbidden` and `is_not_found` would silently
+    /// mis-shape a `Forbidden` into a `404`. This test pins the order.
+    #[test]
+    fn scope_refusal_forbidden_stays_403() {
+        let resp = scope_refusal(ScopeResolutionError::Forbidden(
+            "not authorized for x: this needs write access.".into(),
+        ));
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "Forbidden must stay 403, not 404 or 400 (regression guard)",
+        );
     }
 }

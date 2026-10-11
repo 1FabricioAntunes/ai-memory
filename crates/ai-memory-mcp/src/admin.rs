@@ -3409,6 +3409,13 @@ async fn handle_pending_write_approve(
         skip_webhooks,
         ..AdmissionContext::default()
     });
+    // #1205: an unknown or foreign-scope id must answer 404, not 500.
+    // Validate up front through the same helper the detail and diff
+    // routes already use; a missing id becomes 404 here too, and an
+    // unparsable id (handled inside the helper) stays 400.
+    if let Err(e) = pending_detail(&state, &id, &query).await {
+        return e;
+    }
     match state
         .wiki
         .approve_auto_improve_proposal(ws, proj, proposal_id, actor, author_id, admission_ctx)
@@ -3443,6 +3450,13 @@ async fn handle_pending_write_reject(
             );
         }
     };
+    // #1205: an unknown or foreign-scope id must answer 404, not 500.
+    // Validate up front through the same helper the detail and diff
+    // routes already use; a missing id becomes 404 here too, and an
+    // unparsable id (handled inside the helper) stays 400.
+    if let Err(e) = pending_detail(&state, &id, &query).await {
+        return e;
+    }
     let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
     {
         Ok(ids) => ids,
@@ -12121,6 +12135,7 @@ mod tests {
         let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
 
         let resp = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -12144,6 +12159,293 @@ mod tests {
             .unwrap()
             .expect("approve writes target page");
         assert_eq!(page.body, "# Stored\n\nfrom stored proposal");
+    }
+
+    /// #1205: a `POST /admin/pending-writes/{id}/approve` whose `id` does
+    /// not exist in the requested workspace (or belongs to a different
+    /// one) must answer `404 Not Found`, not `500 Internal Server Error`.
+    /// The detail and diff routes already do this through `pending_detail`
+    /// -- they look the proposal up before reading it. Approve and reject
+    /// skipped the lookup and let the underlying wiki method surface a
+    /// 500-shaped error, which hid a not-found case from the caller and
+    /// could not be distinguished from a real server fault. The fix is to
+    /// thread the same `pending_detail` helper through approve/reject so
+    /// the three routes agree on `400` for an unparsable id, `404` for
+    /// an unknown or foreign-scope id, and `500` for any other error.
+    #[tokio::test]
+    async fn pending_write_approve_unknown_id_returns_404() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        // The requested scope must exist, or the scope lookup itself 404s
+        // and the test never reaches the proposal lookup this regression
+        // is about. Stage an unrelated write so `default/scratch` resolves.
+        let (_ws, _proj, _staged_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/other.md", "# Other\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        // The requested id is brand-new: no proposal carries it. Approve
+        // must surface that as a 404, not a 500.
+        let unknown_id = AutoImproveProposalId::new();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{unknown_id}/approve?workspace=default&project=scratch"
+                    ))
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "approve of an unknown id must be 404, not 500 (regression for #1205): {}",
+            resp.status(),
+        );
+    }
+
+    /// #1205: same expectation as approve, for the reject route.
+    #[tokio::test]
+    async fn pending_write_reject_unknown_id_returns_404() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        // Same fixture need as approve: the requested scope must exist so
+        // the request reaches the proposal lookup.
+        let (_ws, _proj, _staged_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/other.md", "# Other\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let unknown_id = AutoImproveProposalId::new();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{unknown_id}/reject?workspace=default&project=scratch"
+                    ))
+                    .header("content-type", "application/json")
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "reject of an unknown id must be 404, not 500 (regression for #1205): {}",
+            resp.status(),
+        );
+    }
+
+    /// #1205: an id that exists in another workspace must still be 404
+    /// from a request scoped to a different workspace, so a caller cannot
+    /// use approve/reject as a cross-scope side door.
+    #[tokio::test]
+    async fn pending_write_approve_foreign_scope_returns_404() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        // Stage the write in workspace `alpha`.
+        let (_ws_alpha, _proj_alpha, proposal_id) = stage_pending_write(
+            &store,
+            "alpha",
+            "scratch",
+            "notes/foreign.md",
+            "# Foreign
+",
+        )
+        .await;
+        // The requested scope must also exist: without it the scope lookup
+        // 404s first and the test never reaches the proposal lookup that
+        // #1205 is about.
+        let (_ws_default, _proj_default, _own_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/own.md", "# Own\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        // Try to approve it as if it lived in `default`. The lookup must
+        // say "not found in scope" -- 404, not 200.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"
+                    ))
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "approve of a foreign-scope id must be 404, not 500 (regression for #1205): {}",
+            resp.status(),
+        );
+    }
+
+    /// #1205: same expectation as approve, for the reject route.
+    #[tokio::test]
+    async fn pending_write_reject_foreign_scope_returns_404() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (_ws_alpha, _proj_alpha, proposal_id) = stage_pending_write(
+            &store,
+            "alpha",
+            "scratch",
+            "notes/foreign.md",
+            "# Foreign\n",
+        )
+        .await;
+        // The requested scope must also exist: without it the scope lookup
+        // 404s first and the test never reaches the proposal lookup that
+        // #1205 is about.
+        let (_ws_default, _proj_default, _own_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/own.md", "# Own\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/reject?workspace=alpha&project=scratch"
+                    ))
+                    .header("content-type", "application/json")
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Legitimate control: rejecting the id through its own scope must
+        // still succeed, so the 404 below cannot be a blanket deny.
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "reject of an in-scope id must still succeed (regression guard)",
+        );
+
+        // And the foreign-scope request returns 404.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"
+                    ))
+                    .header("content-type", "application/json")
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "reject of a foreign-scope id must be 404, not 500 (regression for #1205): {}",
+            resp.status(),
+        );
+    }
+
+    /// #1205: an unparsable id stays at 400 (the existing behaviour
+    /// before this fix). Approve and reject must not regress to 500.
+    #[tokio::test]
+    async fn pending_write_approve_unparsable_id_returns_400() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/pending-writes/not-a-uuid/approve?workspace=default&project=scratch")
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// #1205: same for the reject route.
+    #[tokio::test]
+    async fn pending_write_reject_unparsable_id_returns_400() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/admin/pending-writes/not-a-uuid/reject?workspace=default&project=scratch",
+                    )
+                    .header("content-type", "application/json")
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

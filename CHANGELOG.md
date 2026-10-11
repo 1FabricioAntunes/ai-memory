@@ -147,6 +147,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unedited files of an earlier export in place. (#1164)
 
 ### Fixed
+- Fixed the web UI answering HTTP 500 when a signed-in viewer opened a project
+  or page by a name that two projects answer to. The page and project routes
+  now return a 400 that names the clash, matching the API and MCP surfaces.
+  (#1204)
 - Fixed SessionEnd consolidation repeating the same expensive prompt on the
   durable queue when the structured LLM response fails deterministically: a
   truncated or empty response, malformed JSON, or an unexpected response
@@ -179,6 +183,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path outside its checkout, or a source file read by a command whose
   `workdir` points at another project, is no longer judged only by the
   destination's policy. (#1199)
+
+- `scope_refusal` (the hooks-side mirror of the web surfaces
+  `refusal_response` mapped in #1204) now answers `404 Not Found`
+  for typed not-found `ScopeResolutionError` variants and `400
+  Bad Request` for typed bad-request variants. Previously every
+  refusal that was not `Forbidden` fell through to `500 Internal
+  Server Error`, hiding a missing-id mistake from the caller and
+  making it indistinguishable from a real fault. The four-branch
+  shape (forbidden / not_found / bad_request / fallback) matches
+  the web mapping from #1204; the typed `is_*` predicates the
+  store already exposes carry the classification, so the fix is
+  purely a branch reshuffle with no new predicate. Four unit
+  tests in `workstream.rs::tests` cover the unknown-id (404),
+  unknown-workspace (404), ambiguous-name (400), and forbidden
+  (403, regression guard) cases. (#1209)
+- `POST /admin/pending-writes/{id}/approve` and `/reject` answered
+  `500 Internal Server Error` for an id that did not exist or belonged
+  to a different workspace, because the routes skipped the lookup and
+  let the wiki method surface a generic error. They now share the same
+  `pending_detail` helper the `/detail` and `/diff` routes already used,
+  so all four routes agree on `400` for an unparsable id, `404` for an
+  unknown or foreign-scope id, and `500` only for unexpected internal
+  errors. New tests in `admin::tests` cover the unknown, foreign-scope,
+  and unparsable cases for both `approve` and `reject`. (#1205)
 
 ## [2.6.3] - 2026-10-09
 
