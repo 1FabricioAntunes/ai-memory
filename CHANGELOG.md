@@ -8,21 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Fixed a web page in the operator's browser being able to change state on an
-  unauthenticated loopback server (the default `127.0.0.1:49374`, no token).
-  Browsers send `GET` and body-less `POST` requests cross-origin without a
-  preflight, and the JSON-only extractors never see those: an `<img>` pointing
-  at `GET /handoff?workspace=…&project=…` claimed the project's single-use
-  handoff (and moved the anonymous active-project pointer), and a body-less
-  `POST /admin/profile/rebuild` ran a profile pass, LLM calls included. With
-  auth off, the machine and admin routes now refuse with 403 any request a
-  browser marks as cross-site (`Sec-Fetch-Site`) or whose `Origin` is not the
-  server's own host. Hooks, the CLI and MCP clients send neither header and
-  are unaffected; the built-in web UI's same-origin calls still pass; servers
-  with a bearer token are unchanged. A new end-to-end test drives every write
-  route with each preflight-free content type, a DNS-rebinding `Host` and CORS
-  preflights, and records the guard as row 12c in
-  `docs/security-boundaries.md`. (#TBD)
+- Fixed a web page open in the operator's browser being able to act on an
+  unauthenticated server (the loopback default, no token), such as claiming a
+  project's pending handoff or starting admin jobs. With auth off, the machine
+  and admin routes now refuse requests a browser marks as coming from another
+  site; hooks, the CLI, MCP clients and the built-in web UI are unaffected, and
+  servers with a bearer token are unchanged. Images in wiki pages rendered by
+  the web UI are also limited to relative paths that stay inside the UI.
+  (GHSA-6mc4-46pr-w82w)
 - Fixed the Jev choice reranker adapter silently fabricating scores from a
   malformed judge response: `docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`
   defaulted missing or misnamed `probabilities` entries to `0.0`, so an HTTP

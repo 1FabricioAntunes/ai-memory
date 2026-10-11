@@ -61,7 +61,9 @@ machine and admin routes: a request the browser marks as cross-site
 (`Sec-Fetch-Site`), or one whose `Origin` is not the server's own host, gets a
 403. Hooks, the CLI and MCP clients never send those headers. The `Host`
 allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
-content types a browser can send without a CORS preflight.
+content types a browser can send without a CORS preflight. Images in wiki pages
+rendered by the web UI may only use relative paths that stay inside the UI, so
+viewing a stored page cannot make your browser call those routes either.
 
 Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
 second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to
