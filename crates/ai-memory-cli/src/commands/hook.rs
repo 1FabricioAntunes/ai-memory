@@ -20,8 +20,8 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDisposition, CaptureMode, HookEvent, PolicyState, absolute_tool_location_paths,
-    repository_admits_capture,
+    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, HookEvent,
+    PolicyState, absolute_tool_location_paths, capture_lookup_locations, repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -33,8 +33,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
     build_client, canonical_context, capture_policy, extract_cwd, get_handoff, hook_scope,
-    marker_query_suffix, marker_query_suffix_without_briefing, marker_requests_briefing,
-    resolve_cwd_with_fallbacks, url_encode,
+    marker_capture_policy, marker_query_suffix, marker_query_suffix_without_briefing,
+    marker_requests_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -753,11 +753,19 @@ where
     let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
-        policy.inspect(
-            AgentKind::from_wire(&args.agent),
-            &json,
-            inspection_cwd.as_deref().unwrap_or(""),
-        )
+        let agent = AgentKind::from_wire(&args.agent);
+        let inspection_cwd = inspection_cwd.as_deref().unwrap_or("");
+        let decision = policy.inspect(agent, &json, inspection_cwd);
+        // Another checkout's `ignore_paths` protect its files from a call
+        // made here too (`cat ../other/secret.env`).
+        if decision.protocol().disposition() == CaptureDisposition::Drop {
+            return decision;
+        }
+        let own_marker = policy_cwd.as_deref().and_then(crate::marker::find_marker);
+        match foreign_capture_decision(agent, &json, inspection_cwd, own_marker.as_deref()) {
+            Some(foreign) => decision.stricter(foreign),
+            None => decision,
+        }
     });
     let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
@@ -1293,6 +1301,84 @@ pub(crate) fn tool_location_routing_cwd(
         .disposition()
         == CaptureDisposition::Keep;
     source_keeps.then(|| dir.to_string_lossy().into_owned())
+}
+
+/// How many distinct directories, and markers other than the event's own, one
+/// tool call may make [`foreign_capture_decision`] look up.
+const MAX_FOREIGN_DIRECTORIES: usize = 256;
+const MAX_FOREIGN_MARKERS: usize = 16;
+
+/// The stricter decision of every other marker that governs a location the
+/// tool call names: a file-tool target, or a path a shell argument spells,
+/// resolved from the event's `cwd`. A checkout's `ignore_paths` must hold
+/// when the call is made from another checkout or an unmarked directory
+/// (`cat ../a/secret.env`), so each such marker's policy inspects the call
+/// as the event's own does. `None` when no other marker governs one.
+///
+/// Markers are found by the same lexical walk as the event's (no
+/// canonicalization), from the nearest existing directory of each location,
+/// with each directory looked up once. A call naming more locations,
+/// directories or markers than the bounds is unprovable and gets the
+/// fail-closed decision of an invalid policy.
+pub(crate) fn foreign_capture_decision(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    inspection_cwd: &str,
+    own_marker: Option<&Path>,
+) -> Option<CaptureDecision> {
+    let unprovable = || {
+        Some(
+            CapturePolicy::resolve(CaptureSource::Invalid, inspection_cwd, None).inspect(
+                agent,
+                raw,
+                inspection_cwd,
+            ),
+        )
+    };
+    let home = home_dir();
+    let Some(locations) = capture_lookup_locations(
+        agent,
+        raw,
+        inspection_cwd,
+        home.as_deref().and_then(Path::to_str),
+    ) else {
+        return unprovable();
+    };
+    let mut directories: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let mut markers: Vec<PathBuf> = Vec::new();
+    for location in locations {
+        let Some(dir) = existing_target_dir(Path::new(&location)) else {
+            continue;
+        };
+        let marker = match directories.get(&dir) {
+            Some(marker) => marker.clone(),
+            None => {
+                if directories.len() == MAX_FOREIGN_DIRECTORIES {
+                    return unprovable();
+                }
+                let marker = crate::marker::find_marker(&dir.to_string_lossy());
+                directories.insert(dir, marker.clone());
+                marker
+            }
+        };
+        let Some(marker) = marker else {
+            continue;
+        };
+        if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
+            continue;
+        }
+        if markers.len() == MAX_FOREIGN_MARKERS {
+            return unprovable();
+        }
+        markers.push(marker);
+    }
+    markers
+        .iter()
+        .map(|marker| {
+            marker_capture_policy(marker, inspection_cwd).inspect(agent, raw, inspection_cwd)
+        })
+        .reduce(CaptureDecision::stricter)
 }
 
 /// Where one event is delivered (#992).
@@ -3081,6 +3167,145 @@ mod tests {
             assert_eq!(
                 query_param(&entries[0].url, "project"),
                 Some(project),
+                "{name}"
+            );
+        }
+    }
+
+    /// Adversarial: checkout A's `ignore_paths` hold for a call made from
+    /// checkout B or from an unmarked directory, by a shell argument
+    /// (relative or absolute) or a file tool, whatever B's own policy says.
+    /// Controls: A's public files, and B's own files, are still captured.
+    #[tokio::test]
+    async fn another_checkouts_exclusions_hold_for_a_call_made_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let bare = tmp.path().join("unmarked");
+        let broken = tmp.path().join("broken");
+        for dir in [&a, &b, &bare, &broken] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(b.join(".ai-memory.toml"), "project = \"b\"\n").unwrap();
+        std::fs::write(broken.join(".ai-memory.toml"), "[capture\n").unwrap();
+        let event = |agent_cwd: &Path, tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "cross",
+                "cwd": agent_cwd,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let secret = a.join("secrets.env");
+        let cases = [
+            (
+                "relative shell",
+                "claude-code",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../a/secrets.env"}),
+                ),
+            ),
+            (
+                "absolute shell",
+                "claude-code",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": format!("cat {}", secret.display())}),
+                ),
+            ),
+            (
+                "unmarked hermes terminal",
+                "hermes",
+                event(
+                    &bare,
+                    "terminal",
+                    serde_json::json!({"command": format!("cat {}", secret.display())}),
+                ),
+            ),
+            (
+                "glob shell",
+                "claude-code",
+                event(&b, "Bash", serde_json::json!({"command": "cat ../a/*.env"})),
+            ),
+        ];
+        for (name, agent, raw) in cases {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            assert!(
+                spool_one(&data_dir, agent, None, &raw).await.is_empty(),
+                "{name}: A's exclusion must drop the event"
+            );
+        }
+        // A broken marker over the target fails closed: metadata-only.
+        let raw = event(
+            &b,
+            "Bash",
+            serde_json::json!({"command": "cat ../broken/x.md"}),
+        );
+        let entries = spool_one(&tmp.path().join("data-broken"), "claude-code", None, &raw).await;
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+            "{}",
+            entries[0].body
+        );
+        assert!(
+            entries[0].body.contains("\"metadata-only\""),
+            "{}",
+            entries[0].body
+        );
+        // More markers than the bound is unprovable: metadata-only.
+        let mut many = String::from("cat");
+        for index in 0..=MAX_FOREIGN_MARKERS {
+            let dir = tmp.path().join(format!("m{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".ai-memory.toml"), "project = \"m\"\n").unwrap();
+            many.push_str(&format!(" ../m{index}/x.md"));
+        }
+        let raw = event(&b, "Bash", serde_json::json!({"command": many}));
+        let entries = spool_one(&tmp.path().join("data-many"), "claude-code", None, &raw).await;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"));
+        // Controls.
+        for (name, raw) in [
+            (
+                "public shell",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../a/public.md README.md"}),
+                ),
+            ),
+            (
+                "own file",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat secrets.env"}),
+                ),
+            ),
+            (
+                "few markers",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../m0/x.md ../m1/x.md"}),
+                ),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, "claude-code", None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
                 "{name}"
             );
         }

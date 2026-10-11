@@ -3034,11 +3034,21 @@ fn handoff_fetch_lacks_client_marker(
 
 /// Headers a forwarding proxy adds; any of them means the `Host` a request
 /// carries may not be the one the browser addressed.
-const PROXY_HEADERS: [&str; 5] = [
+/// CDNs and load balancers name the client in their own headers
+/// (`CF-Connecting-IP`, `True-Client-IP`, `X-Client-IP`), and some add only
+/// the scheme, server or port they forwarded (`X-Forwarded-Proto`, …).
+const PROXY_HEADERS: [&str; 12] = [
     "forwarded",
     "x-forwarded-for",
     "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-server",
+    "x-forwarded-port",
+    "x-original-forwarded-for",
     "x-real-ip",
+    "x-client-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
     "via",
 ];
 
@@ -5301,6 +5311,26 @@ mod tests {
         }
         // A plain-HTTP proxy that rewrites `Host` to loopback: the browser
         // behind it addressed a non-loopback origin and sent no metadata.
+        // Each of these alone marks a request as proxied.
+        for name in [
+            "Forwarded",
+            "X-Forwarded-For",
+            "X-Forwarded-Host",
+            "X-Forwarded-Proto",
+            "X-Forwarded-Server",
+            "X-Forwarded-Port",
+            "X-Original-Forwarded-For",
+            "X-Real-IP",
+            "X-Client-IP",
+            "CF-Connecting-IP",
+            "True-Client-IP",
+            "Via",
+        ] {
+            assert!(
+                PROXY_HEADERS.contains(&name.to_ascii_lowercase().as_str()),
+                "{name}"
+            );
+        }
         for proxy_header in PROXY_HEADERS {
             let mut proxied = headers("127.0.0.1:49374", None);
             proxied.insert(proxy_header, "203.0.113.7".parse().unwrap());

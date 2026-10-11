@@ -162,6 +162,7 @@ dependencies = [
  "async-trait",
  "axum",
  "git2",
+ "icu_normalizer",
  "jiff",
  "rusqlite",
  "serde",

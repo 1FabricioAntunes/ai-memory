@@ -23,8 +23,8 @@ use ai_memory_workstream::RECORD_CWD_KEY;
 use serde_json::Value;
 
 use super::hook::{
-    checkout_admits_capture, delivers_to_same_server, lexical_capture_cwd, routes_to_same_project,
-    tool_location_routing_cwd,
+    checkout_admits_capture, delivers_to_same_server, foreign_capture_decision,
+    lexical_capture_cwd, routes_to_same_project, tool_location_routing_cwd,
 };
 use super::hook_capture::capture_policy;
 
@@ -281,6 +281,16 @@ impl TranscriptCapture {
                 return EventCapture::Drop;
             }
             capture = capture.stricter(inspect(&capture_policy(&destination), &destination));
+        }
+        // Another checkout's `ignore_paths` hold for a call made here too,
+        // as in the live hook.
+        if let Some(foreign) = foreign_capture_decision(
+            event.agent,
+            &raw,
+            &lexical_capture_cwd(cwd),
+            crate::marker::find_marker(cwd).as_deref(),
+        ) {
+            capture = capture.stricter(EventCapture::from_decision(foreign));
         }
         if recognized {
             capture
@@ -596,6 +606,37 @@ mod tests {
             read_call(&other.join("private/key.txt"), Some("a")),
             result("private", Some("a")),
             read_call(&other.join("open.txt"), Some("b")),
+            result("open", Some("b")),
+        ];
+        assert_eq!(
+            kinds(&capture.decide(&events)),
+            ["drop", "drop", "keep", "keep"]
+        );
+    }
+
+    /// A shell command run here that names another checkout's excluded file
+    /// answers to that checkout's policy on import too, as in the live hook;
+    /// one naming its public file is kept.
+    #[test]
+    fn a_shell_command_naming_another_checkouts_file_honors_its_policy() {
+        let source = checkout(None);
+        let other = checkout(Some("private/**"));
+        let capture = TranscriptCapture::for_checkout(source.path(), source.path());
+        let bash = |path: PathBuf, id: &str| {
+            event(
+                WorkstreamEventKind::ToolCall,
+                "assistant",
+                &format!(
+                    "Bash: {}",
+                    json!({"command": format!("cat {}", path.display())})
+                ),
+                json!({"tool": "Bash", "tool_use_id": id}),
+            )
+        };
+        let events = [
+            bash(other.path().join("private/key.txt"), "a"),
+            result("private", Some("a")),
+            bash(other.path().join("open.txt"), "b"),
             result("open", Some("b")),
         ];
         assert_eq!(
