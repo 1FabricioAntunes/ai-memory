@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server must be re-staged with `ai-memory install-hooks` (or
   `ai-memory upgrade`); loopback installs need nothing.
   (GHSA-6mc4-46pr-w82w)
+- Fixed `POST /auth/login` and `POST /auth/recovery` accepting request bodies
+  that are not declared as JSON, which a page on another site could use to
+  sign the operator's browser in or to try passwords when human sign-in is
+  enabled. Both routes now answer 415 unless the body is `application/json`;
+  the built-in login page and the documented `curl` recovery already send
+  that.
 - Fixed approving or rejecting an unknown pending write
   (`POST /admin/pending-writes/{id}/approve` or `/reject`) answering 500 instead
   of 404. An id outside the given workspace and project now answers 404 too.

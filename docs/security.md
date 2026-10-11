@@ -80,7 +80,10 @@ keep working unchanged. A browser that sends no fetch metadata even to loopback
 (Safari before 16.4) only gets the `Origin` check there, which an image or link
 does not trigger; set a bearer token if you use one. The `Host`
 allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
-content types a browser can send without a CORS preflight. Images in wiki pages
+content types a browser can send without a CORS preflight. The public sign-in
+routes (`POST /auth/login`, `POST /auth/recovery`) accept only
+`application/json` bodies too, so a page on another site cannot sign your
+browser in or try passwords. Images in wiki pages
 rendered by the web UI may only use relative paths that stay inside the UI, so
 viewing a stored page cannot make your browser call those routes either.
 
