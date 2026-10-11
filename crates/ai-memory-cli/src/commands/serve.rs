@@ -2957,7 +2957,9 @@ async fn require_allowed_host(
 /// host name gets an `<img>` request with neither fetch metadata nor `Origin`.
 /// For that case the session-start handoff fetch, the one state-changing `GET`
 /// on these routes, must also carry [`CLIENT_MARKER_HEADER`], which a page
-/// cannot add without a preflight these routes never answer. Loopback hosts
+/// cannot add without a preflight these routes never answer. A request that
+/// carries a proxy's forwarding header counts as non-loopback even when the
+/// proxy rewrote `Host` to a loopback address. Loopback hosts
 /// keep working without it, so hook scripts staged before the header existed
 /// still deliver handoffs on a default install. `POST`s need no marker: a
 /// browser sends `Origin` on every cross-origin `POST`, metadata or not.
@@ -2972,7 +2974,7 @@ fn refuse_cross_origin_browser_requests(router: axum::Router, auth_enabled: bool
 /// reaches an operator through a hook staged before the header existed, so it
 /// names both ways out.
 const CLIENT_MARKER_REFUSAL: &str = "handoff fetch refused: this server has no bearer token and \
-     was reached through a non-loopback host name, so it accepts the handoff fetch only from \
+     was reached through a non-loopback host name or a proxy, so it accepts the handoff fetch only from \
      current ai-memory hooks; re-stage them with `ai-memory install-hooks` (or `ai-memory \
      upgrade`), or configure AI_MEMORY_AUTH_TOKEN\n";
 
@@ -3001,7 +3003,7 @@ async fn require_same_origin_browser(req: Request<Body>, next: Next) -> Response
 
 /// Whether this is a handoff fetch (`GET`, or `HEAD`, which axum routes to the
 /// same handler) without [`CLIENT_MARKER_HEADER`] on a host where a browser
-/// sends no fetch metadata. The path is the one inside any `--base-path`
+/// sends no fetch metadata, or through a forwarding proxy. The path is the one inside any `--base-path`
 /// mount, which strips its prefix before this layer runs.
 fn handoff_fetch_lacks_client_marker(
     method: &axum::http::Method,
@@ -3018,11 +3020,27 @@ fn handoff_fetch_lacks_client_marker(
     {
         return false;
     }
-    !headers
-        .get(header::HOST)
-        .and_then(|host| host.to_str().ok())
-        .is_some_and(is_loopback_host)
+    // A plain-HTTP reverse proxy can rewrite `Host` to the loopback address
+    // it forwards to, while the browser behind it saw a non-loopback origin
+    // and so sent no fetch metadata. Such a request is not a loopback one.
+    // First-party clients talk to the server directly and send none of these.
+    let proxied = PROXY_HEADERS.iter().any(|name| headers.contains_key(*name));
+    proxied
+        || !headers
+            .get(header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .is_some_and(is_loopback_host)
 }
+
+/// Headers a forwarding proxy adds; any of them means the `Host` a request
+/// carries may not be the one the browser addressed.
+const PROXY_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-real-ip",
+    "via",
+];
 
 /// Whether a browser treats this `Host` as a potentially trustworthy origin
 /// and so sends fetch metadata to it over plain HTTP: `localhost`, a
@@ -5279,6 +5297,21 @@ mod tests {
                 handoff_fetch_lacks_client_marker(&method, path, &headers(host, marker)),
                 refused,
                 "{method} {path} host={host} marker={marker:?}"
+            );
+        }
+        // A plain-HTTP proxy that rewrites `Host` to loopback: the browser
+        // behind it addressed a non-loopback origin and sent no metadata.
+        for proxy_header in PROXY_HEADERS {
+            let mut proxied = headers("127.0.0.1:49374", None);
+            proxied.insert(proxy_header, "203.0.113.7".parse().unwrap());
+            assert!(
+                handoff_fetch_lacks_client_marker(&Method::GET, "/handoff", &proxied),
+                "{proxy_header} without the marker"
+            );
+            proxied.insert(CLIENT_MARKER_HEADER, "hook".parse().unwrap());
+            assert!(
+                !handoff_fetch_lacks_client_marker(&Method::GET, "/handoff", &proxied),
+                "{proxy_header} with the marker"
             );
         }
         let mut no_host = axum::http::HeaderMap::new();

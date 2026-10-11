@@ -76,7 +76,12 @@ CLI command and generated integration sends; a web page cannot add it without
 a CORS preflight, which these routes never answer. Hooks staged before this
 header existed get a 403 on such a server until you re-run
 `ai-memory install-hooks` (or `ai-memory upgrade`); on a loopback host they
-keep working unchanged. A browser that sends no fetch metadata even to loopback
+keep working unchanged. A request that carries a proxy's forwarding header
+(`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP` or `Via`)
+counts as non-loopback here even when its `Host` is a loopback address,
+because a plain-HTTP reverse proxy may rewrite `Host` to the address it
+forwards to while the browser behind it saw a non-loopback origin. ai-memory's
+own clients connect directly and send none of these headers. A browser that sends no fetch metadata even to loopback
 (Safari before 16.4) only gets the `Origin` check there, which an image or link
 does not trigger; set a bearer token if you use one. The `Host`
 allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the

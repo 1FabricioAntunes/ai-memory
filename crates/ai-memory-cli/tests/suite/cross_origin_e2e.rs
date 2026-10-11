@@ -524,6 +524,55 @@ mod slow {
             "legacy loopback fetch: {body}"
         );
         assert_eq!(open_handoffs(&client, &base).await, 0);
+
+        // Attack: a plain-HTTP proxy that rewrites `Host` to the loopback
+        // address. The browser behind it addressed a non-loopback origin, so
+        // it sent no fetch metadata; the proxy's forwarding header gives the
+        // hop away.
+        begin_handoff(&client, &base).await;
+        let loopback = format!("127.0.0.1:{port}");
+        let proxied = |proxy_header: &'static str, marker: Option<&'static str>| {
+            let mut req = client
+                .get(format!(
+                    "{base}/handoff?agent=claude-code&workspace={WORKSPACE}&project={PROJECT}"
+                ))
+                .header("host", &loopback)
+                .header(proxy_header, "203.0.113.7");
+            if let Some(marker) = marker {
+                req = req.header("x-ai-memory-client", marker);
+            }
+            req.send()
+        };
+        for proxy_header in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-real-ip",
+            "via",
+        ] {
+            let resp = proxied(proxy_header, None).await.expect("proxied fetch");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "loopback Host behind a proxy ({proxy_header}) without the marker"
+            );
+        }
+        assert_eq!(
+            open_handoffs(&client, &base).await,
+            1,
+            "a refused proxied fetch must not claim the baton"
+        );
+        // Control: a current hook behind the same proxy names itself.
+        let resp = proxied("x-forwarded-for", Some("hook"))
+            .await
+            .expect("marked proxied fetch");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.text().await.expect("handoff body");
+        assert!(
+            body.contains(HANDOFF_SUMMARY),
+            "marked proxied fetch: {body}"
+        );
+        assert_eq!(open_handoffs(&client, &base).await, 0);
     }
 
     #[tokio::test]
