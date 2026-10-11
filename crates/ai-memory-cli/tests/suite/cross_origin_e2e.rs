@@ -45,6 +45,8 @@ mod slow {
     const WORKSPACE: &str = "a0-ws";
     /// The operator's real project: the target of the destructive attacks.
     const PROJECT: &str = "a0-project";
+    /// Where the anonymous active-project pointer sits before the attacks.
+    const BASELINE_PROJECT: &str = "a0-baseline";
     /// A project only an attack would create.
     const EVIL_PROJECT: &str = "a0-evil-project";
     const PAGE: &str = "notes/keep-me.md";
@@ -327,6 +329,42 @@ mod slow {
         body["handoffs"].as_array().map_or(0, Vec::len)
     }
 
+    /// The scope an unscoped MCP call resolves to, which for this anonymous
+    /// caller is the active-project pointer a `/handoff` fetch publishes.
+    async fn unscoped_scope(client: &reqwest::Client, base: &str) -> (String, String) {
+        let reply = legit_mcp(client, base, "memory_status", json!({})).await;
+        let text = reply
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("memory_status reply without text: {reply}"));
+        let status: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("non-JSON memory_status {text}: {e}"));
+        let field = |name: &str| {
+            status
+                .pointer(&format!("/scope/{name}"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("memory_status without scope.{name}: {text}"))
+                .to_string()
+        };
+        (field("workspace"), field("project"))
+    }
+
+    /// The anonymous hook-style `/handoff` fetch: no Origin, no fetch metadata.
+    async fn legit_handoff_fetch(client: &reqwest::Client, base: &str, project: &str) -> String {
+        let resp = client
+            .get(format!("{base}/handoff"))
+            .query(&[
+                ("agent", "claude-code"),
+                ("workspace", WORKSPACE),
+                ("project", project),
+            ])
+            .send()
+            .await
+            .expect("legit handoff fetch");
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.text().await.expect("handoff body")
+    }
+
     async fn page_exists(client: &reqwest::Client, base: &str) -> bool {
         client
             .get(format!("{base}/admin/read-page"))
@@ -383,6 +421,27 @@ mod slow {
             }),
         )
         .await;
+        // Park the anonymous active-project pointer on another project, the way
+        // a hook's session-start fetch does, so a claim that moved it shows.
+        legit_mcp(
+            &client,
+            &base,
+            "memory_write_page",
+            json!({
+                "workspace": WORKSPACE,
+                "project": BASELINE_PROJECT,
+                "path": "notes/baseline.md",
+                "body": "Baseline project.",
+            }),
+        )
+        .await;
+        legit_handoff_fetch(&client, &base, BASELINE_PROJECT).await;
+        let baseline = (WORKSPACE.to_string(), BASELINE_PROJECT.to_string());
+        assert_eq!(
+            unscoped_scope(&client, &base).await,
+            baseline,
+            "the hook-style fetch must publish the active project"
+        );
         assert!(page_exists(&client, &base).await, "control page must exist");
         assert_eq!(
             open_handoffs(&client, &base).await,
@@ -509,6 +568,14 @@ mod slow {
             }
         }
 
+        // Checked before the legitimate session-start hook below, which
+        // publishes the project itself.
+        assert_eq!(
+            unscoped_scope(&client, &base).await,
+            baseline,
+            "the refused /handoff fetches must not move the active-project pointer"
+        );
+
         // Legitimate hook: JSON, no Origin, accepted. Waiting for it to commit
         // also gives any wrongly accepted attack hook time to land.
         let status = client
@@ -579,19 +646,47 @@ mod slow {
             "an attack payload reached the store"
         );
 
-        // The hook-style handoff fetch (no Origin) still claims the baton.
-        let handoff = client
-            .get(format!("{base}/handoff"))
-            .query(&[
-                ("agent", "claude-code"),
-                ("workspace", WORKSPACE),
-                ("project", PROJECT),
-            ])
+        // The web UI's own calls into /admin are same-origin and must pass.
+        let own_origin = base.trim_end_matches('/').to_string();
+        let same_origin = |req: RequestBuilder| {
+            req.header("origin", &own_origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("sec-fetch-mode", "cors")
+                .header("sec-fetch-dest", "empty")
+        };
+        let scope = [("workspace", WORKSPACE), ("project", PROJECT)];
+        let list = same_origin(client.get(format!("{base}/admin/pending-writes")))
+            .query(&scope)
             .send()
             .await
-            .expect("legit handoff fetch");
-        assert_eq!(handoff.status(), StatusCode::OK);
-        let text = handoff.text().await.expect("handoff body");
+            .expect("same-origin pending-writes list");
+        assert_eq!(
+            list.status(),
+            StatusCode::OK,
+            "the web UI's same-origin list must pass"
+        );
+        let approve = same_origin(client.post(format!(
+            "{base}/admin/pending-writes/00000000-0000-4000-8000-00000000a0a9/approve"
+        )))
+        .query(&scope)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("same-origin pending-write approve");
+        // The handler answers an unknown proposal with a JSON error (a 500
+        // today); what matters here is that it ran, not the guard's 403.
+        let status = approve.status();
+        let body = approve.text().await.expect("approve body");
+        assert!(
+            status != StatusCode::FORBIDDEN && serde_json::from_str::<Value>(&body).is_ok(),
+            "the web UI's same-origin approve must reach the handler: {status} {body}"
+        );
+
+        // The hook-style handoff fetch (no Origin) still claims the baton and
+        // publishes the project it claimed from.
+        let text = legit_handoff_fetch(&client, &base, PROJECT).await;
         assert!(
             text.contains(HANDOFF_SUMMARY),
             "legitimate fetch must receive the baton: {text}"
@@ -600,6 +695,11 @@ mod slow {
             open_handoffs(&client, &base).await,
             0,
             "legitimate fetch claims it"
+        );
+        assert_eq!(
+            unscoped_scope(&client, &base).await,
+            (WORKSPACE.to_string(), PROJECT.to_string()),
+            "the legitimate fetch moves the pointer, so the check above can see a move"
         );
     }
 }
