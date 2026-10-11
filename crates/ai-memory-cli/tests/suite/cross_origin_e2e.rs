@@ -17,8 +17,10 @@
 //! 1. The browser-origin guard on the machine and admin routes
 //!    (`serve::refuse_cross_origin_browser_requests`) refuses a request a
 //!    browser marks as cross-site (`Sec-Fetch-Site`) or, from a browser too old
-//!    to send fetch metadata, one whose `Origin` names another host. Hooks,
-//!    the CLI and MCP clients never send either header.
+//!    to send fetch metadata, one whose `Origin` names another host. It also
+//!    refuses any request whose `Sec-Fetch-Dest` is not `empty` (a link,
+//!    image or navigation rather than script `fetch()`). Hooks, the CLI and
+//!    MCP clients send none of these headers.
 //! 2. JSON-only extractors (axum `Json`, rmcp's `Content-Type` check) refuse
 //!    the three simple content types with 415, so a preflight-free `POST`
 //!    cannot deliver a body even past guard 1.
@@ -567,6 +569,38 @@ mod slow {
                 );
             }
         }
+
+        // A browser request that is not script fetch(): a link stored in a
+        // page (same-origin navigation or image) or a link opened from another
+        // application (`Sec-Fetch-Site: none`). The origin check alone lets
+        // these through; the destination check refuses them.
+        let handoff_url =
+            format!("{base}/handoff?agent=claude-code&workspace={WORKSPACE}&project={PROJECT}");
+        for (site, dest) in [
+            ("same-origin", "document"),
+            ("same-origin", "image"),
+            ("none", "document"),
+        ] {
+            let status = client
+                .get(&handoff_url)
+                .header("sec-fetch-site", site)
+                .header("sec-fetch-mode", "navigate")
+                .header("sec-fetch-dest", dest)
+                .send()
+                .await
+                .expect("non-fetch browser request")
+                .status();
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "/handoff with Sec-Fetch-Site {site} and Sec-Fetch-Dest {dest} must be refused"
+            );
+        }
+        assert_eq!(
+            open_handoffs(&client, &base).await,
+            1,
+            "a non-fetch browser request must not claim the baton"
+        );
 
         // Checked before the legitimate session-start hook below, which
         // publishes the project itself.
