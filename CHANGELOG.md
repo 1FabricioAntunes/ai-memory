@@ -30,7 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[capture] ignore_paths` would drop the event, so an exclusion that names a
   path outside its checkout, or a source file read by a command whose
   `workdir` points at another project, is no longer judged only by the
-  destination's policy. (#1199)
+  destination's policy. When the payload `cwd`'s own capture policy is
+  invalid, an event aimed at another repository is no longer rerouted; it
+  stays with that source repository as metadata only. (#1199)
 
 ## [2.6.3] - 2026-10-09
 

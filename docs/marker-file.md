@@ -178,14 +178,16 @@ contribute = false
 consume = false
 ```
 
-**Naming rules** for `workspace` and `project`, validated server-side:
-
-- Lowercase ASCII, digits, dots, dashes, underscores
-- Regex: `^[a-z0-9][a-z0-9._-]*$`
-
-Anything else is rejected at `get_or_create_workspace` / `_project`
-time, surfacing as a hook warning. The shell helper URL-encodes
-defensively but the server's regex is the source of truth.
+**Naming** for `workspace` and `project`: the server stores both names
+as given and does not validate their characters. Stick to lowercase ASCII
+letters, digits, dots, dashes and underscores (`^[a-z0-9][a-z0-9._-]*$`)
+anyway: names like that need no quoting in URLs, shells or tool arguments.
+Hook clients URL-encode whatever a repository marker declares. The
+operator-home route map below is stricter: a `route_workspace` or
+`route_project` outside that pattern invalidates the whole map. Names never
+become filesystem paths, because the wiki stores each project under
+`<data_dir>/wiki/<workspace_id>/<project_id>/`. A name such as `../x` is
+an odd label, not a path.
 
 `aliases` is all-or-nothing and intentionally uses a portable subset shared by
 native Rust, POSIX shell, PowerShell, and generated TypeScript: exactly one
