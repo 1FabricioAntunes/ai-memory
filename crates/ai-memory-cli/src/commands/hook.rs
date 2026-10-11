@@ -3379,6 +3379,165 @@ mod tests {
         }
     }
 
+    /// `--check-capture` is how an operator verifies what the native hook will
+    /// do, so its report must agree with what the same payload actually leaves
+    /// in the spool. Each marker variant runs through both paths with the same
+    /// payload cwd and capture mode: the event reaches the spool exactly when
+    /// `admits_capture` holds and the disposition is not `drop`, and a
+    /// `metadata-only` report means the spooled body is metadata only.
+    #[tokio::test]
+    async fn check_capture_report_matches_the_native_spool_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowlist = Some(crate::cli::CaptureModeArg::Allowlist);
+        // (name, marker, tool path, admits_capture, policy_admits_capture,
+        //  scope_resolution, disposition)
+        for (name, marker, path, admits, policy_admits, resolution, disposition) in [
+            (
+                "project-only",
+                Some("project = \"app\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "workspace-only",
+                Some("workspace = \"team\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "both",
+                Some("workspace = \"team\"\nproject = \"app\"\n"),
+                "public.txt",
+                true,
+                true,
+                "explicit",
+                "keep",
+            ),
+            // Names outside the recommended lowercase convention are forwarded
+            // as given; the hook does not judge them.
+            (
+                "unconventional-names",
+                Some("workspace = \"../evil\"\nproject = \"Bad Name!\"\n"),
+                "public.txt",
+                true,
+                true,
+                "explicit",
+                "keep",
+            ),
+            (
+                "empty-project",
+                Some("workspace = \"team\"\nproject = \"\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "invalid-toml",
+                Some("workspace = \"team\nproject = [\n"),
+                "public.txt",
+                true,
+                true,
+                "server-derived",
+                "metadata-only",
+            ),
+            (
+                "capture-exclusion",
+                Some(
+                    "workspace = \"team\"\nproject = \"app\"\n\
+                     [capture]\nignore_paths = [\"secret/**\"]\n",
+                ),
+                "secret/token.txt",
+                true,
+                false,
+                "explicit",
+                "drop",
+            ),
+            (
+                "no-marker",
+                None,
+                "public.txt",
+                false,
+                false,
+                "server-derived",
+                "keep",
+            ),
+        ] {
+            let repo = tmp.path().join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+            }
+            let raw = serde_json::json!({
+                "cwd": repo,
+                "tool_name": "Edit",
+                "tool_input": {"path": path, "content": "PRIVATE_CONTENT_SENTINEL"}
+            });
+
+            let check_data = tmp.path().join(format!("check-{name}"));
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            args.capture_mode = allowlist;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(check_data.clone()),
+                args,
+                raw.to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            )
+            .await
+            .unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert!(!check_data.exists(), "{name}: inspection wrote state");
+            assert_eq!(report["admits_capture"], admits, "{name}: {report}");
+            assert_eq!(
+                report["policy_admits_capture"], policy_admits,
+                "{name}: {report}"
+            );
+            assert_eq!(report["scope_resolution"], resolution, "{name}: {report}");
+            assert_eq!(report["disposition"], disposition, "{name}: {report}");
+
+            let entries = spool_one(
+                &tmp.path().join(format!("spool-{name}")),
+                "devin",
+                allowlist,
+                &raw,
+            )
+            .await;
+            let reported_spool =
+                report["admits_capture"] == true && report["disposition"] != "drop";
+            assert_eq!(
+                entries.len(),
+                usize::from(reported_spool),
+                "{name}: check-capture reported {report} but the native hook spooled {}",
+                entries.len()
+            );
+            if let Some(entry) = entries.first() {
+                let metadata_only = entry.body.contains("\"disposition\":\"metadata-only\"");
+                assert_eq!(
+                    metadata_only,
+                    report["disposition"] == "metadata-only",
+                    "{name}: {}",
+                    entry.body
+                );
+                assert_eq!(
+                    entry.body.contains("PRIVATE_CONTENT_SENTINEL"),
+                    !metadata_only,
+                    "{name}: {}",
+                    entry.body
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn check_capture_bounds_marker_hints_and_refuses_oversized_scope() {
         let tmp = tempfile::tempdir().unwrap();
