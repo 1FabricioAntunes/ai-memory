@@ -603,11 +603,12 @@ impl CapturePolicy {
         let extracted = extract(agent, raw);
         let (disposition, extraction) = match self.state {
             PolicyState::Inactive => (CaptureDisposition::Keep, extracted.state),
-            // A broken marker cannot prove a shell command's arguments miss
-            // every ignored path, so it fails closed like a file tool, readable
-            // or not.
+            // A broken marker cannot prove a shell command's arguments, or a
+            // search's matches, miss every ignored path, so it fails closed
+            // like a file tool, readable or not.
             PolicyState::Invalid
                 if extracted.family == ToolFamily::File
+                    || extracted.family == ToolFamily::SearchList
                     || extracted.shell
                     || extracted.output_reader =>
             {
@@ -955,6 +956,15 @@ struct Extracted<'a> {
     /// locate where the tool ran; capture policy drops search output under an
     /// active marker regardless of it.
     search_paths: Option<Vec<String>>,
+    /// Every place a search/list tool reads from, for the cross-checkout
+    /// lookup: its directory and file arguments (`roots`) and the glob
+    /// arguments that select below them (`patterns`). `None` when one of
+    /// them is not a string, so the lookup cannot be made.
+    search_scope: Option<SearchScope>,
+    /// The files an `apply_patch` call's patch text names, for the
+    /// cross-checkout lookup only; the call's own decision does not read
+    /// them.
+    patch_paths: Option<Vec<String>>,
     /// The paths are globs (Gemini CLI `read_many_files`), not literal files.
     globs: bool,
     /// The tool reads back output of an earlier command (`BashOutput`).
@@ -1028,6 +1038,12 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     let search_paths = (family == ToolFamily::SearchList)
         .then(|| args.and_then(|value| direct_paths(value.as_object()?)))
         .flatten();
+    let search_scope = (family == ToolFamily::SearchList)
+        .then(|| search_scope(name, args))
+        .flatten();
+    let patch_paths = (family == ToolFamily::File && paths.is_none())
+        .then(|| args.and_then(|value| patch_paths(name, value)))
+        .flatten();
     // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
     // when given, Gemini CLI `run_shell_command` in `dir_path` (`directory`
     // before it was renamed), and Antigravity `run_command` in `Cwd`, so
@@ -1075,6 +1091,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         shell,
         workdir,
         search_paths,
+        search_scope,
+        patch_paths,
         globs: name.eq_ignore_ascii_case("read_many_files"),
         output_reader: reads_earlier_output(name),
         powershell: name.eq_ignore_ascii_case("powershell"),
@@ -1386,18 +1404,22 @@ fn native_path(candidate: Normalized) -> String {
 /// tool call.
 pub const MAX_LOOKUP_LOCATIONS: usize = 4_096;
 
-/// The absolute locations a recognized file or shell tool call names, in
-/// their own separator style, for a hook client to find the marker that
-/// governs each: every file-tool target, and every shell argument that names
-/// a path (one with a separator, after `~/` expansion) resolved from the
-/// tool's `workdir` or the `cwd`, plus that directory itself.
+/// The absolute locations a recognized file, search/list or shell tool call
+/// names, in their own separator style, for a hook client to find the marker
+/// that governs each: every file-tool target (for `apply_patch`, the files its
+/// patch names), every directory, file and path-like glob argument of a
+/// search/list tool, and every shell argument that names a path (one with a
+/// separator, after `~/` expansion) resolved from the tool's `workdir` or the
+/// `cwd`, plus that directory itself.
 ///
 /// A checkout's `ignore_paths` protect its files wherever the call is made
 /// from, so a client applies the policy of each location's own marker as
-/// well as the event's (`cat ../other-checkout/secret.env`). Search/list and
-/// unknown tools yield nothing; their policy is the event's. `None` when the
-/// call names more than [`MAX_LOOKUP_LOCATIONS`] distinct locations, since
-/// nothing then proves which markers govern it.
+/// well as the event's (`cat ../other-checkout/secret.env`). A location may
+/// hold glob syntax; [`glob_walk`] says how to follow it. Unknown tools yield
+/// nothing; their policy is the event's. `None` when nothing proves which
+/// markers govern the call: a file tool whose targets cannot be read or
+/// resolved, a search/list argument that is not a string, or more than
+/// [`MAX_LOOKUP_LOCATIONS`] distinct locations.
 pub fn capture_lookup_locations(
     agent: AgentKind,
     raw: &Value,
@@ -1422,8 +1444,31 @@ pub fn capture_lookup_locations(
     };
     match (extracted.family, extracted.command.as_ref()) {
         (ToolFamily::File, _) => {
-            for path in extracted.paths.iter().flatten() {
-                push(normalize_candidate(path, cwd))?;
+            let paths = extracted
+                .paths
+                .as_ref()
+                .or(extracted.patch_paths.as_ref())?;
+            for path in paths {
+                push(Some(normalize_candidate(path, cwd)?))?;
+            }
+        }
+        (ToolFamily::SearchList, _) => {
+            let scope = extracted.search_scope.as_ref()?;
+            let mut roots = Vec::new();
+            for root in &scope.roots {
+                let root = normalize_candidate(root, cwd)?;
+                roots.push(native_path(root.clone()));
+                push(Some(root))?;
+            }
+            if roots.is_empty() {
+                roots.push(cwd.to_owned());
+            }
+            // A glob argument without a separator only selects names below
+            // its root, which the root's own lookup already covers.
+            for pattern in scope.patterns.iter().filter(|p| p.contains(['/', '\\'])) {
+                for root in &roots {
+                    push(Some(normalize_candidate(pattern, root)?))?;
+                }
             }
         }
         (ToolFamily::NonFile, Some(command)) => {
@@ -1445,6 +1490,235 @@ pub fn capture_lookup_locations(
     Some(locations)
 }
 
+/// Where a search/list tool reads: see [`Extracted::search_scope`].
+#[derive(Default)]
+struct SearchScope {
+    roots: Vec<String>,
+    patterns: Vec<String>,
+}
+
+/// A search/list tool's directory and file arguments, and its glob
+/// arguments: a glob tool's `pattern` (Claude Code `Glob`, Gemini CLI `glob`,
+/// Antigravity `find_by_name`), and the file filters of a content search
+/// (`glob`, `include`, `file_pattern`, `Includes`). A grep `pattern` is a
+/// regular expression, not a path, and is left out. `None` when one of them
+/// is present but not a string (or, for a filter, a list of strings).
+fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
+    let object = match args {
+        None | Some(Value::Null) => return Some(SearchScope::default()),
+        Some(value) => value.as_object()?,
+    };
+    let mut scope = SearchScope::default();
+    if object
+        .keys()
+        .any(|key| DIRECT_PATH_KEYS.contains(&key.as_str()) || key == "paths")
+    {
+        scope.roots = direct_paths(object)?;
+    }
+    for key in [
+        "dir_path",
+        "directory",
+        "DirectoryPath",
+        "SearchDirectory",
+        "SearchPath",
+    ] {
+        if let Some(value) = object.get(key) {
+            scope.roots.push(value.as_str()?.to_owned());
+        }
+    }
+    let glob_tool = matches!(
+        name.to_ascii_lowercase().as_str(),
+        "glob" | "find" | "find_by_name"
+    );
+    let pattern_keys: &[&str] = if glob_tool {
+        &[
+            "pattern",
+            "Pattern",
+            "glob",
+            "include",
+            "file_pattern",
+            "Includes",
+        ]
+    } else {
+        &["glob", "include", "file_pattern", "Includes"]
+    };
+    for key in pattern_keys {
+        match object.get(*key) {
+            None => {}
+            Some(Value::String(pattern)) => scope.patterns.push(pattern.clone()),
+            Some(Value::Array(patterns)) => {
+                for pattern in patterns {
+                    scope.patterns.push(pattern.as_str()?.to_owned());
+                }
+            }
+            Some(_) => return None,
+        }
+    }
+    let total = scope.roots.len().checked_add(scope.patterns.len())?;
+    (total <= MAX_CAPTURE_CANDIDATES
+        && scope.roots.iter().chain(&scope.patterns).all(|path| {
+            !path.trim().is_empty() && path.chars().count() <= MAX_CANDIDATE_PATH_CHARS
+        }))
+    .then_some(scope)
+}
+
+/// The files an `apply_patch` patch names in its `*** Add File:`,
+/// `*** Update File:`, `*** Delete File:` and `*** Move to:` headers, from
+/// the patch text itself or the `command`, `patch`, `patchText` or `input`
+/// field that holds it. `None` when no header names a file.
+fn patch_paths(name: &str, args: &Value) -> Option<Vec<String>> {
+    if !matches!(name.to_ascii_lowercase().as_str(), "apply_patch" | "patch") {
+        return None;
+    }
+    let text = match args {
+        Value::String(text) => text.as_str(),
+        Value::Object(object) => ["command", "patch", "patchText", "input"]
+            .iter()
+            .find_map(|key| object.get(*key)?.as_str())?,
+        _ => return None,
+    };
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let Some(path) = [
+            "*** Add File:",
+            "*** Update File:",
+            "*** Delete File:",
+            "*** Move to:",
+        ]
+        .iter()
+        .find_map(|header| line.strip_prefix(header)) else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || path.chars().count() > MAX_CANDIDATE_PATH_CHARS {
+            return None;
+        }
+        if paths.len() == MAX_CAPTURE_CANDIDATES {
+            return None;
+        }
+        paths.push(path.to_owned());
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// How a hook client reaches every directory a [`capture_lookup_locations`]
+/// location could name when it holds glob syntax (`*`, `?`, a `[` class, a
+/// `{` brace, a `(` group).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GlobWalk {
+    /// No glob syntax: look the location up as a path.
+    Literal,
+    /// Look `root` (the leading segments without glob syntax, in the
+    /// location's own separator style) up as a path, then follow `steps`
+    /// through the directories below it.
+    Walk {
+        /// The deepest directory the glob cannot leave.
+        root: String,
+        /// One step per remaining segment; [`GlobStep::AnyDepth`] ends it.
+        steps: Vec<GlobStep>,
+    },
+    /// Syntax a walk cannot follow: a brace or group that spans a separator,
+    /// or an alternative of `..` or `~…` inside one, which leaves the root.
+    /// Nothing proves which markers govern it.
+    Unprovable,
+}
+
+/// One segment of a [`GlobWalk::Walk`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GlobStep {
+    /// A segment without glob syntax: that child directory.
+    Named(String),
+    /// A segment whose only glob syntax is `*` and `?`: every child directory
+    /// whose name it matches, compared without regard to ASCII case.
+    Matching(String),
+    /// A segment with a class, brace or group: every child directory.
+    Any,
+    /// A `**` segment: every directory at any depth below.
+    AnyDepth,
+}
+
+/// Whether a directory entry named `name` is one [`GlobStep::Matching`]
+/// reaches.
+#[must_use]
+pub fn glob_segment_matches(segment: &str, name: &str) -> bool {
+    glob_match(segment, name, None, true)
+}
+
+/// How to follow a lookup location that may hold glob syntax. A segment with
+/// syntax the matcher does not evaluate is read as matching any name, which
+/// only ever adds directories.
+#[must_use]
+pub fn glob_walk(location: &str) -> GlobWalk {
+    // A parameter expansion's braces are not a brace expansion; the shell
+    // split also reads the word with each default in its place.
+    if location.contains("${") {
+        return GlobWalk::Literal;
+    }
+    let syntax = |segment: &str| segment.contains(['*', '?', '[', '{', '(']);
+    let flavor = flavor_of(location);
+    let Ok(normalized) = normalize_root(location) else {
+        return GlobWalk::Literal;
+    };
+    // The root itself (`/`, `C:/`, `//server/share`) is never a glob.
+    let (root, tail) = if let Some(rest) = normalized.strip_prefix("//") {
+        let mut parts = rest.splitn(3, '/');
+        let server = parts.next().unwrap_or_default();
+        let share = parts.next().unwrap_or_default();
+        (
+            format!("//{server}/{share}"),
+            parts.next().unwrap_or_default().to_owned(),
+        )
+    } else if valid_drive_prefix(&normalized) {
+        (normalized[..3].to_owned(), normalized[3..].to_owned())
+    } else {
+        ("/".to_owned(), normalized[1..].to_owned())
+    };
+    let segments: Vec<&str> = tail.split('/').filter(|part| !part.is_empty()).collect();
+    let Some(first) = segments.iter().position(|segment| syntax(segment)) else {
+        return GlobWalk::Literal;
+    };
+    let mut steps = Vec::new();
+    for segment in &segments[first..] {
+        if !syntax(segment) {
+            steps.push(GlobStep::Named((*segment).to_owned()));
+            continue;
+        }
+        let balanced = |open: char, close: char| {
+            segment.matches(open).count() == segment.matches(close).count()
+        };
+        // A brace or group alternative of `..` or `~…` leaves the root.
+        let leaves = segment
+            .split(['{', '}', ',', '(', ')', '|', '@', '!', '+'])
+            .any(|piece| piece == ".." || piece.starts_with('~'));
+        if leaves || !balanced('{', '}') || !balanced('(', ')') {
+            return GlobWalk::Unprovable;
+        }
+        if segment.contains("**") {
+            steps.push(GlobStep::AnyDepth);
+            break;
+        }
+        steps.push(if segment.contains(['[', '{', '(']) {
+            GlobStep::Any
+        } else {
+            GlobStep::Matching((*segment).to_owned())
+        });
+    }
+    let mut root_path = root;
+    for segment in &segments[..first] {
+        if !root_path.ends_with('/') {
+            root_path.push('/');
+        }
+        root_path.push_str(segment);
+    }
+    GlobWalk::Walk {
+        root: native_path(Normalized {
+            path: root_path,
+            flavor,
+        }),
+        steps,
+    }
+}
+
 /// The directory a shell tool's relative arguments resolve from: its own
 /// `workdir` (absolute, or relative to the `cwd`), else the `cwd`.
 fn command_base(workdir: Option<&str>, cwd: &str) -> String {
@@ -1456,17 +1730,20 @@ fn command_base(workdir: Option<&str>, cwd: &str) -> String {
     }
 }
 
+/// The single-path fields of the file and search/list tool schemas.
+const DIRECT_PATH_KEYS: [&str; 7] = [
+    "file_path",
+    "filePath",
+    "path",
+    "absolute_path",
+    "AbsolutePath",
+    "notebook_path",
+    "TargetFile",
+];
+
 fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     let mut paths = Vec::new();
-    for key in [
-        "file_path",
-        "filePath",
-        "path",
-        "absolute_path",
-        "AbsolutePath",
-        "notebook_path",
-        "TargetFile",
-    ] {
+    for key in DIRECT_PATH_KEYS {
         if let Some(value) = object.get(key) {
             if paths.len() == MAX_CAPTURE_CANDIDATES {
                 return None;
@@ -4117,18 +4394,140 @@ mod tests {
             ),
             Some(vec!["C:\\a\\x.md".to_owned()])
         );
-        // Search/list and unknown tools stay with the event's own policy.
+        // A search/list tool names its root and the path-like globs below it;
+        // a grep pattern is a regular expression and names nothing.
+        assert_eq!(
+            locations(
+                &json!({"tool_name": "Grep", "tool_input": {"path": "../a", "pattern": "x/y", "glob": "*.env"}})
+            ),
+            Some(vec!["/work/a".to_owned()])
+        );
+        assert_eq!(
+            locations(&json!({"tool_name": "Glob", "tool_input": {"pattern": "../a/*.env"}})),
+            Some(vec!["/work/a/*.env".to_owned()])
+        );
+        assert_eq!(
+            locations(
+                &json!({"tool_name": "grep_search", "tool_input": {"dir_path": "/work/a", "include": ["src/*.rs", "*.md"]}})
+            ),
+            Some(vec!["/work/a".to_owned(), "/work/a/src/*.rs".to_owned()])
+        );
+        assert_eq!(
+            locations(&json!({"tool_name": "Grep", "tool_input": {"pattern": "x"}})),
+            Some(Vec::new())
+        );
+        // An argument that is not a string, a file tool without readable
+        // targets, and a target that cannot be resolved prove nothing.
         for raw in [
-            json!({"tool_name": "Grep", "tool_input": {"path": "../a"}}),
-            json!({"tool_name": "FutureTool", "tool_input": {"path": "../a/x"}}),
+            json!({"tool_name": "Grep", "tool_input": {"path": 7}}),
+            json!({"tool_name": "Glob", "tool_input": {"pattern": 7}}),
+            json!({"tool_name": "Read", "tool_input": {}}),
+            json!({"tool_name": "Read", "tool_input": {"file_path": "C:x"}}),
+            json!({"tool_name": "apply_patch", "tool_input": {"command": "no headers"}}),
         ] {
-            assert_eq!(locations(&raw), Some(Vec::new()));
+            assert_eq!(locations(&raw), None, "{raw}");
         }
+        // An `apply_patch` names the files its headers name.
+        assert_eq!(
+            locations(
+                &json!({"tool_name": "apply_patch", "tool_input": {"command": "*** Begin Patch\n*** Update File: ../a/secrets.env\n*** Move to: c.md\n*** End Patch"}})
+            ),
+            Some(vec![
+                "/work/a/secrets.env".to_owned(),
+                "/work/b/c.md".to_owned()
+            ])
+        );
+        // Unknown tools stay with the event's own policy.
+        assert_eq!(
+            locations(&json!({"tool_name": "FutureTool", "tool_input": {"path": "../a/x"}})),
+            Some(Vec::new())
+        );
         let many = (0..=MAX_LOOKUP_LOCATIONS)
             .map(|index| format!("d{index}/x"))
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(locations(&bash(&format!("cat {many}"))), None);
+    }
+
+    /// A glob location is followed from its literal root; syntax that can
+    /// leave the root (a brace spanning a separator, a `..` or `~`
+    /// alternative) cannot be followed.
+    #[test]
+    fn glob_walk_follows_every_segment_a_glob_could_pass_through() {
+        assert_eq!(glob_walk("/work/a/secrets.env"), GlobWalk::Literal);
+        assert_eq!(glob_walk("/work/x/${HOME:-a}/*"), GlobWalk::Literal);
+        assert_eq!(
+            glob_walk("/work/*/secrets.env"),
+            GlobWalk::Walk {
+                root: "/work".into(),
+                steps: vec![
+                    GlobStep::Matching("*".into()),
+                    GlobStep::Named("secrets.env".into())
+                ],
+            }
+        );
+        assert_eq!(
+            glob_walk("/work/{a,b}/[xy]/**/z/*"),
+            GlobWalk::Walk {
+                root: "/work".into(),
+                steps: vec![GlobStep::Any, GlobStep::Any, GlobStep::AnyDepth],
+            }
+        );
+        assert_eq!(
+            glob_walk("C:\\work\\a?\\x"),
+            GlobWalk::Walk {
+                root: "C:\\work".into(),
+                steps: vec![GlobStep::Matching("a?".into()), GlobStep::Named("x".into())],
+            }
+        );
+        for location in [
+            "/work/{a/x,b}/secrets.env",
+            "/work/b/{..,c}/secrets.env",
+            "/work/b/{~,c}/x",
+            "/work/b/@(..|c)/x",
+            "/work/b/(a/x)/y",
+        ] {
+            assert_eq!(glob_walk(location), GlobWalk::Unprovable, "{location}");
+        }
+        // A brace sequence and a backup-file glob stay walkable.
+        assert!(matches!(
+            glob_walk("/work/b/ad{1..3}/x"),
+            GlobWalk::Walk { .. }
+        ));
+        assert!(matches!(glob_walk("/work/b/src/*~"), GlobWalk::Walk { .. }));
+        assert!(glob_segment_matches("SEC*", "secrets"));
+        assert!(!glob_segment_matches("*.env", "src"));
+    }
+
+    /// A broken marker fails a search/list tool closed, as it does a file or
+    /// shell tool: nothing proves its matches miss every ignored path.
+    #[test]
+    fn an_invalid_policy_makes_a_search_metadata_only() {
+        let policy = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        for raw in [
+            json!({"tool_name": "Grep", "tool_input": {"pattern": "x"}}),
+            json!({"tool_name": "Glob", "tool_input": {"pattern": "*.rs"}}),
+        ] {
+            assert_eq!(
+                policy
+                    .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::MetadataOnly
+            );
+        }
+        let inactive = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
+        assert_eq!(
+            inactive
+                .inspect(
+                    AgentKind::ClaudeCode,
+                    &json!({"tool_name": "Grep", "tool_input": {"pattern": "x"}}),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
     }
 
     /// Copilot CLI's runtime `view`/`create` names are file tools for that

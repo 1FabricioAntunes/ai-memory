@@ -1194,7 +1194,7 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     stack.into_iter().collect()
 }
 
-fn checkout_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn checkout_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
     loop {
         if dir.join(".git").exists() {

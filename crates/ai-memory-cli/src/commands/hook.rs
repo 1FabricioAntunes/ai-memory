@@ -20,8 +20,9 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, HookEvent,
-    PolicyState, absolute_tool_location_paths, capture_lookup_locations, repository_admits_capture,
+    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, GlobStep,
+    GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths, capture_lookup_locations,
+    glob_segment_matches, glob_walk, repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -852,6 +853,8 @@ where
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
+    // Read before a metadata-only rewrite drops the payload's own fields.
+    let subagent_payload = payload_is_subagent(&json);
     if let Some(decision) = decision {
         match decision.protocol().disposition() {
             CaptureDisposition::Drop => {
@@ -1145,7 +1148,7 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        if !shown.is_file() && !payload_is_subagent(&json) {
+        if !shown.is_file() && !subagent_payload {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id
@@ -1307,6 +1310,10 @@ pub(crate) fn tool_location_routing_cwd(
 /// tool call may make [`foreign_capture_decision`] look up.
 const MAX_FOREIGN_DIRECTORIES: usize = 256;
 const MAX_FOREIGN_MARKERS: usize = 16;
+/// How many directories, and directory entries read, following the glob
+/// syntax of one tool call's locations may cost.
+const MAX_GLOB_DIRECTORIES: usize = 256;
+const MAX_GLOB_ENTRIES: usize = 65_536;
 
 /// The stricter decision of every other marker that governs a location the
 /// tool call names: a file-tool target, or a path a shell argument spells,
@@ -1317,8 +1324,14 @@ const MAX_FOREIGN_MARKERS: usize = 16;
 ///
 /// Markers are found by the same lexical walk as the event's (no
 /// canonicalization), from the nearest existing directory of each location,
-/// with each directory looked up once. A call naming more locations,
-/// directories or markers than the bounds is unprovable and gets the
+/// with each directory looked up once. A location with glob syntax
+/// ([`glob_walk`]) is looked up from its literal root, and every directory
+/// the glob could pass through below the root is checked for a marker of its
+/// own: each glob segment lists the child directories (never following a
+/// symlink), and a `**` lists the whole subtree unless it starts inside the
+/// event's own checkout (its `.git` root). A call naming more locations,
+/// directories, entries or markers than the bounds, glob syntax the walk
+/// cannot follow, or locations that cannot be read is unprovable and gets the
 /// fail-closed decision of an invalid policy.
 pub(crate) fn foreign_capture_decision(
     agent: AgentKind,
@@ -1347,7 +1360,29 @@ pub(crate) fn foreign_capture_decision(
     let mut directories: std::collections::HashMap<PathBuf, Option<PathBuf>> =
         std::collections::HashMap::new();
     let mut markers: Vec<PathBuf> = Vec::new();
+    let checkout = crate::marker::checkout_root(Path::new(inspection_cwd));
+    let mut walk = GlobBudget::default();
     for location in locations {
+        let location = match glob_walk(&location) {
+            GlobWalk::Literal => location,
+            GlobWalk::Unprovable => return unprovable(),
+            GlobWalk::Walk { root, steps } => {
+                let Some(found) = walk.markers_below(Path::new(&root), &steps, checkout.as_deref())
+                else {
+                    return unprovable();
+                };
+                for marker in found {
+                    if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
+                        continue;
+                    }
+                    if markers.len() == MAX_FOREIGN_MARKERS {
+                        return unprovable();
+                    }
+                    markers.push(marker);
+                }
+                root
+            }
+        };
         let Some(dir) = existing_target_dir(Path::new(&location)) else {
             continue;
         };
@@ -1379,6 +1414,95 @@ pub(crate) fn foreign_capture_decision(
             marker_capture_policy(marker, inspection_cwd).inspect(agent, raw, inspection_cwd)
         })
         .reduce(CaptureDecision::stricter)
+}
+
+/// What following one call's glob locations has cost so far.
+#[derive(Default)]
+struct GlobBudget {
+    directories: usize,
+    entries: usize,
+}
+
+impl GlobBudget {
+    /// The marker files of every directory `steps` can reach below `root`,
+    /// `root` itself excluded (its lookup is the caller's). `None` past the
+    /// bounds. A step that reaches no directory ends the walk: the glob then
+    /// matches nothing there.
+    fn markers_below(
+        &mut self,
+        root: &Path,
+        steps: &[GlobStep],
+        checkout: Option<&Path>,
+    ) -> Option<Vec<PathBuf>> {
+        let mut found = Vec::new();
+        let mut current = vec![root.to_path_buf()];
+        for step in steps {
+            let mut next = Vec::new();
+            for dir in &current {
+                match step {
+                    GlobStep::Named(name) => {
+                        let child = dir.join(name);
+                        if child.is_dir() {
+                            next.push(child);
+                        }
+                    }
+                    GlobStep::Matching(segment) => {
+                        next.extend(self.child_directories(dir)?.into_iter().filter(|child| {
+                            child.file_name().is_some_and(|name| {
+                                glob_segment_matches(segment, &name.to_string_lossy())
+                            })
+                        }))
+                    }
+                    GlobStep::Any => next.extend(self.child_directories(dir)?),
+                    GlobStep::AnyDepth => {
+                        if checkout.is_some_and(|checkout| dir.starts_with(checkout)) {
+                            continue;
+                        }
+                        let mut pending = self.child_directories(dir)?;
+                        while let Some(below) = pending.pop() {
+                            pending.extend(self.child_directories(&below)?);
+                            next.push(below);
+                        }
+                    }
+                }
+            }
+            for dir in &next {
+                self.directories += 1;
+                if self.directories > MAX_GLOB_DIRECTORIES {
+                    return None;
+                }
+                let marker = dir.join(ai_memory_core::repository_identity::MARKER_FILENAME);
+                if marker.is_file() {
+                    found.push(marker);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            current = next;
+        }
+        Some(found)
+    }
+
+    /// The child directories of `dir`, symlinks left out. An unreadable
+    /// directory has none the glob could match either.
+    fn child_directories(&mut self, dir: &Path) -> Option<Vec<PathBuf>> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Some(Vec::new());
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            self.entries += 1;
+            if self.entries > MAX_GLOB_ENTRIES {
+                return None;
+            }
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                children.push(entry.path());
+            }
+        }
+        Some(children)
+    }
 }
 
 /// Where one event is delivered (#992).
@@ -3307,6 +3431,169 @@ mod tests {
             assert!(
                 entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
                 "{name}"
+            );
+        }
+    }
+
+    /// Adversarial: checkout A's `ignore_paths` also hold for a call from a
+    /// sibling checkout or an unmarked parent that reaches A through glob
+    /// syntax in a directory segment, through a search/list tool's path or
+    /// glob, or through an `apply_patch` header; glob syntax the lookup
+    /// cannot follow, and a file tool whose target cannot be read, fail
+    /// closed. Controls: public files, the event's own files and searches,
+    /// and ordinary globs are still captured whole.
+    #[tokio::test]
+    async fn globs_searches_and_unreadable_targets_answer_to_another_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("work");
+        let a = parent.join("a");
+        let b = parent.join("b");
+        for dir in [&a, &b, &b.join("src")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(b.join(".ai-memory.toml"), "project = \"b\"\n").unwrap();
+        let event = |agent_cwd: &Path, tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "cross-glob",
+                "cwd": agent_cwd,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let bash = |agent_cwd: &Path, command: &str| {
+            event(agent_cwd, "Bash", serde_json::json!({"command": command}))
+        };
+        let attacks = [
+            (
+                "sibling star",
+                "claude-code",
+                bash(&b, "cat ../*/secrets.env"),
+            ),
+            (
+                "parent star",
+                "claude-code",
+                bash(&parent, "cat */secrets.env"),
+            ),
+            ("brace", "claude-code", bash(&b, "cat ../{a,c}/secrets.env")),
+            ("bracket", "claude-code", bash(&b, "cat ../[a]/secrets.env")),
+            ("globstar", "claude-code", bash(&b, "cat ../**/secrets.env")),
+            (
+                "spanning brace",
+                "claude-code",
+                bash(&b, "cat ../{a/x,c}/secrets.env"),
+            ),
+            (
+                "grep path",
+                "claude-code",
+                event(
+                    &b,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "../a/secrets.env", "output_mode": "content"}),
+                ),
+            ),
+            (
+                "glob pattern",
+                "claude-code",
+                event(&b, "Glob", serde_json::json!({"pattern": "../a/*.env"})),
+            ),
+            (
+                "grep filter from the parent",
+                "claude-code",
+                event(
+                    &parent,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "glob": "*/secrets.env"}),
+                ),
+            ),
+            (
+                "gemini search",
+                "gemini-cli",
+                event(
+                    &b,
+                    "search_file_content",
+                    serde_json::json!({"pattern": "KEY", "dir_path": "../a"}),
+                ),
+            ),
+            (
+                "patch header",
+                "codex",
+                event(
+                    &b,
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Update File: ../a/secrets.env\n+KEY\n*** End Patch"}),
+                ),
+            ),
+            (
+                "unreadable target",
+                "claude-code",
+                event(&parent, "Read", serde_json::json!({})),
+            ),
+        ];
+        for (name, agent, raw) in attacks {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.body.contains("SENTINEL_MUST_NOT_BE_SPOOLED")),
+                "{name}: {entries:?}"
+            );
+        }
+        let controls = [
+            ("public glob", "claude-code", bash(&b, "cat ../*/public.md")),
+            ("own glob", "claude-code", bash(&b, "ls src/*")),
+            (
+                "own globstar",
+                "claude-code",
+                bash(&b, "cat src/**/main.rs"),
+            ),
+            (
+                "own grep",
+                "claude-code",
+                event(
+                    &b,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "src"}),
+                ),
+            ),
+            (
+                "own glob tool",
+                "claude-code",
+                event(&b, "Glob", serde_json::json!({"pattern": "**/*.rs"})),
+            ),
+            (
+                "public grep",
+                "claude-code",
+                event(
+                    &parent,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "b"}),
+                ),
+            ),
+            (
+                "own patch",
+                "codex",
+                event(
+                    &b,
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Add File: src/x.rs\n+fn x() {}\n*** End Patch"}),
+                ),
+            ),
+        ];
+        for (name, agent, raw) in controls {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}: {}",
+                entries[0].body
             );
         }
     }

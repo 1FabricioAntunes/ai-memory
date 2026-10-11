@@ -645,6 +645,55 @@ mod tests {
         );
     }
 
+    /// A search, a directory glob or an `apply_patch` recorded here that
+    /// reaches a sibling checkout's excluded file answers to that checkout's
+    /// policy on import too, as in the live hook. The same tools kept to this
+    /// checkout are imported whole.
+    #[test]
+    fn globs_and_searches_reaching_another_checkout_honor_its_policy() {
+        let parent = tempfile::tempdir().unwrap();
+        let (a, b) = (parent.path().join("a"), parent.path().join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let capture = TranscriptCapture::for_checkout(parent.path(), &b);
+        let call = |tool: &str, input: Value, id: &str| {
+            event(
+                WorkstreamEventKind::ToolCall,
+                "assistant",
+                &format!("{tool}: {input}"),
+                json!({"tool": tool, "tool_use_id": id}),
+            )
+        };
+        let events = [
+            call(
+                "Grep",
+                json!({"pattern": "KEY", "path": "../a/secrets.env"}),
+                "a",
+            ),
+            result("secret", Some("a")),
+            call("Bash", json!({"command": "cat ../*/secrets.env"}), "b"),
+            result("secret", Some("b")),
+            call("Glob", json!({"pattern": "../a/*.env"}), "c"),
+            result("secret", Some("c")),
+            call("Grep", json!({"pattern": "KEY", "path": "src"}), "d"),
+            result("own", Some("d")),
+            call("Bash", json!({"command": "ls src/*"}), "e"),
+            result("own", Some("e")),
+        ];
+        assert_eq!(
+            kinds(&capture.decide(&events)),
+            [
+                "drop", "drop", "drop", "drop", "drop", "drop", "keep", "keep", "keep", "keep"
+            ]
+        );
+    }
+
     /// Under allowlist capture mode the live hook emits nothing — prompts
     /// included — from a checkout without a marker; an import drops every
     /// event there. A marked checkout and the default denylist mode keep them.
