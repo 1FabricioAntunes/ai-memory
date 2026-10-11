@@ -675,12 +675,11 @@ mod slow {
         .send()
         .await
         .expect("same-origin pending-write approve");
-        // The handler answers an unknown proposal with a JSON error (a 500
-        // today); what matters here is that it ran, not the guard's 403.
+        // The handler, not the guard's 403, answers the unknown proposal.
         let status = approve.status();
         let body = approve.text().await.expect("approve body");
         assert!(
-            status != StatusCode::FORBIDDEN && serde_json::from_str::<Value>(&body).is_ok(),
+            status == StatusCode::NOT_FOUND && serde_json::from_str::<Value>(&body).is_ok(),
             "the web UI's same-origin approve must reach the handler: {status} {body}"
         );
 
