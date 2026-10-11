@@ -47,8 +47,8 @@ pub use assistant_capture::{
 pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy,
     CaptureProtocol, CaptureSource, ExtractionState, PolicyState, ToolFamily,
-    absolute_tool_location_paths, describe_invalid_capture_config, repository_admits_capture,
-    tool_call_payload,
+    absolute_tool_location_paths, capture_lookup_locations, describe_invalid_capture_config,
+    repository_admits_capture, tool_call_payload,
 };
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,

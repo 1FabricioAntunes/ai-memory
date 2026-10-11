@@ -24,16 +24,23 @@ use ai_memory_hooks::{
 /// Resolve the nearest marker's capture policy without changing routing parsing.
 /// Root-level marker keys are intentionally ignored here; only `[capture]` is strict.
 pub fn capture_policy(cwd: &str) -> CapturePolicy {
-    let home = home_dir();
     let Some(marker) = find_marker(cwd) else {
+        let home = home_dir();
         return CapturePolicy::resolve(
             CaptureSource::Absent,
             cwd,
             home.as_deref().and_then(Path::to_str),
         );
     };
+    marker_capture_policy(&marker, cwd)
+}
+
+/// The capture policy one marker file declares; `cwd` stands in for its
+/// directory only when that cannot be read as text.
+pub(crate) fn marker_capture_policy(marker: &Path, cwd: &str) -> CapturePolicy {
+    let home = home_dir();
     let marker_dir = marker.parent().and_then(Path::to_str).unwrap_or(cwd);
-    match read_capture_config(&marker) {
+    match read_capture_config(marker) {
         Ok(config) => CapturePolicy::resolve(
             CaptureSource::Parsed(&config),
             marker_dir,

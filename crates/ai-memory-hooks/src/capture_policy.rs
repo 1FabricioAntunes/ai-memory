@@ -438,8 +438,10 @@ pub struct CapturePolicy {
     /// The marker directory, where git resolves a `REV:path` object name
     /// when the repository root holds the marker.
     root: Option<String>,
-    /// POSIX paths compare without regard to ASCII case, as on macOS, whose
-    /// default filesystem reads `NOTES/X.md` as `notes/x.md`.
+    /// POSIX paths compare without regard to case or Unicode composition,
+    /// as on macOS, whose default filesystem reads `NOTES/X.md` as
+    /// `notes/x.md` and a decomposed `é` as a composed one. Patterns are
+    /// stored folded ([`fold_path`]); candidates are folded before matching.
     fold_case: bool,
 }
 
@@ -452,6 +454,16 @@ struct CompiledPattern {
     literal_prefix: String,
 }
 impl CompiledPattern {
+    /// This pattern as a case-folding host compares it.
+    fn folded(self) -> Self {
+        let path = fold_path(&self.path);
+        Self {
+            literal_prefix: literal_prefix(&path).into(),
+            directory_base: self.directory_base.as_deref().map(fold_path),
+            path,
+            flavor: self.flavor,
+        }
+    }
     /// Upper bound on `glob_match` steps for one candidate, directory glob included.
     fn match_cost(&self, candidate: &str) -> usize {
         let pattern = self.path.chars().count()
@@ -490,6 +502,22 @@ impl CaptureDecision {
     #[must_use]
     pub const fn protocol(&self) -> &CaptureProtocol {
         &self.protocol
+    }
+
+    /// The stricter of two policies' decisions for one tool call (drop, then
+    /// metadata-only, then keep), `self` on a tie.
+    #[must_use]
+    pub fn stricter(self, other: Self) -> Self {
+        let rank = |decision: &Self| match decision.protocol.disposition() {
+            CaptureDisposition::Keep => 0,
+            CaptureDisposition::MetadataOnly => 1,
+            CaptureDisposition::Drop => 2,
+        };
+        if rank(&other) > rank(&self) {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -542,7 +570,11 @@ impl CapturePolicy {
         match compiled {
             Ok(patterns) => Self {
                 state: PolicyState::Active,
-                patterns,
+                patterns: if fold_case {
+                    patterns.into_iter().map(CompiledPattern::folded).collect()
+                } else {
+                    patterns
+                },
                 home: home_dir.and_then(|dir| normalize_root(dir).ok()),
                 root: normalize_root(marker_dir).ok(),
                 fold_case,
@@ -615,6 +647,16 @@ impl CapturePolicy {
                         };
                         match matched {
                             Ok(true) => (CaptureDisposition::Drop, ExtractionState::Extracted),
+                            // A harness's saved copy of an earlier tool's
+                            // output is read back like `BashOutput`.
+                            Ok(false)
+                                if paths.iter().any(|path| {
+                                    normalize_candidate(path, cwd)
+                                        .is_some_and(|candidate| output_spool(&candidate.path))
+                                }) =>
+                            {
+                                (CaptureDisposition::MetadataOnly, ExtractionState::Extracted)
+                            }
                             Ok(false) => (CaptureDisposition::Keep, ExtractionState::Extracted),
                             Err(()) => (
                                 CaptureDisposition::MetadataOnly,
@@ -628,24 +670,21 @@ impl CapturePolicy {
                 // output (`cat docs/adr/*.md`). An exhausted match budget
                 // fails closed like an unprovable file candidate.
                 ToolFamily::NonFile => match extracted.command.as_ref().map(|command| {
-                    let base = match extracted.workdir.as_deref() {
-                        Some(dir) if is_absolute(dir) => dir.to_owned(),
-                        // `join` would turn an unusable cwd into `/dir`.
-                        Some(dir) if is_absolute(cwd) => join(cwd, dir),
-                        _ => cwd.to_owned(),
-                    };
+                    let base = command_base(extracted.workdir.as_deref(), cwd);
                     // PowerShell's backquote and cmd's caret escape the next
                     // character, so their commands also get a reading
                     // without them.
                     let split =
                         command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
                     self.match_command(&split.words, &base)
-                        .map(|matched| (matched, split.opaque))
+                        .map(|(matched, spool)| (matched, split.opaque || spool))
                 }) {
                     Some(Ok((true, _)) | Err(())) => (CaptureDisposition::Drop, extracted.state),
                     // Syntax the matcher does not evaluate (brace expansion,
                     // bracket classes, zsh groups, encoded escapes) and inline
-                    // interpreter code prove nothing either way.
+                    // interpreter code prove nothing either way, and a
+                    // harness's saved output file holds an earlier command's
+                    // output.
                     Some(Ok((false, true))) => (CaptureDisposition::MetadataOnly, extracted.state),
                     Some(Ok((false, false))) | None => (CaptureDisposition::Keep, extracted.state),
                 },
@@ -675,6 +714,7 @@ impl CapturePolicy {
         let candidates = candidates.ok_or(())?;
         let mut work = 0_usize;
         for candidate in candidates {
+            let candidate = self.fold_candidate(candidate);
             for pattern in self
                 .patterns
                 .iter()
@@ -701,23 +741,14 @@ impl CapturePolicy {
     /// Lexically matches every path-like shell argument. Nothing is expanded
     /// or executed: variables, command substitution, and `cd` are not
     /// followed, so this narrows the leak rather than closing every alias.
-    fn match_command(&self, words: &[String], cwd: &str) -> Result<bool, ()> {
+    /// Also reports whether an argument names a harness's saved tool output
+    /// ([`output_spool`]).
+    fn match_command(&self, words: &[(String, bool)], cwd: &str) -> Result<(bool, bool), ()> {
         let mut work = 0_usize;
-        for word in words {
+        let mut spool = false;
+        for (word, tilde) in words {
             for (argument, from_root) in shell_arguments(word) {
-                let home = argument
-                    .strip_prefix("~/")
-                    .or_else(|| argument.strip_prefix("~\\"));
-                // `~+` is the working directory.
-                let expanded = if let (Some(rest), Some(home)) = (home, self.home.as_deref()) {
-                    join(home, rest)
-                } else if argument == "~+" {
-                    cwd.to_owned()
-                } else if let Some(rest) = argument.strip_prefix("~+/") {
-                    join(cwd, rest)
-                } else {
-                    argument
-                };
+                let expanded = expand_tilde(argument, *tilde, self.home.as_deref(), cwd);
                 // Git reads `REV:path` from the repository root, which only
                 // the marker directory approximates; try the cwd as well.
                 let root = (from_root && !is_absolute(&expanded))
@@ -728,13 +759,25 @@ impl CapturePolicy {
                     let Some(candidate) = normalize_candidate(&expanded, base) else {
                         continue;
                     };
+                    spool |= output_spool(&candidate.path);
                     if self.match_pattern_candidate(&candidate, false, &mut work)? {
-                        return Ok(true);
+                        return Ok((true, spool));
                     }
                 }
             }
         }
-        Ok(false)
+        Ok((false, spool))
+    }
+    /// `candidate` as this host compares it.
+    fn fold_candidate(&self, candidate: Normalized) -> Normalized {
+        if self.fold_case {
+            Normalized {
+                path: fold_path(&candidate.path),
+                flavor: candidate.flavor,
+            }
+        } else {
+            candidate
+        }
     }
     /// Matches the path arguments of Gemini CLI's `read_many_files`, which are
     /// globs expanded case-insensitively (`nocase`) with `**` recursing into
@@ -765,6 +808,13 @@ impl CapturePolicy {
         tool_glob: bool,
         work: &mut usize,
     ) -> Result<bool, ()> {
+        let folded;
+        let candidate = if self.fold_case {
+            folded = self.fold_candidate(candidate.clone());
+            &folded
+        } else {
+            candidate
+        };
         let insensitive = tool_glob || candidate.flavor == Flavor::Windows || self.fold_case;
         let is_glob = candidate.path.contains(['*', '?']);
         // `read_many_files` reads a directory entry (`docs`, `.`) as
@@ -1068,6 +1118,44 @@ fn reads_earlier_output(name: &str) -> bool {
     )
 }
 
+/// Whether a normalized path is a file a harness saved a tool's output to and
+/// tells the model to read back: Claude Code's large results
+/// (`~/.claude/projects/<project>/<session>/tool-results/<id>.txt`) and
+/// background task output (`<tmp>/claude-<uid>/<project>/<session>/tasks/<id>.output`),
+/// OpenCode's truncated output (`<data>/opencode/tool-output/tool_<id>`) and
+/// Pi's (`<tmp>/pi-bash-<id>.log`). The command that produced it may have been
+/// dropped, so, like [`reads_earlier_output`], nothing proves it missed every
+/// ignored path. Segment names compare without regard to ASCII case.
+fn output_spool(path: &str) -> bool {
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let Some((file, directories)) = segments.split_last() else {
+        return false;
+    };
+    let parent = directories.last().map(String::as_str);
+    let claude_results = directories.iter().enumerate().any(|(index, segment)| {
+        segment == "projects"
+            && index > 0
+            && directories[index - 1].contains("claude")
+            && directories[index + 1..]
+                .iter()
+                .any(|segment| segment == "tool-results")
+    });
+    let claude_task = parent == Some("tasks")
+        && file.ends_with(".output")
+        && directories
+            .iter()
+            .any(|segment| segment.starts_with("claude"));
+    let opencode = parent == Some("tool-output")
+        && directories.len() >= 2
+        && directories[directories.len() - 2] == "opencode";
+    let pi = file.starts_with("pi-bash-") && file.ends_with(".log");
+    claude_results || claude_task || opencode || pi
+}
+
 fn family(name: &str) -> ToolFamily {
     match name.to_ascii_lowercase().as_str() {
         "read"
@@ -1227,18 +1315,96 @@ pub fn absolute_tool_location_paths(
             is_absolute(path)
                 .then(|| normalize_candidate(path, cwd))
                 .flatten()
-                .map(|candidate| match candidate.flavor {
-                    // Matching works on `/`-separated paths, but this path
-                    // leaves the policy module: the hook sends its directory
-                    // as the event's `cwd`. It keeps the native style
-                    // (`C:\…`, like every other cwd the hook forwards) so
-                    // the server never sees two spellings of one checkout;
-                    // segment normalization (`.`/`..`) still applies.
-                    Flavor::Windows => candidate.path.replace('/', "\\"),
-                    Flavor::Posix => candidate.path,
-                })
+                .map(native_path)
         })
         .collect()
+}
+
+/// A normalized candidate in its own separator style. Matching works on
+/// `/`-separated paths, but this path leaves the policy module: the hook
+/// sends a directory as the event's `cwd` and looks markers up from it. It
+/// keeps the native style (`C:\…`, like every other cwd the hook forwards)
+/// so the server never sees two spellings of one checkout; segment
+/// normalization (`.`/`..`) still applies.
+fn native_path(candidate: Normalized) -> String {
+    match candidate.flavor {
+        Flavor::Windows => candidate.path.replace('/', "\\"),
+        Flavor::Posix => candidate.path,
+    }
+}
+
+/// Upper bound on the locations [`capture_lookup_locations`] returns for one
+/// tool call.
+pub const MAX_LOOKUP_LOCATIONS: usize = 4_096;
+
+/// The absolute locations a recognized file or shell tool call names, in
+/// their own separator style, for a hook client to find the marker that
+/// governs each: every file-tool target, and every shell argument that names
+/// a path (one with a separator, after `~/` expansion) resolved from the
+/// tool's `workdir` or the `cwd`, plus that directory itself.
+///
+/// A checkout's `ignore_paths` protect its files wherever the call is made
+/// from, so a client applies the policy of each location's own marker as
+/// well as the event's (`cat ../other-checkout/secret.env`). Search/list and
+/// unknown tools yield nothing; their policy is the event's. `None` when the
+/// call names more than [`MAX_LOOKUP_LOCATIONS`] distinct locations, since
+/// nothing then proves which markers govern it.
+pub fn capture_lookup_locations(
+    agent: AgentKind,
+    raw: &Value,
+    cwd: &str,
+    home: Option<&str>,
+) -> Option<Vec<String>> {
+    let extracted = extract(agent, raw);
+    let mut seen = std::collections::HashSet::new();
+    let mut locations = Vec::new();
+    let mut push = |candidate: Option<Normalized>| -> Option<()> {
+        let Some(candidate) = candidate else {
+            return Some(());
+        };
+        let location = native_path(candidate);
+        if seen.insert(location.clone()) {
+            if locations.len() == MAX_LOOKUP_LOCATIONS {
+                return None;
+            }
+            locations.push(location);
+        }
+        Some(())
+    };
+    match (extracted.family, extracted.command.as_ref()) {
+        (ToolFamily::File, _) => {
+            for path in extracted.paths.iter().flatten() {
+                push(normalize_candidate(path, cwd))?;
+            }
+        }
+        (ToolFamily::NonFile, Some(command)) => {
+            let base = command_base(extracted.workdir.as_deref(), cwd);
+            push(normalize_candidate(&base, &base))?;
+            let home = home.and_then(|dir| normalize_root(dir).ok());
+            let split = command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
+            for (word, tilde) in &split.words {
+                for (argument, _) in shell_arguments(word) {
+                    let expanded = expand_tilde(argument, *tilde, home.as_deref(), &base);
+                    if expanded.contains(['/', '\\']) {
+                        push(normalize_candidate(&expanded, &base))?;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(locations)
+}
+
+/// The directory a shell tool's relative arguments resolve from: its own
+/// `workdir` (absolute, or relative to the `cwd`), else the `cwd`.
+fn command_base(workdir: Option<&str>, cwd: &str) -> String {
+    match workdir {
+        Some(dir) if is_absolute(dir) => dir.to_owned(),
+        // `join` would turn an unusable cwd into `/dir`.
+        Some(dir) if is_absolute(cwd) => join(cwd, dir),
+        _ => cwd.to_owned(),
+    }
 }
 
 fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
@@ -1279,18 +1445,24 @@ enum ShellCommand<'a> {
     Argv(Vec<&'a str>),
 }
 
-/// A shell tool's words, plus whether any of them holds syntax the lexical
-/// matcher does not evaluate, which makes a miss unprovable.
+/// A shell tool's words, each with whether a `~` in it was outside quotes
+/// (only such a tilde names a directory), plus whether any of them holds
+/// syntax the lexical matcher does not evaluate, which makes a miss
+/// unprovable.
 #[derive(Default)]
 struct ShellWords {
-    words: Vec<String>,
+    words: Vec<(String, bool)>,
     opaque: bool,
 }
 
 impl ShellCommand<'_> {
     #[cfg(test)]
     fn words(&self) -> Vec<String> {
-        self.split(false).words
+        self.split(false)
+            .words
+            .into_iter()
+            .map(|(word, _)| word)
+            .collect()
     }
 
     /// Every word, and again every word inside a word that holds more than
@@ -1309,9 +1481,9 @@ impl ShellCommand<'_> {
         match self {
             Self::Line(command) => {
                 split.opaque = has_unevaluated_expansion(command);
-                push_nested_words(&shell_words(command), MAX_SHELL_NESTING, &mut split);
+                push_nested_words(&marked_shell_words(command), MAX_SHELL_NESTING, &mut split);
                 if let Some(plain) = windows.then(|| without_windows_escapes(command)).flatten() {
-                    push_nested_words(&shell_words(&plain), MAX_SHELL_NESTING, &mut split);
+                    push_nested_words(&marked_shell_words(&plain), MAX_SHELL_NESTING, &mut split);
                 }
             }
             Self::Argv(items) => {
@@ -1319,36 +1491,63 @@ impl ShellCommand<'_> {
                 // over-approximation its words make.
                 split.opaque = items.iter().any(|item| has_unevaluated_expansion(item))
                     || runs_inline_code(items);
-                for item in items {
-                    push_argv_item(item, &mut split);
+                for (index, item) in items.iter().enumerate() {
+                    // An element reaches the program as is, so only a script
+                    // a shell runs expands a tilde in it.
+                    let script = is_shell_script(items, index);
+                    push_argv_item(item, script, &mut split);
                     if let Some(plain) = windows.then(|| without_windows_escapes(item)).flatten() {
-                        push_argv_item(&plain, &mut split);
+                        push_argv_item(&plain, script, &mut split);
                     }
                 }
             }
         }
+        // PowerShell resolves `~` in a path itself, quoted or not.
+        if windows {
+            for (_, tilde) in &mut split.words {
+                *tilde = true;
+            }
+        }
         // `~-`, `~N` and `~name` name a directory only the running shell
         // knows, so a path under one proves nothing either way.
-        split.opaque |= split.words.iter().any(|word| {
-            shell_arguments(word)
-                .iter()
-                .any(|(argument, _)| names_unknown_directory(argument))
+        split.opaque |= split.words.iter().any(|(word, tilde)| {
+            *tilde
+                && shell_arguments(word)
+                    .iter()
+                    .any(|(argument, _)| names_unknown_directory(argument))
         });
         split
     }
 }
 
-fn push_argv_item(item: &str, split: &mut ShellWords) {
-    let tokens = shell_words(item);
-    if tokens.len() == 1 && tokens[0] == item {
-        push_word(item, split);
+fn push_argv_item(item: &str, script: bool, split: &mut ShellWords) {
+    let tokens = marked_shell_words(item);
+    if tokens.len() == 1 && tokens[0].0 == item {
+        push_word(item, false, split);
         return;
     }
     // Kept whole, a long script would exhaust the match budget.
     if item.chars().count() <= MAX_ARGV_PATH_CHARS {
-        split.words.push(item.to_owned());
+        split.words.push((item.to_owned(), false));
     }
-    push_nested_words(&tokens, MAX_SHELL_NESTING - 1, split);
+    push_nested_words(
+        &literal_tildes(tokens, script),
+        MAX_SHELL_NESTING - 1,
+        split,
+    );
+}
+
+/// `tokens` re-split from one word, whose unquoted tildes count only when a
+/// shell runs that word as a script; in a quoted message or pattern
+/// (`-m "fix ~approx"`, `grep '~[a-z]+'`) a tilde is literal.
+fn literal_tildes(tokens: Vec<(String, bool)>, script: bool) -> Vec<(String, bool)> {
+    if script {
+        return tokens;
+    }
+    tokens
+        .into_iter()
+        .map(|(token, _)| (token, false))
+        .collect()
 }
 
 /// `command` without PowerShell's backquote and cmd's caret escapes, each of
@@ -1381,43 +1580,63 @@ fn names_unknown_directory(argument: &str) -> bool {
     !prefix.is_empty() && prefix != "+"
 }
 
+/// `argument` with a leading unquoted `~/` (PowerShell's `~\`) read as the
+/// home directory and `~+` as the working directory.
+fn expand_tilde(argument: String, tilde: bool, home: Option<&str>, cwd: &str) -> String {
+    if !tilde {
+        return argument;
+    }
+    let under_home = argument
+        .strip_prefix("~/")
+        .or_else(|| argument.strip_prefix("~\\"));
+    if let (Some(rest), Some(home)) = (under_home, home) {
+        join(home, rest)
+    } else if argument == "~+" {
+        cwd.to_owned()
+    } else if let Some(rest) = argument.strip_prefix("~+/") {
+        join(cwd, rest)
+    } else {
+        argument
+    }
+}
+
 /// How many quoting levels a script inside a word is re-split.
 const MAX_SHELL_NESTING: usize = 4;
 
-fn push_nested_words(words: &[String], depth: usize, split: &mut ShellWords) {
-    if runs_inline_code(words) {
+fn push_nested_words(words: &[(String, bool)], depth: usize, split: &mut ShellWords) {
+    let texts: Vec<&str> = words.iter().map(|(word, _)| word.as_str()).collect();
+    if runs_inline_code(&texts) {
         split.opaque = true;
     }
-    for (index, word) in words.iter().enumerate() {
-        push_word(word, split);
-        let tokens = shell_words(word);
-        if tokens.len() == 1 && tokens[0] == *word {
+    for (index, (word, tilde)) in words.iter().enumerate() {
+        push_word(word, *tilde, split);
+        let tokens = marked_shell_words(word);
+        if tokens.len() == 1 && tokens[0].0 == *word {
             continue;
         }
         let Some(depth) = depth.checked_sub(1) else {
             split.opaque = true;
             continue;
         };
-        // Only a script a shell runs expands its braces and classes; a
-        // quoted message or pattern (`git log --format='%h {a,b}'`) does not.
-        if (word.contains("$(") || word.contains('`') || is_shell_script(words, index))
-            && has_unevaluated_expansion(word)
-        {
+        // Only a script a shell runs expands its braces, classes and
+        // tildes; a quoted message or pattern (`git log --format='%h {a,b}'`)
+        // does not.
+        let script = word.contains("$(") || word.contains('`') || is_shell_script(&texts, index);
+        if script && has_unevaluated_expansion(word) {
             split.opaque = true;
         }
-        push_nested_words(&tokens, depth, split);
+        push_nested_words(&literal_tildes(tokens, script), depth, split);
     }
 }
 
 /// Adds a word, and its POSIX reading when it differs: outside quotes a
 /// shell drops the backslash of `\o`, but [`shell_words`] keeps it so a
 /// Windows path keeps its separators. A word with a parameter default
-/// (`${X:-docs/x.md}`) also adds the reading with the operand in its place.
-fn push_word(word: &str, split: &mut ShellWords) {
-    split.words.push(word.to_owned());
-    if let Some(operands) = parameter_operands(word) {
-        split.words.push(operands);
-    }
+/// (`${X:-docs/x.md}`) also adds the reading with the operand in its place,
+/// of the word as written and of its POSIX reading (`${X:-d\ocs/x.md}`).
+/// `tilde` says whether a `~` in the word was outside quotes.
+fn push_word(word: &str, tilde: bool, split: &mut ShellWords) {
+    push_word_reading(word, tilde, split);
     if word.contains('\\') {
         let mut plain = String::with_capacity(word.len());
         let mut chars = word.chars();
@@ -1429,24 +1648,35 @@ fn push_word(word: &str, split: &mut ShellWords) {
             }
         }
         if plain != word {
-            split.words.push(plain);
+            push_word_reading(&plain, tilde, split);
         }
+    }
+}
+
+fn push_word_reading(word: &str, tilde: bool, split: &mut ShellWords) {
+    split.words.push((word.to_owned(), tilde));
+    if let Some((operands, exhausted)) = parameter_operands(word) {
+        split.words.push((operands, tilde));
+        // A default nested deeper than the matcher reads is unprovable.
+        split.opaque |= exhausted;
     }
 }
 
 /// `word` with each `${NAME:-word}`, `${NAME:=word}` or `${NAME:+word}`
 /// (or the form without `:`) replaced by its operand, which the shell
 /// substitutes when `NAME` is unset (set, for `+`). Nested operands are
-/// replaced down to [`MAX_SHELL_NESTING`] levels.
-fn parameter_operands(word: &str) -> Option<String> {
+/// replaced down to [`MAX_SHELL_NESTING`] levels; the flag is set when one
+/// is nested deeper still.
+fn parameter_operands(word: &str) -> Option<(String, bool)> {
     let mut current = replace_parameter_operands(word)?;
     for _ in 1..MAX_SHELL_NESTING {
         match replace_parameter_operands(&current) {
             Some(next) => current = next,
-            None => break,
+            None => return Some((current, false)),
         }
     }
-    Some(current)
+    let exhausted = replace_parameter_operands(&current).is_some();
+    Some((current, exhausted))
 }
 
 fn replace_parameter_operands(word: &str) -> Option<String> {
@@ -1747,10 +1977,21 @@ fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
 /// opens or closes a command substitution, so it separates too. An ANSI-C
 /// string (`$'…'`) has its escapes decoded; numeric and control escapes stay
 /// as written, and [`has_unevaluated_expansion`] reports them.
+#[cfg(test)]
 fn shell_words(command: &str) -> Vec<String> {
+    marked_shell_words(command)
+        .into_iter()
+        .map(|(word, _)| word)
+        .collect()
+}
+
+/// [`shell_words`], each word with whether it holds a `~` outside quotes and
+/// not after a backslash, the only tilde a shell expands.
+fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
     let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`');
     let mut words = Vec::new();
     let mut word = String::new();
+    let mut tilde = false;
     let mut in_word = false;
     let mut quote = None;
     let mut chars = command.chars().peekable();
@@ -1797,18 +2038,19 @@ fn shell_words(command: &str) -> Vec<String> {
             }
             (None, c) if c.is_whitespace() || is_operator(c) => {
                 if in_word {
-                    words.push(std::mem::take(&mut word));
-                    in_word = false;
+                    words.push((std::mem::take(&mut word), tilde));
+                    (in_word, tilde) = (false, false);
                 }
             }
             (None, c) => {
+                tilde |= c == '~' && !word.ends_with('\\');
                 word.push(c);
                 in_word = true;
             }
         }
     }
     if in_word {
-        words.push(word);
+        words.push((word, tilde));
     }
     words
 }
@@ -1869,12 +2111,15 @@ fn shell_arguments(word: &str) -> Vec<(String, bool)> {
 }
 
 /// The local path a `file:` URL names (`file:///x`, `file://host/x`,
-/// `file:/x`, any case), with ASCII percent-escapes decoded.
+/// `file:/x`, any case), with ASCII percent-escapes decoded. A query or
+/// fragment (`?…`, `#…`) is not part of the path; an escaped `%3F` or `%23`
+/// is, so the URL is cut before decoding.
 fn file_url_path(argument: &str) -> Option<String> {
     if !argument.get(..5)?.eq_ignore_ascii_case("file:") {
         return None;
     }
     let rest = &argument[5..];
+    let rest = rest.find(['?', '#']).map_or(rest, |end| &rest[..end]);
     let path = match rest.strip_prefix("//") {
         Some(authority) => &authority[authority.find('/')?..],
         None => rest,
@@ -2284,6 +2529,15 @@ fn globstar_reaches(glob: &str, prefix: &str, insensitive: bool) -> bool {
         return glob_reaches(glob, prefix, insensitive);
     }
     glob_match(head, &prefix[..offset.min(prefix.len())], None, insensitive)
+}
+/// A path as a case-folding (macOS) host compares it: composed (NFC), since
+/// its filesystem reads a decomposed `é` as the composed one, then lowercased
+/// with the full Unicode mapping (`Ä` as `ä`), which the generated
+/// TypeScript's `normalize("NFC").toLowerCase()` mirrors.
+fn fold_path(path: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(path)
+        .to_lowercase()
 }
 fn char_equal(left: char, right: char, insensitive: bool) -> bool {
     if insensitive && left.is_ascii() && right.is_ascii() {
@@ -3695,6 +3949,139 @@ mod tests {
         );
     }
 
+    /// A file a harness saved a tool's output to (Claude Code's
+    /// `tool-results/` and background `tasks/*.output`, OpenCode's
+    /// `tool-output/`, Pi's `pi-bash-*.log`) holds an earlier command's
+    /// output, which may come from a dropped event, so reading it back is
+    /// metadata-only under an active or invalid policy, like `BashOutput`.
+    /// Without a policy it is kept, and an ignored path still drops.
+    #[test]
+    fn reading_a_harness_output_spool_is_metadata_only_under_a_policy() {
+        let active = shell_policy();
+        let invalid = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        let inactive = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
+        let read = |path: &str| {
+            json!({
+                "tool_name": "Read", "tool_input": {"file_path": path},
+                "tool_response": "PRIVATE_BODY_SENTINEL",
+            })
+        };
+        let disposition = |policy: &CapturePolicy, raw: &Value| {
+            policy
+                .inspect(AgentKind::ClaudeCode, raw, "/repo")
+                .protocol()
+                .disposition()
+        };
+        for spool in [
+            "/tmp/claude-1000/-repo/0f1e/tasks/bvljb9mrz.output",
+            "/private/var/folders/x/T/claude-501/-repo/0f1e/tasks/b1.output",
+            "/home/me/.claude/projects/-repo/0f1e/tool-results/toolu_1.txt",
+            "C:\\Users\\me\\.claude\\projects\\-repo\\0f1e\\tool-results\\t.txt",
+            "/home/me/.local/share/opencode/tool-output/tool_10a9b7111001",
+            "/tmp/pi-bash-0a1b2c3d4e5f6a7b.log",
+        ] {
+            for policy in [&active, &invalid] {
+                let decision = policy.inspect(AgentKind::ClaudeCode, &read(spool), "/repo");
+                assert_eq!(
+                    decision.protocol().disposition(),
+                    CaptureDisposition::MetadataOnly,
+                    "{spool}"
+                );
+                let body = metadata_only_body(Some("s"), Some("/repo"), &decision).to_string();
+                assert!(!body.contains("PRIVATE_BODY_SENTINEL"), "{body}");
+            }
+            assert_eq!(
+                disposition(&inactive, &read(spool)),
+                CaptureDisposition::Keep
+            );
+            assert_eq!(
+                disposition(&active, &bash(&format!("cat '{spool}'"))),
+                CaptureDisposition::MetadataOnly,
+                "{spool}"
+            );
+        }
+        // Controls: the same names elsewhere are ordinary files.
+        for path in [
+            "/tmp/claude-1000/-repo/0f1e/scratchpad/notes.txt",
+            "/repo/tasks/b1.output",
+            "/repo/projects/x/0f1e/tool-results/a.txt",
+            "/repo/tool-output/tool_1",
+            "/repo/src/pi-bash.rs",
+        ] {
+            assert_eq!(
+                disposition(&active, &read(path)),
+                CaptureDisposition::Keep,
+                "{path}"
+            );
+            assert_eq!(
+                disposition(&active, &bash(&format!("cat {path}"))),
+                CaptureDisposition::Keep,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            disposition(&active, &bash("cat docs/adr/1.md /tmp/pi-bash-1.log")),
+            CaptureDisposition::Drop
+        );
+    }
+
+    /// The locations a call names, for the hook to find each one's marker:
+    /// every file target, and every shell argument that spells a path,
+    /// resolved from the tool's directory, plus that directory.
+    #[test]
+    fn capture_lookup_locations_name_every_path_a_call_spells() {
+        let locations = |raw: &Value| {
+            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", Some("/home/me"))
+        };
+        assert_eq!(
+            locations(
+                &json!({"tool_name": "Read", "tool_input": {"file_path": "../a/secrets.env"}})
+            ),
+            Some(vec!["/work/a/secrets.env".to_owned()])
+        );
+        assert_eq!(
+            locations(&bash(
+                "cat ../a/secrets.env /abs/c/x ~/notes/y \"~/lit/z\" secrets.env --in=../d/e"
+            )),
+            Some(vec![
+                "/work/b".to_owned(),
+                "/work/a/secrets.env".to_owned(),
+                "/abs/c/x".to_owned(),
+                "/home/me/notes/y".to_owned(),
+                "/work/b/~/lit/z".to_owned(),
+                "/work/d/e".to_owned(),
+            ])
+        );
+        assert_eq!(
+            locations(&json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "cat secrets.env", "workdir": "/work/a"},
+            })),
+            Some(vec!["/work/a".to_owned()])
+        );
+        assert_eq!(
+            capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &json!({"tool_name": "Read", "tool_input": {"file_path": "C:\\a\\x.md"}}),
+                "C:\\b",
+                None,
+            ),
+            Some(vec!["C:\\a\\x.md".to_owned()])
+        );
+        // Search/list and unknown tools stay with the event's own policy.
+        for raw in [
+            json!({"tool_name": "Grep", "tool_input": {"path": "../a"}}),
+            json!({"tool_name": "FutureTool", "tool_input": {"path": "../a/x"}}),
+        ] {
+            assert_eq!(locations(&raw), Some(Vec::new()));
+        }
+        let many = (0..=MAX_LOOKUP_LOCATIONS)
+            .map(|index| format!("d{index}/x"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(locations(&bash(&format!("cat {many}"))), None);
+    }
+
     /// Copilot CLI's runtime `view`/`create` names are file tools for that
     /// agent only; another agent's same-named tool stays unknown.
     #[test]
@@ -4380,6 +4767,41 @@ mod tests {
                 .disposition(),
             CaptureDisposition::Keep
         );
+        // Beyond ASCII: the full lowercase mapping, and a decomposed `É`
+        // (`E` + U+0301) is the composed one.
+        let unicode = CapturePolicy::resolve_for_host(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["Écrits/Ärger/**".into()],
+            }),
+            "/repo",
+            None,
+            true,
+        );
+        for path in [
+            "écrits/ärger/x.md",
+            "ÉCRITS/ÄRGER/x.md",
+            "E\u{301}crits/A\u{308}rger/x.md",
+        ] {
+            let read = json!({"tool_name": "Read", "tool_input": {"file_path": path}});
+            for raw in [read, bash(&format!("cat {path}"))] {
+                assert_eq!(
+                    unicode
+                        .inspect(AgentKind::ClaudeCode, &raw, "/repo")
+                        .protocol()
+                        .disposition(),
+                    CaptureDisposition::Drop,
+                    "{path}"
+                );
+            }
+        }
+        let other = json!({"tool_name": "Read", "tool_input": {"file_path": "ecrits/arger/x.md"}});
+        assert_eq!(
+            unicode
+                .inspect(AgentKind::ClaudeCode, &other, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
         assert!(
             !CapturePolicy::resolve(CaptureSource::Absent, "/repo", None).fold_case,
             "an inactive policy never folds"
@@ -4451,6 +4873,15 @@ mod tests {
             "git log --oneline HEAD~3..HEAD",
             "git rebase -i HEAD~2",
             "echo a^b",
+            // A quoted tilde is literal, and a query or fragment is not part
+            // of a `file:` URL's path.
+            "git commit -m \"fix ~approx\"",
+            "grep -E '~[a-z]+' f",
+            "echo 'a ~b c'",
+            "sed -i 's/~old/~new/' src/main.rs",
+            "curl -s 'file:///tmp/report.txt?x=1#top'",
+            "echo ${A:-${B:-${C:-x}}}",
+            "tail -f /tmp/claude-1000/-repo/0f1e/scratchpad/build.log",
         ] {
             assert_eq!(
                 policy
