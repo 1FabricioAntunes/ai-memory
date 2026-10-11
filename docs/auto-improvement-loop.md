@@ -402,7 +402,7 @@ matching every page.
 
 Note that `max_patchable_pages` still bounds how many of the matching pages are
 sent, and the recent-page list they are drawn from is ordered by recency, so a
-project with heavy `sessions/` churn may still crowd out durable pages.
+durable page that has not been updated recently can fall outside it.
 
 
 `[auto_improve.scheduler]` controls whether and how often the server launches
@@ -544,10 +544,11 @@ validation.
 The reviewer does not see every page. Two limits shape what durable knowledge it
 can notice already exists, and therefore what it may redundantly re-propose:
 
-- **Only `_rules/` and `procedures/` page *bodies* are loaded** for patch
-  context (`load_patchable_pages`). Durable pages in other families
-  (`decisions/`, `gotchas/`, `concepts/`, `notes/`) are not sent to the reviewer
-  in full.
+- **Only page *bodies* under `patchable_page_prefixes` are loaded**
+  (`load_patchable_pages`). The default is `_rules/` and `procedures/`; durable
+  pages in other families (`decisions/`, `gotchas/`, `concepts/`, `notes/`) are
+  not sent to the reviewer in full unless their folder is added. Patch
+  proposals stay limited to `_rules/` and `procedures/` either way.
 - **The "recent pages" list is recency-ordered, one line per page** (path,
   title, kind, updated_at), drawn from the project briefing. Because it is a flat
   bounded list, a project with many pages only shows the reviewer the most
@@ -557,8 +558,8 @@ can notice already exists, and therefore what it may redundantly re-propose:
   the list). This exclusion is scoped to the reviewer only; the SessionStart
   briefing and `memory_briefing` still include session pages, where they belong.
 
-The practical consequence: a durable page that lives outside `_rules/` /
-`procedures/` and is not among the most-recent pages may be invisible to the
+The practical consequence: a durable page that lives outside the configured
+prefixes and is not among the most-recent pages may be invisible to the
 reviewer, so the same lesson can be proposed again. Reviewer duplicates are
 caught downstream (validation rejects a proposal whose path/title duplicates an
 existing page it *can* see, and staging enforces one pending proposal per
@@ -567,8 +568,6 @@ prevented at review time.
 
 Deferred improvements (future work, not in this line):
 
-- **Configurable patchable prefixes**, so `decisions/`/`gotchas/` bodies can
-  reach the reviewer without hard-coding the family list.
 - **Embedding-nearest dedup**, replacing the recency-ordered flat list with a
   retrieval of the pages semantically closest to the session under review, so
   relevant durable pages are surfaced regardless of recency.
