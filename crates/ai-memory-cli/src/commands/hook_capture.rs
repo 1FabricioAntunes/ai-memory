@@ -402,6 +402,16 @@ impl HookScope {
         self.project.is_some() || self.identity.is_some()
     }
 
+    /// Whether a project the server derives from the cwd follows the
+    /// enclosing repository (`repo-root`) rather than the cwd's own folder,
+    /// the default `basename`.
+    pub(crate) fn derives_from_repo_root(&self) -> bool {
+        matches!(
+            self.project_strategy.as_deref(),
+            Some("repo-root" | "repo_root")
+        )
+    }
+
     /// Whether both names were resolved on the host.
     #[must_use]
     pub fn is_explicit(&self) -> bool {

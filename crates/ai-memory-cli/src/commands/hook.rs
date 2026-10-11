@@ -1595,9 +1595,15 @@ pub(crate) fn delivers_to_same_server(data_dir: &Path, source: &str, destination
 /// Whether the live hook would file events from `destination` under the same
 /// project as events from `source`. Both must send the same routing hints
 /// ([`hook_scope`]). When those hints name no project or identity, the server
-/// derives one from the cwd itself, matching it to the project that owns the
-/// enclosing repository: the two then agree only inside one repository and
-/// marker boundary, or, outside any repository, in the same directory.
+/// derives one from the cwd itself. Under the default `basename` strategy it
+/// names the project after the cwd's own folder, and a cwd below a project
+/// anchored at its repository root (one first seen at that root) joins that
+/// project: the two agree in the same directory, or when `source` is the
+/// root of the repository and marker boundary `destination` lies in. Two
+/// subdirectories of one repository are two projects. Under `repo-root` it
+/// matches the cwd to the project that owns the enclosing repository: the
+/// two then agree inside one repository and marker boundary, or, outside any
+/// repository, in the same directory.
 /// A transcript import posts every event under one project, so an event the
 /// hook would file under another project must not ride along.
 pub(crate) fn routes_to_same_project(source: &str, destination: &str) -> bool {
@@ -1608,11 +1614,25 @@ pub(crate) fn routes_to_same_project(source: &str, destination: &str) -> bool {
     if scope.names_the_project() {
         return true;
     }
-    let anchor = |cwd: &str| existing_target_dir(Path::new(cwd)).map(|dir| file_route_anchor(&dir));
-    match (anchor(source), anchor(destination)) {
-        (Some(source), Some(destination)) if source.repository.is_some() => source == destination,
-        _ => lexical_capture_cwd(source) == lexical_capture_cwd(destination),
+    let (source_dir, destination_dir) = (
+        lexical_capture_cwd(source),
+        lexical_capture_cwd(destination),
+    );
+    if source_dir == destination_dir {
+        return true;
     }
+    let anchor = |cwd: &str| existing_target_dir(Path::new(cwd)).map(|dir| file_route_anchor(&dir));
+    let same_repository = || match (anchor(source), anchor(destination)) {
+        (Some(source), Some(destination)) => source.repository.is_some() && source == destination,
+        _ => false,
+    };
+    if scope.derives_from_repo_root() {
+        return same_repository();
+    }
+    let source_dir = Path::new(&source_dir);
+    Path::new(&destination_dir).starts_with(source_dir)
+        && crate::marker::checkout_root(source_dir).as_deref() == Some(source_dir)
+        && same_repository()
 }
 
 /// Normalize the raw hook `cwd` into the base `policy.inspect` joins a tool
@@ -3596,6 +3616,54 @@ mod tests {
                 entries[0].body
             );
         }
+    }
+
+    /// Under the default `basename` strategy the server files two
+    /// subdirectories of one unmarked repository under two projects, so an
+    /// import from one must not take the other's events. The same directory
+    /// still agrees, a subdirectory joins a project rooted at the repository
+    /// root, and a `repo-root` marker keeps the whole repository together.
+    #[test]
+    fn subdirectories_of_one_repository_are_one_project_only_under_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (basename, repo_root) = (tmp.path().join("rr"), tmp.path().join("rt"));
+        for repo in [&basename, &repo_root] {
+            for sub in ["sub1", "sub2"] {
+                std::fs::create_dir_all(repo.join(sub)).unwrap();
+            }
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(repo)
+                .status()
+                .unwrap();
+            assert!(init.success());
+        }
+        std::fs::write(
+            repo_root.join(".ai-memory.toml"),
+            "project_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
+        let path = |dir: &Path| dir.to_string_lossy().into_owned();
+        assert!(!routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename.join("sub2"))
+        ));
+        assert!(!routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename)
+        ));
+        assert!(routes_to_same_project(
+            &path(&basename),
+            &path(&basename.join("sub1"))
+        ));
+        assert!(routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename.join("sub1").join("."))
+        ));
+        assert!(routes_to_same_project(
+            &path(&repo_root.join("sub1")),
+            &path(&repo_root.join("sub2"))
+        ));
     }
 
     #[tokio::test]
