@@ -892,7 +892,7 @@ fn parse_claude(
         losses.push("Claude non-conversation message records were intentionally excluded".into());
         return;
     }
-    if role == "user" && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+    if role == "user" && value.get("isCompactSummary").is_some_and(truthy) {
         // The summary Claude Code writes after compacting the conversation,
         // recorded as a user turn the operator never typed.
         let text = message.get("content").map(value_text).unwrap_or_default();
@@ -931,20 +931,23 @@ fn parse_claude(
 /// A user turn Claude Code writes itself to report a background task: a
 /// monitored command's streamed output, a finished background command or
 /// agent and its result. No prompt hook fires for it, so live capture never
-/// stores it as a prompt.
+/// stores it as a prompt. Recognized by an `origin.kind` of
+/// `task-notification` in any case, or by a first text block that opens with
+/// a `<task-notification>` tag in any case, attributes allowed, after any
+/// byte-order mark, zero-width character or whitespace.
 fn claude_task_notification(record: &Value, message: &Value) -> bool {
     let origin = |value: &Value| {
         value
             .pointer("/origin/kind")
             .and_then(Value::as_str)
-            .is_some_and(|kind| kind == "task-notification")
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("task-notification"))
     };
     if origin(record) || origin(message) {
         return true;
     }
     let first_text = match message.get("content") {
         Some(Value::String(text)) => Some(text.as_str()),
-        Some(Value::Array(blocks)) => blocks.first().and_then(|block| {
+        Some(Value::Array(blocks)) => blocks.iter().find_map(|block| {
             block.as_str().or_else(|| {
                 (block.get("type").and_then(Value::as_str) == Some("text"))
                     .then(|| first_string(block, &["text"]))
@@ -953,7 +956,36 @@ fn claude_task_notification(record: &Value, message: &Value) -> bool {
         }),
         _ => None,
     };
-    first_text.is_some_and(|text| text.trim_start().starts_with("<task-notification>"))
+    first_text.is_some_and(|text| {
+        const TAG: &str = "<task-notification";
+        let text = text.trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}'
+                )
+        });
+        text.get(..TAG.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(TAG))
+            && text[TAG.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+    })
+}
+
+/// A record flag Claude Code writes as `true`, and that a rewritten
+/// transcript may carry as `"true"` or `1`.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(text) => {
+            let text = text.trim();
+            text.eq_ignore_ascii_case("true") || text == "1"
+        }
+        _ => false,
+    }
 }
 
 fn parse_codex(
@@ -5716,6 +5748,37 @@ mod tests {
                 json!({"origin":{"kind":"human"}}),
                 "why does <task-notification> show up?".into(),
             ),
+            user(
+                "bom",
+                json!({}),
+                "\u{feff}\u{200b} <Task-Notification id=\"t1\">BOMSENTINEL</Task-Notification>"
+                    .into(),
+            ),
+            user(
+                "later-block",
+                json!({}),
+                json!([{"type":"image","source":{}},{"type":"text","text":"<TASK-NOTIFICATION>\nLATERSENTINEL"}]),
+            ),
+            user(
+                "origin-case",
+                json!({"origin":{"kind":"Task-Notification"}}),
+                "[ORIGINSENTINEL]".into(),
+            ),
+            user(
+                "summary-string",
+                json!({"isCompactSummary":"true"}),
+                "STRINGSUMMARY".into(),
+            ),
+            user(
+                "summary-number",
+                json!({"isCompactSummary":1}),
+                "NUMBERSUMMARY".into(),
+            ),
+            user(
+                "lookalike",
+                json!({"isCompactSummary":"false"}),
+                "<task-notifications are odd>".into(),
+            ),
         ];
         let mut events = Vec::new();
         let mut losses = Vec::new();
@@ -5728,7 +5791,13 @@ mod tests {
             .filter(|event| event.kind == WorkstreamEventKind::Message)
             .map(|event| event.content.as_str())
             .collect();
-        assert_eq!(messages, ["why does <task-notification> show up?"]);
+        assert_eq!(
+            messages,
+            [
+                "why does <task-notification> show up?",
+                "<task-notifications are odd>"
+            ]
+        );
         let compactions: Vec<&str> = events
             .iter()
             .filter(|event| event.kind == WorkstreamEventKind::Compaction)
@@ -5736,12 +5805,16 @@ mod tests {
             .collect();
         assert_eq!(
             compactions,
-            ["This session is being continued. SUMMARYSENTINEL"]
+            [
+                "This session is being continued. SUMMARYSENTINEL",
+                "STRINGSUMMARY",
+                "NUMBERSUMMARY"
+            ]
         );
-        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events.len(), 5, "{events:?}");
         assert_eq!(
             losses,
-            ["Claude task notifications were intentionally excluded"; 3]
+            ["Claude task notifications were intentionally excluded"; 6]
         );
     }
 
