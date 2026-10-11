@@ -54,7 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file tool whose target cannot be read. A glob inside the event's own
   checkout is not walked, so ordinary monorepo commands over many packages
   (`cat packages/*/package.json`, `du -sh packages/*`) keep their output with
-  or without a marker. A `..` after a `**`, a brace expansion, a zsh glob
+  or without a marker. A `..` after a `**`, a dot glob that older bash
+  expands to the parent directory, a brace expansion, a zsh glob
   group, an ANSI-C escape, an indented `apply_patch` header and Hermes
   `search_files`' `file_glob` filter can no longer hide which checkout a call
   reaches. A broken

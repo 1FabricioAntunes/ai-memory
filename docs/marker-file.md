@@ -585,7 +585,10 @@ file read. An argument containing `*` or `?` also matches when its glob can
 reach a pattern's directory: `cat docs/*/0001.md` is dropped under
 `docs/adr/**`, `cat *.md` at the repository root is not. A `**` matches no
 directory as well as many under zsh and bash's `globstar`, so a `..` after it
-is read both ways. A command that exceeds
+is read both ways. bash before 5.2 (macOS ships 3.2) also lets a pattern that
+starts with a dot match the `..` entry, so a directory segment that could
+(a dot followed by `*`, `?` or a class admitting a dot) is read as `..` as
+well. A command that exceeds
 the match budget is dropped. A command that no argument matches outright is
 **metadata-only** when it uses syntax the matcher does not evaluate: an
 unquoted brace expansion (`docs/{adr,x}/1.md`, `{1..3}`), a bracket class
@@ -649,7 +652,8 @@ followed. The walk reads at most 32,768 directory entries, visits at most 256
 directories and runs at most 50 ms per call; past any bound the call is
 metadata-only, and so is glob syntax that can leave its leading directories: a
 brace or group spanning a separator, a `..` or `~` alternative, or a brace
-expansion that builds one. A `..` after a `**` is looked up in both readings,
+expansion that builds one. A `..` after a `**`, and a dot-glob directory
+segment that older bash can expand to `..`, are looked up in both readings,
 and a zsh glob group or an ANSI-C numeric escape is looked up as the shell
 expands it. An older server drops these metadata-only shell and output-reader
 events, so upgrade the server before the clients. Excluding content before transport

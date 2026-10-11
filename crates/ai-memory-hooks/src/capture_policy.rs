@@ -2805,8 +2805,10 @@ const MAX_GLOBSTAR_READINGS: usize = 16;
 /// one it matched), which a lexical `..` that removes the `**` misses: every
 /// such `..` gives two readings, the `**` matching nothing (the `..` steps
 /// back from the segment before it) and the `**` matching at least one
-/// directory (the `**` stays). `Ok(None)` when the candidate is not a usable
-/// path; `Err` past [`MAX_GLOBSTAR_READINGS`], which proves nothing.
+/// directory (the `**` stays). A directory segment that an older bash can
+/// expand to `..` ([`could_name_parent`]) is also read as `..`. `Ok(None)`
+/// when the candidate is not a usable path; `Err` past
+/// [`MAX_GLOBSTAR_READINGS`], which proves nothing.
 fn normalize_readings(candidate: &str, cwd: &str) -> Result<Option<Vec<Normalized>>, ()> {
     let Some((raw, flavor)) = candidate_raw(candidate, cwd) else {
         return Ok(None);
@@ -2814,27 +2816,37 @@ fn normalize_readings(candidate: &str, cwd: &str) -> Result<Option<Vec<Normalize
     let Some((root, tail)) = split_root(&raw) else {
         return Ok(None);
     };
+    let segments: Vec<&str> = tail
+        .into_iter()
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
     let mut readings: Vec<Vec<&str>> = vec![Vec::new()];
-    for part in tail {
-        if part.is_empty() || part == "." {
-            continue;
-        }
+    for (index, &part) in segments.iter().enumerate() {
+        // A directory segment an older bash can expand to `..` is read as
+        // that too.
+        let directory = index + 1 < segments.len();
+        let parent = directory && part != ".." && could_name_parent(part);
         let mut next: Vec<Vec<&str>> = Vec::with_capacity(readings.len());
-        for mut parts in readings {
+        for parts in readings {
+            if parent {
+                let mut up = parts.clone();
+                up.pop();
+                keep(&mut next, up);
+            }
             if part != ".." {
-                parts.push(part);
+                let mut down = parts;
+                down.push(part);
+                keep(&mut next, down);
             } else if parts.last().is_some_and(|last| last.contains("**")) {
                 let mut none = parts.clone();
                 none.pop();
                 none.pop();
-                if !next.contains(&none) {
-                    next.push(none);
-                }
+                keep(&mut next, none);
+                keep(&mut next, parts);
             } else {
-                parts.pop();
-            }
-            if !next.contains(&parts) {
-                next.push(parts);
+                let mut up = parts;
+                up.pop();
+                keep(&mut next, up);
             }
         }
         if next.len() > MAX_GLOBSTAR_READINGS {
@@ -2851,6 +2863,68 @@ fn normalize_readings(candidate: &str, cwd: &str) -> Result<Option<Vec<Normalize
             })
             .collect(),
     ))
+}
+
+/// Adds a reading unless an equal one is already there.
+fn keep<'a>(readings: &mut Vec<Vec<&'a str>>, parts: Vec<&'a str>) {
+    if !readings.contains(&parts) {
+        readings.push(parts);
+    }
+}
+
+/// Whether a glob segment can match `..` in a shell that, like bash before
+/// 5.2, lets a pattern with a leading `.` match the `.` and `..` entries
+/// (`.*`, `.?`, a class after the dot that admits `.`). zsh and newer bash
+/// never do; reading the segment as `..` as well only adds a reading.
+fn could_name_parent(segment: &str) -> bool {
+    let Some(rest) = segment.strip_prefix('.') else {
+        return false;
+    };
+    rest.contains(['*', '?', '[']) && class_glob_matches(&rest.chars().collect::<Vec<_>>(), &['.'])
+}
+
+/// A one-segment glob over `*`, `?` and `[…]` classes (`!` or `^` negates,
+/// `a-z` ranges, a leading `]` is a member) matched against `text`. A `[`
+/// without a closing `]` is literal.
+fn class_glob_matches(pattern: &[char], text: &[char]) -> bool {
+    match pattern.first() {
+        None => text.is_empty(),
+        Some('*') => (0..=text.len()).any(|skip| class_glob_matches(&pattern[1..], &text[skip..])),
+        Some('?') => !text.is_empty() && class_glob_matches(&pattern[1..], &text[1..]),
+        Some('[') => {
+            let negated = matches!(pattern.get(1), Some('!' | '^'));
+            let start = if negated { 2 } else { 1 };
+            // A `]` right after the opening (and negation) is a member.
+            let close = pattern
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, c)| **c == ']')
+                .map(|(index, _)| index);
+            let Some(close) = close else {
+                return text.first() == Some(&'[') && class_glob_matches(&pattern[1..], &text[1..]);
+            };
+            let Some(&c) = text.first() else {
+                return false;
+            };
+            let members = &pattern[start..close];
+            let mut index = 0;
+            let mut found = false;
+            while index < members.len() {
+                if index + 2 < members.len() && members[index + 1] == '-' {
+                    found |= (members[index]..=members[index + 2]).contains(&c);
+                    index += 3;
+                } else {
+                    found |= members[index] == c;
+                    index += 1;
+                }
+            }
+            found != negated && class_glob_matches(&pattern[close + 1..], &text[1..])
+        }
+        Some(&literal) => {
+            text.first() == Some(&literal) && class_glob_matches(&pattern[1..], &text[1..])
+        }
+    }
 }
 
 /// A candidate joined to `cwd` when relative, with the flavor its matching
@@ -4981,6 +5055,55 @@ mod tests {
             assert!(
                 locations(&raw).contains(&"/work/a/secrets.env".to_owned()),
                 "{raw}"
+            );
+        }
+    }
+
+    /// Adversarial: bash before 5.2 lets a leading-dot pattern match `..`, so
+    /// a directory segment that can (`.` then `*`, `?` or a class admitting
+    /// `.`) is read as `..` too, by the event's own matcher and the lookup.
+    /// Controls: a final segment, a literal dot directory and a dot glob that
+    /// cannot match `..` read as before.
+    #[test]
+    fn a_dot_glob_directory_that_can_match_the_parent_is_read_as_it() {
+        for segment in [".*", ".?", ".[.]", ".[!x]", ".[^x]", ".[--0]", ".**"] {
+            assert!(could_name_parent(segment), "{segment}");
+        }
+        for segment in [
+            ".g*", ".[!.]", ".[x]", "*", "?", "..", ".", ".config", ".?x",
+        ] {
+            assert!(!could_name_parent(segment), "{segment}");
+        }
+        let paths = |candidate: &str| {
+            normalize_readings(candidate, "/work/b")
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|reading| reading.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(".*/a/x"), ["/work/a/x", "/work/b/.*/a/x"]);
+        assert_eq!(paths("./.?/a/x"), ["/work/a/x", "/work/b/.?/a/x"]);
+        assert_eq!(paths("src/.*"), ["/work/b/src/.*"]);
+        assert_eq!(paths(".github/*.yml"), ["/work/b/.github/*.yml"]);
+        assert_eq!(
+            normalize_readings(&".*/".repeat(20), "/work/b").map(|r| r.is_some()),
+            Err(())
+        );
+        let locations = |command: &str| {
+            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
+                .unwrap()
+        };
+        for command in ["cat .*/a/secrets.env", "cat ./.?/a/secrets.env"] {
+            assert!(
+                locations(command).contains(&"/work/a/secrets.env".to_owned()),
+                "{command}"
+            );
+        }
+        for command in ["ls .*", "cat .config/x", "cat .github/*.yml"] {
+            assert!(
+                locations(command).iter().all(|l| l.starts_with("/work/b")),
+                "{command}"
             );
         }
     }

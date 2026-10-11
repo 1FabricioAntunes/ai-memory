@@ -3892,6 +3892,12 @@ mod tests {
                 "claude-code",
                 bash("cat $'\\056\\056'/a/secrets.env"),
             ),
+            ("dot star", "claude-code", bash("cat .*/a/secrets.env")),
+            (
+                "dot question",
+                "claude-code",
+                bash("cat ./.?/a/secrets.env"),
+            ),
             (
                 "indented patch header",
                 "codex",
@@ -3928,6 +3934,9 @@ mod tests {
             ("own brace", "claude-code", bash("cat {sub,lib}/README.md")),
             ("own sequence", "claude-code", bash("cat v{1..3}/README.md")),
             ("subshell", "claude-code", bash("(cd sub && ls)")),
+            ("dot list", "claude-code", bash("ls .*")),
+            ("dot directory", "claude-code", bash("cat .config/x")),
+            ("dot glob", "claude-code", bash("cat .github/*.yml")),
             (
                 "ansi-c own",
                 "claude-code",
