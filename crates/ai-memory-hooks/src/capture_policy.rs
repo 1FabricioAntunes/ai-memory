@@ -724,11 +724,10 @@ impl CapturePolicy {
             if *work > MAX_MATCH_WORK {
                 return Err(());
             }
-            let reaches = if tool_glob {
-                globstar_reaches
-            } else {
-                glob_reaches
-            };
+            // Treat `**` as recursive for shell globs too: bash leaves it a
+            // single segment, but zsh (and bash with `globstar`) recurse, and
+            // an over-eager drop is the safe side of a capture exclusion.
+            let reaches = globstar_reaches;
             if (under_prefix
                 && glob_match(
                     &pattern.path,
@@ -2383,6 +2382,24 @@ mod tests {
         json!({"tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "call-1"})
     }
 
+    /// zsh, and bash with `globstar`, recurse on `**`, so a shell glob whose
+    /// `**` can descend into an ignored directory drops the event; a `**`
+    /// rooted elsewhere is still kept (control).
+    #[test]
+    fn recursive_shell_globs_cannot_reach_ignored_paths() {
+        let policy = shell_policy();
+        for command in ["cat **/*.md", "cat **/0001.md", "cat docs/**/0001.md"] {
+            let decision = policy.inspect(AgentKind::ClaudeCode, &bash(command), "/repo");
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "{command}"
+            );
+        }
+        let decision = policy.inspect(AgentKind::ClaudeCode, &bash("cat src/**/main.rs"), "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+    }
+
     /// The drop/keep tables live in the shared fixture so the generated
     /// TypeScript matcher runs the very same vectors (#961).
     #[test]
@@ -2751,7 +2768,7 @@ mod tests {
         // Without `**` it is exactly `glob_reaches`.
         assert!(!globstar_reaches("/repo/*.md", "/repo/docs/adr", false));
         assert!(globstar_reaches("/repo/*/adr/x", "/repo/docs/adr", false));
-        // A shell glob does not recurse: `glob_reaches` keeps that reading.
+        // `glob_reaches` alone does not recurse; matching uses `globstar_reaches`.
         assert!(!glob_reaches("/repo/**/*.md", "/repo/docs/adr", false));
     }
 

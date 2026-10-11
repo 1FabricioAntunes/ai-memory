@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `include` globs names or could expand into an ignored path, and glob syntax
   the matcher cannot evaluate makes it metadata-only. Gemini's
   `list_directory` and the legacy `search_file_content` name are now search
-  tools, dropped under an active policy like `grep_search` and `glob`. This
-  applies to the native hook, the server, and the generated TypeScript
-  integrations.
+  tools, dropped under an active policy like `grep_search` and `glob`. A shell
+  command whose `**` glob could recurse into an ignored directory (zsh, or bash
+  with `globstar`) is now dropped too. This applies to the native hook, the
+  server, and the generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a
   project's pending handoff or starting admin jobs. With auth off, the machine
