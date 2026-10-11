@@ -48,14 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool call made from another checkout or from an unmarked directory that
   reaches one of its files, including through glob syntax in a directory
   name, a search's path or file filter, or the files an `apply_patch` names.
-  Glob directories are followed through the directories on disk within fixed
-  bounds; past them, or for glob syntax that cannot be followed, the call is
-  metadata-only, and so is a file tool whose target cannot be read. A broken
+  Glob directories outside the event's own checkout are followed through the
+  directories on disk within fixed bounds of count and time; past them, or for
+  glob syntax that cannot be followed, the call is metadata-only, and so is a
+  file tool whose target cannot be read. A glob inside the event's own
+  checkout is not walked, so ordinary monorepo commands over many packages
+  (`cat packages/*/package.json`, `du -sh packages/*`) keep their output with
+  or without a marker. A `..` after a `**`, a brace expansion, a zsh glob
+  group, an ANSI-C escape, an indented `apply_patch` header and Hermes
+  `search_files`' `file_glob` filter can no longer hide which checkout a call
+  reaches. A broken
   marker makes a search metadata-only, as it does a file or shell call.
   Reading back a file a harness saved an earlier tool's output to
   (Claude Code's saved large results and background task output, OpenCode's
   and Pi's truncated output files), or a glob that could match one, is
-  metadata-only under an active or invalid policy, like `BashOutput`. A `file:` URL's query or fragment is no longer
+  metadata-only under an active or invalid policy, like `BashOutput`; an
+  ordinary log glob (`tail -n 50 log/*.log`, `cat /tmp/*.log`) is not taken
+  for one. A `file:` URL's query or fragment is no longer
   read as part of its path, a parameter default nested deeper than the matcher
   reads is metadata-only, and a backslash escape inside a default is read. A
   quoted `~` (`git commit -m "fix ~approx"`) is no longer treated as a home

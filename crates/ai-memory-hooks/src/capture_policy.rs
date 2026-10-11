@@ -652,8 +652,14 @@ impl CapturePolicy {
                             // output is read back like `BashOutput`.
                             Ok(false)
                                 if paths.iter().any(|path| {
-                                    normalize_candidate(path, cwd)
-                                        .is_some_and(|candidate| output_spool(&candidate.path))
+                                    let readings = if extracted.globs {
+                                        normalize_readings(path, cwd).ok().flatten()
+                                    } else {
+                                        normalize_candidate(path, cwd).map(|c| vec![c])
+                                    };
+                                    readings.is_some_and(|readings| {
+                                        readings.iter().any(|c| output_spool(&c.path))
+                                    })
                                 }) =>
                             {
                                 (CaptureDisposition::MetadataOnly, ExtractionState::Extracted)
@@ -757,12 +763,14 @@ impl CapturePolicy {
                     .flatten();
                 for base in std::iter::once(cwd).chain(root) {
                     // Not a usable path (drive-relative, oversized, bad cwd).
-                    let Some(candidate) = normalize_candidate(&expanded, base) else {
+                    let Some(readings) = normalize_readings(&expanded, base)? else {
                         continue;
                     };
-                    spool |= output_spool(&candidate.path);
-                    if self.match_pattern_candidate(&candidate, false, &mut work)? {
-                        return Ok((true, spool));
+                    for candidate in readings {
+                        spool |= output_spool(&candidate.path);
+                        if self.match_pattern_candidate(&candidate, false, &mut work)? {
+                            return Ok((true, spool));
+                        }
                     }
                 }
             }
@@ -792,9 +800,10 @@ impl CapturePolicy {
             if path.contains(['[', ']', '{', '}', '(', ')', '!']) {
                 return Err(());
             }
-            let candidate = normalize_candidate(path, cwd).ok_or(())?;
-            if self.match_pattern_candidate(&candidate, true, &mut work)? {
-                return Ok(true);
+            for candidate in normalize_readings(path, cwd)?.ok_or(())? {
+                if self.match_pattern_candidate(&candidate, true, &mut work)? {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -1149,8 +1158,10 @@ fn reads_earlier_output(name: &str) -> bool {
 /// (`~/.claude/projects/*/*/tool-results/*`): each of its segments is read as
 /// a one-segment glob (`**` included) that fits a named directory or file
 /// when the two globs share a match. At least one segment that fits must
-/// spell some literal text, so a bare `*` or `*/*` is never taken for a saved
-/// output file on its own.
+/// spell part of what makes its name distinctive (`claude`, `projects`,
+/// `tool-results`, `tasks`, `.output`, `opencode`, `tool-output`, `pi-bash-`)
+/// in literal text, so a bare `*` or `*/*`, or a `*.log` whose wildcard stands
+/// where `pi-bash-` would be, is never taken for a saved output file.
 fn output_spool(path: &str) -> bool {
     let segments: Vec<Vec<char>> = path
         .split('/')
@@ -1163,35 +1174,53 @@ fn output_spool(path: &str) -> bool {
     let fits = |segment: &[char], shape: &str| {
         globs_intersect(segment, &shape.chars().collect::<Vec<_>>())
     };
-    // A segment that is not only wildcards names something.
-    let named = |segments: &[&Vec<char>]| {
-        segments
-            .iter()
-            .any(|segment| segment.iter().any(|c| !matches!(c, '*' | '?')))
+    let named = |segments: &[(&Vec<char>, &str)]| {
+        segments.iter().any(|(segment, word)| spells(segment, word))
     };
     let count = directories.len();
     let claude_results = (1..count).any(|index| {
         let (claude, projects) = (&directories[index - 1], &directories[index]);
         fits(claude, "*claude*")
             && fits(projects, "projects")
-            && directories[index + 1..]
-                .iter()
-                .any(|results| fits(results, "tool-results") && named(&[claude, projects, results]))
+            && directories[index + 1..].iter().any(|results| {
+                fits(results, "tool-results")
+                    && named(&[
+                        (claude, "claude"),
+                        (projects, "projects"),
+                        (results, "tool-results"),
+                    ])
+            })
     });
     let claude_task = count > 0 && {
         let parent = &directories[count - 1];
         fits(parent, "tasks")
             && fits(file, "*.output")
-            && directories
-                .iter()
-                .any(|claude| fits(claude, "claude*") && named(&[parent, file, claude]))
+            && directories.iter().any(|claude| {
+                fits(claude, "claude*")
+                    && named(&[(parent, "tasks"), (file, ".output"), (claude, "claude")])
+            })
     };
     let opencode = count >= 2 && {
         let (data, output) = (&directories[count - 2], &directories[count - 1]);
-        fits(data, "opencode") && fits(output, "tool-output") && named(&[data, output])
+        fits(data, "opencode")
+            && fits(output, "tool-output")
+            && named(&[(data, "opencode"), (output, "tool-output")])
     };
-    let pi = fits(file, "pi-bash-*.log") && named(&[file]);
+    let pi = fits(file, "pi-bash-*.log") && named(&[(file, "pi-bash-")]);
     claude_results || claude_task || opencode || pi
+}
+
+/// Whether a one-segment glob spells part of `word` in literal text: some
+/// run of it between wildcards shares at least three characters in a row
+/// with `word` (all of a shorter one). `tool-res*` and `pi-*` do; `*.log`,
+/// `t*` and `*` do not.
+fn spells(segment: &[char], word: &str) -> bool {
+    let word: Vec<char> = word.chars().collect();
+    let needed = word.len().min(3);
+    segment.split(|c| matches!(c, '*' | '?')).any(|run| {
+        run.windows(needed)
+            .any(|piece| word.windows(needed).any(|w| w == piece))
+    })
 }
 
 /// Whether two one-segment globs over `*` and `?` match a common string.
@@ -1416,9 +1445,13 @@ pub const MAX_LOOKUP_LOCATIONS: usize = 4_096;
 /// from, so a client applies the policy of each location's own marker as
 /// well as the event's (`cat ../other-checkout/secret.env`). A location may
 /// hold glob syntax; [`glob_walk`] says how to follow it. Unknown tools yield
-/// nothing; their policy is the event's. `None` when nothing proves which
-/// markers govern the call: a file tool whose targets cannot be read or
-/// resolved, a search/list argument that is not a string, or more than
+/// nothing; their policy is the event's. A glob whose `..` follows a `**`
+/// yields each of its readings (`normalize_readings`), and a shell script
+/// with a zsh glob group or ANSI-C numeric escapes also yields its words as
+/// the shell expands them (`ShellWords::expanded`). `None` when nothing
+/// proves which markers govern the call: a file tool whose targets cannot be
+/// read or resolved, a search/list argument that is not a string, a glob with
+/// more than 16 readings, or more than
 /// [`MAX_LOOKUP_LOCATIONS`] distinct locations.
 pub fn capture_lookup_locations(
     agent: AgentKind,
@@ -1442,6 +1475,8 @@ pub fn capture_lookup_locations(
         }
         Some(())
     };
+    // Every reading of a glob whose `..` follows a `**` ([`normalize_readings`]).
+    let readings = |path: &str, base: &str| normalize_readings(path, base).ok();
     match (extracted.family, extracted.command.as_ref()) {
         (ToolFamily::File, _) => {
             let paths = extracted
@@ -1449,16 +1484,19 @@ pub fn capture_lookup_locations(
                 .as_ref()
                 .or(extracted.patch_paths.as_ref())?;
             for path in paths {
-                push(Some(normalize_candidate(path, cwd)?))?;
+                for candidate in readings(path, cwd)?? {
+                    push(Some(candidate))?;
+                }
             }
         }
         (ToolFamily::SearchList, _) => {
             let scope = extracted.search_scope.as_ref()?;
             let mut roots = Vec::new();
             for root in &scope.roots {
-                let root = normalize_candidate(root, cwd)?;
-                roots.push(native_path(root.clone()));
-                push(Some(root))?;
+                for root in readings(root, cwd)?? {
+                    roots.push(native_path(root.clone()));
+                    push(Some(root))?;
+                }
             }
             if roots.is_empty() {
                 roots.push(cwd.to_owned());
@@ -1467,7 +1505,9 @@ pub fn capture_lookup_locations(
             // its root, which the root's own lookup already covers.
             for pattern in scope.patterns.iter().filter(|p| p.contains(['/', '\\'])) {
                 for root in &roots {
-                    push(Some(normalize_candidate(pattern, root)?))?;
+                    for candidate in readings(pattern, root)?? {
+                        push(Some(candidate))?;
+                    }
                 }
             }
         }
@@ -1476,11 +1516,13 @@ pub fn capture_lookup_locations(
             push(normalize_candidate(&base, &base))?;
             let home = home.and_then(|dir| normalize_root(dir).ok());
             let split = command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
-            for (word, tilde) in &split.words {
+            for (word, tilde) in split.words.iter().chain(&split.expanded) {
                 for (argument, _) in shell_arguments(word) {
                     let expanded = expand_tilde(argument, *tilde, home.as_deref(), &base);
                     if expanded.contains(['/', '\\']) {
-                        push(normalize_candidate(&expanded, &base))?;
+                        for candidate in readings(&expanded, &base)?.into_iter().flatten() {
+                            push(Some(candidate))?;
+                        }
                     }
                 }
             }
@@ -1500,9 +1542,10 @@ struct SearchScope {
 /// A search/list tool's directory and file arguments, and its glob
 /// arguments: a glob tool's `pattern` (Claude Code `Glob`, Gemini CLI `glob`,
 /// Antigravity `find_by_name`), and the file filters of a content search
-/// (`glob`, `include`, `file_pattern`, `Includes`). A grep `pattern` is a
-/// regular expression, not a path, and is left out. `None` when one of them
-/// is present but not a string (or, for a filter, a list of strings).
+/// (`glob`, `include`, `file_pattern`, Hermes `file_glob`, `Includes`). A
+/// grep `pattern` is a regular expression, not a path, and is left out.
+/// `None` when one of them is present but not a string (or, for a filter, a
+/// list of strings).
 fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
     let object = match args {
         None | Some(Value::Null) => return Some(SearchScope::default()),
@@ -1537,10 +1580,11 @@ fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
             "glob",
             "include",
             "file_pattern",
+            "file_glob",
             "Includes",
         ]
     } else {
-        &["glob", "include", "file_pattern", "Includes"]
+        &["glob", "include", "file_pattern", "file_glob", "Includes"]
     };
     for key in pattern_keys {
         match object.get(*key) {
@@ -1565,7 +1609,8 @@ fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
 /// The files an `apply_patch` patch names in its `*** Add File:`,
 /// `*** Update File:`, `*** Delete File:` and `*** Move to:` headers, from
 /// the patch text itself or the `command`, `patch`, `patchText` or `input`
-/// field that holds it. `None` when no header names a file.
+/// field that holds it. Codex trims each line before it reads a header, so
+/// leading whitespace does not hide one. `None` when no header names a file.
 fn patch_paths(name: &str, args: &Value) -> Option<Vec<String>> {
     if !matches!(name.to_ascii_lowercase().as_str(), "apply_patch" | "patch") {
         return None;
@@ -1586,7 +1631,7 @@ fn patch_paths(name: &str, args: &Value) -> Option<Vec<String>> {
             "*** Move to:",
         ]
         .iter()
-        .find_map(|header| line.strip_prefix(header)) else {
+        .find_map(|header| line.trim_start().strip_prefix(header)) else {
             continue;
         };
         let path = path.trim();
@@ -1618,7 +1663,8 @@ pub enum GlobWalk {
         steps: Vec<GlobStep>,
     },
     /// Syntax a walk cannot follow: a brace or group that spans a separator,
-    /// or an alternative of `..` or `~…` inside one, which leaves the root.
+    /// or an alternative of `..` or `~…` inside one (also one a brace
+    /// expansion builds), which leaves the root.
     /// Nothing proves which markers govern it.
     Unprovable,
 }
@@ -1686,10 +1732,19 @@ pub fn glob_walk(location: &str) -> GlobWalk {
         let balanced = |open: char, close: char| {
             segment.matches(open).count() == segment.matches(close).count()
         };
-        // A brace or group alternative of `..` or `~…` leaves the root.
-        let leaves = segment
-            .split(['{', '}', ',', '(', ')', '|', '@', '!', '+'])
-            .any(|piece| piece == ".." || piece.starts_with('~'));
+        // A brace or group alternative of `..` or `~…` leaves the root, and
+        // so does one a brace expansion builds out of other pieces.
+        let leaves_at = |text: &str| {
+            text.split(['{', '}', ',', '(', ')', '|', '@', '!', '+'])
+                .any(|piece| piece == ".." || piece.starts_with('~'))
+        };
+        let leaves = leaves_at(segment)
+            || (segment.contains('{')
+                && brace_alternatives(segment).is_none_or(|alternatives| {
+                    alternatives.iter().any(|alternative| {
+                        alternative.contains(['/', '\\']) || leaves_at(alternative)
+                    })
+                }));
         if leaves || !balanced('{', '}') || !balanced('(', ')') {
             return GlobWalk::Unprovable;
         }
@@ -1717,6 +1772,136 @@ pub fn glob_walk(location: &str) -> GlobWalk {
         }),
         steps,
     }
+}
+
+/// Upper bound on the words [`brace_alternatives`] expands one segment to,
+/// and on the braces it reads.
+const MAX_BRACE_ALTERNATIVES: usize = 64;
+
+/// Every word a shell's brace expansion makes of `text`: a `{…}` holding a
+/// top-level comma, or a sequence (`{1..3}`, `{a..e}`, `{x..y..n}` over
+/// integers or single characters), gives one word per alternative, nested
+/// and repeated braces included; any other `{…}` stays as written. `None`
+/// past [`MAX_BRACE_ALTERNATIVES`].
+fn brace_alternatives(text: &str) -> Option<Vec<String>> {
+    if text.matches('{').count() > MAX_BRACE_ALTERNATIVES {
+        return None;
+    }
+    let mut words = Vec::new();
+    expand_braces(&text.chars().collect::<Vec<_>>(), &mut words)?;
+    Some(words)
+}
+
+fn expand_braces(text: &[char], words: &mut Vec<String>) -> Option<()> {
+    for open in (0..text.len()).filter(|&index| text[index] == '{') {
+        let mut depth = 0_usize;
+        let mut close = None;
+        let mut commas = Vec::new();
+        for (index, &c) in text.iter().enumerate().skip(open) {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(index);
+                        break;
+                    }
+                }
+                ',' if depth == 1 => commas.push(index),
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            continue;
+        };
+        let pieces: Vec<Vec<char>> = if commas.is_empty() {
+            match brace_sequence(&text[open + 1..close])? {
+                Some(pieces) => pieces,
+                None => continue,
+            }
+        } else {
+            let mut start = open + 1;
+            let mut pieces = Vec::new();
+            for end in commas.into_iter().chain(std::iter::once(close)) {
+                pieces.push(text[start..end].to_vec());
+                start = end + 1;
+            }
+            pieces
+        };
+        for piece in pieces {
+            let mut word = text[..open].to_vec();
+            word.extend(piece);
+            word.extend_from_slice(&text[close + 1..]);
+            expand_braces(&word, words)?;
+        }
+        return Some(());
+    }
+    if words.len() == MAX_BRACE_ALTERNATIVES {
+        return None;
+    }
+    words.push(text.iter().collect());
+    Some(())
+}
+
+/// The words of a brace sequence body (`1..3`, `a..e`, `x..y..n`):
+/// `Some(None)` when the body is not one; `None` past
+/// [`MAX_BRACE_ALTERNATIVES`] words.
+fn brace_sequence(body: &[char]) -> Option<Option<Vec<Vec<char>>>> {
+    let body: String = body.iter().collect();
+    let parts: Vec<&str> = body.split("..").collect();
+    if !(2..=3).contains(&parts.len()) {
+        return Some(None);
+    }
+    let step = match parts.get(2) {
+        Some(step) => match step.parse::<i64>() {
+            Ok(step) => step.unsigned_abs().max(1),
+            Err(_) => return Some(None),
+        },
+        None => 1,
+    };
+    let bounds = match (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+        (Ok(from), Ok(to)) => Some((from, to, true)),
+        _ => {
+            let single = |part: &str| {
+                let mut chars = part.chars();
+                chars.next().filter(|_| chars.next().is_none())
+            };
+            match (single(parts[0]), single(parts[1])) {
+                (Some(from), Some(to)) => {
+                    Some((i64::from(u32::from(from)), i64::from(u32::from(to)), false))
+                }
+                _ => None,
+            }
+        }
+    };
+    let Some((from, to, numeric)) = bounds else {
+        return Some(None);
+    };
+    let count = from.abs_diff(to) / step + 1;
+    if count > MAX_BRACE_ALTERNATIVES as u64 {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut value = from;
+    for _ in 0..count {
+        let word = if numeric {
+            value.to_string().chars().collect()
+        } else {
+            u32::try_from(value)
+                .ok()
+                .and_then(char::from_u32)
+                .map(|c| vec![c])
+                .unwrap_or_default()
+        };
+        words.push(word);
+        let delta = i64::try_from(step).unwrap_or(1);
+        value = if from <= to {
+            value + delta
+        } else {
+            value - delta
+        };
+    }
+    Some(Some(words))
 }
 
 /// The directory a shell tool's relative arguments resolve from: its own
@@ -1779,6 +1964,13 @@ enum ShellCommand<'a> {
 struct ShellWords {
     words: Vec<(String, bool)>,
     opaque: bool,
+    /// The words of each script that holds such syntax, read as the shell
+    /// expands them where that can change which directory a path names: a
+    /// zsh glob group kept inside its word and an ANSI-C string with its
+    /// numeric escapes decoded. Only the
+    /// marker lookup reads them; the matcher already treats such a script
+    /// as opaque.
+    expanded: Vec<(String, bool)>,
 }
 
 impl ShellCommand<'_> {
@@ -1807,6 +1999,9 @@ impl ShellCommand<'_> {
         match self {
             Self::Line(command) => {
                 split.opaque = has_unevaluated_expansion(command);
+                if split.opaque {
+                    split.expanded.extend(shell_tokens(command, true));
+                }
                 push_nested_words(&marked_shell_words(command), MAX_SHELL_NESTING, &mut split);
                 if let Some(plain) = windows.then(|| without_windows_escapes(command)).flatten() {
                     push_nested_words(&marked_shell_words(&plain), MAX_SHELL_NESTING, &mut split);
@@ -1817,6 +2012,9 @@ impl ShellCommand<'_> {
                 // over-approximation its words make.
                 split.opaque = items.iter().any(|item| has_unevaluated_expansion(item))
                     || runs_inline_code(items);
+                for item in items.iter().filter(|item| has_unevaluated_expansion(item)) {
+                    split.expanded.extend(shell_tokens(item, true));
+                }
                 for (index, item) in items.iter().enumerate() {
                     // An element reaches the program as is, so only a script
                     // a shell runs expands a tilde in it.
@@ -1950,6 +2148,7 @@ fn push_nested_words(words: &[(String, bool)], depth: usize, split: &mut ShellWo
         let script = word.contains("$(") || word.contains('`') || is_shell_script(&texts, index);
         if script && has_unevaluated_expansion(word) {
             split.opaque = true;
+            split.expanded.extend(shell_tokens(word, true));
         }
         push_nested_words(&literal_tildes(tokens, script), depth, split);
     }
@@ -2314,6 +2513,13 @@ fn shell_words(command: &str) -> Vec<String> {
 /// [`shell_words`], each word with whether it holds a `~` outside quotes and
 /// not after a backslash, the only tilde a shell expands.
 fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
+    shell_tokens(command, false)
+}
+
+/// [`marked_shell_words`]; with `expand`, a zsh glob group stays inside its
+/// word (`docs/(a|b)/x`, `(a|b)/x`) instead of splitting it as a subshell, and
+/// the numeric and control escapes of an ANSI-C string are decoded.
+fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
     let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`');
     let mut words = Vec::new();
     let mut word = String::new();
@@ -2332,7 +2538,11 @@ fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
                 word.extend(chars.next());
             }
             (Some('$'), '\\') => match chars.next() {
-                Some(escape) => match ansi_c_escape(escape) {
+                Some(escape) => match ansi_c_escape(escape).or_else(|| {
+                    expand
+                        .then(|| ansi_c_numeric_escape(escape, &mut chars))
+                        .flatten()
+                }) {
                     Some(decoded) => word.push(decoded),
                     None => {
                         word.push('\\');
@@ -2362,6 +2572,15 @@ fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
                 word.extend(chars.next());
                 in_word = true;
             }
+            (None, '(')
+                if expand
+                    && (!in_word || !word.ends_with(['$', '=']))
+                    && let Some((group, rest)) = glob_group(&chars, in_word) =>
+            {
+                word.push_str(&group);
+                chars = rest;
+                in_word = true;
+            }
             (None, c) if c.is_whitespace() || is_operator(c) => {
                 if in_word {
                     words.push((std::mem::take(&mut word), tilde));
@@ -2379,6 +2598,72 @@ fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
         words.push((word, tilde));
     }
     words
+}
+
+/// The zsh glob group an unquoted `(` opens, `(` through its matching `)`,
+/// and the characters after it: inside a word (`docs/(a|b)/x`), or at the start
+/// of one when a word character follows the `)` (`(a|b)/x`). `None` for a
+/// subshell, or when whitespace, a quote, an escape or another operator comes
+/// first.
+fn glob_group<'a>(
+    after_open: &std::iter::Peekable<std::str::Chars<'a>>,
+    in_word: bool,
+) -> Option<(String, std::iter::Peekable<std::str::Chars<'a>>)> {
+    let mut ahead = after_open.clone();
+    let mut group = String::from("(");
+    let mut depth = 1_usize;
+    while depth > 0 {
+        let c = ahead.next()?;
+        if c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | ';' | '&' | '<' | '>' | '`') {
+            return None;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        group.push(c);
+    }
+    let word_follows = ahead.peek().is_some_and(|next| {
+        !next.is_whitespace() && !matches!(next, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`')
+    });
+    (in_word || word_follows).then_some((group, ahead))
+}
+
+/// The character a numeric or control ANSI-C escape stands for, reading its
+/// digits from `rest`: `\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\NNN` (octal) and
+/// `\cX`. `None` when it spells no character.
+fn ansi_c_numeric_escape(
+    escape: char,
+    rest: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<char> {
+    let (radix, mut value, most) = match escape {
+        'x' => (16, 0, 2),
+        'u' => (16, 0, 4),
+        'U' => (16, 0, 8),
+        '0'..='7' => (8, escape.to_digit(8)?, 2),
+        'c' => {
+            let control = rest.next_if(char::is_ascii)?;
+            return Some(char::from(control as u8 & 0x1f));
+        }
+        _ => return None,
+    };
+    // Digits are consumed only when they spell a character.
+    let mut ahead = rest.clone();
+    let mut digits = 0;
+    while digits < most {
+        let Some(digit) = ahead.peek().and_then(|c| c.to_digit(radix)) else {
+            break;
+        };
+        value = value * radix + digit;
+        ahead.next();
+        digits += 1;
+    }
+    let decoded = (radix == 8 || digits > 0)
+        .then(|| char::from_u32(value))
+        .flatten()?;
+    *rest = ahead;
+    Some(decoded)
 }
 
 /// The character an ANSI-C escape stands for, or `None` for a numeric or
@@ -2504,6 +2789,73 @@ struct Normalized {
     flavor: Flavor,
 }
 fn normalize_candidate(candidate: &str, cwd: &str) -> Option<Normalized> {
+    let (raw, flavor) = candidate_raw(candidate, cwd)?;
+    Some(Normalized {
+        path: normalize_segments(&raw)?,
+        flavor,
+    })
+}
+
+/// Upper bound on the readings [`normalize_readings`] gives one glob.
+const MAX_GLOBSTAR_READINGS: usize = 16;
+
+/// [`normalize_candidate`] for a glob, whose `**` a shell (zsh, bash with
+/// `globstar`) and a glob tool expand to no directory as well as to many. A
+/// `..` after it then steps back from the directory before the `**` (or from
+/// one it matched), which a lexical `..` that removes the `**` misses: every
+/// such `..` gives two readings, the `**` matching nothing (the `..` steps
+/// back from the segment before it) and the `**` matching at least one
+/// directory (the `**` stays). `Ok(None)` when the candidate is not a usable
+/// path; `Err` past [`MAX_GLOBSTAR_READINGS`], which proves nothing.
+fn normalize_readings(candidate: &str, cwd: &str) -> Result<Option<Vec<Normalized>>, ()> {
+    let Some((raw, flavor)) = candidate_raw(candidate, cwd) else {
+        return Ok(None);
+    };
+    let Some((root, tail)) = split_root(&raw) else {
+        return Ok(None);
+    };
+    let mut readings: Vec<Vec<&str>> = vec![Vec::new()];
+    for part in tail {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        let mut next: Vec<Vec<&str>> = Vec::with_capacity(readings.len());
+        for mut parts in readings {
+            if part != ".." {
+                parts.push(part);
+            } else if parts.last().is_some_and(|last| last.contains("**")) {
+                let mut none = parts.clone();
+                none.pop();
+                none.pop();
+                if !next.contains(&none) {
+                    next.push(none);
+                }
+            } else {
+                parts.pop();
+            }
+            if !next.contains(&parts) {
+                next.push(parts);
+            }
+        }
+        if next.len() > MAX_GLOBSTAR_READINGS {
+            return Err(());
+        }
+        readings = next;
+    }
+    Ok(Some(
+        readings
+            .into_iter()
+            .map(|parts| Normalized {
+                path: join_segments(root.clone(), &parts),
+                flavor,
+            })
+            .collect(),
+    ))
+}
+
+/// A candidate joined to `cwd` when relative, with the flavor its matching
+/// uses, before segment normalization.
+fn candidate_raw(candidate: &str, cwd: &str) -> Option<(String, Flavor)> {
     if candidate.trim().is_empty()
         || candidate.chars().count() > MAX_CANDIDATE_PATH_CHARS
         || is_drive_relative(candidate)
@@ -2530,10 +2882,7 @@ fn normalize_candidate(candidate: &str, cwd: &str) -> Option<Normalized> {
         raw
     };
     let flavor = flavor_of(&raw);
-    Some(Normalized {
-        path: normalize_segments(&raw)?,
-        flavor,
-    })
+    Some((raw, flavor))
 }
 fn compile(
     config: &CaptureConfig,
@@ -2687,21 +3036,7 @@ fn normalize_root(path: &str) -> Result<String, ()> {
         .ok_or(())
 }
 fn normalize_segments(path: &str) -> Option<String> {
-    let path = path.replace('\\', "/");
-    let (root, tail): (String, Vec<&str>) = if let Some(rest) = path.strip_prefix("//") {
-        let mut parts = rest.split('/').filter(|p| !p.is_empty());
-        let server = parts.next()?;
-        let share = parts.next()?;
-        (format!("//{server}/{share}"), parts.collect())
-    } else if valid_drive_prefix(&path) && path.as_bytes().get(2) == Some(&b'/') {
-        (
-            format!("{}:/", path[..1].to_ascii_uppercase()),
-            path[3..].split('/').collect(),
-        )
-    } else {
-        let rest = path.strip_prefix('/')?;
-        ("/".into(), rest.split('/').collect())
-    };
+    let (root, tail) = split_root(path)?;
     let mut parts = Vec::new();
     for part in tail {
         if part.is_empty() || part == "." {
@@ -2713,14 +3048,40 @@ fn normalize_segments(path: &str) -> Option<String> {
             parts.push(part);
         }
     }
-    let mut output = root;
+    Some(join_segments(root, &parts))
+}
+/// A path's root (`/`, `C:/`, `//server/share`, with either separator) and
+/// the segments after it.
+fn split_root(path: &str) -> Option<(String, Vec<&str>)> {
+    fn tail(rest: &str) -> Vec<&str> {
+        rest.split(['/', '\\']).collect()
+    }
+    let bytes = path.as_bytes();
+    let separator = |index: usize| matches!(bytes.get(index), Some(b'/' | b'\\'));
+    if separator(0) && separator(1) {
+        let mut parts = path[2..].split(['/', '\\']).filter(|p| !p.is_empty());
+        let server = parts.next()?;
+        let share = parts.next()?;
+        Some((format!("//{server}/{share}"), parts.collect()))
+    } else if valid_drive_prefix(path) && separator(2) {
+        Some((
+            format!("{}:/", path[..1].to_ascii_uppercase()),
+            tail(&path[3..]),
+        ))
+    } else if separator(0) {
+        Some(("/".into(), tail(&path[1..])))
+    } else {
+        None
+    }
+}
+fn join_segments(mut output: String, parts: &[&str]) -> String {
     if !parts.is_empty() {
         if !output.ends_with('/') {
             output.push('/');
         }
         output.push_str(&parts.join("/"));
     }
-    Some(output)
+    output
 }
 fn glob_match(
     pattern: &str,
@@ -4497,6 +4858,234 @@ mod tests {
         assert!(matches!(glob_walk("/work/b/src/*~"), GlobWalk::Walk { .. }));
         assert!(glob_segment_matches("SEC*", "secrets"));
         assert!(!glob_segment_matches("*.env", "src"));
+    }
+
+    /// Adversarial: a brace expansion can build a `..` or a separator out of
+    /// pieces that are not one, which leaves
+    /// the walk's root just like a literal `..` alternative. Controls: braces
+    /// whose words stay below the root, sequences included, are walked.
+    #[test]
+    fn a_brace_that_builds_a_parent_step_cannot_be_walked() {
+        for location in [
+            "/work/b/.{.,x}/a/secrets.env",
+            "/work/b/{.,}./a/secrets.env",
+            "/work/b/.{.,.}/a/secrets.env",
+            "/work/b/.{-..0}/a/secrets.env",
+            "/work/b/{x,.{.,y}}/a/secrets.env",
+            "/work/b/{a,{~,c}}/x",
+        ] {
+            assert_eq!(glob_walk(location), GlobWalk::Unprovable, "{location}");
+        }
+        for location in [
+            "/work/{a,c}/x",
+            "/work/b/.{git,hub}/x",
+            "/work/b/v{1..3}/x",
+            "/work/b/{a..c}.d/x",
+            "/work/b/{.,x}/y",
+        ] {
+            assert!(
+                matches!(glob_walk(location), GlobWalk::Walk { .. }),
+                "{location}"
+            );
+        }
+        assert_eq!(
+            brace_alternatives(".{-..0}"),
+            Some(vec![".-".into(), "..".into(), "./".into(), ".0".into()])
+        );
+        assert_eq!(
+            brace_alternatives("a{1..5..2}{x,y}"),
+            Some(
+                ["a1x", "a1y", "a3x", "a3y", "a5x", "a5y"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        assert_eq!(brace_alternatives("{a}b{}"), Some(vec!["{a}b{}".into()]));
+        assert_eq!(brace_alternatives("{1..1000}"), None);
+        assert_eq!(brace_alternatives(&"{a,b}".repeat(7)), None);
+    }
+
+    /// Adversarial: a `**` matches no directory as well as many, so a `..`
+    /// after it steps back from the directory before it (`sub/**/../x` reads
+    /// `x`), which a lexical `..` that only removes the `**` misses. Both the
+    /// event's own policy and the marker lookup read every such reading.
+    /// Controls: a `**` without a later `..`, and a `..` that steps back
+    /// over an ordinary segment, read as before.
+    #[test]
+    fn a_parent_step_after_a_globstar_is_read_both_ways() {
+        let paths = |candidate: &str| {
+            normalize_readings(candidate, "/repo")
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|reading| reading.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths("sub/**/../secrets.env"),
+            ["/repo/secrets.env", "/repo/sub/**/secrets.env"]
+        );
+        assert_eq!(paths("./**/../../a/x"), ["/a/x", "/repo/**/a/x"]);
+        assert_eq!(paths("src/**/*.rs"), ["/repo/src/**/*.rs"]);
+        assert_eq!(paths("src/x/../y"), ["/repo/src/y"]);
+        assert_eq!(
+            normalize_readings(&"**/../".repeat(20), "/repo").map(|r| r.is_some()),
+            Err(())
+        );
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into(), "secrets.env".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let read_many = |include: &[&str]| json!({"tool_name": "read_many_files", "tool_input": {"include": include}});
+        let decide = |raw: &Value| {
+            policy
+                .inspect(AgentKind::GeminiCli, raw, "/repo")
+                .protocol()
+                .disposition()
+        };
+        assert_eq!(
+            decide(&bash("cat sub/**/../secrets.env")),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            decide(&bash("cat src/**/../../repo/secrets.env")),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            decide(&read_many(&["src/**/../docs/adr"])),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            decide(&bash(&format!("cat {}x", "**/../".repeat(20)))),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            decide(&bash("cat sub/**/../README.md")),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            decide(&read_many(&["src/**/../lib"])),
+            CaptureDisposition::Keep
+        );
+        let locations = |raw: &Value| {
+            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", None).unwrap()
+        };
+        for raw in [
+            bash("cat ./**/../a/secrets.env"),
+            json!({"tool_name": "Glob", "tool_input": {"pattern": "./**/../a/secrets.env"}}),
+            json!({"tool_name": "Grep", "tool_input": {"pattern": "KEY", "glob": "**/../a/secrets.env"}}),
+        ] {
+            assert!(
+                locations(&raw).contains(&"/work/a/secrets.env".to_owned()),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Adversarial: a zsh glob group splits into subshell tokens and an
+    /// ANSI-C string keeps its numeric escapes, so neither spelled the other
+    /// checkout's path for the marker lookup. The lookup reads the words as the shell expands them.
+    /// Controls: a subshell, a command substitution and an array
+    /// assignment add no such word.
+    #[test]
+    fn glob_groups_and_ansi_c_escapes_reach_the_marker_lookup() {
+        let locations = |command: &str| {
+            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
+                .unwrap()
+        };
+        for (command, location) in [
+            ("cat ../(a)/secrets.env", "/work/(a)/secrets.env"),
+            ("cat ../(a|c)/secrets.env", "/work/(a|c)/secrets.env"),
+            ("cat (../a|x)/secrets.env", "/work/b/(../a|x)/secrets.env"),
+            ("cat ..$'\\x2f'a/secrets.env", "/work/a/secrets.env"),
+            ("cat $'\\056\\056/a'/secrets.env", "/work/a/secrets.env"),
+            ("cat ..$'\\u002f'a/secrets.env", "/work/a/secrets.env"),
+            (
+                "bash -c \"cat ../(a)/secrets.env\"",
+                "/work/(a)/secrets.env",
+            ),
+        ] {
+            assert!(
+                locations(command).contains(&location.to_owned()),
+                "{command}: {:?}",
+                locations(command)
+            );
+        }
+        assert_eq!(
+            glob_walk("/work/(a)/secrets.env"),
+            GlobWalk::Walk {
+                root: "/work".into(),
+                steps: vec![GlobStep::Any, GlobStep::Named("secrets.env".into())],
+            }
+        );
+        assert_eq!(
+            glob_walk("/work/b/(../a|x)/secrets.env"),
+            GlobWalk::Unprovable
+        );
+        for command in ["(cd .. && ls)", "echo $(pwd)/x", "x=(a b) && ls src/x"] {
+            assert!(
+                locations(command)
+                    .iter()
+                    .all(|location| !location.contains('(')),
+                "{command}: {:?}",
+                locations(command)
+            );
+        }
+    }
+
+    /// A saved-output rule needs its distinctive name spelled in literal text:
+    /// `*.log` stands for `pi-bash-` with a wildcard and is an ordinary log
+    /// glob, while `pi-*` and `tool-res*` spell enough of it to count.
+    #[test]
+    fn a_saved_output_glob_needs_its_distinctive_name_in_literal_text() {
+        for path in [
+            "/repo/log/*.log",
+            "/tmp/*.log",
+            "/tmp/p*.log",
+            "/data/*/t*/tool_01",
+            "/home/me/.c*/p*/x/s/t*/a.txt",
+        ] {
+            assert!(!output_spool(path), "{path}");
+        }
+        for path in [
+            "/tmp/pi-*",
+            "/tmp/*-bash-*.log",
+            "/home/me/.claude/projects/x/s/tool-res*/a.txt",
+            "/home/me/.c*/p*/x/s/*results/a.txt",
+            "/data/*/tool-*/tool_01",
+            "/tmp/c*/x/s/tasks/*",
+        ] {
+            assert!(output_spool(path), "{path}");
+        }
+    }
+
+    /// Codex trims each patch line before it reads a header, so indentation
+    /// does not hide a target from the marker lookup; Hermes `search_files`
+    /// names its file filter `file_glob`.
+    #[test]
+    fn indented_patch_headers_and_hermes_file_globs_reach_the_marker_lookup() {
+        let patch = json!({
+            "tool_name": "apply_patch",
+            "tool_input": {"command": "*** Begin Patch\n*** Add File: x.rs\n+x\n  \t*** Update File: ../a/secrets.env\n+KEY\n*** End Patch"},
+        });
+        assert_eq!(
+            capture_lookup_locations(AgentKind::Codex, &patch, "/work/b", None),
+            Some(vec![
+                "/work/b/x.rs".to_owned(),
+                "/work/a/secrets.env".to_owned()
+            ])
+        );
+        let search = json!({
+            "tool_name": "search_files",
+            "tool_input": {"pattern": "KEY", "path": "/work", "file_glob": "a/*.env"},
+        });
+        assert_eq!(
+            capture_lookup_locations(AgentKind::Hermes, &search, "/work/b", None),
+            Some(vec!["/work".to_owned(), "/work/a/*.env".to_owned()])
+        );
     }
 
     /// A broken marker fails a search/list tool closed, as it does a file or

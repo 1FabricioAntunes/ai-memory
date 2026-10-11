@@ -517,7 +517,11 @@ OpenCode's truncated output (`<data>/opencode/tool-output/…`) and Pi's
 (`<tmp>/pi-bash-<id>.log`). A glob that could match such a file counts too
 (`cat ~/.claude/projects/*/*/tool-results/*`): each glob segment fits a
 directory or file name it shares a match with, and at least one fitting segment
-must spell literal text, so `ls src/*` is not read as one. Other unknown tools
+must spell part of that name's distinctive text (`claude`, `projects`,
+`tool-results`, `tasks`, `.output`, `opencode`, `tool-output`, `pi-bash-`)
+literally, at least three characters in a row: `tool-res*` and `/tmp/pi-*`
+count, while `ls src/*`, `tail -n 50 log/*.log` and `cat /tmp/*.log` (whose
+wildcard stands where `pi-bash-` would be) are ordinary globs. Other unknown tools
 retain current behavior. GitHub Copilot CLI's runtime `view`, `create` and
 `str_replace_editor` names are file tools read from their `path` argument.
 
@@ -527,7 +531,8 @@ reaching any depth. ai-memory reads every entry and drops the whole call when
 any one names an ignored path or could expand into one, matching case-insensitively
 like Gemini: `docs/adr/x.md`, `docs/*/x.md`, `docs/**` and `**/*.md` are
 all dropped under `docs/adr/**`, while `src/**/*.rs` and a root-level `*.md`
-are not. Gemini reads an entry that names a directory recursively, and the
+are not. A `..` after a `**` is read both ways, since `**` can match no
+directory as well as many. Gemini reads an entry that names a directory recursively, and the
 matcher cannot tell a directory from a file, so an entry that could contain an
 ignored path drops the call too: `docs`, `.` and `docs/` are dropped under
 `docs/adr/**`, while `src` and `README.md` are not. Its `exclude` list never
@@ -578,7 +583,9 @@ repository root. If
 one matches a pattern, the whole event is **dropped**, exactly like a matching
 file read. An argument containing `*` or `?` also matches when its glob can
 reach a pattern's directory: `cat docs/*/0001.md` is dropped under
-`docs/adr/**`, `cat *.md` at the repository root is not. A command that exceeds
+`docs/adr/**`, `cat *.md` at the repository root is not. A `**` matches no
+directory as well as many under zsh and bash's `globstar`, so a `..` after it
+is read both ways. A command that exceeds
 the match budget is dropped. A command that no argument matches outright is
 **metadata-only** when it uses syntax the matcher does not evaluate: an
 unquoted brace expansion (`docs/{adr,x}/1.md`, `{1..3}`), a bracket class
@@ -609,12 +616,14 @@ decomposed accent like the composed letter, as its filesystem does; other POSIX
 hosts compare case-sensitively, and Windows paths always ignore ASCII case.
 
 A checkout's exclusions protect its files wherever a call is made from. For
-every file-tool target (for `apply_patch`, the files its patch headers name),
-every directory, file and path-like glob argument of a search/list tool (Grep,
-Glob, LS, `grep_search`, `glob`, `list_directory`, `search_file_content` and
-the other agents' equivalents; a grep `pattern` is a regular expression and is
-not read), and every shell argument that spells a path (one with a separator,
-after `~/` expansion) plus the tool's `workdir`, the native hook and the
+every file-tool target (for `apply_patch`, the files its `*** Add File:`,
+`*** Update File:`, `*** Delete File:` and `*** Move to:` headers name, read
+after leading whitespace as Codex reads them), every directory, file and
+path-like glob argument of a search/list tool (Grep, Glob, LS, `grep_search`,
+`glob`, `list_directory`, `search_file_content`, Hermes `search_files` with its
+`file_glob` filter, and the other agents' equivalents; a grep `pattern` is a
+regular expression and is not read), and every shell argument that spells a
+path (one with a separator, after `~/` expansion) plus the tool's `workdir`, the native hook and the
 generated integrations find the marker that governs that location, by the
 same lexical walk as the event's own, and when it is another checkout's (or the
 event's directory has none) apply that marker's policy as well: `cat
@@ -627,23 +636,29 @@ call metadata-only. Each directory is looked up once; a call naming more than
 so is a file tool whose target cannot be read or resolved.
 
 A location with glob syntax in a directory name (`cat ../*/secrets.env`, `cat
-*/secrets.env` from a parent folder, `../{a,b}/x`, `../[ab]/x`) is looked up
-from its literal leading directories, and every directory the glob could pass
-through is checked for a marker of its own: a `*`/`?` segment lists the child
-directories whose names it matches (ignoring ASCII case), a class, brace or
-group segment lists every child, and a `**` lists the whole subtree unless it
-starts inside the event's own checkout (the directory holding `.git`). Symlinks
-are never followed. The walk reads at most 65,536 directory entries and visits
-at most 256 directories per call; past either bound, or for glob syntax that
-can leave its leading directories (a brace or group spanning a separator, a
-`..` or `~` alternative), the call is metadata-only. An older server drops these metadata-only shell and output-reader
+*/secrets.env` from a parent folder, `../{a,b}/x`, `../[ab]/x`)
+is looked up from its literal leading directories. When those lie outside the
+event's own checkout (the directory holding `.git`), every directory the glob
+could pass through is checked for a marker of its own: a `*`/`?` segment lists
+the child directories whose names it matches (ignoring ASCII case), a class,
+brace or group segment lists every child, and a `**` lists the whole subtree
+(not below the event's own checkout). A glob whose leading directories lie
+inside the event's own checkout is not walked, so `cat packages/*/package.json`
+in a monorepo costs nothing however many packages it has. Symlinks are never
+followed. The walk reads at most 32,768 directory entries, visits at most 256
+directories and runs at most 50 ms per call; past any bound the call is
+metadata-only, and so is glob syntax that can leave its leading directories: a
+brace or group spanning a separator, a `..` or `~` alternative, or a brace
+expansion that builds one. A `..` after a `**` is looked up in both readings,
+and a zsh glob group or an ANSI-C numeric escape is looked up as the shell
+expands it. An older server drops these metadata-only shell and output-reader
 events, so upgrade the server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
 
 This is a lexical capture boundary, **not complete DLP**. It does not resolve
 symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands are
-matched only lexically (above), and free-form patches are not parsed; prompts,
+matched only lexically (above), and a patch is read only for its file headers; prompts,
 assistant text, notifications, and quoted content are not path-attributable.
 A copy of a file's content under another path is not linked back to it either.
 The harness output files listed above are read back metadata-only under a
@@ -674,10 +689,11 @@ can be mentioned.
 - a bare word naming another checkout's directory (`grep -r x other`) is not
   looked up for that checkout's marker, only arguments that spell a path
   separator are; a recursive search of a literal directory (a Grep whose
-  `path` is `..`) does not walk into the checkouts below it, a `**` that
-  starts inside the event's own checkout is not walked, so a checkout nested
-  inside it is reached only by a path or one-level glob that names it, and a
-  glob is not followed through a symlinked directory; a harness output file kept at a
+  `path` is `..`) does not walk into the checkouts below it, a glob whose
+  leading directories lie inside the event's own checkout is not walked, so a
+  checkout nested inside it is reached only by a path that names it, and a
+  glob is not followed through a symlinked directory; a parameter expansion
+  next to glob syntax (`${X}/*/x`) is not walked; a harness output file kept at a
   location other than the defaults listed above (a Claude Code config
   directory whose name lacks `claude`) is read as an ordinary file;
 - a value glued to a short flag is read after the flag's first letter only,
