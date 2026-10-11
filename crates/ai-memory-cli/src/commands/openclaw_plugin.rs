@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::{
-    ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
-    ts_timeout_signal,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime,
+    ts_string_literal, ts_timeout_signal,
 };
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
@@ -249,11 +249,7 @@ const AGENT = "openclaw";
 {capture_policy}
 
 {timeout_signal}
-function authHeaders(): Record<string, string> {{
-  const token = resolveToken();
-  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
-}}
-
+{auth_headers}
 function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
@@ -491,6 +487,7 @@ export default definePluginEntry({{
         token_line = token_line,
         repo_root_project = super::install_hooks::TS_REPO_ROOT_PROJECT,
         timeout_signal = ts_timeout_signal(),
+        auth_headers = ts_auth_headers_fn(),
         spool_runtime = ts_spool_runtime(),
     )
 }

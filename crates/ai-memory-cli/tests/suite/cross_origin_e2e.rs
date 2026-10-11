@@ -25,6 +25,11 @@
 //!    the three simple content types with 415, so a preflight-free `POST`
 //!    cannot deliver a body even past guard 1.
 //! 3. The `Host` allowlist refuses a rebinding hostname with 403.
+//! 4. On a host a browser sends no fetch metadata to (a LAN address or name in
+//!    the allowlist, over plain HTTP), an `<img>` request carries neither
+//!    fetch metadata nor `Origin`. There the handoff fetch must also carry the
+//!    `X-AI-Memory-Client` marker every first-party client sends and a page
+//!    cannot add; loopback hosts keep accepting legacy hooks without it.
 //!
 //! Every attack carries a canary string. After the attacks the test scans the
 //! whole data directory, SQLite and wiki alike, for it, and checks that the
@@ -380,6 +385,145 @@ mod slow {
             .expect("read-page request")
             .status()
             .is_success()
+    }
+
+    /// A LAN name and a LAN address the operator put in the allowlist.
+    const LAN_NAME: &str = "a0-memory.lan";
+    const LAN_ADDR: &str = "192.168.77.5";
+
+    async fn handoff_status(
+        client: &reqwest::Client,
+        base: &str,
+        method: Method,
+        host: &str,
+        marker: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut req = client
+            .request(
+                method,
+                format!("{base}/handoff?agent=claude-code&workspace={WORKSPACE}&project={PROJECT}"),
+            )
+            .header("host", host);
+        if let Some(marker) = marker {
+            req = req.header("x-ai-memory-client", marker);
+        }
+        let resp = req.send().await.expect("handoff request");
+        let status = resp.status();
+        (status, resp.text().await.expect("handoff body"))
+    }
+
+    async fn begin_handoff(client: &reqwest::Client, base: &str) {
+        legit_mcp(
+            client,
+            base,
+            "memory_handoff_begin",
+            json!({
+                "workspace": WORKSPACE,
+                "project": PROJECT,
+                "summary": HANDOFF_SUMMARY,
+                "shared": true,
+            }),
+        )
+        .await;
+        assert_eq!(open_handoffs(client, base).await, 1, "baton must be open");
+    }
+
+    #[tokio::test]
+    async fn handoff_fetch_on_a_lan_host_requires_the_client_marker() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let data_dir = root.path().join("data");
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).expect("home");
+        let client = reqwest::Client::new();
+        let (_server, base) = start_serve(&client, &root.path().join("serve.log"), |port| {
+            let mut cmd = serve(&data_dir, &home, port);
+            cmd.env(
+                "AI_MEMORY_ALLOWED_HOSTS",
+                format!("localhost,127.0.0.1,::1,{LAN_NAME},{LAN_ADDR}"),
+            );
+            cmd
+        })
+        .await;
+        let port = base.rsplit(':').next().expect("port").to_string();
+        let lan_hosts = [format!("{LAN_NAME}:{port}"), format!("{LAN_ADDR}:{port}")];
+
+        legit_mcp(
+            &client,
+            &base,
+            "memory_write_page",
+            json!({
+                "workspace": WORKSPACE,
+                "project": BASELINE_PROJECT,
+                "path": "notes/baseline.md",
+                "body": "Baseline project.",
+            }),
+        )
+        .await;
+        legit_handoff_fetch(&client, &base, BASELINE_PROJECT).await;
+        let baseline = (WORKSPACE.to_string(), BASELINE_PROJECT.to_string());
+        begin_handoff(&client, &base).await;
+
+        // Attack: what an `<img>` on a foreign page sends to a LAN host over
+        // plain HTTP: no fetch metadata, no Origin, no marker.
+        for host in &lan_hosts {
+            for method in [Method::GET, Method::HEAD] {
+                let (status, body) =
+                    handoff_status(&client, &base, method.clone(), host, None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} /handoff via {host} without the marker must be refused"
+                );
+                if method == Method::GET {
+                    assert!(
+                        body.contains("install-hooks") && body.contains("AI_MEMORY_AUTH_TOKEN"),
+                        "the refusal must tell the operator what to do: {body}"
+                    );
+                }
+            }
+            // An empty marker is no marker.
+            let (status, _) = handoff_status(&client, &base, Method::GET, host, Some("")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "empty marker via {host}");
+        }
+        assert_eq!(
+            open_handoffs(&client, &base).await,
+            1,
+            "a refused LAN fetch must not claim the baton"
+        );
+        assert_eq!(
+            unscoped_scope(&client, &base).await,
+            baseline,
+            "a refused LAN fetch must not move the active-project pointer"
+        );
+
+        // Control: a current hook names itself and claims through the LAN name.
+        let (status, body) =
+            handoff_status(&client, &base, Method::GET, &lan_hosts[0], Some("hook")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(HANDOFF_SUMMARY),
+            "marked fetch claims: {body}"
+        );
+        assert_eq!(open_handoffs(&client, &base).await, 0);
+
+        // Legacy hooks on a loopback install send no marker and must keep
+        // working: browsers send fetch metadata to loopback, which guard 1
+        // already checks.
+        begin_handoff(&client, &base).await;
+        let (status, body) = handoff_status(
+            &client,
+            &base,
+            Method::GET,
+            &format!("127.0.0.1:{port}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(HANDOFF_SUMMARY),
+            "legacy loopback fetch: {body}"
+        );
+        assert_eq!(open_handoffs(&client, &base).await, 0);
     }
 
     #[tokio::test]

@@ -13,8 +13,8 @@ use ai_memory_consolidate::{
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, WorkstreamState, hook_router,
-    workstream_router,
+    CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
+    WorkstreamState, hook_router, workstream_router,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
@@ -2950,6 +2950,17 @@ async fn require_allowed_host(
 /// a link opened from another application, off these routes even when the
 /// browser labels it `same-origin` or `none`. Non-browser clients send no
 /// fetch metadata and are unaffected.
+///
+/// Both checks rely on fetch metadata, which browsers send only to
+/// potentially trustworthy origins: loopback names and addresses, and HTTPS.
+/// A server reached over plain HTTP through a LAN address or another allowed
+/// host name gets an `<img>` request with neither fetch metadata nor `Origin`.
+/// For that case the session-start handoff fetch, the one state-changing `GET`
+/// on these routes, must also carry [`CLIENT_MARKER_HEADER`], which a page
+/// cannot add without a preflight these routes never answer. Loopback hosts
+/// keep working without it, so hook scripts staged before the header existed
+/// still deliver handoffs on a default install. `POST`s need no marker: a
+/// browser sends `Origin` on every cross-origin `POST`, metadata or not.
 fn refuse_cross_origin_browser_requests(router: axum::Router, auth_enabled: bool) -> axum::Router {
     if auth_enabled {
         return router;
@@ -2957,20 +2968,75 @@ fn refuse_cross_origin_browser_requests(router: axum::Router, auth_enabled: bool
     router.layer(axum::middleware::from_fn(require_same_origin_browser))
 }
 
+/// Body of the 403 a handoff fetch without [`CLIENT_MARKER_HEADER`] gets. It
+/// reaches an operator through a hook staged before the header existed, so it
+/// names both ways out.
+const CLIENT_MARKER_REFUSAL: &str = "handoff fetch refused: this server has no bearer token and \
+     was reached through a non-loopback host name, so it accepts the handoff fetch only from \
+     current ai-memory hooks; re-stage them with `ai-memory install-hooks` (or `ai-memory \
+     upgrade`), or configure AI_MEMORY_AUTH_TOKEN\n";
+
 async fn require_same_origin_browser(req: Request<Body>, next: Next) -> Response {
     let headers = req.headers();
-    if !is_cross_origin_browser_request(headers) && !is_non_script_browser_request(headers) {
-        return next.run(req).await;
+    if is_cross_origin_browser_request(headers) || is_non_script_browser_request(headers) {
+        // Any page the operator opens can trigger this at will, so it stays
+        // out of the default log level.
+        tracing::debug!(
+            path = req.uri().path(),
+            origin = ?headers.get(header::ORIGIN),
+            dest = ?headers.get("sec-fetch-dest"),
+            "rejected browser request to an unauthenticated server"
+        );
+        return (StatusCode::FORBIDDEN, "browser request refused\n").into_response();
     }
-    // Any page the operator opens can trigger this at will, so it stays out
-    // of the default log level.
-    tracing::debug!(
-        path = req.uri().path(),
-        origin = ?req.headers().get(header::ORIGIN),
-        dest = ?req.headers().get("sec-fetch-dest"),
-        "rejected browser request to an unauthenticated server"
-    );
-    (StatusCode::FORBIDDEN, "browser request refused\n").into_response()
+    if handoff_fetch_lacks_client_marker(req.method(), req.uri().path(), headers) {
+        tracing::debug!(
+            host = ?headers.get(header::HOST),
+            "rejected handoff fetch without the client marker on a non-loopback host"
+        );
+        return (StatusCode::FORBIDDEN, CLIENT_MARKER_REFUSAL).into_response();
+    }
+    next.run(req).await
+}
+
+/// Whether this is a handoff fetch (`GET`, or `HEAD`, which axum routes to the
+/// same handler) without [`CLIENT_MARKER_HEADER`] on a host where a browser
+/// sends no fetch metadata. The path is the one inside any `--base-path`
+/// mount, which strips its prefix before this layer runs.
+fn handoff_fetch_lacks_client_marker(
+    method: &axum::http::Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    if path != "/handoff" || !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+    {
+        return false;
+    }
+    if headers
+        .get(CLIENT_MARKER_HEADER)
+        .is_some_and(|value| !value.as_bytes().is_empty())
+    {
+        return false;
+    }
+    !headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(is_loopback_host)
+}
+
+/// Whether a browser treats this `Host` as a potentially trustworthy origin
+/// and so sends fetch metadata to it over plain HTTP: `localhost`, a
+/// `*.localhost` name, `127.0.0.0/8` or `[::1]`. Anything else, including a
+/// LAN address, `0.0.0.0` or `host.docker.internal`, is not.
+fn is_loopback_host(host: &str) -> bool {
+    let name = host_without_port(host).to_ascii_lowercase();
+    name == "localhost"
+        || name
+            .strip_suffix(".localhost")
+            .is_some_and(|label| !label.is_empty())
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Whether a browser marks this request as issued by a page of another origin.
@@ -5124,6 +5190,171 @@ mod tests {
             .await,
             StatusCode::OK
         );
+    }
+
+    #[test]
+    fn loopback_host_detection() {
+        for (host, loopback) in [
+            ("127.0.0.1:49374", true),
+            ("127.0.0.1", true),
+            ("127.8.9.10:49374", true),
+            ("[::1]:49374", true),
+            ("localhost:49374", true),
+            ("LOCALHOST", true),
+            ("ai-memory.localhost:49374", true),
+            ("a.b.LocalHost", true),
+            // Not potentially trustworthy to a browser: no fetch metadata.
+            ("192.168.1.20:49374", false),
+            ("10.0.0.5", false),
+            ("0.0.0.0:49374", false),
+            ("host.docker.internal:49374", false),
+            ("memory.lan:49374", false),
+            ("[::ffff:127.0.0.1]:49374", false),
+            ("notlocalhost:49374", false),
+            ("localhost.evil.example", false),
+            (".localhost", false),
+            ("", false),
+        ] {
+            assert_eq!(is_loopback_host(host), loopback, "{host:?}");
+        }
+    }
+
+    #[test]
+    fn handoff_fetch_client_marker_decision() {
+        use axum::http::Method;
+
+        let headers = |host: &'static str, marker: Option<&'static str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::HOST, host.parse().unwrap());
+            if let Some(marker) = marker {
+                headers.insert(CLIENT_MARKER_HEADER, marker.parse().unwrap());
+            }
+            headers
+        };
+        for (method, path, host, marker, refused) in [
+            // Attack: an `<img>` to a LAN host carries no fetch metadata.
+            (Method::GET, "/handoff", "192.168.1.20:49374", None, true),
+            (Method::HEAD, "/handoff", "192.168.1.20:49374", None, true),
+            (
+                Method::GET,
+                "/handoff",
+                "host.docker.internal:49374",
+                None,
+                true,
+            ),
+            (Method::GET, "/handoff", "memory.lan", Some(""), true),
+            // Controls: a current hook names itself on any host.
+            (
+                Method::GET,
+                "/handoff",
+                "192.168.1.20:49374",
+                Some("hook"),
+                false,
+            ),
+            (
+                Method::GET,
+                "/handoff",
+                "memory.lan",
+                Some("hook-sh"),
+                false,
+            ),
+            // Loopback: browsers send fetch metadata there, and hooks staged
+            // before the marker existed must keep working.
+            (Method::GET, "/handoff", "127.0.0.1:49374", None, false),
+            (Method::GET, "/handoff", "localhost:49374", None, false),
+            (Method::GET, "/handoff", "[::1]:49374", None, false),
+            // Other routes and methods are not the state-changing GET.
+            (Method::POST, "/hook", "192.168.1.20:49374", None, false),
+            (
+                Method::GET,
+                "/admin/handoffs",
+                "192.168.1.20:49374",
+                None,
+                false,
+            ),
+            (Method::GET, "/handoff/x", "192.168.1.20:49374", None, false),
+            (Method::POST, "/handoff", "192.168.1.20:49374", None, false),
+        ] {
+            assert_eq!(
+                handoff_fetch_lacks_client_marker(&method, path, &headers(host, marker)),
+                refused,
+                "{method} {path} host={host} marker={marker:?}"
+            );
+        }
+        let mut no_host = axum::http::HeaderMap::new();
+        assert!(handoff_fetch_lacks_client_marker(
+            &Method::GET,
+            "/handoff",
+            &no_host
+        ));
+        no_host.insert(CLIENT_MARKER_HEADER, "hook".parse().unwrap());
+        assert!(!handoff_fetch_lacks_client_marker(
+            &Method::GET,
+            "/handoff",
+            &no_host
+        ));
+    }
+
+    #[tokio::test]
+    async fn handoff_client_marker_guard_on_lan_hosts_and_under_a_base_path() {
+        use tower::ServiceExt as _;
+
+        let send = |auth_enabled: bool,
+                    base: &'static str,
+                    host: &'static str,
+                    marker: Option<&'static str>| async move {
+            let guarded = refuse_cross_origin_browser_requests(
+                axum::Router::new().route("/handoff", axum::routing::get(|| async { "claimed" })),
+                auth_enabled,
+            );
+            let app = if base.is_empty() {
+                guarded
+            } else {
+                axum::Router::new().nest(base, guarded)
+            };
+            let mut request = Request::builder()
+                .uri(format!("{base}/handoff?workspace=w&project=p"))
+                .header(header::HOST, host);
+            if let Some(marker) = marker {
+                request = request.header(CLIENT_MARKER_HEADER, marker);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        for base in ["", "/memory"] {
+            // Attack: no metadata, no Origin, no marker, LAN host.
+            let (status, body) = send(false, base, "192.168.1.20:49374", None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "base={base:?}");
+            assert!(
+                body.contains("install-hooks") && body.contains("AI_MEMORY_AUTH_TOKEN"),
+                "the refusal must name both remedies: {body}"
+            );
+            // Control: the same request from a current hook.
+            assert_eq!(
+                send(false, base, "192.168.1.20:49374", Some("hook")).await,
+                (StatusCode::OK, "claimed".to_string()),
+                "base={base:?}"
+            );
+            // Legacy hook on a loopback install.
+            assert_eq!(
+                send(false, base, "127.0.0.1:49374", None).await.0,
+                StatusCode::OK,
+                "base={base:?}"
+            );
+            // Auth on: the bearer gate decides.
+            assert_eq!(
+                send(true, base, "192.168.1.20:49374", None).await.0,
+                StatusCode::OK,
+                "base={base:?}"
+            );
+        }
     }
 
     #[test]

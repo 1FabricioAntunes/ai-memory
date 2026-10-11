@@ -15,7 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that are not script calls from a page, such as links and images; hooks, the
   CLI, MCP clients and the built-in web UI are unaffected, and servers with a
   bearer token are unchanged. Images in wiki pages rendered by the web UI are
-  also limited to relative paths that stay inside the UI.
+  also limited to relative paths that stay inside the UI. When an
+  unauthenticated server is reached through a non-loopback host name in its
+  allowlist (a LAN address or name, or `host.docker.internal`), where browsers
+  do not send the request metadata the check relies on, the session-start
+  handoff fetch now also requires an `X-AI-Memory-Client` header that every
+  ai-memory hook, CLI command and generated integration sends. Hooks on such a
+  server must be re-staged with `ai-memory install-hooks` (or
+  `ai-memory upgrade`); loopback installs need nothing.
   (GHSA-6mc4-46pr-w82w)
 - Fixed approving or rejecting an unknown pending write
   (`POST /admin/pending-writes/{id}/approve` or `/reject`) answering 500 instead

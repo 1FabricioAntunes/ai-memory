@@ -44,7 +44,7 @@ function Invoke-WebRequest {
         [string] $ContentType,
         $Body
     )
-    Add-Content -LiteralPath $env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f $Method.ToUpperInvariant(), $Uri)
+    Add-Content -LiteralPath $env:AI_MEMORY_TEST_LOG -Value ('{0} {1} client={2}' -f $Method.ToUpperInvariant(), $Uri, $Headers['X-AI-Memory-Client'])
     if ($Method -eq 'Post') { return $null }
     return [pscustomobject]@{ Content = 'HANDOFF FROM SERVER' }
 }
@@ -163,6 +163,20 @@ Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff
             "the fetched context must still reach the agent: {:?}",
             run.stdout
         );
+    }
+
+    #[test]
+    fn every_request_carries_the_client_marker() {
+        // An unauthenticated server reached by a LAN name refuses a handoff
+        // fetch without it; the event POST rides the same header table.
+        let run = run(None);
+        assert_eq!(run.methods(), vec!["POST", "GET"], "{:?}", run.requests);
+        for request in &run.requests {
+            assert!(
+                request.ends_with(" client=hook-ps"),
+                "request without the client marker: {request}"
+            );
+        }
     }
 
     #[test]
