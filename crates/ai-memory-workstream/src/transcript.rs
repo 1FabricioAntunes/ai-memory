@@ -29,6 +29,9 @@ const MAX_ANTIGRAVITY_HISTORY_LINE_BYTES: usize = 64 * 1024;
 /// of its `.db` being created.
 const ANTIGRAVITY_OPENING_PROMPT_WINDOW: Duration = Duration::from_secs(5);
 const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
+/// Event metadata key holding the working directory the event's own record
+/// was written in, when the harness records one per record.
+pub const RECORD_CWD_KEY: &str = "cwd";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,6 +671,7 @@ fn export_jsonl(
     let mut line = Vec::new();
     let mut events = Vec::new();
     let mut losses = Vec::new();
+    let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
         let read = reader.read_until(b'\n', &mut line)?;
@@ -706,6 +710,7 @@ fn export_jsonl(
         } else {
             source_id(&value).unwrap_or_else(|| format!("byte-{}", offset - read as u64))
         };
+        let first_event = events.len();
         match harness {
             ManagedHarness::Claude => parse_claude(
                 &value,
@@ -774,6 +779,21 @@ fn export_jsonl(
                 ));
             }
         }
+        let record_cwd = match harness {
+            ManagedHarness::Claude => value.get("cwd").and_then(Value::as_str),
+            ManagedHarness::Codex => {
+                if matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("session_meta" | "turn_context")
+                ) && let Some(cwd) = value.pointer("/payload/cwd").and_then(Value::as_str)
+                {
+                    codex_turn_cwd = Some(cwd.to_owned());
+                }
+                codex_turn_cwd.as_deref()
+            }
+            _ => None,
+        };
+        stamp_record_cwd(&mut events[first_event..], record_cwd);
     }
     if harness == ManagedHarness::Kimi {
         annotate_kimi_subagents(path, &mut losses);
@@ -790,6 +810,23 @@ fn export_jsonl(
         events,
         losses: deduplicate_losses(losses),
     })
+}
+
+/// Label each event with the working directory its record was written in.
+/// Claude Code records `cwd` on every line and Codex in each `turn_context`,
+/// and both follow the session as it moves, so the session's opening cwd can
+/// be the wrong base for a relative path. Imports resolve tool arguments and
+/// the capture policy from this label, as the live hook does from each event's
+/// own `cwd`.
+fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
+    let Some(cwd) = cwd.filter(|cwd| Path::new(cwd).is_absolute()) else {
+        return;
+    };
+    for event in events {
+        if let Some(metadata) = event.metadata.as_object_mut() {
+            metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
+        }
+    }
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -5024,6 +5061,65 @@ mod tests {
         assert_eq!(second.events.len(), 1);
         assert_eq!(second.events[0].kind, WorkstreamEventKind::ToolResult);
         assert_eq!(second.events[0].content, "ok");
+    }
+
+    /// Claude Code writes `cwd` on every record and Codex in each
+    /// `turn_context`; each event carries the cwd of the record it came from,
+    /// so an import resolves relative tool arguments from where the call ran.
+    #[test]
+    fn jsonl_events_carry_their_record_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let docs = root.join("docs");
+        let claude = temp.path().join("claude.jsonl");
+        let record = |uuid: &str, cwd: &Path, content: Value| json!({"type":"assistant","uuid":uuid,"cwd":cwd,"message":{"role":"assistant","content":content}});
+        fs::write(
+            &claude,
+            [
+                record("one", &root, json!("at the root")),
+                record(
+                    "two",
+                    &docs,
+                    json!([{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}]),
+                ),
+                json!({"type":"assistant","uuid":"three","cwd":"relative","message":{"role":"assistant","content":"no usable cwd"}}),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let events = export_jsonl(ManagedHarness::Claude, &claude, "s", None)
+            .unwrap()
+            .events;
+        let cwds: Vec<_> = events
+            .iter()
+            .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
+            .collect();
+        assert_eq!(cwds, [root.to_str(), docs.to_str(), None], "{events:?}");
+        assert_eq!(events[1].metadata["tool"], "Bash");
+
+        let codex = temp.path().join("codex.jsonl");
+        let item = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        fs::write(
+            &codex,
+            [
+                json!({"type":"session_meta","payload":{"id":"s","cwd":root}}),
+                item("first turn"),
+                json!({"type":"turn_context","payload":{"cwd":docs}}),
+                item("second turn"),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let events = export_jsonl(ManagedHarness::Codex, &codex, "s", None)
+            .unwrap()
+            .events;
+        let cwds: Vec<_> = events
+            .iter()
+            .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
+            .collect();
+        assert_eq!(cwds, [root.to_str(), docs.to_str()], "{events:?}");
     }
 
     #[test]

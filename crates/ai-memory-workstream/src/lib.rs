@@ -26,9 +26,9 @@ pub use repository::{
 };
 pub use transcript::{
     AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, NativeSessionCandidate,
-    claude_continued_session, claude_live_background_attach_id, claude_session_ran_in_background,
-    discover_native_session, export_transcript, kiro_harness_from_source_cursor,
-    kiro_v3_resume_uses_default_store, list_native_sessions, native_memory_dir,
-    native_session_exists, native_session_in_checkout, native_store_root,
+    RECORD_CWD_KEY, claude_continued_session, claude_live_background_attach_id,
+    claude_session_ran_in_background, discover_native_session, export_transcript,
+    kiro_harness_from_source_cursor, kiro_v3_resume_uses_default_store, list_native_sessions,
+    native_memory_dir, native_session_exists, native_session_in_checkout, native_store_root,
     wait_for_transcript_flush,
 };
