@@ -29,7 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `write_bash`) and shell commands using brace expansion or a bracket class
   are now metadata-only, since the matcher cannot prove they miss an ignored
   path; upgrade the server before the clients, because an older server drops
-  those events. This applies to the native hook, the server, and the
+  those events. A script quoted inside a string-form shell command (an
+  `sh -c` argument, a command substitution in double quotes) is now read like
+  the rest of the command line, the path in a git object name (`REV:path`) is
+  checked, Antigravity's `run_command` resolves its arguments from its `Cwd`,
+  and ANSI-C strings and backslash-escaped letters are read the way the shell
+  reads them. Inline interpreter code (`python3 -c`, `node -e` and similar)
+  and further glob syntax the matcher does not evaluate (zsh glob groups,
+  extglobs, encoded escapes) are now metadata-only under an active policy.
+  This applies to the native hook, the server, and the
   generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a

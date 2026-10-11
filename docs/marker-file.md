@@ -461,6 +461,17 @@ out of capture:
 ignore_paths = ["private/**", "~/personal-notes/**"]
 ```
 
+> **`ignore_paths` is a best-effort filter for shell commands and unknown
+> tools.** File tools are matched on their explicit path fields, but a shell
+> command is only read lexically and a tool the matcher does not list is not
+> read at all. The [gaps listed below](#capture-exclusion-residuals) stay
+> open: shell variables (`$VAR`), a `cd` inside a command, symlinks, a
+> recursive search of a parent directory, unknown tools, and scripts that a
+> command reads from a file or a heredoc. For a sensitive project, use
+> **allowlist capture mode** (`install-hooks --capture-mode allowlist`, above)
+> and leave that repository without a marker. That mode is the strict
+> guarantee: nothing from an unmarked repository is captured at all.
+
 A repository that keeps its decision records in the tree (an ADR directory,
 a [Keep the Why](https://github.com/oliver-zehentleitner/keep-the-why)
 `context/` tree) belongs here too: `ignore_paths = ["docs/adr/**"]` or
@@ -521,19 +532,40 @@ Codex shell calls, including its `exec_command` path, reach hooks as `Bash`
 with the command in `tool_input.command`.
 A command given as an argument vector keeps each element as one word (a path
 with spaces stays whole, up to 256 characters) and also splits each element on
-its own, so a `bash -lc "<script>"` script is read like any command line. Each
+its own. Any word that holds more than one word is split again the same way,
+whether it is an argument vector element, a quoted script (`bash -c '…'`,
+`sh -c "…"`), or a command substitution inside double quotes (`"$(…)"` or
+backquotes), so a script is read like any command line, up to four quoting
+levels; a script nested deeper is **metadata-only**. A quoted message that
+mentions an ignored path (`git commit -m "…docs/adr/…"`) therefore drops the
+event too. An ANSI-C string (`$'…'`) is decoded and a backslash before an
+ordinary letter is dropped, as the shell does. Each
 argument that is not a flag, plus the value of a `--flag=value`, `NAME=value`,
 or PowerShell `-Param:value` word, is resolved like a file-tool path: from the tool's own
-`workdir` argument (Gemini CLI's `dir_path`) when it has one, otherwise from the event's `cwd`. If
+`workdir` argument (Gemini CLI's `dir_path`, Antigravity's `Cwd`) when it has one, otherwise from the event's `cwd`.
+The path in a git object name (`HEAD:docs/x.md`, `:docs/x.md`) is resolved
+from both the `cwd` and the marker directory, because git reads it from the
+repository root. If
 one matches a pattern, the whole event is **dropped**, exactly like a matching
 file read. An argument containing `*` or `?` also matches when its glob can
 reach a pattern's directory: `cat docs/*/0001.md` is dropped under
 `docs/adr/**`, `cat *.md` at the repository root is not. A command that exceeds
-the match budget is dropped. A command with an unquoted brace expansion
-(`docs/{adr,x}/1.md`, `{1..3}`) or bracket class (`docs/ad[r]/1.md`) that no
-argument matches outright is **metadata-only**, because those are not
-evaluated; quoted or escaped braces and brackets, `${…}`, `{}` and `[ -f x ]`
-are unaffected. Variables, command substitution, `cd` state, and
+the match budget is dropped. A command that no argument matches outright is
+**metadata-only** when it uses syntax the matcher does not evaluate: an
+unquoted brace expansion (`docs/{adr,x}/1.md`, `{1..3}`), a bracket class
+(`docs/ad[r]/1.md`, including one that starts with `]`), a zsh glob group or
+extglob (`docs/(a|b)/1.md`, `@(…)`), or a numeric or control escape in an
+ANSI-C string. The same holds for those inside a script run by `sh -c`,
+`eval` or a command substitution, but not inside a quoted message or pattern
+(`git log --format='%h {a,b}'`). Quoted or escaped braces and brackets,
+`${…}`, `{}`, `[ -f x ]`, `$(…)`, `<(…)` and a `( … )` subshell are
+unaffected; a word glued to a parenthesis (`f()`, `(a|b)x`) also counts as a
+glob group. Inline interpreter code (`python3 -c`, `node -e`, `ruby -e`,
+`perl -e`, `php -r`, `deno eval`) is **metadata-only** under an active policy
+unless one of its words names an ignored path outright, which drops it:
+code can build a path at run time (`'docs/' + name`), so no lexical match can
+rule one out. Running a script file or a module (`python3 -m pytest`,
+`node build.js`) is unaffected. Variables, command substitution, `cd` state, and
 commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
 their output is still captured. An invalid policy makes a shell command
 **metadata-only**, like a file tool, because a broken marker cannot prove its
@@ -556,13 +588,19 @@ re-reads too (for every file, not only the ignored ones). Add each relevant visi
 explicitly, and do not rely on this feature to detect every way private content
 can be mentioned.
 
-These gaps are inherent to lexical matching and stay open:
+<a id="capture-exclusion-residuals"></a>These gaps are inherent to lexical matching and stay open:
 
-- shell variables (`$VAR`) and command substitution are not expanded;
+- shell variables (`$VAR`) are not expanded, and a command substitution's
+  output is not known (its own words are read);
 - a `cd` inside a command is not followed (the tool's own `workdir` is);
 - symlinks are not resolved, by design;
 - a recursive search of a parent directory through a shell (`grep -r x docs`,
   `rg x`) names no ignored path, so its output is kept;
+- a script read from a file (`bash run.sh`, `python3 tool.py`) is not read,
+  and a heredoc fed to an interpreter (`python3 - <<EOF`) is read only for the
+  words it spells out;
+- git resolves `REV:path` from the repository root, which is approximated by
+  the marker directory and the `cwd`;
 - tools the matcher does not list keep their current behavior.
 
 For a project whose content must never be captured, use allowlist capture mode
