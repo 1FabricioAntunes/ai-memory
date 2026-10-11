@@ -3385,18 +3385,10 @@ async fn handle_pending_write_approve(
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<PendingWriteScopeQuery>,
 ) -> impl IntoResponse {
-    let proposal_id: AutoImproveProposalId = match id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
-            );
-        }
-    };
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
-    {
-        Ok(ids) => ids,
+    // Looked up first so an unknown id answers 404 rather than surfacing the
+    // decision path's not-found error as a 500.
+    let (ws, proj, proposal_id) = match pending_detail(&state, &id, &query).await {
+        Ok((ws, proj, owned)) => (ws, proj, owned.detail.summary.id),
         Err(e) => return e,
     };
     let actor = actor_ext
@@ -3434,18 +3426,10 @@ async fn handle_pending_write_reject(
     Query(query): Query<PendingWriteScopeQuery>,
     Json(body): Json<PendingRejectRequest>,
 ) -> impl IntoResponse {
-    let proposal_id: AutoImproveProposalId = match id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
-            );
-        }
-    };
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
-    {
-        Ok(ids) => ids,
+    // Looked up first so an unknown id answers 404 rather than surfacing the
+    // decision path's not-found error as a 500.
+    let (ws, proj, proposal_id) = match pending_detail(&state, &id, &query).await {
+        Ok((ws, proj, owned)) => (ws, proj, owned.detail.summary.id),
         Err(e) => return e,
     };
     let actor = actor_ext
@@ -12133,6 +12117,86 @@ mod tests {
             .unwrap()
             .expect("approve writes target page");
         assert_eq!(page.body, "# Stored\n\nfrom stored proposal");
+    }
+
+    #[tokio::test]
+    async fn pending_write_decision_on_unknown_id_returns_404() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/known.md",
+            "# Known\n\nstaged body",
+        )
+        .await;
+        // A second project, so a proposal addressed through the wrong scope
+        // resolves the scope and then misses the proposal.
+        stage_pending_write(&store, "default", "other", "notes/x.md", "# X").await;
+        wiki.write_auto_improve_sidecar(ws, proj, proposal_id)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let decide = |id: String, project: &'static str, action: &'static str| {
+            let router = router.clone();
+            async move {
+                let resp = router
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!(
+                                "/admin/pending-writes/{id}/{action}?workspace=default&project={project}"
+                            ))
+                            .header("content-type", "application/json")
+                            .body(Body::from(r#"{"reason":"r"}"#))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).ok(),
+                )
+            }
+        };
+
+        let unknown = AutoImproveProposalId::new().to_string();
+        for action in ["approve", "reject"] {
+            let (status, body) = decide(unknown.clone(), "scratch", action).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{action} unknown id");
+            assert_eq!(
+                body.as_ref().and_then(|b| b["error"].as_str()),
+                Some("proposal not found in scope"),
+                "{action} unknown id body"
+            );
+            let (status, _) = decide(proposal_id.to_string(), "other", action).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{action} through a foreign scope"
+            );
+        }
+        // Still a 400 for an id that does not parse.
+        let (status, _) = decide("not-an-id".into(), "scratch", "approve").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Control: the known proposal is still pending and approves.
+        let (status, body) = decide(proposal_id.to_string(), "scratch", "approve").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/known.md")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

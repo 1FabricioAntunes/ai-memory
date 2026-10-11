@@ -1732,9 +1732,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     &args.web_slug,
                 ))
             });
-            let router = machine
+            let router = refuse_cross_origin_browser_requests(machine.merge(admin), auth_enabled)
                 .merge(healthz_router())
-                .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
@@ -2929,6 +2928,83 @@ async fn require_allowed_host(
     }
     tracing::warn!(host, allowed = ?allowed_hosts, "rejected request with disallowed Host header");
     (StatusCode::FORBIDDEN, "forbidden host\n").into_response()
+}
+
+/// Refuse browser requests from a foreign page on a server with no credential
+/// gate.
+///
+/// With auth off, the machine and admin routes trust whoever can reach the
+/// port, and a page in the operator's browser can reach `127.0.0.1`. Browsers
+/// send `GET` and body-less `POST` cross-origin without a preflight, and the
+/// JSON extractors cannot refuse a request that has no body: `GET /handoff`
+/// claims the single-use baton, `POST /admin/profile/rebuild` runs a profile
+/// pass. Hooks, the CLI and MCP clients never send `Origin` or
+/// `Sec-Fetch-Site`; the built-in web UI's same-origin calls into `/admin`
+/// pass. With auth on, the bearer token (which a foreign page cannot attach)
+/// and the session CSRF token are the gate instead.
+///
+/// The same layer also refuses any browser request whose `Sec-Fetch-Dest` is
+/// not `empty`. Script `fetch()`/XHR, which is how the web UI calls `/admin`,
+/// sends `empty`; images, navigations, link clicks, iframes and form posts
+/// send another destination. That keeps a link or image stored in a page, or
+/// a link opened from another application, off these routes even when the
+/// browser labels it `same-origin` or `none`. Non-browser clients send no
+/// fetch metadata and are unaffected.
+fn refuse_cross_origin_browser_requests(router: axum::Router, auth_enabled: bool) -> axum::Router {
+    if auth_enabled {
+        return router;
+    }
+    router.layer(axum::middleware::from_fn(require_same_origin_browser))
+}
+
+async fn require_same_origin_browser(req: Request<Body>, next: Next) -> Response {
+    let headers = req.headers();
+    if !is_cross_origin_browser_request(headers) && !is_non_script_browser_request(headers) {
+        return next.run(req).await;
+    }
+    // Any page the operator opens can trigger this at will, so it stays out
+    // of the default log level.
+    tracing::debug!(
+        path = req.uri().path(),
+        origin = ?req.headers().get(header::ORIGIN),
+        dest = ?req.headers().get("sec-fetch-dest"),
+        "rejected browser request to an unauthenticated server"
+    );
+    (StatusCode::FORBIDDEN, "browser request refused\n").into_response()
+}
+
+/// Whether a browser marks this request as issued by a page of another origin.
+///
+/// `Sec-Fetch-Site` is computed by the browser and decides when present. A
+/// browser too old to send it still sends `Origin` on every cross-origin
+/// `POST`, so that falls back to comparing `Origin` with `Host`; `Origin: null`
+/// (sandboxed frames, some redirects) never matches.
+fn is_cross_origin_browser_request(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return !matches!(site.to_str(), Ok("same-origin" | "none"));
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return false;
+    };
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    let authority = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| origin.split_once("://"))
+        .map(|(_, authority)| authority);
+    match (authority, host) {
+        (Some(authority), Some(host)) => !authority.eq_ignore_ascii_case(host),
+        _ => true,
+    }
+}
+
+/// Whether a browser says this request was not issued by script `fetch()` or
+/// XHR (`Sec-Fetch-Dest` other than `empty`). A value that is not valid UTF-8
+/// is refused; an absent header leaves the decision to the origin check.
+fn is_non_script_browser_request(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-dest")
+        .is_some_and(|dest| !dest.to_str().is_ok_and(|d| d.eq_ignore_ascii_case("empty")))
 }
 
 fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
@@ -4870,6 +4946,184 @@ mod tests {
     #[test]
     fn host_without_port_handles_ipv6_loopback() {
         assert_eq!(host_without_port("[::1]:49374"), "::1");
+    }
+
+    fn browser_headers(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:49374".parse().unwrap());
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn cross_origin_browser_request_detection() {
+        for (pairs, cross) in [
+            // Hooks, the CLI and MCP clients send neither header.
+            (&[][..], false),
+            (&[("sec-fetch-mode", "cors")][..], false),
+            (&[("sec-fetch-site", "same-origin")][..], false),
+            (&[("sec-fetch-site", "none")][..], false),
+            (&[("origin", "http://127.0.0.1:49374")][..], false),
+            (
+                &[
+                    ("origin", "http://127.0.0.1:49374"),
+                    ("sec-fetch-site", "same-origin"),
+                ][..],
+                false,
+            ),
+            (&[("sec-fetch-site", "cross-site")][..], true),
+            (&[("sec-fetch-site", "same-site")][..], true),
+            (&[("origin", "https://evil.example")][..], true),
+            (&[("origin", "http://localhost:49374")][..], true),
+            (&[("origin", "null")][..], true),
+            // Fetch metadata decides over a forged-looking Origin and vice versa.
+            (
+                &[
+                    ("origin", "http://127.0.0.1:49374"),
+                    ("sec-fetch-site", "cross-site"),
+                ][..],
+                true,
+            ),
+        ] {
+            assert_eq!(
+                is_cross_origin_browser_request(&browser_headers(pairs)),
+                cross,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_script_browser_request_detection() {
+        for (pairs, refused) in [
+            // No fetch metadata (hooks, CLI, MCP clients): the origin check decides.
+            (&[][..], false),
+            (&[("sec-fetch-site", "same-origin")][..], false),
+            // Script fetch()/XHR, as the web UI sends.
+            (&[("sec-fetch-dest", "empty")][..], false),
+            (&[("sec-fetch-dest", "EMPTY")][..], false),
+            (
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "empty"),
+                ][..],
+                false,
+            ),
+            // Images, navigations, frames: refused even same-origin or `none`.
+            (&[("sec-fetch-dest", "image")][..], true),
+            (&[("sec-fetch-dest", "document")][..], true),
+            (&[("sec-fetch-dest", "iframe")][..], true),
+            (
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "image"),
+                ][..],
+                true,
+            ),
+            (
+                &[("sec-fetch-site", "none"), ("sec-fetch-dest", "document")][..],
+                true,
+            ),
+            (&[("sec-fetch-dest", "")][..], true),
+        ] {
+            assert_eq!(
+                is_non_script_browser_request(&browser_headers(pairs)),
+                refused,
+                "{pairs:?}"
+            );
+        }
+        let mut headers = browser_headers(&[]);
+        headers.insert(
+            "sec-fetch-dest",
+            axum::http::HeaderValue::from_bytes(b"emp\xffty").unwrap(),
+        );
+        assert!(is_non_script_browser_request(&headers), "non-UTF-8 dest");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_browser_guard_applies_only_without_auth() {
+        use tower::ServiceExt as _;
+
+        let send = |auth_enabled: bool, pairs: &'static [(&'static str, &'static str)]| async move {
+            let app = refuse_cross_origin_browser_requests(
+                axum::Router::new().route("/handoff", axum::routing::get(|| async { "claimed" })),
+                auth_enabled,
+            );
+            let mut request = Request::builder()
+                .uri("/handoff")
+                .header(header::HOST, "127.0.0.1:49374");
+            for (name, value) in pairs {
+                request = request.header(*name, *value);
+            }
+            app.oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+        // Attack: an `<img src>` from a foreign page, auth off.
+        assert_eq!(
+            send(false, &[("sec-fetch-site", "cross-site")]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(false, &[("origin", "https://evil.example")]).await,
+            StatusCode::FORBIDDEN
+        );
+        // Attack: a same-origin image or a navigation from outside the browser.
+        assert_eq!(
+            send(
+                false,
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "image")
+                ]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                false,
+                &[("sec-fetch-site", "none"), ("sec-fetch-dest", "document")]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // Controls: a hook-style request, and the web UI's same-origin call.
+        assert_eq!(send(false, &[]).await, StatusCode::OK);
+        assert_eq!(
+            send(false, &[("sec-fetch-site", "same-origin")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                false,
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "empty")
+                ]
+            )
+            .await,
+            StatusCode::OK
+        );
+        // With auth on, the bearer gate decides; this layer stays out of it.
+        assert_eq!(
+            send(true, &[("sec-fetch-site", "cross-site")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                true,
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "document")
+                ]
+            )
+            .await,
+            StatusCode::OK
+        );
     }
 
     #[test]

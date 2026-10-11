@@ -55,6 +55,22 @@ HTTPS-only. Close or redirect direct HTTP access to that hostname.
 Non-loopback binds should also set `AI_MEMORY_ALLOWED_HOSTS` to guard against
 DNS rebinding.
 
+With no token (the loopback default), a web page open in your browser can
+still address `127.0.0.1:49374`. The server refuses those requests on the
+machine and admin routes: a request the browser marks as cross-site
+(`Sec-Fetch-Site`), or one whose `Origin` is not the server's own host, gets a
+403. So does any browser request that is not a script `fetch()` call
+(`Sec-Fetch-Dest` other than `empty`): a link, image or navigation is refused
+even when it comes from the server's own pages or from another application.
+Hooks, the CLI and MCP clients never send those headers, and the web UI's own
+admin calls use `fetch()`. A browser without fetch metadata (Safari before
+16.4) only gets the `Origin` check, which an image or link does not trigger;
+set a bearer token if you use one. The `Host`
+allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
+content types a browser can send without a CORS preflight. Images in wiki pages
+rendered by the web UI may only use relative paths that stay inside the UI, so
+viewing a stored page cannot make your browser call those routes either.
+
 Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
 second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to
 bound one runaway session without blocking unrelated hook sources. Unset or `0`

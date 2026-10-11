@@ -545,27 +545,91 @@ fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
     }
 }
 
-/// Allow images only from the current origin.
+/// Allow images only from relative paths under the web mount.
 ///
 /// Unlike links, images are fetched as soon as untrusted markdown is viewed.
 /// An absolute or network-path URL would therefore disclose the viewer's IP,
 /// user agent, and view timing without a click. Keep ordinary external links
 /// clickable, but neutralise every non-relative image target. Backslashes are
 /// rejected because browsers can interpret them as URL path separators.
+///
+/// The fetch is also same-origin, so it carries the viewer's standing with
+/// the server: a target that resolved to a machine or admin route would run
+/// that route as the viewer. Root-relative targets and `..` segments (also
+/// percent-encoded, which browsers resolve as dot segments) could climb out
+/// of the web mount, and a first segment naming a server route reaches it
+/// when the UI is mounted at the base-path root (`--web-slug /`).
 fn safe_image_url(url: CowStr<'_>) -> CowStr<'_> {
-    let trimmed = url.trim_start();
-    let is_network_path = trimmed.starts_with("//")
-        || trimmed.starts_with("\\\\")
-        || trimmed.starts_with("/\\")
-        || trimmed.starts_with("\\/");
-    let is_relative =
-        trimmed.starts_with('/') || trimmed.starts_with('#') || !trimmed.contains(':');
-
-    if !trimmed.is_empty() && is_relative && !is_network_path && !trimmed.contains('\\') {
+    if is_safe_image_target(&url) {
         url
     } else {
         CowStr::Boxed("#".into())
     }
+}
+
+/// Top-level server routes outside the web UI. A relative image whose first
+/// segment matches one would hit it when the UI is mounted at the root.
+const SERVER_ROUTE_SEGMENTS: &[&str] = &[
+    "admin",
+    "auth",
+    "handoff",
+    "hook",
+    "identity",
+    "mcp",
+    "workstream",
+];
+
+fn is_safe_image_target(url: &str) -> bool {
+    // Browsers trim leading and trailing C0 controls and spaces; the HTML
+    // writer percent-encodes the rest, so no other control reaches the URL.
+    let cleaned = url.trim_matches(|c: char| c <= ' ');
+    if cleaned.is_empty() {
+        return false;
+    }
+    if cleaned.starts_with('#') {
+        return true;
+    }
+    if cleaned.starts_with('/') || cleaned.contains(['\\', ':']) {
+        return false;
+    }
+    let path = cleaned.split(['?', '#']).next().unwrap_or_default();
+    let decoded = percent_decode_lossy(path);
+    if decoded.starts_with('/')
+        || decoded.contains('\\')
+        || decoded.split('/').any(|segment| segment == "..")
+    {
+        return false;
+    }
+    let first = decoded
+        .split('/')
+        .find(|segment| !segment.is_empty() && *segment != ".")
+        .unwrap_or_default();
+    !SERVER_ROUTE_SEGMENTS
+        .iter()
+        .any(|route| first.eq_ignore_ascii_case(route))
+}
+
+/// Decode `%XX` escapes once, the way a URL parser sees dot segments.
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// True when `target` carries a URL scheme that should never be
@@ -741,8 +805,10 @@ mod tests {
     fn preserves_relative_images() {
         for target in [
             "images/diagram.png",
-            "../shared/diagram.png",
-            "/static/logo.svg",
+            "./images/diagram.png",
+            "static/logo.png",
+            "diagram.png?v=2",
+            "#figure-1",
         ] {
             let markdown = format!("![local]({target})");
             let html = render(&markdown, "default", "scratch");
@@ -750,6 +816,41 @@ mod tests {
                 html.contains(&format!(r#"src="{target}""#)),
                 "target {target}: {html}"
             );
+        }
+    }
+
+    /// A same-origin image fetch runs as the viewer, so a stored page must not
+    /// be able to point one at a machine or admin route (the handoff claim, an
+    /// admin job): root-relative, network-path, dot-segment (plain or
+    /// percent-encoded) and root-mounted route targets are all neutralised.
+    #[test]
+    fn neutralises_images_that_reach_server_routes() {
+        for target in [
+            "/handoff?workspace=default&project=scratch",
+            "/admin/backup",
+            "/static/logo.png",
+            "//evil.example/x.png",
+            "../../../../handoff?workspace=default&project=scratch",
+            "%2e%2e/%2e%2e/handoff?workspace=default&project=scratch",
+            ".%2E/admin/backup",
+            "images/%2e%2e/%2e%2e/handoff",
+            "../shared/diagram.png",
+            // `--web-slug /` puts the UI at the root, where these relative
+            // targets resolve straight to the server routes.
+            "handoff?workspace=default&project=scratch",
+            "./handoff",
+            ".//handoff",
+            "Admin/backup",
+            "mcp",
+            "hook/batch",
+            "workstream/runs",
+            "identity",
+            "%2fhandoff",
+        ] {
+            let markdown = format!("![pixel](<{target}>)");
+            let html = render(&markdown, "default", "scratch");
+            assert!(html.contains("src=\"#\""), "target {target}: {html}");
+            assert!(html.contains("alt=\"pixel\""), "target {target}: {html}");
         }
     }
 
