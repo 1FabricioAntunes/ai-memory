@@ -1126,34 +1126,79 @@ fn reads_earlier_output(name: &str) -> bool {
 /// Pi's (`<tmp>/pi-bash-<id>.log`). The command that produced it may have been
 /// dropped, so, like [`reads_earlier_output`], nothing proves it missed every
 /// ignored path. Segment names compare without regard to ASCII case.
+///
+/// A path holding `*` or `?` is a glob that could expand to such a file
+/// (`~/.claude/projects/*/*/tool-results/*`): each of its segments is read as
+/// a one-segment glob (`**` included) that fits a named directory or file
+/// when the two globs share a match. At least one segment that fits must
+/// spell some literal text, so a bare `*` or `*/*` is never taken for a saved
+/// output file on its own.
 fn output_spool(path: &str) -> bool {
-    let segments: Vec<String> = path
+    let segments: Vec<Vec<char>> = path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(str::to_ascii_lowercase)
+        .map(|segment| segment.to_ascii_lowercase().chars().collect())
         .collect();
     let Some((file, directories)) = segments.split_last() else {
         return false;
     };
-    let parent = directories.last().map(String::as_str);
-    let claude_results = directories.iter().enumerate().any(|(index, segment)| {
-        segment == "projects"
-            && index > 0
-            && directories[index - 1].contains("claude")
+    let fits = |segment: &[char], shape: &str| {
+        globs_intersect(segment, &shape.chars().collect::<Vec<_>>())
+    };
+    // A segment that is not only wildcards names something.
+    let named = |segments: &[&Vec<char>]| {
+        segments
+            .iter()
+            .any(|segment| segment.iter().any(|c| !matches!(c, '*' | '?')))
+    };
+    let count = directories.len();
+    let claude_results = (1..count).any(|index| {
+        let (claude, projects) = (&directories[index - 1], &directories[index]);
+        fits(claude, "*claude*")
+            && fits(projects, "projects")
             && directories[index + 1..]
                 .iter()
-                .any(|segment| segment == "tool-results")
+                .any(|results| fits(results, "tool-results") && named(&[claude, projects, results]))
     });
-    let claude_task = parent == Some("tasks")
-        && file.ends_with(".output")
-        && directories
-            .iter()
-            .any(|segment| segment.starts_with("claude"));
-    let opencode = parent == Some("tool-output")
-        && directories.len() >= 2
-        && directories[directories.len() - 2] == "opencode";
-    let pi = file.starts_with("pi-bash-") && file.ends_with(".log");
+    let claude_task = count > 0 && {
+        let parent = &directories[count - 1];
+        fits(parent, "tasks")
+            && fits(file, "*.output")
+            && directories
+                .iter()
+                .any(|claude| fits(claude, "claude*") && named(&[parent, file, claude]))
+    };
+    let opencode = count >= 2 && {
+        let (data, output) = (&directories[count - 2], &directories[count - 1]);
+        fits(data, "opencode") && fits(output, "tool-output") && named(&[data, output])
+    };
+    let pi = fits(file, "pi-bash-*.log") && named(&[file]);
     claude_results || claude_task || opencode || pi
+}
+
+/// Whether two one-segment globs over `*` and `?` match a common string.
+/// A literal is a glob without wildcards, so for one this is `glob_match`.
+fn globs_intersect(left: &[char], right: &[char]) -> bool {
+    // `common[i][j]`: some string matches both `left[i..]` and `right[j..]`.
+    let mut common = vec![vec![false; right.len() + 1]; left.len() + 1];
+    common[left.len()][right.len()] = true;
+    for i in (0..=left.len()).rev() {
+        for j in (0..=right.len()).rev() {
+            if i == left.len() && j == right.len() {
+                continue;
+            }
+            common[i][j] = if left.get(i) == Some(&'*') {
+                common[i + 1][j] || (j < right.len() && common[i][j + 1])
+            } else if right.get(j) == Some(&'*') {
+                common[i][j + 1] || (i < left.len() && common[i + 1][j])
+            } else if let (Some(l), Some(r)) = (left.get(i), right.get(j)) {
+                (*l == '?' || *r == '?' || l == r) && common[i + 1][j + 1]
+            } else {
+                false
+            };
+        }
+    }
+    common[0][0]
 }
 
 fn family(name: &str) -> ToolFamily {
