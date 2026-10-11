@@ -18,7 +18,7 @@ use ai_memory_hooks::{
 };
 use serde_json::Value;
 
-use super::hook::{lexical_capture_cwd, tool_location_routing_cwd};
+use super::hook::{checkout_admits_capture, lexical_capture_cwd, tool_location_routing_cwd};
 use super::hook_capture::capture_policy;
 
 /// What an import does with one transcript event.
@@ -60,25 +60,36 @@ impl EventCapture {
 
 /// The capture policy of the checkout a transcript was recorded in.
 pub(crate) struct TranscriptCapture {
+    admitted: bool,
     policy: CapturePolicy,
     cwd: String,
     inspection_cwd: String,
 }
 
 impl TranscriptCapture {
-    /// Resolve the nearest marker's policy for `cwd`, exactly as the live hook
-    /// does for an event reporting that cwd.
-    pub(crate) fn for_checkout(cwd: &Path) -> Self {
+    /// Resolve the live hook's admission gate (this install's capture mode
+    /// under `data_dir`) and the nearest marker's policy for `cwd`, exactly as
+    /// the hook does for an event reporting that cwd.
+    pub(crate) fn for_checkout(data_dir: &Path, cwd: &Path) -> Self {
         let cwd = cwd.to_string_lossy().into_owned();
         Self {
+            admitted: checkout_admits_capture(data_dir, &cwd),
             policy: capture_policy(&cwd),
             inspection_cwd: lexical_capture_cwd(&cwd),
             cwd,
         }
     }
 
-    /// One decision per event, in transcript order. Messages are always kept,
-    /// as live prompt capture keeps them.
+    /// Whether the live hook would emit anything at all from this checkout.
+    /// Under allowlist capture mode an unmarked checkout admits nothing.
+    pub(crate) const fn admits_capture(&self) -> bool {
+        self.admitted
+    }
+
+    /// One decision per event, in transcript order. A checkout the hook's
+    /// admission gate refuses drops every event, prompts included, as the
+    /// live hook emits none. Otherwise messages are kept, as live prompt
+    /// capture keeps them.
     ///
     /// A result answers the call with the same native id. Some adapters record
     /// no id, so a result without a matching call takes the strictest decision
@@ -88,6 +99,9 @@ impl TranscriptCapture {
     /// dropped under a policy, since nothing proves it missed every ignored
     /// path.
     pub(crate) fn decide(&self, events: &[NewWorkstreamEvent]) -> Vec<EventCapture> {
+        if !self.admitted {
+            return vec![EventCapture::Drop; events.len()];
+        }
         let mut by_id: HashMap<&str, EventCapture> = HashMap::new();
         let mut turn: Vec<EventCapture> = Vec::new();
         let mut out = Vec::with_capacity(events.len());
@@ -309,7 +323,7 @@ mod tests {
     #[test]
     fn an_excluded_read_drops_its_call_and_result_by_id() {
         let repo = checkout(Some("docs/adr/**"));
-        let capture = TranscriptCapture::for_checkout(repo.path());
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
         let events = [
             event(WorkstreamEventKind::Message, "user", "read both", json!({})),
             read_call(&repo.path().join("docs/adr/1.md"), Some("adr")),
@@ -329,7 +343,7 @@ mod tests {
     #[test]
     fn id_less_results_take_the_strictest_call_of_their_turn() {
         let repo = checkout(Some("docs/adr/**"));
-        let capture = TranscriptCapture::for_checkout(repo.path());
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
         let events = [
             event(WorkstreamEventKind::Message, "user", "turn one", json!({})),
             read_call(&repo.path().join("docs/adr/1.md"), None),
@@ -351,7 +365,7 @@ mod tests {
     #[test]
     fn unrecoverable_arguments_and_orphan_results_fail_closed_under_a_policy() {
         let repo = checkout(Some("docs/adr/**"));
-        let capture = TranscriptCapture::for_checkout(repo.path());
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
         let truncated_shell = event(
             WorkstreamEventKind::ToolCall,
             "assistant",
@@ -379,7 +393,7 @@ mod tests {
     #[test]
     fn without_a_policy_every_event_is_kept() {
         let repo = checkout(None);
-        let capture = TranscriptCapture::for_checkout(repo.path());
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
         let events = [
             read_call(&repo.path().join("docs/adr/1.md"), None),
             result("ADR text", None),
@@ -394,7 +408,7 @@ mod tests {
     fn a_call_into_another_checkout_honors_its_policy() {
         let source = checkout(None);
         let other = checkout(Some("private/**"));
-        let capture = TranscriptCapture::for_checkout(source.path());
+        let capture = TranscriptCapture::for_checkout(source.path(), source.path());
         let events = [
             read_call(&other.path().join("private/key.txt"), Some("a")),
             result("private", Some("a")),
@@ -407,10 +421,59 @@ mod tests {
         );
     }
 
+    /// Under allowlist capture mode the live hook emits nothing — prompts
+    /// included — from a checkout without a marker; an import drops every
+    /// event there. A marked checkout and the default denylist mode keep them.
+    #[test]
+    fn allowlist_mode_admits_nothing_from_an_unmarked_checkout() {
+        let allowlist = tempfile::tempdir().unwrap();
+        std::fs::write(
+            allowlist.path().join(super::super::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        let denylist = tempfile::tempdir().unwrap();
+        let unmarked = checkout(None);
+        let marked = checkout(Some("docs/adr/**"));
+        let events = |repo: &Path| {
+            vec![
+                event(WorkstreamEventKind::Message, "user", "a prompt", json!({})),
+                read_call(&repo.join("src/lib.rs"), Some("pub")),
+                result("public code", Some("pub")),
+                event(WorkstreamEventKind::Message, "assistant", "done", json!({})),
+            ]
+        };
+
+        let refused = TranscriptCapture::for_checkout(allowlist.path(), unmarked.path());
+        assert!(!refused.admits_capture());
+        assert_eq!(
+            kinds(&refused.decide(&events(unmarked.path()))),
+            ["drop", "drop", "drop", "drop"]
+        );
+        assert!(
+            refused
+                .filter_ledger_events(events(unmarked.path()))
+                .is_empty()
+        );
+
+        let opted_in = TranscriptCapture::for_checkout(allowlist.path(), marked.path());
+        assert!(opted_in.admits_capture());
+        assert_eq!(
+            kinds(&opted_in.decide(&events(marked.path()))),
+            ["keep", "keep", "keep", "keep"]
+        );
+        let default = TranscriptCapture::for_checkout(denylist.path(), unmarked.path());
+        assert!(default.admits_capture());
+        assert_eq!(
+            kinds(&default.decide(&events(unmarked.path()))),
+            ["keep", "keep", "keep", "keep"]
+        );
+    }
+
     #[test]
     fn ledger_events_are_dropped_or_stripped_before_upload() {
         let repo = checkout(Some("docs/adr/**"));
-        let capture = TranscriptCapture::for_checkout(repo.path());
+        let capture = TranscriptCapture::for_checkout(repo.path(), repo.path());
         let malformed = event(
             WorkstreamEventKind::ToolCall,
             "assistant",

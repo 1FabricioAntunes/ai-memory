@@ -445,7 +445,9 @@ resume, continue, session, or fork selector.
    decision table: an excluded tool call and its result never enter the
    ledger, one the policy cannot prove safe keeps only its tool family, and a
    result whose call was imported by an earlier run is dropped under a
-   policy. Messages are unaffected. Each delivered
+   policy. Messages are unaffected. Under allowlist capture mode a checkout
+   without a marker uploads no events at all, as the live hook emits none
+   there; the run still finishes. Each delivered
    workstream packet begins with a versioned origin marker. If Claude Code
    persists that packet and its `Read` tool returns it, the Claude transcript
    normalizer excludes the marked result instead of feeding delivered history

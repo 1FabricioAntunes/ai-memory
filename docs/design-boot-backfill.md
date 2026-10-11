@@ -194,7 +194,11 @@ Retroactive text is exactly as untrusted as live hook text, since it is old mode
   call is dropped under a policy. Kept events carry no protocol: their body is a
   normalized transcript record, not the native payload the server's re-inspection
   reads, and the server never receives the ignore patterns. The `ai-memory run` ledger
-  applies the same decisions before its segments are uploaded.
+  applies the same decisions before its segments are uploaded. Both also apply the
+  hook's repository admission gate (`checkout_admits_capture`): under allowlist capture
+  mode a checkout without a marker imports nothing, prompts included, exactly as the
+  live hook emits nothing there; a manual `ai-memory backfill` says so and stops before
+  contacting the server.
 - **Emptiness + lease** prevent a backfill from overwriting or racing an established
   project's real history.
 - **Multi-user posture.** On a shared server, default-on retro-import of a long local

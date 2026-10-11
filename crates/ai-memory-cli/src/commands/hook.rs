@@ -767,14 +767,8 @@ where
         crate::cli::CaptureModeArg::mode,
     );
     let route = resolve_hook_route(&dd, policy_cwd.as_deref(), || std::env::current_dir().ok());
-    // Marker presence is the opt-in signal under allowlist mode. Resolved from
-    // the same upward walk the policy uses, so opting in needs no new file.
-    let marker_present = policy_cwd
-        .as_deref()
-        .is_some_and(|cwd| crate::marker::find_marker(cwd).is_some());
-    let routing_valid = policy_cwd
-        .as_deref()
-        .is_none_or(|cwd| crate::marker::routing_selection(cwd).is_ok());
+    let marker_present = marker_present(policy_cwd.as_deref());
+    let routing_valid = routing_valid(policy_cwd.as_deref());
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
@@ -1405,6 +1399,27 @@ pub(crate) fn lexical_capture_cwd(cwd: &str) -> String {
 /// does so by construction rather than by preservation logic that a new render
 /// path could forget.
 pub(crate) const CAPTURE_MODE_FILE: &str = "capture-mode";
+
+/// Marker presence is the opt-in signal under allowlist mode. Resolved from
+/// the same upward walk the policy uses, so opting in needs no new file.
+fn marker_present(cwd: Option<&str>) -> bool {
+    cwd.is_some_and(|cwd| crate::marker::find_marker(cwd).is_some())
+}
+
+/// An unreadable routing marker emits nothing rather than guess a scope.
+fn routing_valid(cwd: Option<&str>) -> bool {
+    cwd.is_none_or(|cwd| crate::marker::routing_selection(cwd).is_ok())
+}
+
+/// The hook's repository admission gate (#446) for a transcript import from
+/// the checkout at `cwd`: this install's persisted capture mode, the marker
+/// opt-in, and a readable routing marker. `backfill` and the `ai-memory run`
+/// ledger import nothing — prompts included — from a checkout the live hook
+/// would emit nothing for.
+pub(crate) fn checkout_admits_capture(data_dir: &Path, cwd: &str) -> bool {
+    repository_admits_capture(persisted_capture_mode(data_dir), marker_present(Some(cwd)))
+        && routing_valid(Some(cwd))
+}
 
 /// Read the persisted capture mode. Anything unreadable, absent, or
 /// unrecognised means the historical default: this file can only ever tighten

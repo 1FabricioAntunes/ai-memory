@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them. Both now apply the same decision as the live hook to every imported
   tool call and its result: an excluded call is not imported at all, one the
   policy cannot prove safe keeps only its tool family, and prompts and
-  assistant messages are imported as before. Results recorded without an id
+  assistant messages are imported as before, and under allowlist capture
+  mode a checkout without a marker imports nothing. Results recorded without an id
   linking them to their call take the strictest decision of their turn.
   (GHSA-gcpc-88hm-3xqr)
 - Fixed a web page open in the operator's browser being able to act on an

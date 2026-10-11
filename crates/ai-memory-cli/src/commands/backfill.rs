@@ -93,6 +93,9 @@ struct BackfillReport {
     /// True when the store was already populated (or `--force` off) and nothing
     /// was imported.
     skipped_non_empty: bool,
+    /// True when this install's capture mode admits nothing from this
+    /// checkout (allowlist mode without a marker), so nothing was imported.
+    skipped_not_admitted: bool,
     /// True for a `--dry-run` (planning only, no import).
     dry_run: bool,
 }
@@ -191,7 +194,11 @@ async fn backfill_endpoint(
 /// are returned, including in JSON mode.
 pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the current working directory")?;
+    run_in(config, args, cwd).await
+}
 
+/// [`run`] for the checkout at `cwd`.
+async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -> Result<()> {
     // The automatic (SessionStart-spawned) path honors the opt-out and records
     // that it has been attempted for this checkout, so it runs at most once per
     // machine regardless of outcome. Manual runs ignore both.
@@ -205,14 +212,23 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let home = run::native_home(config).context("locating the local harness session stores")?;
-    let endpoint = backfill_endpoint(config, &args).await?;
-
     let mut report = BackfillReport {
         workspace: workspace.clone(),
         project: project.clone(),
         dry_run: args.dry_run,
         ..BackfillReport::default()
     };
+
+    // The live hook's admission gate and `[capture] ignore_paths`, applied to
+    // the import as the hook applies them to live events. A checkout the hook
+    // would emit nothing for (allowlist capture mode without a marker) imports
+    // nothing, before the server is contacted at all.
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, &cwd);
+    if !capture.admits_capture() {
+        report.skipped_not_admitted = true;
+        return finish(&args, &report);
+    }
+    let endpoint = backfill_endpoint(config, &args).await?;
 
     // Emptiness gate. Only bootstrap a brand-new store; an established project
     // is never retro-imported (that would duplicate hook-captured history).
@@ -237,10 +253,6 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     if args.dry_run {
         return finish(&args, &report);
     }
-
-    // The checkout's `[capture] ignore_paths`, applied to every imported tool
-    // call as the live hook applies it.
-    let capture = TranscriptCapture::for_checkout(&cwd);
 
     // Import each selected session, oldest-first so the imported history reads
     // chronologically, until the total-events circuit breaker trips.
@@ -801,6 +813,13 @@ fn finish(args: &crate::cli::BackfillArgs, report: &BackfillReport) -> Result<()
     if args.quiet {
         return Ok(());
     }
+    if report.skipped_not_admitted {
+        println!(
+            "ai-memory: capture mode is allowlist and this checkout has no .ai-memory.toml marker opting in (or its marker is unreadable) — nothing to backfill for {}/{}.",
+            report.workspace, report.project
+        );
+        return Ok(());
+    }
     if report.skipped_non_empty {
         println!(
             "ai-memory: {}/{} already has captured sessions — nothing to backfill (use --force to import anyway).",
@@ -1268,7 +1287,7 @@ mod tests {
             native_session_id: sid.into(),
             updated_at: SystemTime::now(),
         };
-        let capture = TranscriptCapture::for_checkout(repo.path());
+        let capture = TranscriptCapture::for_checkout(home.path(), repo.path());
         import_one(
             &endpoint,
             "ws",
@@ -1306,6 +1325,78 @@ mod tests {
             assert_eq!(item["body"]["tool_family"], "file");
             assert_eq!(item["body"]["tool_call_id"], "toolu_bad");
         }
+    }
+
+    /// Allowlist capture mode (#446) makes an unmarked checkout emit nothing
+    /// from the live hook, so a manual backfill of it must not contact the
+    /// server at all. Controls: the same checkout with a marker, and the same
+    /// unmarked checkout under the default denylist mode, both proceed to the
+    /// server.
+    #[tokio::test]
+    async fn allowlist_mode_backfills_nothing_from_an_unmarked_checkout() {
+        use axum::{Router, extract::Request};
+        use std::sync::{Arc, Mutex};
+
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(request.uri().path().to_owned());
+                axum::Json(serde_json::json!({ "by_agent": [], "accepted": 0 }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let attempt = |mode: Option<&'static str>, marked: bool| {
+            let requests = requests.clone();
+            async move {
+                let home = tempfile::tempdir().unwrap();
+                let data_dir = tempfile::tempdir().unwrap();
+                let repo = tempfile::tempdir().unwrap();
+                if let Some(mode) = mode {
+                    std::fs::write(
+                        data_dir.path().join(super::super::hook::CAPTURE_MODE_FILE),
+                        mode,
+                    )
+                    .unwrap();
+                }
+                if marked {
+                    std::fs::write(repo.path().join(".ai-memory.toml"), "[capture]\n").unwrap();
+                }
+                let mut config =
+                    crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+                config.data_dir = data_dir.path().to_path_buf();
+                config.home_dir = Some(home.path().to_string_lossy().into_owned());
+                config.server_url = format!("http://{address}");
+                config.auth.bearer_token = None;
+                let mut args = spawned_args(None, None);
+                args.auto = false;
+                args.workspace = Some("ws".into());
+                args.project = Some("proj".into());
+                requests.lock().unwrap().clear();
+                run_in(&config, args, repo.path().to_path_buf())
+                    .await
+                    .unwrap();
+                requests.lock().unwrap().clone()
+            }
+        };
+
+        assert!(
+            attempt(Some("allowlist\n"), false).await.is_empty(),
+            "allowlist + unmarked checkout must not reach the server"
+        );
+        assert!(
+            !attempt(Some("allowlist\n"), true).await.is_empty(),
+            "control: a marked checkout proceeds under allowlist"
+        );
+        assert!(
+            !attempt(None, false).await.is_empty(),
+            "control: denylist (default) is unchanged"
+        );
+        server.abort();
     }
 
     fn spawned_args(

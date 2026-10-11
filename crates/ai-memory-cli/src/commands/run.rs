@@ -1251,7 +1251,7 @@ async fn run_once_with_wiring(
         checkpoint,
         Some(exit_code),
         &privacy,
-        &TranscriptCapture::for_checkout(&repository.cwd),
+        &TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd),
     )
     .await
     {
@@ -8775,7 +8775,7 @@ mod tests {
                     Default::default(),
                     Some(0),
                     &sanitizer,
-                    &TranscriptCapture::for_checkout(home.path()),
+                    &TranscriptCapture::for_checkout(home.path(), home.path()),
                 )
                 .await
                 .is_err(),
@@ -8802,7 +8802,7 @@ mod tests {
                     Default::default(),
                     Some(0),
                     &sanitizer,
-                    &TranscriptCapture::for_checkout(home.path()),
+                    &TranscriptCapture::for_checkout(home.path(), home.path()),
                 )
                 .await
                 .is_err(),
@@ -8818,7 +8818,7 @@ mod tests {
                 Default::default(),
                 Some(0),
                 &sanitizer,
-                &TranscriptCapture::for_checkout(home.path()),
+                &TranscriptCapture::for_checkout(home.path(), home.path()),
             )
             .await
             .unwrap(),
@@ -8919,7 +8919,7 @@ mod tests {
             Default::default(),
             Some(0),
             &Sanitizer::builtin(),
-            &TranscriptCapture::for_checkout(repo.path()),
+            &TranscriptCapture::for_checkout(home.path(), repo.path()),
         )
         .await
         .unwrap();
@@ -8935,6 +8935,117 @@ mod tests {
             Some("cursor"),
             "the cursor still advances past the excluded events"
         );
+    }
+
+    /// Allowlist capture mode (#446): the live hook emits nothing from an
+    /// unmarked checkout, so its run ledger upload carries no events — no
+    /// prompt, no tool content — while still finishing the run. A marked
+    /// checkout under allowlist and an unmarked one under the default denylist
+    /// upload the transcript as before.
+    #[tokio::test]
+    async fn ledger_upload_under_allowlist_mode_carries_nothing_from_an_unmarked_checkout() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let allowlist = tempfile::tempdir().unwrap();
+        std::fs::write(
+            allowlist.path().join(super::super::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        let denylist = tempfile::tempdir().unwrap();
+        let unmarked = tempfile::tempdir().unwrap();
+        let marked = tempfile::tempdir().unwrap();
+        std::fs::write(marked.path().join(".ai-memory.toml"), "[capture]\n").unwrap();
+        let transcript = || ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                ai_memory_core::NewWorkstreamEvent {
+                    event_id: "prompt".into(),
+                    agent: AgentKind::ClaudeCode,
+                    native_session_id: "sid-1".into(),
+                    source_record_id: None,
+                    kind: ai_memory_core::WorkstreamEventKind::Message,
+                    role: Some("user".into()),
+                    content: "PROMPTSENTINEL".into(),
+                    occurred_at: None,
+                    metadata: serde_json::json!({}),
+                },
+                ai_memory_core::NewWorkstreamEvent {
+                    event_id: "tool".into(),
+                    agent: AgentKind::ClaudeCode,
+                    native_session_id: "sid-1".into(),
+                    source_record_id: None,
+                    kind: ai_memory_core::WorkstreamEventKind::ToolCall,
+                    role: Some("assistant".into()),
+                    content: "Bash: {\"command\":\"echo TOOLSENTINEL\"}".into(),
+                    occurred_at: None,
+                    metadata: serde_json::json!({"tool": "Bash"}),
+                },
+            ],
+            losses: Vec::new(),
+        };
+        let upload = |data_dir: &Path, repo: &Path| {
+            let capture = TranscriptCapture::for_checkout(data_dir, repo);
+            let endpoint = &endpoint;
+            let requests = requests.clone();
+            async move {
+                requests.lock().unwrap().clear();
+                import_batches(
+                    endpoint,
+                    "/workstream/runs/test",
+                    transcript(),
+                    Default::default(),
+                    Some(0),
+                    &Sanitizer::builtin(),
+                    &capture,
+                )
+                .await
+                .unwrap();
+                serde_json::to_string(&*requests.lock().unwrap()).unwrap()
+            }
+        };
+
+        let refused = upload(allowlist.path(), unmarked.path()).await;
+        assert!(!refused.contains("SENTINEL"), "{refused}");
+        assert!(
+            requests.lock().unwrap()[0].complete,
+            "the run still finishes, with no events"
+        );
+        assert!(requests.lock().unwrap()[0].events.is_empty());
+        for (data_dir, repo, label) in [
+            (allowlist.path(), marked.path(), "marked under allowlist"),
+            (denylist.path(), unmarked.path(), "unmarked under denylist"),
+        ] {
+            let kept = upload(data_dir, repo).await;
+            assert!(
+                kept.contains("PROMPTSENTINEL") && kept.contains("TOOLSENTINEL"),
+                "control {label}: {kept}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
