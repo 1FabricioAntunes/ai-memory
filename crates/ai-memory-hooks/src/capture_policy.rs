@@ -572,14 +572,21 @@ impl CapturePolicy {
                             ExtractionState::MissingOrMalformed,
                         )
                     }
-                    Some(paths) => match self.match_paths(paths, cwd) {
-                        Ok(true) => (CaptureDisposition::Drop, ExtractionState::Extracted),
-                        Ok(false) => (CaptureDisposition::Keep, ExtractionState::Extracted),
-                        Err(()) => (
-                            CaptureDisposition::MetadataOnly,
-                            ExtractionState::MissingOrMalformed,
-                        ),
-                    },
+                    Some(paths) => {
+                        let matched = if extracted.globs {
+                            self.match_globs(paths, cwd)
+                        } else {
+                            self.match_paths(paths, cwd)
+                        };
+                        match matched {
+                            Ok(true) => (CaptureDisposition::Drop, ExtractionState::Extracted),
+                            Ok(false) => (CaptureDisposition::Keep, ExtractionState::Extracted),
+                            Err(()) => (
+                                CaptureDisposition::MetadataOnly,
+                                ExtractionState::MissingOrMalformed,
+                            ),
+                        }
+                    }
                 },
                 // A shell command has no path field, but its arguments can
                 // still name an ignored file whose content lands in the
@@ -661,39 +668,77 @@ impl CapturePolicy {
                 let Some(candidate) = normalize_candidate(&expanded, cwd) else {
                     continue;
                 };
-                let insensitive = candidate.flavor == Flavor::Windows;
-                let is_glob = candidate.path.contains(['*', '?']);
-                for pattern in self
-                    .patterns
-                    .iter()
-                    .filter(|pattern| pattern.flavor == candidate.flavor)
-                {
-                    // Linear and bounded by the command itself; only the
-                    // quadratic matches below are charged to the budget.
-                    let under_prefix =
-                        starts_with_chars(&candidate.path, &pattern.literal_prefix, insensitive);
-                    if !under_prefix && !is_glob {
-                        continue;
-                    }
-                    work = work
-                        .checked_add(pattern.match_cost(&candidate.path))
-                        .ok_or(())?;
-                    if work > MAX_MATCH_WORK {
-                        return Err(());
-                    }
-                    if (under_prefix
-                        && glob_match(
-                            &pattern.path,
-                            &candidate.path,
-                            pattern.directory_base.as_deref(),
-                            insensitive,
-                        ))
-                        || (is_glob
-                            && glob_reaches(&candidate.path, &pattern.literal_prefix, insensitive))
-                    {
-                        return Ok(true);
-                    }
+                if self.match_pattern_candidate(&candidate, false, &mut work)? {
+                    return Ok(true);
                 }
+            }
+        }
+        Ok(false)
+    }
+    /// Matches the path arguments of Gemini CLI's `read_many_files`, which are
+    /// globs expanded case-insensitively (`nocase`) with `**` recursing into
+    /// any depth. A literal path matches like a file tool's; a glob drops when
+    /// it could expand into an ignored path, the same over-approximation
+    /// shell globs get. Glob syntax the matcher cannot evaluate (classes,
+    /// braces, extglobs, negation) fails closed.
+    fn match_globs(&self, paths: &[String], cwd: &str) -> Result<bool, ()> {
+        let mut work = 0_usize;
+        for path in paths {
+            if path.contains(['[', ']', '{', '}', '(', ')', '!']) {
+                return Err(());
+            }
+            let candidate = normalize_candidate(path, cwd).ok_or(())?;
+            if self.match_pattern_candidate(&candidate, true, &mut work)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    /// Whether one normalized candidate, literal or glob, names or can expand
+    /// into an ignored path. `tool_glob` selects `read_many_files` expansion
+    /// (case-insensitive, recursive `**`) over a shell's; Windows always
+    /// ignores case.
+    fn match_pattern_candidate(
+        &self,
+        candidate: &Normalized,
+        tool_glob: bool,
+        work: &mut usize,
+    ) -> Result<bool, ()> {
+        let insensitive = tool_glob || candidate.flavor == Flavor::Windows;
+        let is_glob = candidate.path.contains(['*', '?']);
+        for pattern in self
+            .patterns
+            .iter()
+            .filter(|pattern| pattern.flavor == candidate.flavor)
+        {
+            // Linear and bounded by the candidate itself; only the
+            // quadratic matches below are charged to the budget.
+            let under_prefix =
+                starts_with_chars(&candidate.path, &pattern.literal_prefix, insensitive);
+            if !under_prefix && !is_glob {
+                continue;
+            }
+            *work = work
+                .checked_add(pattern.match_cost(&candidate.path))
+                .ok_or(())?;
+            if *work > MAX_MATCH_WORK {
+                return Err(());
+            }
+            let reaches = if tool_glob {
+                globstar_reaches
+            } else {
+                glob_reaches
+            };
+            if (under_prefix
+                && glob_match(
+                    &pattern.path,
+                    &candidate.path,
+                    pattern.directory_base.as_deref(),
+                    insensitive,
+                ))
+                || (is_glob && reaches(&candidate.path, &pattern.literal_prefix, insensitive))
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -737,6 +782,8 @@ struct Extracted<'a> {
     /// locate where the tool ran; capture policy drops search output under an
     /// active marker regardless of it.
     search_paths: Option<Vec<String>>,
+    /// The paths are globs (Gemini CLI `read_many_files`), not literal files.
+    globs: bool,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -805,11 +852,18 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         .then(|| args.and_then(|value| direct_paths(value.as_object()?)))
         .flatten();
     // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
-    // when given, so relative arguments resolve from there.
+    // when given, Gemini CLI `run_shell_command` in `dir_path` (`directory`
+    // before it was renamed), so relative arguments resolve from there.
     let shell = family == ToolFamily::NonFile && !name.eq_ignore_ascii_case("web_search");
     let workdir = command
         .as_ref()
-        .and_then(|_| args?.get("workdir")?.as_str())
+        .and_then(|_| {
+            let args = args?;
+            ["workdir", "dir_path", "directory"]
+                .iter()
+                .find_map(|key| args.get(*key))?
+                .as_str()
+        })
         .filter(|dir| !dir.trim().is_empty())
         .map(str::to_owned);
     let state = if family == ToolFamily::File && paths.is_none() {
@@ -841,6 +895,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         shell,
         workdir,
         search_paths,
+        globs: name.eq_ignore_ascii_case("read_many_files"),
         call_id,
         state,
     }
@@ -870,14 +925,21 @@ fn family(name: &str) -> ToolFamily {
         | "fs_read"
         | "fs_write" => ToolFamily::File,
         "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
+        // Gemini CLI reads every file its `include` globs expand to.
+        "read_many_files" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
         | "list_dir" | "grep_search" | "search_files" | "find_by_name" => ToolFamily::SearchList,
+        // Gemini CLI's directory listing, and the pre-rename name of its
+        // `grep_search` that it still accepts as an alias.
+        "list_directory" | "search_file_content" => ToolFamily::SearchList,
         "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
         | "search_web" | "manage_task" | "manage_subagents" | "terminal" | "execute_bash"
         | "execute_cmd" => ToolFamily::NonFile,
         // Claude Code on Windows exposes `PowerShell` beside `Bash`, with the
         // same `tool_input.command` field (#1186).
         "powershell" => ToolFamily::NonFile,
+        // Gemini CLI's shell tool, `{command, dir_path?}`.
+        "run_shell_command" => ToolFamily::NonFile,
         // Hermes Agent tool surface (agent/shell_hooks.py envelope; tool
         // names from model_tools registry, live-captured 2026-10-07). These
         // execute code, drive a browser, or fetch the web — none touch
@@ -927,6 +989,20 @@ fn extract_paths(name: &str, args: &Value) -> Option<Vec<String>> {
                 return None;
             }
             paths.extend(paths_in_entry);
+        }
+    }
+    // Gemini CLI `read_many_files` names its globs in `include` (`paths`,
+    // which `direct_paths` reads, before a rename). `exclude` only narrows
+    // the read, so it is not a candidate.
+    if name.eq_ignore_ascii_case("read_many_files")
+        && let Some(include) = object.get("include")
+    {
+        let entries = include.as_array()?;
+        if paths.len().checked_add(entries.len())? > MAX_CAPTURE_CANDIDATES {
+            return None;
+        }
+        for entry in entries {
+            paths.push(entry.as_str()?.to_owned());
         }
     }
     if matches!(name.to_ascii_lowercase().as_str(), "read" | "fs_read")
@@ -1449,6 +1525,35 @@ fn glob_reaches(glob: &str, prefix: &str, insensitive: bool) -> bool {
         offset += 1;
     }
     false
+}
+/// `glob_reaches` for a glob whose `**` spans any number of segments, as in
+/// Gemini CLI's `read_many_files`: once the segments before the first `**`
+/// lead into `prefix` (or `prefix` lies below them), the glob can reach it.
+fn globstar_reaches(glob: &str, prefix: &str, insensitive: bool) -> bool {
+    let Some(star) = glob.find("**") else {
+        return glob_reaches(glob, prefix, insensitive);
+    };
+    let head = glob[..star].rfind('/').map_or("", |slash| &glob[..slash]);
+    let depth = head.split('/').filter(|part| !part.is_empty()).count();
+    let mut seen = 0;
+    let mut offset = 0;
+    for part in prefix.split('/') {
+        if seen == depth {
+            break;
+        }
+        offset += part.len();
+        if !part.is_empty() {
+            seen += 1;
+        }
+        if seen < depth {
+            offset += 1;
+        }
+    }
+    if seen < depth {
+        // `prefix` is shallower than the literal head; compare as usual.
+        return glob_reaches(glob, prefix, insensitive);
+    }
+    glob_match(head, &prefix[..offset.min(prefix.len())], None, insensitive)
 }
 fn char_equal(left: char, right: char, insensitive: bool) -> bool {
     if insensitive && left.is_ascii() && right.is_ascii() {
@@ -2372,6 +2477,282 @@ mod tests {
                 assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
             }
         }
+    }
+
+    /// Gemini CLI's `run_shell_command` and `read_many_files` fell to the
+    /// unknown family, so `ignore_paths` never read their arguments and the
+    /// raw output reached the spool. `read_many_files` takes globs that Gemini
+    /// expands case-insensitively with a recursive `**`; any one that names or
+    /// can expand into an ignored path drops the call, and glob syntax the
+    /// matcher cannot evaluate fails closed.
+    #[test]
+    fn gemini_cli_shell_and_read_many_files_honor_ignored_paths() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let gemini = |tool: &str, input: Value| {
+            json!({"hook_event_name": "AfterTool", "tool_name": tool, "tool_input": input,
+                "tool_response": {"llmContent": "SENTINEL_CONTENT"}})
+        };
+        let read_many = |include: &[&str]| gemini("read_many_files", json!({"include": include}));
+        let shell = |input: Value| gemini("run_shell_command", input);
+        for (raw, expected, family) in [
+            (
+                read_many(&["docs/adr/x.md"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["README.md", "docs/adr/x.md"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["docs/adr"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["docs/*/x.md"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["**/*.md"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["docs/**"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["/repo/**/x.md"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["Docs/ADR/x.md"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&[r"docs\adr\x.md"]),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&[
+                    "src/**/*.rs",
+                    "*.md",
+                    "docs/guide.md",
+                    "docs/adr-notes/x.md",
+                ]),
+                CaptureDisposition::Keep,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["src/**"]),
+                CaptureDisposition::Keep,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["/elsewhere/**/*.md"]),
+                CaptureDisposition::Keep,
+                ToolFamily::File,
+            ),
+            // `exclude` cannot be trusted to subtract an ignored path.
+            (
+                gemini(
+                    "read_many_files",
+                    json!({"include": ["docs/**"], "exclude": ["docs/adr/**"]}),
+                ),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            // Pre-rename spelling of the same tool.
+            (
+                gemini("read_many_files", json!({"paths": ["docs/adr/x.md"]})),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                gemini(
+                    "read_many_files",
+                    json!({"paths": ["README.md"], "include": ["docs/adr/*"]}),
+                ),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            // Unprovable globs and shapes fail closed to metadata only.
+            (
+                read_many(&["docs/ad[r]/x.md"]),
+                CaptureDisposition::MetadataOnly,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["docs/{adr,x}/*.md"]),
+                CaptureDisposition::MetadataOnly,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&["README.md", "!(x)"]),
+                CaptureDisposition::MetadataOnly,
+                ToolFamily::File,
+            ),
+            (
+                read_many(&[]),
+                CaptureDisposition::MetadataOnly,
+                ToolFamily::File,
+            ),
+            (
+                gemini("read_many_files", json!({"include": ["README.md", 7]})),
+                CaptureDisposition::MetadataOnly,
+                ToolFamily::File,
+            ),
+            (
+                shell(json!({"command": "cat docs/adr/x.md"})),
+                CaptureDisposition::Drop,
+                ToolFamily::NonFile,
+            ),
+            (
+                shell(json!({"command": "cat x.md", "dir_path": "docs/adr"})),
+                CaptureDisposition::Drop,
+                ToolFamily::NonFile,
+            ),
+            (
+                shell(json!({"command": "cat x.md", "dir_path": "/repo/docs/adr"})),
+                CaptureDisposition::Drop,
+                ToolFamily::NonFile,
+            ),
+            (
+                shell(json!({"command": "cat x.md", "directory": "docs/adr"})),
+                CaptureDisposition::Drop,
+                ToolFamily::NonFile,
+            ),
+            (
+                shell(json!({"command": "cat README.md", "description": "show"})),
+                CaptureDisposition::Keep,
+                ToolFamily::NonFile,
+            ),
+            (
+                shell(json!({"command": "cat x.md", "dir_path": "src"})),
+                CaptureDisposition::Keep,
+                ToolFamily::NonFile,
+            ),
+            (
+                gemini("list_directory", json!({"dir_path": "docs"})),
+                CaptureDisposition::Drop,
+                ToolFamily::SearchList,
+            ),
+            (
+                gemini("search_file_content", json!({"pattern": "x"})),
+                CaptureDisposition::Drop,
+                ToolFamily::SearchList,
+            ),
+            (
+                gemini("grep_search", json!({"pattern": "x"})),
+                CaptureDisposition::Drop,
+                ToolFamily::SearchList,
+            ),
+            (
+                gemini("glob", json!({"pattern": "**/*.md"})),
+                CaptureDisposition::Drop,
+                ToolFamily::SearchList,
+            ),
+            (
+                gemini("read_file", json!({"file_path": "docs/adr/x.md"})),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                gemini(
+                    "write_file",
+                    json!({"file_path": "docs/adr/x.md", "content": "x"}),
+                ),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                gemini(
+                    "replace",
+                    json!({"file_path": "docs/adr/x.md", "old_string": "a", "new_string": "b"}),
+                ),
+                CaptureDisposition::Drop,
+                ToolFamily::File,
+            ),
+            (
+                gemini("read_file", json!({"file_path": "README.md"})),
+                CaptureDisposition::Keep,
+                ToolFamily::File,
+            ),
+        ] {
+            let decision = policy.inspect(AgentKind::GeminiCli, &raw, "/repo");
+            assert_eq!(decision.protocol().disposition(), expected, "raw: {raw}");
+            assert_eq!(decision.protocol().tool_family(), family, "raw: {raw}");
+        }
+
+        // Windows host: Gemini normalizes `\` and ignores case like the drive.
+        let windows = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            r"C:\repo",
+            None,
+        );
+        for (include, expected) in [
+            (r"DOCS\adr\*.md", CaptureDisposition::Drop),
+            (r"C:\repo\**\x.md", CaptureDisposition::Drop),
+            (r"src\**\*.rs", CaptureDisposition::Keep),
+        ] {
+            let raw = read_many(&[include]);
+            let decision = windows.inspect(AgentKind::GeminiCli, &raw, r"C:\repo");
+            assert_eq!(decision.protocol().disposition(), expected, "{include}");
+        }
+
+        // An absolute `dir_path` locates the shell call for rerouting, exactly
+        // like a `workdir`; a relative one cannot prove a checkout.
+        assert_eq!(
+            absolute_tool_location_paths(
+                AgentKind::GeminiCli,
+                &shell(json!({"command": "ls", "dir_path": "/other/repo"})),
+                "/repo"
+            ),
+            Some(vec!["/other/repo".to_owned()])
+        );
+        assert_eq!(
+            absolute_tool_location_paths(
+                AgentKind::GeminiCli,
+                &shell(json!({"command": "ls", "dir_path": "sub"})),
+                "/repo"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn globstar_reaches_lets_double_star_span_any_depth() {
+        assert!(globstar_reaches("/repo/**/*.md", "/repo/docs/adr", false));
+        assert!(globstar_reaches("/**", "/repo/docs/adr", false));
+        assert!(globstar_reaches("/repo/d*/**", "/repo/docs/adr", false));
+        assert!(globstar_reaches(
+            "/repo/docs/adr/sub/**",
+            "/repo/docs/adr",
+            false
+        ));
+        assert!(globstar_reaches("C:/**/x", "C:/Docs", true));
+        assert!(!globstar_reaches("/repo/src/**", "/repo/docs/adr", false));
+        assert!(!globstar_reaches("/other/**", "/repo/docs/adr", false));
+        // Without `**` it is exactly `glob_reaches`.
+        assert!(!globstar_reaches("/repo/*.md", "/repo/docs/adr", false));
+        assert!(globstar_reaches("/repo/*/adr/x", "/repo/docs/adr", false));
+        // A shell glob does not recurse: `glob_reaches` keeps that reading.
+        assert!(!glob_reaches("/repo/**/*.md", "/repo/docs/adr", false));
     }
 
     /// Claude Code's Windows `PowerShell` tool was classified unknown, so its

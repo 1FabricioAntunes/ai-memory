@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed Gemini CLI's `run_shell_command` and `read_many_files` tools being
+  classified as unknown, so `[capture] ignore_paths` never checked them and a
+  call reading an ignored file still had its output written to the local hook
+  spool and sent to the server, which then discarded it. `run_shell_command` is
+  now a shell tool, read like `Bash` and resolved from its `dir_path`, and
+  `read_many_files` is a file tool: the call is dropped when any of its
+  `include` globs names or could expand into an ignored path, and glob syntax
+  the matcher cannot evaluate makes it metadata-only. Gemini's
+  `list_directory` and the legacy `search_file_content` name are now search
+  tools, dropped under an active policy like `grep_search` and `glob`. This
+  applies to the native hook, the server, and the generated TypeScript
+  integrations.
 - Fixed a web page open in the operator's browser being able to act on an
   unauthenticated server (the loopback default, no token), such as claiming a
   project's pending handoff or starting admin jobs. With auth off, the machine

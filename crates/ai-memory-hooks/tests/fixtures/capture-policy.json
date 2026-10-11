@@ -46,7 +46,34 @@
     {"agent":"codex","payload":{"tool_name":"Bash","tool_input":{"command":"secret/a"}},"disposition":"drop","tool_family":"non-file","extraction_state":"extracted","path_count":0},
     {"agent":"codex","payload":{"tool_name":"FutureTool","tool_input":{"path":"secret/a"}},"disposition":"keep","tool_family":"unknown","extraction_state":"extracted","path_count":0},
     {"agent":"codex","payload":{"tool_name":"Edit","tool_input":{"nested":{"path":"secret/a"}}},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":0},
-    {"agent":"claude-code","payload":{"tool_name":"Edit","tool_input":{"file_path":"//repo/secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1}
+    {"agent":"claude-code","payload":{"tool_name":"Edit","tool_input":{"file_path":"//repo/secret/a"}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["secret/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["public/a","secret/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":2},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["**/*.md"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["s*/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["SECRET/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["src/**/*.rs","*.md","public/a"],"exclude":["secret/**"]}},"disposition":"keep","tool_family":"file","extraction_state":"extracted","path_count":3},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"paths":["secret/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":"secret/a"}},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":0},
+    {"agent":"gemini-cli","payload":{"tool_name":"run_shell_command","tool_input":{"command":"cat secret/a"}},"disposition":"drop","tool_family":"non-file","extraction_state":"extracted","path_count":0},
+    {"agent":"gemini-cli","payload":{"tool_name":"run_shell_command","tool_input":{"command":"cat a","dir_path":"secret"}},"disposition":"drop","tool_family":"non-file","extraction_state":"extracted","path_count":0},
+    {"agent":"gemini-cli","payload":{"tool_name":"run_shell_command","tool_input":{"command":"cat public/a"}},"disposition":"keep","tool_family":"non-file","extraction_state":"extracted","path_count":0},
+    {"agent":"gemini-cli","payload":{"tool_name":"list_directory","tool_input":{"dir_path":"secret"}},"disposition":"drop","tool_family":"search-list","extraction_state":"not-applicable","path_count":0},
+    {"agent":"gemini-cli","payload":{"tool_name":"search_file_content","tool_input":{"pattern":"x"}},"disposition":"drop","tool_family":"search-list","extraction_state":"not-applicable","path_count":0},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"include":["secret/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"include":["public/a","secret/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":2},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"include":["**/*.md"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"include":["s*/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"include":["SECRET/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"include":["src/**/*.rs","*.md","public/a"],"exclude":["secret/**"]}},"disposition":"keep","tool_family":"file","extraction_state":"extracted","path_count":3},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"paths":["secret/a"]}},"disposition":"drop","tool_family":"file","extraction_state":"extracted","path_count":1},
+    {"agent":"open-code","payload":{"tool":"read_many_files","args":{"include":"secret/a"}},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":0},
+    {"agent":"open-code","payload":{"tool":"run_shell_command","args":{"command":"cat secret/a"}},"disposition":"drop","tool_family":"non-file","extraction_state":"extracted","path_count":0},
+    {"agent":"open-code","payload":{"tool":"run_shell_command","args":{"command":"cat a","dir_path":"secret"}},"disposition":"drop","tool_family":"non-file","extraction_state":"extracted","path_count":0},
+    {"agent":"open-code","payload":{"tool":"run_shell_command","args":{"command":"cat public/a"}},"disposition":"keep","tool_family":"non-file","extraction_state":"extracted","path_count":0},
+    {"agent":"open-code","payload":{"tool":"list_directory","args":{"dir_path":"secret"}},"disposition":"drop","tool_family":"search-list","extraction_state":"not-applicable","path_count":0},
+    {"agent":"open-code","payload":{"tool":"search_file_content","args":{"pattern":"x"}},"disposition":"drop","tool_family":"search-list","extraction_state":"not-applicable","path_count":0},
+    {"agent":"gemini-cli","payload":{"tool_name":"read_many_files","tool_input":{"include":["public/a","secret/[ab]"]}},"disposition":"metadata-only","tool_family":"file","extraction_state":"missing-or-malformed","path_count":2}
   ],
   "shell": {
     "note": "Shell-tool vectors run by both matchers. `{root}` is the marker directory, `cwd` is relative to it, and `command` is shorthand for a `bash` payload.",
@@ -108,7 +135,10 @@
       {"payload":{"tool":"bash","args":{"command":"cat ../adr/0001.md","workdir":"docs/x"}},"disposition":"drop"},
       {"payload":{"tool":"bash","args":{"command":"cat docs/adr/0001.md","workdir":"  "}},"disposition":"drop"},
       {"payload":{"tool":"bash","args":{"command":"cat docs/adr/0001.md","workdir":"sub"}},"disposition":"keep"},
-      {"payload":{"tool":"bash","args":{"command":"cat 0001.md","workdir":7}},"disposition":"keep"}
+      {"payload":{"tool":"bash","args":{"command":"cat 0001.md","workdir":7}},"disposition":"keep"},
+      {"payload":{"tool":"run_shell_command","args":{"command":"cat adr/x.md","dir_path":"docs"}},"disposition":"drop"},
+      {"payload":{"tool":"run_shell_command","args":{"command":"cat 0001.md","directory":"docs/adr"}},"disposition":"drop"},
+      {"payload":{"tool":"run_shell_command","args":{"command":"cat x.md","dir_path":"src"}},"disposition":"keep"}
     ]
   },
   "protocol": {"accept":{"version":1,"disposition":"drop","policy_state":"active","tool_family":"file","path_count":1,"extraction_state":"extracted"},"reject":{"version":1,"disposition":"drop","policy_state":"active","tool_family":"file","path_count":1,"extraction_state":"extracted","paths":["SENTINEL"]}}
