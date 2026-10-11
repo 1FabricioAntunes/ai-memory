@@ -2955,22 +2955,14 @@ mod tests {
                 prompt.contains("JSON keys stay in English"),
                 "{name} prompt"
             );
-        }
-    }
-
-    #[test]
-    fn consolidation_system_prompts_limit_cross_scope_links_to_input_targets() {
-        // Lint reports a missing `project:` / `_global:` target as
-        // `broken_link`, so the prompts must not license inventing one.
-        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            // Lint reports a missing `project:` / `_global:` target as
+            // `broken_link`, so the prompt must not license inventing one.
             assert!(
                 prompt.contains("Never invent project names or page paths"),
                 "{name} prompt"
             );
-            assert!(
-                prompt.contains("only when that\n  exact path appears in the observations"),
-                "{name} prompt"
-            );
+            assert!(prompt.contains("page body"), "{name} prompt");
+            assert!(prompt.contains("not a repo file path"), "{name} prompt");
             assert!(
                 prompt.contains("never pad with a cross-scope link"),
                 "{name} prompt"
