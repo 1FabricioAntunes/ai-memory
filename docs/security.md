@@ -81,7 +81,15 @@ keep working unchanged. A request that carries a proxy's forwarding header
 counts as non-loopback here even when its `Host` is a loopback address,
 because a plain-HTTP reverse proxy may rewrite `Host` to the address it
 forwards to while the browser behind it saw a non-loopback origin. ai-memory's
-own clients connect directly and send none of these headers. A browser that sends no fetch metadata even to loopback
+own clients connect directly and send none of these headers. The server cannot
+see a proxy that says nothing, though: nginx's default `proxy_pass` rewrites
+`Host` to the upstream address and adds no `Forwarded`, `X-Forwarded-*` or
+`Via` header, so its requests look like a local client's. A plain-HTTP proxy in
+front of an unauthenticated server must therefore add `X-Forwarded-For`
+(`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) or keep the
+browser's host (`proxy_set_header Host $host;`, which also needs that name in
+the `Host` allowlist). Better still, terminate TLS at the proxy or set a bearer
+token. A browser that sends no fetch metadata even to loopback
 (Safari before 16.4) only gets the `Origin` check there, which an image or link
 does not trigger; set a bearer token if you use one. The `Host`
 allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
