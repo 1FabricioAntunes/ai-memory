@@ -199,6 +199,7 @@ on upstream drift.
 cargo build --release -p ai-memory-cli   # the server under test
 cargo run --release -p ai-memory-eval -- retrieval --fetch   # full 500
 cargo run -p ai-memory-eval -- retrieval --sample 10         # smoke
+cargo run -p ai-memory-eval -- retrieval --question-id 07741c44,07741c45  # chosen questions
 ```
 
 Output: a per-slice table on stdout plus
