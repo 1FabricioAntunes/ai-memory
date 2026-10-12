@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory project init`, an interactive command that creates a
+  checkout-local `.ai-memory.toml` with suggested workspace and project names
+  from the checkout's `upstream` or `origin` Git remote. (#1227)
+
 ### Fixed
 - Fixed the cross-project profile harvester treating pages the auto-improve
   scheduler auto-approved as curated human input: model output nobody
