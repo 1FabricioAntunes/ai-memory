@@ -132,6 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enabled. Both routes now answer 415 unless the body is `application/json`;
   the built-in login page and the documented `curl` recovery already send
   that. (GHSA-6mc4-46pr-w82w)
+- Fixed the web UI allowing other sites to frame it. With auth off, a page
+  that framed `/web/pending` could trick a click on Approve or Reject, since
+  the framed page's own requests are same-origin. Every web page and API
+  response now sends `X-Frame-Options: DENY` and
+  `Content-Security-Policy: frame-ancestors 'none'`. (GHSA-6mc4-46pr-w82w)
 - Fixed the cross-project profile harvester treating pages the auto-improve
   scheduler auto-approved as curated human input: model output nobody
   reviewed fed the profile like a hand-written rule. A page stamped from an
