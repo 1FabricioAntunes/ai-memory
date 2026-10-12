@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Softened the consolidation prompts' wikilink quota that pushed models to
+  invent links. The single and batch prompts told the model "2-5 well-chosen
+  links per page beat exhaustive linking; zero links should be rare", which
+  pressured it to add links just to hit the number. They now state that zero
+  links is fine when nothing in the input genuinely relates, require a genuine
+  reason visible in the input for every link, and forbid padding a page with
+  links to hit a number; the #1207 restriction on cross-scope links whose
+  target is not visible in the input is unchanged. The validated
+  `consolidation.max_input_tokens` floor moved from 6,000 to 6,500 tokens so
+  the larger prompts still leave room for observation evidence at the minimum.
+  (#1219)
 - Fixed consolidation inventing `[[_global:…]]` and `[[project:…]]` wikilinks to
   pages that never existed, which `ai-memory lint` then reported as
   `broken_link`. The single, batch and bootstrap prompts told the model that a

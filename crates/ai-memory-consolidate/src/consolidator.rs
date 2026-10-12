@@ -1376,7 +1376,7 @@ const MIN_OBSERVATION_RESERVE_CHARS: usize = 1_024;
 /// Smallest input budget that still leaves room for observations after
 /// the fixed prompts and structured-output schema. Below this the batch prompt
 /// can leave too little room for observations.
-pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_000;
+pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_500;
 
 /// Smallest useful structured-output allowance. Lower values are unlikely to
 /// fit even one concise batch update and its JSON framing.
@@ -2970,6 +2970,42 @@ mod tests {
             assert!(
                 !prompt.contains("A link whose target does not exist yet is acceptable"),
                 "{name} prompt must scope the pending-link allowance to the same project"
+            );
+        }
+    }
+
+    /// #1219: a numeric quota ("2-5 links per page, zero links should be
+    /// rare") pressures the model to invent links to hit the number. The
+    /// prompts must state that zero links is a fine outcome, that links
+    /// need a genuine reason visible in the input, and that padding to
+    /// hit a number is never acceptable — while keeping the #1217
+    /// cross-scope restriction intact.
+    #[test]
+    fn consolidation_system_prompts_do_not_pressure_invented_links() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(
+                prompt.contains("zero links is fine"),
+                "{name} prompt must permit a linkless page"
+            );
+            assert!(
+                prompt.contains("genuine reason"),
+                "{name} prompt must require a genuine reason to link"
+            );
+            assert!(
+                prompt.contains("Never pad a page with links to hit a number"),
+                "{name} prompt must forbid quota padding"
+            );
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt must keep the #1217 cross-scope restriction"
+            );
+            assert!(
+                !prompt.contains("zero links should be rare"),
+                "{name} prompt must not stigmatise a linkless page"
+            );
+            assert!(
+                !prompt.contains("2-5"),
+                "{name} prompt must not carry a numeric link quota"
             );
         }
     }
