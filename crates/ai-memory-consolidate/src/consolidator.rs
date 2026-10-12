@@ -38,6 +38,11 @@ pub enum ConsolidatorError {
     #[error(transparent)]
     Store(#[from] ai_memory_store::StoreError),
 
+    /// Cross-scope link validation could not resolve a named scope (a real
+    /// store failure — a merely absent scope is de-linked, not an error).
+    #[error(transparent)]
+    Scope(#[from] ai_memory_store::ScopeResolutionError),
+
     /// Underlying wiki error.
     #[error(transparent)]
     Wiki(#[from] ai_memory_wiki::WikiError),
@@ -81,6 +86,7 @@ pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
     let (class, status) = match error {
         ConsolidatorError::Memory(_) => ("memory", None),
         ConsolidatorError::Store(_) => ("store", None),
+        ConsolidatorError::Scope(_) => ("scope", None),
         ConsolidatorError::Wiki(_) => ("wiki", None),
         ConsolidatorError::Llm(llm) => (llm.class(), llm.http_status()),
         ConsolidatorError::Serde(_) => ("serde", None),
@@ -318,6 +324,19 @@ impl Consolidator {
             page.body_markdown = new_body;
             page.title = new_title;
         }
+
+        // #1218: a cross-scope wikilink the model invented must not be
+        // written — resolve each against the store and de-link the ones that
+        // do not land on an existing page, so the write cannot mint a
+        // dangling cross-project edge the lint pass would flag.
+        let unresolved = crate::link_guard::unresolved_cross_scope_links(
+            &self.reader,
+            ws,
+            &[(&path, page.body_markdown.as_str())],
+        )
+        .await?;
+        page.body_markdown =
+            crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved).into_owned();
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -805,6 +824,26 @@ impl Consolidator {
             }
             requests.push(req);
             outcomes_preview.push(outcome);
+        }
+
+        // #1218: same cross-scope link guard as the single-page path, run
+        // once over every proposed body so the store checks batch too.
+        // De-linking rewrites in memory only; `apply_batch` below stays the
+        // single atomic write.
+        let unresolved = {
+            let bodies: Vec<(&PagePath, &str)> = requests
+                .iter()
+                .map(|req| (&req.path, req.body.as_str()))
+                .collect();
+            crate::link_guard::unresolved_cross_scope_links(&self.reader, ws, &bodies).await?
+        };
+        if !unresolved.is_empty() {
+            for (req, outcome) in requests.iter_mut().zip(outcomes_preview.iter_mut()) {
+                let rewritten =
+                    crate::link_guard::delink_body(&req.body, &req.path, &unresolved).into_owned();
+                req.body = rewritten.clone();
+                outcome.new_body_markdown = rewritten;
+            }
         }
 
         let ids = self.wiki.apply_batch(requests).await?;
@@ -5562,5 +5601,179 @@ mod tests {
             slot_page.body.contains("New focus."),
             "state slots still refresh"
         );
+    }
+
+    /// Write one page into a second project of the fixture's workspace, so a
+    /// cross-scope wikilink has something real to resolve to.
+    async fn seed_other_project_page(
+        store: &ai_memory_store::Store,
+        wiki: &Wiki,
+        ws: WorkspaceId,
+        project: &str,
+        path: &str,
+    ) {
+        let other = store
+            .writer
+            .get_or_create_project(ws, project.to_string(), None)
+            .await
+            .unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: other,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "Existing target page.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Same, for the reserved `_global` preferences project, which lives in
+    /// the default workspace and goes through its own scope helper.
+    async fn seed_global_page(store: &ai_memory_store::Store, wiki: &Wiki, path: &str) {
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: global.workspace_id,
+            project_id: global.project_id,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "A standing preference.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// #1218: a batch whose model output invents cross-scope wikilinks must
+    /// not write them as links. `[[_global:nope]]` (missing page in the
+    /// reserved project), `[[otherproj:notes/missing.md]]` (missing page in
+    /// a real project) and `[[ghostproj:x.md]]` (a project that does not
+    /// exist at all) are all de-linked to plain text before the write.
+    /// Controls in the same body: a cross-scope link to an existing page
+    /// survives byte-identical, and a same-project pending link stays
+    /// untouched — pending links are by design (#1218 scope).
+    #[tokio::test]
+    async fn batch_delinks_invented_cross_scope_wikilinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+        seed_global_page(&store, &wiki, "prefs.md").await;
+
+        let path = PagePath::new("notes/with-links.md").unwrap();
+        let body = "Invented: [[_global:nope]], [[otherproj:notes/missing.md]], \
+                    [[ghostproj:x.md]]. \
+                    Controls: [[otherproj:notes/exists.md]], [[_global:prefs.md|the prefs]], \
+                    [[notes/pending.md]].";
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(batch_targeting(path.as_str(), body))),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        // Invented links are plain text now: brackets dropped, label kept.
+        assert!(!stored.body.contains("[[_global:nope]]"));
+        assert!(!stored.body.contains("[[otherproj:notes/missing.md]]"));
+        assert!(!stored.body.contains("[[ghostproj:x.md]]"));
+        assert!(stored.body.contains("_global:nope"));
+        assert!(stored.body.contains("otherproj:notes/missing.md"));
+        assert!(stored.body.contains("ghostproj:x.md"));
+        assert!(
+            stored.body.contains("[[otherproj:notes/exists.md]]"),
+            "a cross-scope link to an existing page survives byte-identical: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains("[[_global:prefs.md|the prefs]]"),
+            "a resolved _global link keeps its label form: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains("[[notes/pending.md]]"),
+            "a same-project pending link is by design untouched: {}",
+            stored.body
+        );
+        // The outcome reports the body as actually written.
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].new_body_markdown, stored.body);
+
+        // And the lint pass has nothing left to flag: no dangling
+        // cross-project edge was minted.
+        let dangling = store
+            .reader
+            .dangling_cross_project_links(ws, proj)
+            .await
+            .unwrap();
+        assert!(
+            dangling.is_empty(),
+            "de-linking must leave no dangling cross-project edges: {dangling:?}"
+        );
+    }
+
+    /// #1218 on the single-page path: the session page gets the same guard
+    /// before `Wiki::write_page`.
+    #[tokio::test]
+    async fn single_page_delinks_invented_cross_scope_wikilinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+
+        let response = serde_json::json!({
+            "title": "Link cleanup",
+            "body_markdown": "Saw [[otherproj:notes/missing.md]] and \
+                              [[otherproj:notes/exists.md]] and [[notes/pending.md]].",
+            "tags": [],
+        });
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert!(!stored.body.contains("[[otherproj:notes/missing.md]]"));
+        assert!(stored.body.contains("otherproj:notes/missing.md"));
+        assert!(stored.body.contains("[[otherproj:notes/exists.md]]"));
+        assert!(stored.body.contains("[[notes/pending.md]]"));
     }
 }

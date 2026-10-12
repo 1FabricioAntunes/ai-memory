@@ -8545,6 +8545,53 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the subset of `paths` that name a latest page in this scope, in
+    /// a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
+    /// for callers that need to know *which* paths resolve — the consolidation
+    /// link guard validates proposed cross-scope wikilinks against it (#1218).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn existing_latest_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        paths: Vec<String>,
+    ) -> StoreResult<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            let mut distinct: Vec<String> = paths;
+            distinct.sort();
+            distinct.dedup();
+            let placeholders = std::iter::repeat_n("?", distinct.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT path FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND path IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 2);
+            binds.push(ws_bytes as &dyn rusqlite::ToSql);
+            binds.push(proj_bytes as &dyn rusqlite::ToSql);
+            for p in &distinct {
+                binds.push(p as &dyn rusqlite::ToSql);
+            }
+            let rows = stmt.query_map(binds.as_slice(), |row| row.get::<_, String>(0))?;
+            let mut found = Vec::new();
+            for r in rows {
+                found.push(r?);
+            }
+            Ok(found)
+        })
+        .await
+    }
+
     /// Return whether the latest version of one fully scoped page is expired.
     /// Returns `None` when the path has no latest indexed row.
     ///

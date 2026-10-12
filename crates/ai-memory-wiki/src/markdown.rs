@@ -520,6 +520,95 @@ fn rewrite_wikilinks_in_segment(
     }
 }
 
+/// Rewrite `body`, replacing each wikilink whose normalised
+/// `(workspace, project, path)` key appears in `delink` with its plain label
+/// text: the `|label` when one is present, otherwise the raw target text.
+/// Every other wikilink — resolved cross-scope links and all same-project
+/// links included — is copied byte-identically, and fenced code blocks /
+/// inline code spans are skipped exactly as [`extract_links`] skips them, so
+/// an example `[[project:path]]` shown as code is never rewritten.
+///
+/// The consolidation apply path uses this to strip cross-scope links the
+/// store cannot resolve (#1218): the `delink` set is built from
+/// [`extract_links`] keys, so a key computed here matches byte-for-byte.
+/// Wikilink targets are project-root-relative, so `page_path` only matters
+/// for the (never-delinked) same-project form.
+#[must_use]
+pub fn delink_wikilinks(
+    body: &str,
+    page_path: &PagePath,
+    delink: &BTreeSet<(Option<String>, Option<String>, String)>,
+) -> String {
+    if delink.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<CodeFence> = None;
+    for raw_line in body.split_inclusive('\n') {
+        let (line, terminator) = split_line_terminator(raw_line);
+        let (next_fence, is_fence_or_code) = CodeFence::step(fence, line);
+        fence = next_fence;
+        if is_fence_or_code {
+            out.push_str(line);
+            out.push_str(terminator);
+            continue;
+        }
+        let code_spans = inline_code_spans(line);
+        let mut pos = 0;
+        for span in &code_spans {
+            delink_wikilinks_in_segment(&line[pos..span.start], page_path, delink, &mut out);
+            out.push_str(&line[span.clone()]);
+            pos = span.end;
+        }
+        delink_wikilinks_in_segment(&line[pos..], page_path, delink, &mut out);
+        out.push_str(terminator);
+    }
+    out
+}
+
+fn delink_wikilinks_in_segment(
+    seg: &str,
+    page_path: &PagePath,
+    delink: &BTreeSet<(Option<String>, Option<String>, String)>,
+    out: &mut String,
+) {
+    let mut rest = seg;
+    loop {
+        let Some(start) = rest.find("[[") else {
+            out.push_str(rest);
+            return;
+        };
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            out.push_str(&rest[start..]);
+            return;
+        };
+        let raw = &after_start[..end];
+        // Parse exactly as `extract_wikilinks` does so a key in `delink`
+        // (built from `extract_links` output) hits the same occurrence.
+        let (target_part, label) = raw
+            .split_once('|')
+            .map_or((raw, None), |(t, l)| (t, Some(l)));
+        let unlabelled = target_part.trim();
+        let (workspace, project, path_part) = split_scope(unlabelled);
+        let delinked = normalize_link_target(&path_part, page_path, true)
+            .is_some_and(|path| delink.contains(&(workspace, project, path)));
+        if delinked {
+            let text = label
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(unlabelled);
+            out.push_str(text);
+        } else {
+            out.push_str("[[");
+            out.push_str(raw);
+            out.push_str("]]");
+        }
+        rest = &after_start[end + 2..];
+    }
+}
+
 /// Resolve a local `[[...]]` wikilink target into `(bundle-relative href,
 /// display label)`. Returns `None` when the target is cross-project,
 /// cross-workspace, empty, or otherwise not a page — the caller then keeps
@@ -1251,6 +1340,63 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    /// Build a `delink` key exactly as the consolidation guard does: from
+    /// `extract_links` output for the cross-project targets named in
+    /// `targets`.
+    fn delink_set(body: &str, page: &PagePath, targets: &[&str]) -> BTreeSet<LinkKey> {
+        extract_links(body, page)
+            .into_iter()
+            .filter(|l| l.project.is_some() && targets.contains(&l.path.as_str()))
+            .map(|l| (l.workspace, l.project, l.path.as_str().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn delink_wikilinks_strips_only_listed_cross_scope_links() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "See [[infra:runbooks/02.md]] and [[infra:runbooks/missing.md|the gap]], \
+                    plus [[notes/pending.md]] and [[infra:runbooks/02.md|again]].\n";
+        let delink = delink_set(body, &page, &["runbooks/missing.md"]);
+        let out = delink_wikilinks(body, &page, &delink);
+        assert_eq!(
+            out,
+            "See [[infra:runbooks/02.md]] and the gap, \
+             plus [[notes/pending.md]] and [[infra:runbooks/02.md|again]].\n",
+            "only the unresolved link is de-linked; the resolved one and the \
+             same-project pending link stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn delink_wikilinks_without_label_keeps_the_target_text() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "Depends on [[_global:nope]].\n";
+        let delink = delink_set(body, &page, &["nope.md"]);
+        assert_eq!(delink.len(), 1, "_global target is extracted");
+        assert_eq!(
+            delink_wikilinks(body, &page, &delink),
+            "Depends on _global:nope.\n"
+        );
+    }
+
+    #[test]
+    fn delink_wikilinks_skips_code_and_leaves_empty_set_untouched() {
+        let page = PagePath::new("notes/a.md").unwrap();
+        let body = "```\n[[infra:runbooks/missing.md]]\n```\n\
+                    Inline `[[infra:runbooks/missing.md]]` stays code, \
+                    but [[infra:runbooks/missing.md]] is prose.\n";
+        let delink = delink_set(body, &page, &["runbooks/missing.md"]);
+        let out = delink_wikilinks(body, &page, &delink);
+        assert_eq!(
+            out,
+            "```\n[[infra:runbooks/missing.md]]\n```\n\
+             Inline `[[infra:runbooks/missing.md]]` stays code, \
+             but infra:runbooks/missing.md is prose.\n"
+        );
+        // An empty set must be a byte-identical no-op.
+        assert_eq!(delink_wikilinks(body, &page, &BTreeSet::new()), body);
     }
 
     #[test]

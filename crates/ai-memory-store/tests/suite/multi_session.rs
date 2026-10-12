@@ -477,6 +477,80 @@ async fn concurrent_writes_to_one_path_supersede_rather_than_destroy() {
     );
 }
 
+/// The batched path-existence probe the consolidation link guard validates
+/// proposed cross-scope wikilinks against (#1218): it reports exactly the
+/// paths with a latest row, in any input order, and never invents one.
+#[tokio::test]
+async fn existing_latest_paths_reports_exactly_the_live_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/real.md", "Real", "a real page"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, proj, "decisions/adr.md", "ADR", "a decision"))
+        .await
+        .unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/missing.md".to_string(),
+                "decisions/adr.md".to_string(),
+                "notes/real.md".to_string(),
+                // A duplicate must not double-report.
+                "notes/real.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["decisions/adr.md", "notes/real.md"]);
+
+    // A superseded path still counts: the latest version is the one a link
+    // resolves to.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/real.md", "Real", "rewritten"))
+        .await
+        .unwrap();
+    let found = store
+        .reader
+        .existing_latest_paths(ws, proj, vec!["notes/real.md".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(found, vec!["notes/real.md"]);
+
+    // A foreign scope never sees this project's pages.
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+    let found = store
+        .reader
+        .existing_latest_paths(ws, other_proj, vec!["notes/real.md".to_string()])
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+
+    // Empty input is a no-op, not an error.
+    let found = store
+        .reader
+        .existing_latest_paths(ws, proj, Vec::new())
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+}
+
 /// Re-writing identical content must not churn a new version.
 ///
 /// Two harnesses syncing the same file would otherwise manufacture a version
