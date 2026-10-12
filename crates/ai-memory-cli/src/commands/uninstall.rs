@@ -641,10 +641,10 @@ fn apply_change(
             if *kind == DeleteKind::ManagedSkill {
                 remove_empty_skill_dirs(path)?;
             }
-            if *kind == DeleteKind::GrokHandoffRule {
-                if let Some(parent) = path.parent() {
-                    remove_dir_if_empty(parent)?;
-                }
+            if *kind == DeleteKind::GrokHandoffRule
+                && let Some(parent) = path.parent()
+            {
+                remove_dir_if_empty(parent)?;
             }
         }
         PlannedChange::Rewrite { path, ops, .. } => {
