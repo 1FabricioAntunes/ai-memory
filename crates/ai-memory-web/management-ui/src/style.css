@@ -34,55 +34,32 @@
     "Bricolage Grotesque Variable", "Instrument Sans Variable", system-ui,
     sans-serif;
   --font-mono: "Commit Mono", ui-monospace, "SF Mono", Menlo, monospace;
-  --color-canvas: oklch(98.5% 0.006 285);
-  --color-surface: oklch(100% 0 0);
-  --color-ink: oklch(15.5% 0.035 282);
-  --color-body: oklch(21% 0.045 282);
-  --color-muted: oklch(45% 0.035 282);
-  --color-line: oklch(88.5% 0.02 285);
-  --color-tint: oklch(95.8% 0.014 285);
+  --color-canvas: light-dark(oklch(98.5% 0.006 285), oklch(15.5% 0.035 282));
+  --color-surface: light-dark(oklch(100% 0 0), oklch(20% 0.04 282));
+  --color-ink: light-dark(oklch(15.5% 0.035 282), oklch(95.5% 0.012 285));
+  --color-body: light-dark(oklch(21% 0.045 282), oklch(95.5% 0.012 285));
+  --color-muted: light-dark(oklch(45% 0.035 282), oklch(74% 0.03 285));
+  --color-line: light-dark(oklch(88.5% 0.02 285), oklch(33% 0.045 282));
+  --color-tint: light-dark(oklch(95.8% 0.014 285), oklch(24% 0.04 282));
   --color-accent: oklch(81% 0.16 75);
   --color-accent-hover: oklch(87% 0.15 85);
   --color-on-accent: oklch(20% 0.05 60);
-  --color-success: oklch(47% 0.09 205);
-  --color-success-soft: oklch(95% 0.03 205);
-  --color-danger: oklch(47% 0.17 355);
-  --color-danger-soft: oklch(95% 0.03 355);
+  --color-success: light-dark(oklch(47% 0.09 205), oklch(83% 0.11 205));
+  --color-success-soft: light-dark(oklch(95% 0.03 205), oklch(27% 0.05 205));
+  --color-danger: light-dark(oklch(47% 0.17 355), oklch(83% 0.1 355));
+  --color-danger-soft: light-dark(oklch(95% 0.03 355), oklch(27% 0.07 355));
 }
 
 :root {
   color-scheme: light;
 }
-
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --color-canvas: oklch(15.5% 0.035 282);
-  --color-surface: oklch(20% 0.04 282);
-  --color-ink: oklch(95.5% 0.012 285);
-  --color-body: oklch(95.5% 0.012 285);
-  --color-muted: oklch(74% 0.03 285);
-  --color-line: oklch(33% 0.045 282);
-  --color-tint: oklch(24% 0.04 282);
-  --color-success: oklch(83% 0.11 205);
-  --color-success-soft: oklch(27% 0.05 205);
-  --color-danger: oklch(83% 0.1 355);
-  --color-danger-soft: oklch(27% 0.07 355);
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+  :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --color-canvas: oklch(15.5% 0.035 282);
-    --color-surface: oklch(20% 0.04 282);
-    --color-ink: oklch(95.5% 0.012 285);
-    --color-body: oklch(95.5% 0.012 285);
-    --color-muted: oklch(74% 0.03 285);
-    --color-line: oklch(33% 0.045 282);
-    --color-tint: oklch(24% 0.04 282);
-    --color-success: oklch(83% 0.11 205);
-    --color-success-soft: oklch(27% 0.05 205);
-    --color-danger: oklch(83% 0.1 355);
-    --color-danger-soft: oklch(27% 0.07 355);
   }
 }
 

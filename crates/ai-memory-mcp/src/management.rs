@@ -23,6 +23,9 @@ use serde_json::{Value, json};
 use crate::auth::AuthState;
 use crate::human_auth::require_session;
 
+// Bounds browser reads. Returned with each page so client offsets cannot drift.
+const MANAGEMENT_PAGE_SIZE: usize = 50;
+
 /// Dependencies resolved once at server startup.
 #[derive(Clone)]
 pub struct ManagementState {
@@ -173,12 +176,14 @@ async fn sessions(
             s.project_id,
             owners(level, &actor),
             true,
-            50,
+            MANAGEMENT_PAGE_SIZE,
             q.offset,
         )
         .await
         .map_err(store_error)?;
-    Ok(Json(json!({"sessions": sessions})))
+    Ok(Json(
+        json!({"sessions": sessions, "page_size": MANAGEMENT_PAGE_SIZE}),
+    ))
 }
 
 async fn observations(
@@ -206,7 +211,7 @@ async fn observations(
             s.project_id,
             id,
             ObservationPage {
-                limit: 50,
+                limit: MANAGEMENT_PAGE_SIZE,
                 offset: q.offset,
                 order: ObservationOrder::Asc,
                 kinds: None,
@@ -215,7 +220,12 @@ async fn observations(
         )
         .await
         .map_err(store_error)?;
-    Ok(Json(json!(page)))
+    Ok(Json(json!({
+        "records": page.records,
+        "total": page.total,
+        "elided_other_scope": page.elided_other_scope,
+        "page_size": MANAGEMENT_PAGE_SIZE,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -257,6 +267,8 @@ async fn purge(
     if !admin && session.actor_user.as_deref() != Some(owner.storage_key().as_str()) {
         return Err(error(StatusCode::NOT_FOUND, "session not found"));
     }
+    // Preflight collateral before admission/checkpoints; the writer repeats
+    // this check at commit so a changed grant or session cannot race deletion.
     let preview = if admin {
         state
             .writer
@@ -292,6 +304,9 @@ async fn purge(
             "destructive operation requires confirm=true",
         ));
     }
+    // Both human and machine administration use the same Wiki primitives.
+    // This orchestration stays explicit here because self-service must recheck
+    // exact ownership and project grants, unlike the root-only admin surface.
     let dispatch = state
         .wiki
         .admit_purge_session(

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { csrfCookie, scopedQuery, request } from "./api.js";
+import { csrfCookie, scopedQuery, request, serverEndpoint } from "./api.js";
 
 test("scopes encode names separately, including slashes, plus signs and ampersands", () => {
   const q = new URLSearchParams(
@@ -36,4 +36,15 @@ test("mutations send same-origin session cookies and CSRF under the mount prefix
     }),
     { done: true },
   );
+});
+
+test("MCP endpoint uses the same configured mount as API requests", () => {
+  globalThis.window = { location: { origin: "https://memory.example" } };
+  globalThis.document = { querySelector: () => ({ content: "/team/memory" }) };
+  assert.equal(
+    serverEndpoint("/mcp"),
+    "https://memory.example/team/memory/mcp",
+  );
+  globalThis.document.querySelector = () => null;
+  assert.equal(serverEndpoint("/mcp"), "https://memory.example/mcp");
 });

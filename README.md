@@ -587,6 +587,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/programmatic-memory.md`](docs/programmatic-memory.md) | Use ai-memory from any tool: MCP write/query/handoff calls, scope rules and incremental reads. |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield migration. |
+| [`docs/management-ui.md`](docs/management-ui.md) | Optional React/Tailwind console: feature gates, user and session management, MCP keys, public deployment, and frontend checks. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
 | [`docs/backup.md`](docs/backup.md) | Backing up the wiki + data dir to a remote git repository: what to include, what to exclude, scheduled push pattern, restore, and security posture. Companion to `docs/lifecycle-ops.md` (which covers the on-box `ai-memory backup` snapshot). |

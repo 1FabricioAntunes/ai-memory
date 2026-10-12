@@ -77,11 +77,17 @@ async fn browser(store: &Store, name: &str, role: UserRole, must_change: bool) -
     }
 }
 async fn harness() -> Harness {
+    harness_with_chain(None).await
+}
+async fn harness_with_chain(chain: Option<ai_memory_wiki::AdmissionChain>) -> Harness {
     let tmp = TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+    let mut wiki = Wiki::new(tmp.path(), store.writer.clone())
         .unwrap()
         .with_store_reader(store.reader.clone());
+    if let Some(chain) = chain {
+        wiki = wiki.with_admission_chain(chain);
+    }
     let alice = browser(&store, "alice", UserRole::User, false).await;
     let bob = browser(&store, "bob", UserRole::User, false).await;
     let root = browser(&store, "root", UserRole::Root, false).await;
@@ -467,5 +473,317 @@ async fn management_project_and_credential_isolation_and_password_change_gate() 
         .await
         .0,
         StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn management_raw_session_ids_fail_closed_on_wrong_and_partial_scope() {
+    let h = harness().await;
+    let sid = session(&h, Some("alice")).await;
+    let other_workspace = h
+        .store
+        .writer
+        .get_or_create_workspace("other")
+        .await
+        .unwrap();
+    h.store
+        .writer
+        .get_or_create_project(other_workspace, "app", None)
+        .await
+        .unwrap();
+    h.store
+        .writer
+        .get_or_create_project(h.ws, "other", None)
+        .await
+        .unwrap();
+    for browser in [&h.alice, &h.root] {
+        for (workspace, project) in [
+            ("other", "app"),
+            ("default", "other"),
+            ("default", "missing"),
+        ] {
+            let uri = format!(
+                "/management/v1/sessions/{sid}/observations?workspace={workspace}&project={project}"
+            );
+            assert_eq!(
+                call(&h, Some(browser), "GET", &uri, Value::Null, false)
+                    .await
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+            let uri = format!("/management/v1/sessions/{sid}/purge");
+            for dry_run in [true, false] {
+                assert_eq!(call(&h, Some(browser), "POST", &uri, json!({"workspace":workspace,"project":project,"dry_run":dry_run,"confirm":true}), true).await.0, StatusCode::NOT_FOUND);
+            }
+        }
+        for query in ["", "workspace=default", "project=app"] {
+            let uri = format!("/management/v1/sessions/{sid}/observations?{query}");
+            assert_eq!(
+                call(&h, Some(browser), "GET", &uri, Value::Null, false)
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for body in [json!({"workspace":"default"}), json!({"project":"app"})] {
+            assert_eq!(
+                call(
+                    &h,
+                    Some(browser),
+                    "POST",
+                    &format!("/management/v1/sessions/{sid}/purge"),
+                    body,
+                    true
+                )
+                .await
+                .0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        assert_eq!(
+            call(
+                &h,
+                Some(browser),
+                "GET",
+                &format!(
+                    "/management/v1/sessions/{sid}/observations?workspace=default&project=app"
+                ),
+                Value::Null,
+                false
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    assert!(
+        h.store
+            .reader
+            .find_project(h.ws, "missing".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.store
+            .reader
+            .find_session_scope(sid)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn management_purge_admission_rejection_preserves_rows_and_files() {
+    use ai_memory_wiki::{AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let allowed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let hook = Router::new().route(
+        "/guard",
+        axum::routing::post({
+            let allowed = allowed.clone();
+            let calls = calls.clone();
+            move |axum::Json(payload): axum::Json<Value>| {
+                calls.lock().unwrap().push(payload);
+                let allowed = allowed.load(Ordering::SeqCst);
+                async move {
+                    if allowed {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, hook).await.unwrap() });
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "management-guard".into(),
+        url: format!("http://{address}/guard"),
+        timeout_ms: 1_000,
+        failure_policy: FailurePolicy::Reject,
+        events: vec![AdmissionOp::PurgeSession],
+        blocking: true,
+    }])
+    .unwrap();
+    let h = harness_with_chain(Some(chain)).await;
+    let sid = session(&h, Some("alice")).await;
+    let path = ai_memory_core::PagePath::new(format!("sessions/{sid}.md")).unwrap();
+    h.wiki
+        .write_page(WritePageRequest {
+            workspace_id: h.ws,
+            project_id: h.project,
+            path: path.clone(),
+            frontmatter: json!({"session_id":sid.to_string()}),
+            body: "# Retained until admitted".into(),
+            tier: ai_memory_core::Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: Some(h.alice.user),
+            actor: ActorContext::default(),
+            evidence: vec![],
+        })
+        .await
+        .unwrap();
+    let abs = h.wiki.abs_path(h.ws, h.project, &path);
+    let before = std::fs::read(&abs).unwrap();
+    let uri = format!("/management/v1/sessions/{sid}/purge");
+    let body = json!({"workspace":"default","project":"app","confirm":true});
+    assert_eq!(
+        call(
+            &h,
+            Some(&h.alice),
+            "POST",
+            &uri,
+            json!({"workspace":"default","project":"app","dry_run":true,"confirm":true}),
+            true
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "preview must not run admission"
+    );
+    assert_eq!(std::fs::read(&abs).unwrap(), before);
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &uri, body.clone(), true)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert!(
+        h.store
+            .reader
+            .find_session_scope(sid)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(std::fs::read(&abs).unwrap(), before);
+    assert!(
+        h.wiki
+            .purged_sessions(h.ws, h.project)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    allowed.store(true, Ordering::SeqCst);
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &uri, body, true).await.0,
+        StatusCode::OK
+    );
+    assert!(!abs.exists());
+    assert!(
+        h.store
+            .reader
+            .find_session_scope(sid)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let recorded = calls.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    for payload in recorded.iter() {
+        assert_eq!(payload["ctx"]["workspace"], "default");
+        assert_eq!(payload["ctx"]["project"], "app");
+        assert_eq!(payload["ctx"]["actor"]["user"], "alice");
+        assert_eq!(payload["ctx"]["op"], "purge_session");
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn management_pagination_reports_its_limit_and_keeps_pages_disjoint() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+    let h = harness().await;
+    let uri = "/management/v1/sessions?workspace=default&project=app";
+    let limit = call(&h, Some(&h.alice), "GET", uri, Value::Null, false)
+        .await
+        .1["page_size"]
+        .as_u64()
+        .unwrap() as usize;
+    let mut ids = Vec::new();
+    for _ in 0..limit + 1 {
+        ids.push(session(&h, Some("alice")).await);
+    }
+    let first = call(&h, Some(&h.alice), "GET", uri, Value::Null, false)
+        .await
+        .1;
+    let next = call(
+        &h,
+        Some(&h.alice),
+        "GET",
+        &format!("{uri}&offset={limit}"),
+        Value::Null,
+        false,
+    )
+    .await
+    .1;
+    assert_eq!(first["sessions"].as_array().unwrap().len(), limit);
+    assert_eq!(next["sessions"].as_array().unwrap().len(), 1);
+    let next_id = &next["sessions"][0]["session_id"];
+    assert!(
+        first["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| &row["session_id"] != next_id)
+    );
+    for index in 0..limit + 1 {
+        h.store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: ids[0],
+                    workspace_id: h.ws,
+                    project_id: h.project,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: format!("event {index}"),
+                    body: format!("event body {index}"),
+                    importance: 5,
+                    occurred_at: None,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+    }
+    let uri = format!(
+        "/management/v1/sessions/{}/observations?workspace=default&project=app",
+        ids[0]
+    );
+    let first = call(&h, Some(&h.alice), "GET", &uri, Value::Null, false)
+        .await
+        .1;
+    let next = call(
+        &h,
+        Some(&h.alice),
+        "GET",
+        &format!("{uri}&offset={limit}"),
+        Value::Null,
+        false,
+    )
+    .await
+    .1;
+    assert_eq!(first["page_size"], limit);
+    assert_eq!(first["total"], limit + 1);
+    assert_eq!(first["records"].as_array().unwrap().len(), limit);
+    assert_eq!(next["records"].as_array().unwrap().len(), 1);
+    let next_id = &next["records"][0]["id"];
+    assert!(
+        first["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| &row["id"] != next_id)
     );
 }

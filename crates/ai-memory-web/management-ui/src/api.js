@@ -14,13 +14,21 @@ export function scopedQuery(project, offset = 0) {
   }).toString();
 }
 
+export function serverBasePath() {
+  return (
+    document.querySelector('meta[name="ai-memory-base-path"]')?.content || ""
+  );
+}
+
+export function serverEndpoint(path) {
+  return `${window.location.origin}${serverBasePath()}${path}`;
+}
+
 export async function request(path, { method = "GET", body, signal } = {}) {
-  const base =
-    document.querySelector('meta[name="ai-memory-base-path"]')?.content || "";
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET") headers["X-CSRF-Token"] = csrfCookie(document.cookie);
-  const response = await fetch(base + path, {
+  const response = await fetch(serverBasePath() + path, {
     method,
     headers,
     credentials: "include",

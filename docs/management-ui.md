@@ -16,11 +16,12 @@ cargo build --locked --release -p ai-memory-cli --features management-ui
 
 The equivalent runtime setting is `AI_MEMORY_ENABLE_MANAGEMENT_UI=true`.
 The console follows the [ai-memory website](https://aimemorybr.netlify.app/)
-visual style: light and dark surfaces, amber controls, and locally served Instrument Sans,
-Bricolage Grotesque, and Commit Mono fonts. Font notices are bundled under
-`management-ui/licenses/` and served at `/manage/assets/font-licenses.txt`.
-The theme follows your system by default. The header offers System, Light, and Dark;
-explicit choices are saved in your browser.
+visual style: light and dark surfaces, amber controls, and locally served
+Instrument Sans, Bricolage Grotesque, and Commit Mono fonts. Font notices are
+bundled under `management-ui/licenses/` and served at
+`/manage/assets/font-licenses.txt`.
+The theme follows your system by default. The header offers System, Light, and
+Dark; explicit choices are saved in your browser.
 The password form requires at least 12 characters, counting Unicode code points;
 the existing engine password policy and authentication endpoints are unchanged.
 
@@ -101,16 +102,17 @@ existing wiki mutation path, admission webhooks, and pre/post git checkpoints.
 
 A session purge removes its captured observations, authored handoffs, generated
 session-page versions, and associated review records. It preserves maintained
-knowledge pages and later manual versions of a session page. Accepted handoffs
-belong to their original author and are preserved. Git history, backups, and
-native harness transcripts can still contain earlier content; this operation
-is not an erasure guarantee.
+knowledge pages and later manual versions of a session page. Handoffs accepted
+by this session but authored by another session are preserved. Git history,
+backups, and native harness transcripts can still contain earlier content; this
+operation is not an erasure guarantee.
 
 A regular user's purge checks exact ownership and current project write access
 again in the SQLite deletion transaction. Ownerless legacy sessions are shared
 for reading but require an Admin to delete. A session whose deletion would
-cascade into another project also requires an Admin; the preview reports that
-collateral effect. The existing purge tombstone prevents hook replay from
+cascade into another project also requires an Admin. An Admin's preview reports
+both collateral observations and handoffs. A regular user's preview is refused
+for these sessions. The existing purge tombstone prevents hook replay from
 recreating a deleted session.
 
 ## Management endpoints
@@ -129,11 +131,19 @@ pair. Existing `/admin/*` routes retain their existing dual-auth and root gates.
 | GET / POST | `/management/v1/credentials` | List own keys / create an own key with a `label`. |
 | POST | `/management/v1/credentials/{id}/revoke` | Revoke an own key. |
 
+Session and observation listings return `page_size`, currently 50. The console
+uses that value for offsets instead of keeping a separate pagination limit.
+
 ## Frontend development and checks
 
 Sources and vendored production assets live in
 `crates/ai-memory-web/management-ui`. Cargo embeds the production assets only
 when the feature is enabled; ordinary Rust builds do not need Node or npm.
+`src/App.jsx` owns authentication and navigation; `Sessions.jsx`, `Users.jsx`,
+and `Keys.jsx` own their respective screens. Shared controls live in `ui.jsx`,
+authentication forms in `auth.jsx`, theme selection in `theme.jsx`, and the
+browser password/username constraints in `policy.js`. `api.js` owns HTTP requests
+and server URLs, including subpath handling.
 
 ```bash
 npm ci --prefix crates/ai-memory-web/management-ui --ignore-scripts
@@ -153,7 +163,11 @@ npm exec --prefix crates/ai-memory-web/management-ui -- playwright install chrom
 npm run test:e2e --prefix crates/ai-memory-web/management-ui
 ```
 
-The browser test covers a root-created user, forced password change, personal
-MCP-key issuance, authenticated machine identity, hook capture, session
-inspection/deletion, subpath hosting, and absence of console routes when the
-runtime switch is off. It creates and removes its own temporary data directory.
+The browser test covers user creation, password reset, role changes, disabling
+and enabling accounts, Admin and personal API-key issuance and revocation,
+forced password change, account switching, theme selection, authenticated
+machine identity, hook capture, event pagination, session inspection/deletion,
+subpath hosting, and absence of console routes when the runtime switch is off.
+It creates and removes its own temporary data directory. Rust tests also cover
+wrong and partial scopes, admission rejection, and owned-purge cleanup failures
+and recovery.

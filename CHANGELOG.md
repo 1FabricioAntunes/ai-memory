@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `--enable-management-ui` runtime switch. Limited user deletion to owned
   sessions and preserved shared knowledge. (#1231)
 
+### Fixed
+- Fixed the management console retaining an Admin-only tab after account
+  switching, and displayed cross-project handoff effects in deletion previews.
+  (#1231)
+
 ## [2.6.4] - 2026-10-12
 
 ### Fixed

@@ -158,9 +158,67 @@ test(
       await admin.getByRole("button", { name: "Add user" }).click();
       const dialog = admin.getByRole("dialog");
       await dialog.waitFor();
-      const temporaryPassword = await dialog.locator("pre").innerText();
+      let temporaryPassword = await dialog.locator("pre").innerText();
       await dialog.getByRole("button", { name: "I saved it" }).click();
       await admin.getByRole("row").filter({ hasText: "alice" }).waitFor();
+      const aliceRow = admin.getByRole("row").filter({ hasText: "alice" });
+      const accountAction = async (label) => {
+        await aliceRow
+          .getByRole("button", { name: label, exact: true })
+          .click();
+        await admin
+          .getByRole("dialog")
+          .getByRole("button", { name: "Confirm", exact: true })
+          .click();
+      };
+      await accountAction("Make admin");
+      await aliceRow
+        .getByRole("button", { name: "Make user", exact: true })
+        .waitFor();
+      await accountAction("Make user");
+      await aliceRow
+        .getByRole("button", { name: "Make admin", exact: true })
+        .waitFor();
+      await accountAction("Disable");
+      await aliceRow
+        .getByRole("button", { name: "Enable", exact: true })
+        .waitFor();
+      assert.equal(
+        await aliceRow.getByText("Disabled", { exact: true }).count(),
+        1,
+      );
+      await accountAction("Enable");
+      await aliceRow
+        .getByRole("button", { name: "Disable", exact: true })
+        .waitFor();
+      await accountAction("Issue MCP key");
+      const issuedDialog = admin.getByRole("dialog");
+      await issuedDialog.locator("pre").waitFor();
+      const issuedKey = await issuedDialog.locator("pre").innerText();
+      await issuedDialog.getByRole("button", { name: "I saved it" }).click();
+      await aliceRow.getByRole("button", { name: "Manage keys" }).click();
+      await admin
+        .getByRole("dialog")
+        .getByRole("button", { name: "Revoke", exact: true })
+        .click();
+      await admin
+        .getByRole("dialog")
+        .getByRole("button", { name: "Confirm", exact: true })
+        .click();
+      await admin.getByRole("dialog").waitFor({ state: "hidden" });
+      assert.equal(
+        (
+          await fetch(`${base}/identity`, {
+            headers: { authorization: `Bearer ${issuedKey}` },
+          })
+        ).status,
+        401,
+      );
+      await accountAction("Reset password");
+      const resetDialog = admin.getByRole("dialog");
+      await resetDialog.locator("pre").waitFor();
+      temporaryPassword = await resetDialog.locator("pre").innerText();
+      await resetDialog.getByRole("button", { name: "I saved it" }).click();
       const user = await browser.newPage();
       user.on("pageerror", (error) => errors.push(error.message));
       await user.goto(`${base}/manage/`);
@@ -221,6 +279,18 @@ test(
       await hook("user-prompt", {
         prompt: "A browser test session with an owned prompt.",
       });
+      const listingUrl = `${base}/management/v1/sessions?workspace=default&project=browser-demo`;
+      await user.waitForFunction(
+        async (url) => (await fetch(url)).ok,
+        listingUrl,
+      );
+      const pageSize = await user.evaluate(
+        async (url) => (await (await fetch(url)).json()).page_size,
+        listingUrl,
+      );
+      for (let index = 0; index <= pageSize; index++) {
+        await hook("user-prompt", { prompt: `Paged browser prompt ${index}.` });
+      }
       await hook("session-end");
       await user.getByRole("button", { name: "Sessions", exact: true }).click();
       await user
@@ -235,11 +305,36 @@ test(
           exact: true,
         })
         .waitFor();
+      const eventDialog = user.getByRole("dialog");
+      await eventDialog
+        .getByRole("button", { name: "Next events", exact: true })
+        .click();
+      await eventDialog
+        .getByText(`Paged browser prompt ${pageSize}.`, { exact: true })
+        .waitFor();
+      assert.equal(
+        await eventDialog
+          .getByRole("button", { name: "Next events", exact: true })
+          .isDisabled(),
+        true,
+      );
+      await eventDialog
+        .getByRole("button", { name: "Previous events", exact: true })
+        .click();
+      await eventDialog
+        .getByText("A browser test session with an owned prompt.", {
+          exact: true,
+        })
+        .waitFor();
       await user
         .getByRole("dialog")
         .getByRole("button", { name: "Close dialog" })
         .click();
       await row.getByRole("button", { name: "Delete", exact: true }).click();
+      await user
+        .getByRole("dialog")
+        .getByText("Handoffs unlinked in other projects", { exact: true })
+        .waitFor();
       await user.getByRole("dialog").getByRole("checkbox").check();
       await user
         .getByRole("dialog")
@@ -250,6 +345,45 @@ test(
         .filter({ hasText: "Session deleted." })
         .waitFor();
       assert.equal(await row.count(), 0);
+      await user
+        .getByRole("button", { name: "MCP connection", exact: true })
+        .click();
+      await user
+        .getByRole("button", { name: "Revoke", exact: true })
+        .and(user.locator("button:enabled"))
+        .click();
+      await user
+        .getByRole("dialog")
+        .getByRole("button", { name: "Revoke key", exact: true })
+        .click();
+      await user.getByRole("dialog").waitFor({ state: "hidden" });
+      assert.equal(
+        (
+          await fetch(`${base}/identity`, {
+            headers: { authorization: `Bearer ${key}` },
+          })
+        ).status,
+        401,
+      );
+      // An Admin's selected Users tab must not carry into the next operator's session.
+      await admin
+        .getByRole("button", { name: "Sign out", exact: true })
+        .click();
+      await admin
+        .getByRole("heading", { name: "Sign in", exact: true })
+        .waitFor();
+      await admin.getByLabel("Username", { exact: true }).fill("alice");
+      await admin
+        .getByLabel("Password", { exact: true })
+        .fill("alice-browser-password");
+      await admin.getByRole("button", { name: "Sign in", exact: true }).click();
+      await admin
+        .getByRole("heading", { name: "Your sessions", exact: true })
+        .waitFor();
+      assert.equal(
+        await admin.getByRole("button", { name: "Users", exact: true }).count(),
+        0,
+      );
       assert.deepEqual(errors, []);
       // The same feature-enabled binary must expose no console unless explicitly enabled.
       await browser.close();
