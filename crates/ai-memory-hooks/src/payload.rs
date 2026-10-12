@@ -1166,6 +1166,12 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
         }
         HookEvent::Notification => extract_content(raw, &["message", "text"]),
         HookEvent::PostCompaction => extract_content(raw, &["summary"]),
+        // Why the session ended (#1225): a string only, first line only, so
+        // consolidation and the zero-LLM page can tell a normal quit from
+        // anything else.
+        HookEvent::SessionEnd => extract_string(raw, &["reason"])
+            .and_then(first_line)
+            .map(|reason| format!("reason: {reason}")),
         _ => None,
     }
 }
@@ -2501,6 +2507,31 @@ mod tests {
         };
         let env = HookEnvelope::from_query_and_body(q, serde_json::json!({}));
         assert_eq!(env.agent, AgentKind::Other);
+    }
+
+    /// #1225: a SessionEnd's `reason` becomes the observation body (first
+    /// line, string only), so why a session ended survives capture. An
+    /// absent, empty or non-string reason leaves the body empty as before.
+    #[test]
+    fn session_end_reason_becomes_the_observation_body() {
+        let q = HookQuery {
+            event: "session-end".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let body = |raw| HookEnvelope::from_query_and_body(q.clone(), raw).body_excerpt;
+        assert_eq!(
+            body(serde_json::json!({ "reason": "prompt_input_exit" })).as_deref(),
+            Some("reason: prompt_input_exit")
+        );
+        assert_eq!(
+            body(serde_json::json!({ "reason": "logout\ninjected second line" })).as_deref(),
+            Some("reason: logout")
+        );
+        assert_eq!(body(serde_json::json!({})), None);
+        assert_eq!(body(serde_json::json!({ "reason": "" })), None);
+        assert_eq!(body(serde_json::json!({ "reason": 7 })), None);
+        assert_eq!(body(serde_json::json!({ "reason": { "kind": "x" } })), None);
     }
 
     /// Title-hint extraction must truncate at the first newline (the

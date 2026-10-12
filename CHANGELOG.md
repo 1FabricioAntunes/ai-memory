@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added the end reason to session-end observations. When a harness's
+  `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
+  `logout`, `prompt_input_exit` or `other`), its first line is stored,
+  sanitized, as the observation body, so consolidation can tell a normal
+  quit from anything else, and the zero-LLM session page closes its summary
+  with `ended (<reason>)`. Payloads without a reason are stored as before.
+  (#1225)
+
 - The web UI shows pending cross-project mail. Project cards carry an amber
   `N inbox` badge when messages are waiting for an agent in that project, the
   home page summarises the total and links the projects holding mail, and the
