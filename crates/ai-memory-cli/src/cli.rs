@@ -123,6 +123,8 @@ pub enum Command {
     /// Check capture coverage: compare local harness session stores for this
     /// project against what the server captured, and warn when a harness ran
     /// here recently but has no captured sessions (its hook is likely missing).
+    /// Also reports agentmemory MCP entries and rules-file guideline blocks
+    /// left after a migration; it only reads and prints the fix.
     Doctor(DoctorArgs),
     /// One-time import of this project's existing local harness session history
     /// into a brand-new (empty) ai-memory store, so installing hooks

@@ -12,6 +12,11 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use walkdir::WalkDir;
 
+mod agentmemory;
+mod mcp;
+#[cfg(test)]
+mod test_http;
+
 const IMPORT_VERSION: &str = "omc-wiki-v1";
 const CONVERSATION_IMPORT_VERSION: &str = "external-conversation-v1";
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
@@ -36,6 +41,10 @@ enum Commands {
     OmcWiki(OmcArgs),
     /// Replay a generic external conversation through ai-memory's hook API.
     ExternalConversation(ConversationArgs),
+    /// Import the Obsidian vault agentmemory's `obsidian-export` writes.
+    AgentmemoryVault(agentmemory::vault::VaultArgs),
+    /// Import an agentmemory `ExportData` JSON file.
+    AgentmemoryExport(agentmemory::export::ExportArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -297,6 +306,8 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Commands::OmcWiki(args) => run_omc(args).await,
         Commands::ExternalConversation(args) => run_conversation(args).await,
+        Commands::AgentmemoryVault(args) => agentmemory::vault::run(args).await,
+        Commands::AgentmemoryExport(args) => agentmemory::export::run(args).await,
     }
 }
 
@@ -1058,13 +1069,31 @@ struct ParsedMarkdown {
     pinned: bool,
 }
 
-/// Split an OMC page into frontmatter fields and body. The fence is found
-/// the way `ai_memory_wiki::markdown::parse` finds it: past a leading UTF-8
-/// BOM, and with either LF or CRLF fence lines, since a wiki checked out on
-/// Windows with `core.autocrlf=true` has CRLF throughout. Missing it dropped
-/// kind, tier, tags and pin, and imported the YAML block as body text.
+/// Split an OMC page into frontmatter fields and body.
 fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     let mut out = ParsedMarkdown::default();
+    let (frontmatter, body) = split_frontmatter(input)?;
+    if let Some(map) = frontmatter.as_ref() {
+        out.title = yaml_string(map, "title");
+        out.kind = yaml_string(map, "kind");
+        out.tier = yaml_string(map, "tier");
+        out.pinned = yaml_bool(map, "pinned").unwrap_or(false);
+        out.tags = yaml_tags(map);
+    }
+    if out.title.is_none() {
+        out.title = first_h1(&body);
+    }
+    out.body = body;
+    Ok(out)
+}
+
+/// Split a Markdown page into its YAML frontmatter mapping (when the block
+/// is a mapping) and its body. The fence is found the way
+/// `ai_memory_wiki::markdown::parse` finds it: past a leading UTF-8 BOM, and
+/// with either LF or CRLF fence lines, since a wiki checked out on Windows
+/// with `core.autocrlf=true` has CRLF throughout. Missing it dropped kind,
+/// tier, tags and pin, and imported the YAML block as body text.
+fn split_frontmatter(input: &str) -> Result<(Option<YamlMap>, String)> {
     let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
     let (rest, newline) = if let Some(rest) = input.strip_prefix("---\r\n") {
         (Some(rest), "\r\n")
@@ -1072,31 +1101,21 @@ fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
         (input.strip_prefix("---\n"), "\n")
     };
     let close = format!("\n---{newline}");
-    let body = if let Some(rest) = rest {
-        if let Some(end) = rest.find(&close) {
-            let yaml = rest[..end].trim_end_matches('\r');
-            let value: serde_json::Value =
-                serde_saphyr::from_str_with_options(yaml, frontmatter_parse_options())
-                    .context("parse YAML frontmatter")?;
-            if let Some(map) = value.as_object() {
-                out.title = yaml_string(map, "title");
-                out.kind = yaml_string(map, "kind");
-                out.tier = yaml_string(map, "tier");
-                out.pinned = yaml_bool(map, "pinned").unwrap_or(false);
-                out.tags = yaml_tags(map);
-            }
-            rest[end + close.len()..].to_owned()
-        } else {
-            input.to_owned()
-        }
-    } else {
-        input.to_owned()
+    let Some(rest) = rest else {
+        return Ok((None, input.to_owned()));
     };
-    if out.title.is_none() {
-        out.title = first_h1(&body);
-    }
-    out.body = body;
-    Ok(out)
+    let Some(end) = rest.find(&close) else {
+        return Ok((None, input.to_owned()));
+    };
+    let yaml = rest[..end].trim_end_matches('\r');
+    let value: serde_json::Value =
+        serde_saphyr::from_str_with_options(yaml, frontmatter_parse_options())
+            .context("parse YAML frontmatter")?;
+    let map = match value {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    };
+    Ok((map, rest[end + close.len()..].to_owned()))
 }
 
 /// Read frontmatter the way `serde_yaml` 0.9 did, matching the server's
@@ -1374,8 +1393,8 @@ fn enc_path(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use crate::test_http::{read_http_request, respond_json};
+    use std::net::TcpListener;
     use std::thread;
     use tempfile::tempdir;
 
@@ -1400,47 +1419,6 @@ mod tests {
                 {"role": "assistant", "content": "To make backpressure explicit."}
             ]
         })
-    }
-
-    fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 4096];
-        let header_end = loop {
-            let read = stream.read(&mut buf).unwrap();
-            assert!(read > 0, "client closed before sending complete headers");
-            bytes.extend_from_slice(&buf[..read]);
-            if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap_or(0);
-        while bytes.len() - header_end < content_length {
-            let read = stream.read(&mut buf).unwrap();
-            assert!(read > 0, "client closed before sending complete body");
-            bytes.extend_from_slice(&buf[..read]);
-        }
-        (
-            headers,
-            bytes[header_end..header_end + content_length].to_vec(),
-        )
-    }
-
-    fn respond_json(stream: &mut TcpStream, status: &str, body: &str) {
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        stream.flush().unwrap();
     }
 
     #[test]

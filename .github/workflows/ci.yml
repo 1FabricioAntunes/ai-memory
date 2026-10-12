@@ -101,6 +101,13 @@ jobs:
           uv run --no-project python tests/e2e/external_relay_smoke.py
           --ai-memory-bin "${{ github.workspace }}/target/debug/ai-memory"
           --relay-bin "${{ github.workspace }}/target/debug/ai-memory-relay"
+      # The companion job runs the importer's unit tests without a server;
+      # its agentmemory end-to-end tests need the binary built above.
+      - name: agentmemory import against the real server
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          AI_MEMORY_IMPORTER_E2E_BIN: ${{ github.workspace }}/target/debug/ai-memory
+        run: cargo test --locked --manifest-path companions/ai-memory-importer/Cargo.toml e2e
       # The Jev reranker adapter under docs/examples is stdlib Python with its
       # own unittest suite; nothing else runs it. `unittest discover` exits 5
       # when it finds no tests, so the step skips cleanly until a test file

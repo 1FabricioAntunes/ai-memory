@@ -18,6 +18,10 @@
 //!
 //! It never opens the store directly; the server remains the source of truth
 //! for the captured side, and the local side is read-only.
+//!
+//! It also reports configuration agentmemory left behind (an MCP server entry
+//! or a guideline block in a rules file) with the line to fix by hand; see
+//! [`super::agentmemory_residue`]. That check only reads.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -179,6 +183,9 @@ struct DoctorReport {
     /// itself. `None` when no ai-memory Codex hook is installed or Codex could
     /// not be asked.
     codex_hooks: Option<super::codex_hook_trust::CodexHookTrust>,
+    /// agentmemory MCP entries and rules-file guideline blocks still present
+    /// after a migration. Detected only; never changed.
+    agentmemory_residue: Vec<super::agentmemory_residue::ResidueFinding>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,6 +581,15 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
 
     let native_memory = native_memory_reports(&home, &cwd);
     let codex_hooks = codex_hook_trust(&cwd).await;
+    let repo_root =
+        ai_memory_consolidate::discover_main_repo_root(&cwd).unwrap_or_else(|_| cwd.clone());
+    let agentmemory_residue = super::agentmemory_residue::scan(
+        &home,
+        &repo_root,
+        &super::agentmemory_residue::mcp_config_candidates(&repo_root, &|name| {
+            std::env::var_os(name)
+        }),
+    );
 
     let report = DoctorReport {
         workspace,
@@ -591,6 +607,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         spool,
         server_unreachable,
         codex_hooks,
+        agentmemory_residue,
     };
 
     if args.json {
@@ -755,6 +772,10 @@ fn render_human(report: &DoctorReport) {
         println!("  capture coverage: unavailable ({})", problem.reason);
     }
     print!("{}", render_capture_health(report));
+    print!(
+        "{}",
+        super::agentmemory_residue::render(&report.agentmemory_residue)
+    );
     if report.since_days == 0 {
         println!("  recent window: all on-disk sessions\n");
     } else {
@@ -879,6 +900,7 @@ mod tests {
             spool,
             server_unreachable,
             codex_hooks,
+            agentmemory_residue: Vec::new(),
         }
     }
 

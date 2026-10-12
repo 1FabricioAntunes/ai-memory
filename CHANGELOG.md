@@ -178,6 +178,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a Cordis profile patch rather than a fixed config file, so the command prints a
   ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
   refuses `--apply`. (#1193)
+- The `ai-memory-importer` companion imports agentmemory data. `agentmemory-vault`
+  reads its Obsidian vault export; `agentmemory-export` reads its `ExportData`
+  JSON file, from disk only, and needs a mapping file from agentmemory's
+  project names (or exact session working directories) to ai-memory
+  workspaces and projects. `--apply` refuses to run while any record is
+  unmapped. Pages land under `imported/agentmemory/` (`--dest-prefix`), never
+  under `sessions/` or another reserved family, and links to pages that were
+  not imported become plain text. Every write goes through `memory_write_page`
+  with `create_only` or `expected_page_id`, and the importer refuses servers
+  older than 2.7. A memory's versions are written oldest first so ai-memory
+  keeps the supersession chain, and `forgetAfter` becomes `expires_at`. Each
+  page carries a stable UUIDv5 ingest key, so an interrupted import resumes
+  without duplicates and a rerun writes nothing. Text is redacted before
+  anything is planned or sent. Observations are dropped unless
+  `--replay-observations` replays them as `external-import` sessions through
+  `/hook/batch`, and records with no ai-memory counterpart are counted in the
+  manifest. The cookbook has a "Coming from agentmemory" section.
+- `ai-memory doctor` reports agentmemory configuration left behind after a
+  migration: an MCP server entry in any harness config `install-mcp` knows (or
+  in a project's `.mcp.json`, `.cursor/mcp.json`, `.gemini/settings.json` or
+  `.vscode/mcp.json`), and agentmemory guideline blocks in rules files such as
+  `AGENTS.md`, `GEMINI.md`, `.cursor/rules/` and `.kiro/steering/`. It names
+  each file and the key or lines, prints the fix, and warns when a block names
+  `memory_consolidate`, which ai-memory also has with different arguments. The
+  check only reads; it never edits or deletes another tool's files. `doctor
+  --json` carries the findings as `agentmemory_residue`.
 
 ### Changed
 - Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
