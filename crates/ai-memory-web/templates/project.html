@@ -13,6 +13,22 @@
 
 <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-6">{{ workspace }}/{{ project }}</h1>
 
+<form action="search" method="get" class="mb-8 flex flex-wrap items-center gap-2" aria-label="Search this project">
+  <input type="hidden" name="workspace" value="{{ workspace }}">
+  <input type="hidden" name="project" value="{{ project }}">
+  <input
+    name="q"
+    type="search"
+    placeholder="Search this project…"
+    class="flex-1 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+  >
+  <label class="flex items-center gap-1 text-sm text-slate-600 dark:text-slate-400">
+    <input type="checkbox" name="explain" value="1">
+    Explain ranking
+  </label>
+  <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Search</button>
+</form>
+
 <div class="flex flex-col md:flex-row gap-8">
   <!-- Sidebar: folder tree -->
   <aside class="w-full md:w-56 shrink-0">

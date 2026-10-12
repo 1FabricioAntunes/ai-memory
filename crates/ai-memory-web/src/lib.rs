@@ -13,9 +13,12 @@
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
 //! - `GET /w/:workspace/:project/h/*path` → version history + unified diff
 //! - `GET /w/:workspace/:project/s/:session` → session timeline, paged
-//! - `GET /search?q=…`                    → FTS5 hit list
+//! - `GET /search?q=…`                    → cross-project FTS5 hit list
+//! - `GET /search?q=…&workspace=…&project=…&explain=1` → project search
+//!   through `memory_query`'s hybrid ranker, with the recall trace
 //! - `GET /pending`                       → root-only pending-writes triage;
 //!   its buttons post to `/admin/pending-writes/*`, not to this crate
+//! - `GET /health`                        → root-only server health panel
 //! - `GET /login` / `GET /change-password` → public human-auth HTML forms
 //! - `GET /static/*`                      → embedded CSS + logo (public)
 //!
@@ -34,9 +37,11 @@ use ai_memory_wiki::Wiki;
 use axum::Router;
 
 mod diff;
+pub mod health;
 mod html_auth;
 mod markdown;
 pub mod mount;
+pub mod recall;
 mod routes;
 mod state;
 mod templates;
@@ -46,6 +51,7 @@ pub use mount::{
     SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
     split_web_routers, web_base_href,
 };
+pub use recall::Recall;
 pub use state::WebState;
 
 /// Build the read-only web router. Call once at server startup and

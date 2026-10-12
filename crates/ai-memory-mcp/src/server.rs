@@ -510,9 +510,12 @@ pub struct AiMemoryServer {
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
-    /// Optional post-RRF reranker. When `None`, `memory_query` returns
-    /// fused, authority-adjusted order and stays on the zero-LLM path.
-    reranker: Option<Arc<dyn ai_memory_llm::Reranker>>,
+    /// Optional post-RRF reranker behind its concurrency gate, shared with
+    /// the web search so cloned request handlers and both surfaces together
+    /// cannot create an unbounded number of billable provider calls. When
+    /// `None`, `memory_query` returns fused, authority-adjusted order and
+    /// stays on the zero-LLM path.
+    rerank: Option<ai_memory_llm::RerankStage>,
     /// Per-client MCP tool-call counters, buffered in memory and folded
     /// into `client_activity` at most once per flush interval so a query
     /// burst costs the writer one tiny upsert batch, not one write per
@@ -526,9 +529,6 @@ pub struct AiMemoryServer {
     /// running pass the moment the operator returns — consolidation must never
     /// contend with live work.
     activity_clock: ai_memory_consolidate::ActivityClock,
-    /// Shared across cloned request handlers so concurrent searches cannot
-    /// create an unbounded number of billable provider calls.
-    rerank_gate: Arc<tokio::sync::Semaphore>,
     /// Privacy strip. Applied to agent-supplied handoff fields in
     /// `memory_handoff_begin` (handoffs bypass `Wiki::write_page` so
     /// the wiki-level scrub doesn't cover them).
@@ -791,11 +791,50 @@ impl From<ai_memory_store::PageHit> for QueryHit {
 #[derive(Clone, Copy)]
 struct ProjectSearchOptions<'a> {
     query: &'a str,
-    query_vec: Option<&'a [f32]>,
+    query_vec: Option<&'a ai_memory_llm::QueryVector>,
     limit: usize,
     include_expired: bool,
     explain: bool,
     include_superseded: bool,
+}
+
+/// Borrow an embedded query as the store's vector-stream input.
+fn vector_query(qv: &ai_memory_llm::QueryVector) -> ai_memory_store::VectorQuery<'_> {
+    ai_memory_store::VectorQuery {
+        vector: &qv.vector,
+        provider: &qv.provider,
+        model: &qv.model,
+        dim: qv.dim,
+    }
+}
+
+/// Rerank fused page hits through `stage`, recording each judged hit's
+/// relevance in its explain details.
+async fn rerank_page_hits(
+    stage: &ai_memory_llm::RerankStage,
+    query: &str,
+    hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+    limit: usize,
+    timeout: std::time::Duration,
+) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+    stage
+        .apply(
+            query,
+            hits,
+            limit,
+            timeout,
+            |(hit, _)| ai_memory_llm::RerankCandidate {
+                id: hit.id.to_string(),
+                title: hit.title.clone(),
+                snippet: hit.snippet.clone(),
+            },
+            |(_, explain), relevance| {
+                if let Some(explain) = explain.as_mut() {
+                    explain.rerank_score = Some(relevance);
+                }
+            },
+        )
+        .await
 }
 
 /// Synthesized "dialectic" answer attached to a `memory_query` response when
@@ -906,20 +945,6 @@ struct AnsweredScope {
     /// `default_after_mismatch`.
     resolved_by: &'static str,
 }
-
-/// How many extra candidates to fetch for the reranker to reorder. The
-/// point of reranking is promoting a hit RRF put below the cut, so the
-/// candidate pool has to be deeper than the caller's limit.
-const RERANK_OVERFETCH: usize = 3;
-/// Hard cap on rerank candidates, whatever `limit * RERANK_OVERFETCH`
-/// works out to — bounds both prompt size and latency.
-const RERANK_MAX_CANDIDATES: usize = 30;
-/// Maximum number of provider-backed rerank calls executing concurrently.
-/// Saturated requests keep the locally computed order without waiting.
-const RERANK_MAX_IN_FLIGHT: usize = 4;
-/// Wall-clock budget for one rerank call. Past this, `memory_query`
-/// answers from the adjusted pre-rerank order instead of waiting.
-const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Microseconds in one UTC day, for `client_activity` bucketing.
 const US_PER_DAY: i64 = 86_400_000_000;
@@ -1806,13 +1831,12 @@ impl AiMemoryServer {
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             embedder: None,
-            reranker: None,
+            rerank: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
             mcp_metrics: Arc::new(crate::McpMetrics::default()),
             activity_clock: ai_memory_consolidate::ActivityClock::new(
                 jiff::Timestamp::now().as_microsecond(),
             ),
-            rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
@@ -2364,25 +2388,9 @@ impl AiMemoryServer {
         ))
     }
 
-    async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
-        let Some(embedder) = &self.embedder else {
-            return None;
-        };
-        // `embed_query`, not `embed`: an asymmetric embedder (configured
-        // query/document prefixes, or Google's RETRIEVAL_QUERY task type)
-        // must see this text on the query side, not the document side.
-        match embedder.embed_query(query).await {
-            Ok(qv) => Some(qv),
-            Err(e) => {
-                tracing::warn!(
-                    provider = embedder.provider(),
-                    model = embedder.model(),
-                    error = %e,
-                    "embedder failed; degrading memory_query to FTS5 + entity + graph"
-                );
-                None
-            }
-        }
+    async fn embed_query(&self, query: &str) -> Option<ai_memory_llm::QueryVector> {
+        let embedder = self.embedder.as_ref()?;
+        ai_memory_llm::embed_search_query(embedder.as_ref(), query).await
     }
 
     /// One project's fused hits, plus per-stream timings when
@@ -2396,72 +2404,44 @@ impl AiMemoryServer {
         Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
         Option<ai_memory_store::StreamTimings>,
     )> {
+        self.search_scopes(&[(workspace_id, project_id)], options)
+            .await
+    }
+
+    /// Fused hits over `scopes` through the shared hybrid ranker
+    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes`]), the same call
+    /// the web search makes.
+    async fn search_scopes(
+        &self,
+        scopes: &[(WorkspaceId, ProjectId)],
+        options: ProjectSearchOptions<'_>,
+    ) -> ai_memory_store::StoreResult<(
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Option<ai_memory_store::StreamTimings>,
+    )> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = options.include_expired.then_some(i64::MIN);
-        // Provider/model/dim only select which stored vectors are
-        // eligible; with no query vector the vector stream never runs,
-        // so the empty triple is inert rather than a fake identity.
-        let (provider, model, dim) = match (&self.embedder, options.query_vec) {
-            // Not `.model()`: eligible stored vectors are keyed by the
-            // DOCUMENT identity they were embedded under, which a
-            // configured document prefix folds in. See
-            // `Embedder::model_identity`.
-            (Some(e), Some(_)) => (e.provider().to_string(), e.model_identity(), e.dim()),
-            _ => (String::new(), String::new(), 0),
-        };
-        if options.explain {
-            let (hits, timings) = self
-                .reader
-                .hybrid_search_explained_timed(
-                    workspace_id,
-                    project_id,
-                    options.query.to_owned(),
-                    options.query_vec.map(<[f32]>::to_vec),
-                    provider,
-                    model,
-                    dim,
-                    options.limit,
-                    expiry_cutoff,
-                    options.include_superseded,
-                )
-                .await?;
-            Ok((
-                hits.into_iter()
-                    .map(|(hit, details)| (hit, Some(details)))
-                    .collect(),
-                Some(timings),
-            ))
-        } else {
-            let hits = self
-                .reader
-                .hybrid_search(
-                    workspace_id,
-                    project_id,
-                    options.query.to_owned(),
-                    options.query_vec.map(<[f32]>::to_vec),
-                    provider,
-                    model,
-                    dim,
-                    options.limit,
-                    expiry_cutoff,
-                    options.include_superseded,
-                )
-                .await?;
-            Ok((hits.into_iter().map(|hit| (hit, None)).collect(), None))
-        }
+        self.reader
+            .hybrid_search_scopes(
+                scopes,
+                ai_memory_store::HybridSearch {
+                    query: options.query,
+                    vector: options.query_vec.map(vector_query),
+                    limit: options.limit,
+                    expiry_cutoff_us: expiry_cutoff,
+                    include_superseded: options.include_superseded,
+                    explain: options.explain,
+                },
+            )
+            .await
     }
 
     fn rerank_fetch_limit(&self, limit: usize) -> usize {
-        if self.reranker.is_none() {
-            return limit;
-        }
-        limit.max(
-            limit
-                .saturating_mul(RERANK_OVERFETCH)
-                .min(RERANK_MAX_CANDIDATES),
-        )
+        self.rerank
+            .as_ref()
+            .map_or(limit, |stage| stage.fetch_limit(limit))
     }
 
     async fn rerank_hits(
@@ -2470,7 +2450,7 @@ impl AiMemoryServer {
         hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
         limit: usize,
     ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
-        self.rerank_hits_with_timeout(query, hits, limit, RERANK_TIMEOUT)
+        self.rerank_hits_with_timeout(query, hits, limit, ai_memory_llm::reranker::RERANK_TIMEOUT)
             .await
     }
 
@@ -2481,116 +2461,11 @@ impl AiMemoryServer {
         limit: usize,
         timeout: std::time::Duration,
     ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
-        let Some(reranker) = &self.reranker else {
+        let Some(stage) = &self.rerank else {
             hits.truncate(limit);
             return hits;
         };
-        let candidate_count = hits.len().min(RERANK_MAX_CANDIDATES);
-        if candidate_count < 2 {
-            hits.truncate(limit);
-            return hits;
-        }
-        let Ok(_permit) = self.rerank_gate.clone().try_acquire_owned() else {
-            tracing::debug!(
-                reranker = reranker.name(),
-                model = reranker.model(),
-                max_in_flight = RERANK_MAX_IN_FLIGHT,
-                "reranker concurrency limit reached; keeping pre-rerank order"
-            );
-            hits.truncate(limit);
-            return hits;
-        };
-        let candidates: Vec<ai_memory_llm::RerankCandidate> = hits
-            .iter()
-            .take(candidate_count)
-            .map(|(hit, _)| ai_memory_llm::RerankCandidate {
-                id: hit.id.to_string(),
-                title: hit.title.clone(),
-                snippet: hit.snippet.clone(),
-            })
-            .collect();
-        let scored = match tokio::time::timeout(timeout, reranker.rerank(query, &candidates)).await
-        {
-            Ok(Ok(scores)) => scores,
-            Ok(Err(e)) => {
-                // Redacted fields only: the `Display` of a provider failure
-                // carries the upstream response body.
-                tracing::warn!(
-                    reranker = reranker.name(),
-                    model = reranker.model(),
-                    error_class = %e.class(),
-                    error_status = ?e.http_status(),
-                    "reranker failed; keeping pre-rerank order"
-                );
-                hits.truncate(limit);
-                return hits;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    reranker = reranker.name(),
-                    model = reranker.model(),
-                    timeout_secs = timeout.as_secs_f64(),
-                    "reranker timed out; keeping pre-rerank order"
-                );
-                hits.truncate(limit);
-                return hits;
-            }
-        };
-        let candidate_index: HashMap<&str, usize> = candidates
-            .iter()
-            .enumerate()
-            .map(|(idx, candidate)| (candidate.id.as_str(), idx))
-            .collect();
-        let mut relevance = vec![None; candidates.len()];
-        let mut invalid = scored.len() != candidates.len();
-        for score in &scored {
-            let Some(&idx) = candidate_index.get(score.id.as_str()) else {
-                invalid = true;
-                continue;
-            };
-            if !score.relevance.is_finite()
-                || !(0.0..=1.0).contains(&score.relevance)
-                || relevance[idx].replace(score.relevance).is_some()
-            {
-                invalid = true;
-            }
-        }
-        if invalid || relevance.iter().any(Option::is_none) {
-            tracing::warn!(
-                reranker = reranker.name(),
-                model = reranker.model(),
-                scored = scored.len(),
-                candidates = candidates.len(),
-                "reranker returned incomplete or invalid scores; keeping pre-rerank order"
-            );
-            hits.truncate(limit);
-            return hits;
-        }
-        let relevance: Vec<f32> = relevance
-            .into_iter()
-            .map(Option::unwrap_or_default)
-            .collect();
-
-        let tail = hits.split_off(candidate_count);
-        let mut indexed: Vec<(usize, (PageHit, Option<ai_memory_store::SearchExplain>))> =
-            hits.into_iter().enumerate().collect();
-        indexed.sort_by(|a, b| {
-            relevance[b.0]
-                .total_cmp(&relevance[a.0])
-                .then(a.0.cmp(&b.0))
-        });
-        let mut out: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = indexed
-            .into_iter()
-            .map(|(idx, mut entry)| {
-                if let Some(explain) = entry.1.as_mut() {
-                    explain.rerank_score = Some(relevance[idx]);
-                }
-                entry
-            })
-            .collect();
-        out.extend(tail);
-        out.truncate(limit);
-        out
+        rerank_page_hits(stage, query, hits, limit, timeout).await
     }
 
     /// The process counters this server records into. `serve` hands the same
@@ -2603,9 +2478,23 @@ impl AiMemoryServer {
     /// Attach a reranker. Without one, `memory_query` keeps its
     /// RRF-only, zero-LLM behaviour.
     #[must_use]
-    pub fn with_reranker(mut self, reranker: Arc<dyn ai_memory_llm::Reranker>) -> Self {
-        self.reranker = Some(reranker);
+    pub fn with_reranker(self, reranker: Arc<dyn ai_memory_llm::Reranker>) -> Self {
+        self.with_rerank_stage(ai_memory_llm::RerankStage::new(reranker))
+    }
+
+    /// Attach a rerank stage built elsewhere, sharing its concurrency gate
+    /// (`serve` hands the same stage to the web search).
+    #[must_use]
+    pub fn with_rerank_stage(mut self, stage: ai_memory_llm::RerankStage) -> Self {
+        self.rerank = Some(stage);
         self
+    }
+
+    /// The configured rerank stage, if any, so another search surface can
+    /// share its reranker and concurrency gate.
+    #[must_use]
+    pub fn rerank_stage(&self) -> Option<ai_memory_llm::RerankStage> {
+        self.rerank.clone()
     }
 
     /// Attach a bare LLM provider so `memory_query(answer=true)` can synthesize
@@ -2891,52 +2780,16 @@ impl AiMemoryServer {
         // Explain-only: per-stream timings of the primary search, summed over
         // `scopes`. `None` on the normal path, which reads no clocks for it.
         let mut timings: Option<ai_memory_store::StreamTimings> = None;
+        let options = ProjectSearchOptions {
+            query: &args.query,
+            query_vec: query_vec.as_ref(),
+            limit: candidate_limit,
+            include_expired,
+            explain,
+            include_superseded,
+        };
         let hits = if let Some(scopes) = &resolved_scopes {
-            let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
-                HashMap::new();
-            for &(ws, proj) in scopes {
-                let (hits, scope_timings) = self
-                    .search_project(
-                        ws,
-                        proj,
-                        ProjectSearchOptions {
-                            query: &args.query,
-                            query_vec: query_vec.as_deref(),
-                            limit: candidate_limit,
-                            include_expired,
-                            explain,
-                            include_superseded,
-                        },
-                    )
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                if let Some(scope_timings) = scope_timings {
-                    timings
-                        .get_or_insert_with(Default::default)
-                        .accumulate(&scope_timings);
-                }
-                for hit in hits {
-                    hits_by_id
-                        .entry(hit.0.id)
-                        .and_modify(|existing| {
-                            if hit.0.rank < existing.0.rank {
-                                *existing = hit.clone();
-                            }
-                        })
-                        .or_insert(hit);
-                }
-            }
-            let mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> =
-                hits_by_id.into_values().collect();
-            hits.sort_by(|a, b| {
-                a.0.rank
-                    .partial_cmp(&b.0.rank)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
-                    .then_with(|| a.0.id.as_bytes().cmp(b.0.id.as_bytes()))
-            });
-            hits.truncate(candidate_limit);
-            Ok(hits)
+            self.search_scopes(scopes, options).await
         } else {
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
@@ -2946,26 +2799,14 @@ impl AiMemoryServer {
                     Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
-            self.search_project(
-                ws,
-                proj,
-                ProjectSearchOptions {
-                    query: &args.query,
-                    query_vec: query_vec.as_deref(),
-                    limit: candidate_limit,
-                    include_expired,
-                    explain,
-                    include_superseded,
-                },
-            )
-            .await
-            .map(|(hits, project_timings)| {
-                timings = project_timings;
-                hits
-            })
-        };
+            self.search_project(ws, proj, options).await
+        }
+        .map(|(hits, search_timings)| {
+            timings = search_timings;
+            hits
+        });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let rerank_started = (explain && self.reranker.is_some()).then(std::time::Instant::now);
+        let rerank_started = (explain && self.rerank.is_some()).then(std::time::Instant::now);
         let hits = self.rerank_hits(&args.query, hits, limit).await;
         if let (Some(timings), Some(started)) = (timings.as_mut(), rerank_started) {
             timings.rerank_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
@@ -3053,7 +2894,7 @@ impl AiMemoryServer {
                                 scope.project_id,
                                 ProjectSearchOptions {
                                     query: &args.query,
-                                    query_vec: query_vec.as_deref(),
+                                    query_vec: query_vec.as_ref(),
                                     limit,
                                     include_expired,
                                     explain,
@@ -3122,7 +2963,7 @@ impl AiMemoryServer {
                                 scope.project_id,
                                 ProjectSearchOptions {
                                     query: &args.query,
-                                    query_vec: query_vec.as_deref(),
+                                    query_vec: query_vec.as_ref(),
                                     limit,
                                     include_expired,
                                     explain,
@@ -3147,20 +2988,7 @@ impl AiMemoryServer {
                 }
             }
         }
-        let streams_active = explain.then(|| {
-            let mut streams = vec!["fts", "entity"];
-            if query_vec.is_some() {
-                streams.push("vector");
-                if self.reader.retrieval_tuning().abstract_vectors {
-                    streams.push("abstract");
-                }
-            }
-            streams.push("graph");
-            if self.reader.retrieval_tuning().observation_stream {
-                streams.push("observation");
-            }
-            streams
-        });
+        let streams_active = explain.then(|| self.reader.active_streams(query_vec.is_some()));
         let hits: Vec<QueryHit> = hits
             .into_iter()
             .map(|(hit, score_details)| QueryHit {
@@ -7563,7 +7391,7 @@ mod tests {
         let query_vec = server.embed_query("anything").await;
 
         assert_eq!(
-            query_vec.as_deref(),
+            query_vec.as_ref().map(|qv| qv.vector.as_slice()),
             Some([0.0_f32, 1.0].as_slice()),
             "memory_query's embed_query helper must call Embedder::embed_query \
              (query-side vector [0.0, 1.0]), not the generic Embedder::embed \
@@ -7831,8 +7659,9 @@ mod tests {
         let (_tmp, _store, server, _ws, _proj) = setup_server().await;
         let (reranker, calls, _) = stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
         let server = server.with_reranker(reranker);
-        let _permits: Vec<_> = (0..RERANK_MAX_IN_FLIGHT)
-            .map(|_| server.rerank_gate.clone().try_acquire_owned().unwrap())
+        let gate = server.rerank_stage().unwrap().gate().clone();
+        let _permits: Vec<_> = (0..ai_memory_llm::reranker::RERANK_MAX_IN_FLIGHT)
+            .map(|_| gate.clone().try_acquire_owned().unwrap())
             .collect();
         let hits = rerank_test_hits(4);
         let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();

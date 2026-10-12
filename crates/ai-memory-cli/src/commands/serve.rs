@@ -1766,6 +1766,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_href: &base_href,
                     base_path: &base_path,
                     trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                    // The same embedder and rerank stage `memory_query`
+                    // holds (the stage shares its concurrency gate), so web
+                    // project search ranks like the MCP tool.
+                    recall: ai_memory_web::Recall {
+                        embedder: embedder.clone(),
+                        rerank: server.rerank_stage(),
+                    },
+                    health: Some(Arc::new(ai_memory_web::health::HealthSources {
+                        ingest: ingest_metrics.clone(),
+                        providers: provider_health.clone(),
+                        probe: Arc::new(ServeHealthProbe {
+                            writer: store.writer.clone(),
+                            data_dir: config.data_dir.clone(),
+                        }),
+                    })),
                 },
             )?;
             // HTML navigational 401/403 → builtin login / change-password.
@@ -2863,6 +2878,38 @@ fn configure_consolidator(
         consolidator: Some(consolidator),
         admin_llm: Some(llm),
     })
+}
+
+/// What the web health page reads from this process: the writer queue,
+/// and the hook spool and recovery journal under this server's data
+/// directory (a hook client on another machine spools there, not here).
+struct ServeHealthProbe {
+    writer: ai_memory_store::WriterHandle,
+    data_dir: std::path::PathBuf,
+}
+
+impl ai_memory_web::health::HealthProbe for ServeHealthProbe {
+    fn process_state(&self) -> ai_memory_web::health::ProcessState {
+        use ai_memory_web::health::{JournalState, ProcessState, SpoolState};
+        let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&self.data_dir));
+        let (pending, degraded, finish_failed, error) =
+            super::recovery::journal_summary(&self.data_dir);
+        ProcessState {
+            write_queue: Some(self.writer.queue_depth()),
+            spool: Some(SpoolState {
+                pending: spool.pending,
+                oldest_age_ms: spool.oldest_age_ms,
+                retries_total: spool.retries_total,
+                capacity: spool.capacity,
+            }),
+            journal: Some(JournalState {
+                pending,
+                degraded,
+                finish_failed,
+                unreadable: error.is_some(),
+            }),
+        }
+    }
 }
 
 /// Validate a list of CORS origins before the server binds.
@@ -5847,6 +5894,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -5949,6 +5998,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -6021,6 +6072,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -6167,6 +6220,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -6229,6 +6284,8 @@ mod tests {
                 base_href: "/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();

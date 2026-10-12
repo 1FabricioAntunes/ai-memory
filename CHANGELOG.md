@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a recall trace to web search. A project page has its own search box,
+  and a search with `workspace` and `project`
+  (`/web/search?q=…&workspace=…&project=…`) now ranks with the same hybrid
+  ranker as `memory_query` for that project: FTS5, entity, vector, graph and
+  observation streams, the authority adjustment, and the reranker when one is
+  configured. The server now hands its configured embedder and reranker to the
+  web UI, and the reranker's four-call concurrency limit is shared with
+  `memory_query`. With "Explain ranking" (`explain=1`) each hit shows its rank,
+  raw score and RRF contribution in every stream, the fused score, the
+  authority multiplier, and the intent boost and rerank score when present;
+  the page also lists the streams that ran, the embedder and reranker in use,
+  and each stream's time in milliseconds. A scoped `/api/v1/search` (one
+  project or `scopes`) uses the same ranker, so it returns the same order as
+  `memory_query`, and its `rank` is now the fused rank. A search without a
+  scope is still the cross-project FTS5 search, as `memory_query(global=true)`
+  is. Project search follows the per-project read rule: a viewer without a
+  grant on a restricted project gets a 403 and no trace, and an unknown project
+  is a 404.
+- Added a root-only server health page at `/web/health`, linked from the web UI
+  header. It shows the hook counters since the server started (accepted, shed
+  with 429 by saturation or rate limit, stored, failed, dropped), the writer
+  queue depth, the hook spool and recovery journal in the server's data
+  directory, the consolidation queue (last completion, pending, running,
+  completed and failed jobs), the configured embedder, both providers' status
+  and the stored vector identities. Failing checks are listed with the command
+  that fixes them, the same lines `ai-memory status` prints: `ai-memory
+  recover` for a backed-up spool or journal, `ai-memory compact --confirm` for
+  reclaimable space, `ai-memory embed` for pages without vectors, `ai-memory
+  embed --force` for vectors made under another model, and the LLM provider's
+  retry command. The page is read-only and is gated like `/web/pending`: on a
+  multi-user server anonymous requests get a 401 and database users a 403. It
+  never shows provider error text, page content or project names.
 - Added page history and session replay to the read-only web UI. Each page
   links to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version,
   newest first, superseded ones included, so a version a concurrent write

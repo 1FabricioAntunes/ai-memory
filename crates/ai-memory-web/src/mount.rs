@@ -314,6 +314,11 @@ pub struct WebMountSpec<'a> {
     /// A trusted identity proxy is configured; the root-only pending-writes
     /// page needs it to decide whether operators are told apart.
     pub trusted_proxy_identity: bool,
+    /// The server's configured embedder and reranker, so project search in
+    /// `/web` and `/api/v1` ranks like `memory_query`.
+    pub recall: crate::Recall,
+    /// Process-side sources for the root-only health page.
+    pub health: Option<Arc<crate::health::HealthSources>>,
 }
 
 /// Public SPA vs dual-auth wiki/API split.
@@ -379,7 +384,13 @@ fn split_web_routers_unframed(
             html_auth: None,
         });
     }
-    let api = build_api_router(&reader, &wiki, spec.cors_origins);
+    let mut state = crate::WebState::new(reader, wiki)
+        .with_trusted_proxy_identity(spec.trusted_proxy_identity)
+        .with_recall(spec.recall);
+    if let Some(health) = spec.health {
+        state = state.with_health(health);
+    }
+    let api = build_api_router(state.clone(), spec.cors_origins);
     let protected_api = axum::Router::new().nest("/api/v1", api);
     if !enable_web {
         return Ok(SplitWebRouters {
@@ -422,14 +433,7 @@ fn split_web_routers_unframed(
             spec.base_path,
             mount,
         ),
-        protected: mount_builtin_browser(
-            protected_api,
-            crate::WebState::new(reader, wiki)
-                .with_trusted_proxy_identity(spec.trusted_proxy_identity),
-            &slug,
-            mount,
-            browser_inject,
-        ),
+        protected: mount_builtin_browser(protected_api, state, &slug, mount, browser_inject),
         html_auth: Some(auth_cfg),
     })
 }
@@ -453,8 +457,8 @@ fn mount_web_router(
 /// the operator configured any. The layer is scoped to this router only
 /// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
 /// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = crate::api_router(reader.clone(), wiki.clone());
+fn build_api_router(state: crate::WebState, cors_origins: &[String]) -> axum::Router {
+    let api = crate::routes::build_api(Arc::new(state));
     if cors_origins.is_empty() {
         return api;
     }
@@ -722,6 +726,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1124,6 +1130,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1202,6 +1210,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1288,6 +1298,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1358,6 +1370,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1418,6 +1432,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1507,6 +1523,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1564,6 +1582,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1610,6 +1630,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();

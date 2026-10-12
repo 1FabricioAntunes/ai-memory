@@ -511,7 +511,7 @@ pub(crate) struct SessionView {
 // search.html
 // ---------------------------------------------------------------------------
 
-/// One FTS5 search hit.
+/// One search hit.
 pub(crate) struct SearchHit {
     /// Workspace name.
     pub workspace: String,
@@ -525,6 +525,51 @@ pub(crate) struct SearchHit {
     pub title: String,
     /// FTS5 snippet (HTML-marked with `<mark>` tags).
     pub snippet: String,
+    /// How the ranker placed this hit; set on an explained project search.
+    pub trace: Option<HitTrace>,
+}
+
+/// One hit's recall trace: what each stream saw and how the fused score
+/// became the final order. Every number is pre-formatted for display.
+pub(crate) struct HitTrace {
+    /// 1-based position in the result list.
+    pub position: usize,
+    /// The returned rank (lower is better).
+    pub rank: String,
+    /// Sum of the RRF contributions.
+    pub fused: String,
+    /// The bounded authority multiplier, or `—` when the page had none.
+    pub authority: String,
+    /// The query-intent boost, when routing applied one.
+    pub intent_boost: Option<String>,
+    /// Reranker relevance, when the reranker judged this hit.
+    pub rerank_score: Option<String>,
+    /// One row per stream that ran.
+    pub streams: Vec<StreamTraceRow>,
+    /// Entity names that matched the query, comma-separated.
+    pub matched_entities: String,
+    /// `seed path (direction[, edge])` when the graph stream pulled it in.
+    pub graph_via: Option<String>,
+}
+
+/// One stream's view of one hit.
+pub(crate) struct StreamTraceRow {
+    /// Stream name as `streams_active` reports it.
+    pub stream: &'static str,
+    /// 1-based rank in that stream, or `—` when the hit missed it.
+    pub rank: String,
+    /// The stream's raw score (bm25, cosine, entity weight), or `—`.
+    pub raw: String,
+    /// The stream's RRF contribution.
+    pub rrf: String,
+}
+
+/// One stream's wall time on an explained search.
+pub(crate) struct TimingRow {
+    /// `fts`, `entity`, `vector`, `graph`, `observation` or `rerank`.
+    pub stream: &'static str,
+    /// Milliseconds, formatted.
+    pub ms: String,
 }
 
 /// View-model for `GET /search?q=…`.
@@ -533,10 +578,33 @@ pub(crate) struct SearchHit {
 pub(crate) struct SearchView {
     /// The raw query string.
     pub query: String,
-    /// FTS5 search hits.
+    /// Search hits, best first.
     pub hits: Vec<SearchHit>,
     /// Pre-computed hit count for display (avoids needing `|length` filter).
     pub hit_count: usize,
+    /// Workspace of a project search; empty for a cross-project search.
+    pub workspace: String,
+    /// Project of a project search; empty for a cross-project search.
+    pub project: String,
+    /// The viewer asked for the recall trace.
+    pub explain: bool,
+    /// Streams that ran, comma-separated (explain only).
+    pub streams_active: String,
+    /// Per-stream wall time (explain only).
+    pub timings: Vec<TimingRow>,
+    /// `provider / model (dim N)` of the embedder, or `none`.
+    pub embedder: String,
+    /// `name / model` of the reranker, or `none`.
+    pub reranker: String,
+    /// The same query across every project.
+    pub global_href: String,
+}
+
+impl SearchView {
+    /// A project search (hybrid ranker) rather than a cross-project one.
+    pub(crate) fn scoped(&self) -> bool {
+        !self.workspace.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +675,50 @@ pub(crate) struct PendingView {
     pub truncated: bool,
     /// The read cap, shown when `truncated`.
     pub limit: usize,
+}
+
+// ---------------------------------------------------------------------------
+// health.html
+// ---------------------------------------------------------------------------
+
+/// One failed health check.
+pub(crate) struct HealthCheckRow {
+    /// Stable check id.
+    pub id: &'static str,
+    /// `warn` or `error`.
+    pub status: &'static str,
+    /// What is wrong.
+    pub detail: String,
+    /// The exact command that fixes it, when there is one.
+    pub fix: Option<String>,
+}
+
+/// One label/value line on the health page.
+pub(crate) struct HealthRow {
+    /// Label.
+    pub label: &'static str,
+    /// Value.
+    pub value: String,
+}
+
+/// A titled group of health rows.
+pub(crate) struct HealthSection {
+    /// Section heading.
+    pub title: &'static str,
+    /// Its rows.
+    pub rows: Vec<HealthRow>,
+}
+
+/// View-model for the root-only `GET /health`.
+#[derive(Template)]
+#[template(path = "health.html")]
+pub(crate) struct HealthView {
+    /// The host wired the process-side sources (hook counters, spool…).
+    pub wired: bool,
+    /// Failed checks, most severe first.
+    pub checks: Vec<HealthCheckRow>,
+    /// Counter groups.
+    pub sections: Vec<HealthSection>,
 }
 
 /// View-model for a non-root session that opens a root-only page.
