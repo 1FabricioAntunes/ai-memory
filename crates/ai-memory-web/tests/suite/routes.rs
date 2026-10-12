@@ -4186,8 +4186,14 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
 
-        assert!(text.contains(r##"href="#main-content""##), "{uri}: skip link");
-        assert!(text.contains(r#"<main id="main-content""#), "{uri}: skip target");
+        assert!(
+            text.contains(r##"href="#main-content""##),
+            "{uri}: skip link"
+        );
+        assert!(
+            text.contains(r#"<main id="main-content""#),
+            "{uri}: skip target"
+        );
         assert!(
             text.contains(&format!(r#"<label for="{input_id}""#)),
             "{uri}: label for {input_id}"
