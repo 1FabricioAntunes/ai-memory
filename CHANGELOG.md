@@ -287,6 +287,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `auth: none (loopback)` with the fix, `ai-memory auth enable`.
 
 ### Changed
+- Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
+  `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
+  FTS5 alone, so it returns the same order as `memory_query`, and `rank` is
+  now the fused rank. Cross-project search without a scope is unchanged.
 - Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
   Code, Goose, Qwen Code and OpenHuman in `docs/install.md`, and listed them
   in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
