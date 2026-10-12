@@ -237,7 +237,8 @@ pub enum Command {
     /// Current values are listed under `--client`; see docs/mcp-install.md
     /// for the full guide.
     InstallMcp(InstallMcpArgs),
-    /// Internal stdio-to-HTTP MCP bridge for session-aware Claude Code installs.
+    /// Internal stdio-to-HTTP MCP bridge: session-aware for Claude Code, or
+    /// session-less (`--no-session-id`) for every other stdio MCP client.
     #[command(hide = true)]
     McpBridge(McpBridgeArgs),
     /// Stage + commit the wiki tree under git.
@@ -3219,14 +3220,25 @@ pub struct InstallMcpArgs {
     /// out of the harness config.
     #[arg(skip)]
     pub token_env_var: bool,
+    /// Write a stdio entry that runs the session-less `ai-memory mcp-bridge`
+    /// instead of an HTTP entry. Set by the installer, never a flag: it is how
+    /// a client without env-var indirection reaches a server whose token lives
+    /// in `[auth].bearer_token_file`.
+    #[arg(skip)]
+    pub stdio_bridge: bool,
 }
 
-/// Arguments for the internal Claude Code session-aware MCP bridge.
+/// Arguments for the internal stdio-to-HTTP MCP bridge.
 #[derive(Debug, Clone, Args)]
 pub struct McpBridgeArgs {
     /// Remote ai-memory base URL or full `/mcp` endpoint.
     #[arg(long)]
     pub server_url: Option<String>,
+    /// Run as a plain stdio-to-HTTP bridge that forwards no session identity,
+    /// for MCP clients other than Claude Code. Without it the bridge forwards
+    /// `CLAUDE_CODE_SESSION_ID` and refuses to start when it is missing.
+    #[arg(long)]
+    pub no_session_id: bool,
 }
 
 /// Transport for the MCP server.

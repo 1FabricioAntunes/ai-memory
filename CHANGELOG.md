@@ -219,10 +219,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created without it. It reuses or creates an owner-only token at
   `<data_dir>/auth-tokens/default`, records it in `config.toml`, gives the
   installed hooks the token when they hold no other credential, and
-  re-registers Claude Code's MCP entry for this server as the
-  `ai-memory mcp-bridge` stdio bridge. Running it again changes nothing, and
-  the token is never printed or written into a harness config. Restart the
-  server afterwards.
+  re-registers every MCP client whose `ai-memory` entry points at this server
+  the way `install-mcp` now wires a token-file install. It lists each client
+  it changed, each entry for another server it left alone, and anything that
+  needs a manual change. Running it again changes nothing, and the token is
+  never printed or written into a harness config. Restart the server
+  afterwards.
+- Added `ai-memory mcp-bridge --no-session-id`, a plain stdio-to-HTTP MCP
+  bridge for any client that runs local commands. It authenticates with the
+  token from config (`AI_MEMORY_AUTH_TOKEN`, `[auth] bearer_token`, or the
+  file `[auth] bearer_token_file` names), forwards no session identity (the
+  client passes `workspace` and `project` like any static MCP client, and an
+  inherited `CLAUDE_CODE_SESSION_ID` is ignored), and exits at once with
+  `401 Unauthorized` when the server refuses it. Without the flag the bridge
+  keeps Claude Code's session forwarding and still refuses to start without
+  `CLAUDE_CODE_SESSION_ID`.
 - Added the `[auth] bearer_token_file` config key (env
   `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`): a file holding the root bearer token,
   read once at startup. A relative path resolves against the data dir.
@@ -230,9 +241,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[auth] bearer_token` is a startup error, and a server whose configured file
   is missing or empty refuses to start. A token read from the file is never
   written into a harness config: `install-mcp` registers Claude Code through
-  `ai-memory mcp-bridge`, gives Codex and Prime Agent a reference to
-  `$AI_MEMORY_AUTH_TOKEN`, and refuses clients that can only hold a literal
-  header; `install-hooks --apply` stores it in the hook credential files only.
+  the session-aware `ai-memory mcp-bridge`, gives Codex and Prime Agent a
+  reference to `$AI_MEMORY_AUTH_TOKEN`, and writes every other client a stdio
+  entry for `ai-memory mcp-bridge --no-session-id` in that client's own config
+  format (OpenCode, OpenCode 2, Cursor, Claude Desktop, Gemini CLI, OpenClaw,
+  OMP, Antigravity CLI, Zero, Devin, Grok, Kimi Code, Kiro CLI, Command Code,
+  Copilot CLI, Swival, VS Code, Zed, Muse Code; DeepSeek Harness's printed
+  patch too). Only ZCode, whose config keeps HTTP entries only, is refused with
+  the manual option. `uninstall` recognises these entries.
+  `install-hooks --apply` stores the token in the hook credential files only.
 - `ai-memory status` and `ai-memory doctor` now show the server's auth
   posture, and for an unauthenticated loopback server print
   `auth: none (loopback)` with the fix, `ai-memory auth enable`.

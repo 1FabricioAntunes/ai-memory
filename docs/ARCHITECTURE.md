@@ -660,14 +660,27 @@ MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
 cwd parameters use their canonical names.
 
-Claude Code's optional session-aware MCP registration is a transport adapter,
-not a second tool implementation. `ai-memory mcp-bridge` serves the upstream
-tool catalogue over local stdio, delegates tool calls to the configured HTTP
-server through rmcp's client transport, and injects the inherited
-`CLAUDE_CODE_SESSION_ID` as `X-Memory-Actor-Session-Id`. The server therefore
-keeps the same auth, scope resolver, and tool handlers as direct HTTP clients.
-The adapter fails closed without a Claude session id and is installed only by
-the explicit `install-mcp --client claude-code --session-aware` option.
+`ai-memory mcp-bridge` is a transport adapter, not a second tool
+implementation. It serves the upstream tool catalogue over local stdio and
+delegates tool calls to the configured HTTP server through rmcp's client
+transport, authenticating with the bearer `Config::load` resolved, so the
+server keeps the same auth, scope resolver, and tool handlers as direct HTTP
+clients. It has two modes, chosen by the entry that launches it:
+
+- session-aware (Claude Code, `install-mcp --client claude-code
+  --session-aware`, and every Claude Code entry on a token-file install): it
+  injects the inherited `CLAUDE_CODE_SESSION_ID` as
+  `X-Memory-Actor-Session-Id` and fails closed without one, so a
+  registration meant for per-session routing never silently degrades to the
+  shared slot;
+- session-less (`--no-session-id`, every other client on a token-file
+  install): it forwards no session identity and ignores an inherited
+  `CLAUDE_CODE_SESSION_ID`, which a client started from a Claude Code
+  terminal would otherwise lend to that session's active-project pointer.
+  The client is a static MCP client and passes `workspace` + `project`.
+
+The bridge connects upstream before it serves stdio, so a refused credential
+(401) or an unreachable server ends it at once with the reason.
 
 ## HTTP authentication classes
 
@@ -1303,13 +1316,17 @@ and no bearer supplied another way. An existing install keeps the loopback
 no-auth behaviour until `ai-memory auth enable`, which is idempotent: it reuses
 or mints the file, records the key, copies the token into the hook credential
 files (`auth-token`, `auth-header`) when none are stored, and re-registers
-Claude Code's MCP entry for this server as the `mcp-bridge` stdio bridge.
+every MCP client whose `ai-memory` entry targets this server the way
+`install-mcp` wires a token-file install, listing what it changed and what
+needs a manual change.
 
 A token read from the file is never written into a harness config or onto a
-command line. `install-mcp` gives Claude Code the `ai-memory mcp-bridge` stdio
-entry, which reads the file itself; Codex and Prime Agent reference
-`AI_MEMORY_AUTH_TOKEN` by name; clients that only accept a literal header are
-refused. `install-hooks --apply` persists it to the hook credential files and
+command line. `install-mcp` gives Claude Code the session-aware
+`ai-memory mcp-bridge` stdio entry, which reads the file itself; Codex and
+Prime Agent reference `AI_MEMORY_AUTH_TOKEN` by name; every other client gets
+a stdio entry, in its own config format, for `ai-memory mcp-bridge
+--no-session-id`. ZCode keeps HTTP entries only and is refused.
+`install-hooks --apply` persists it to the hook credential files and
 never inlines it. Client commands of a packaged install, whose config lives
 outside the data dir and so is not read without `--config`, use
 `<data_dir>/auth-tokens/default` when no config file exists where they look,

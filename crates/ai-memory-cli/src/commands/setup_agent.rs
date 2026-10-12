@@ -393,6 +393,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
                 session_aware: false,
                 flavor: None,
                 token_env_var: false,
+                stdio_bridge: false,
             },
             Some(dialect),
         )?;

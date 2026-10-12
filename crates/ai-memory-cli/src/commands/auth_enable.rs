@@ -9,9 +9,12 @@
 //! 2. record `bearer_token_file` in `config.toml`, keeping its comments;
 //! 3. give the hooks the token through `auth-token` / `auth-header`, the files
 //!    every hook front door reads, unless another credential is stored there;
-//! 4. re-register Claude Code's `ai-memory` MCP entry, when it points at this
-//!    server, through `install-mcp`: it becomes the `mcp-bridge` stdio entry,
-//!    which reads the token file itself.
+//! 4. re-register every MCP client whose `ai-memory` entry points at this
+//!    server, through `install-mcp`: Claude Code gets the session-aware
+//!    `mcp-bridge` entry, Codex and Prime Agent a reference to
+//!    `$AI_MEMORY_AUTH_TOKEN`, every other client a stdio entry for the
+//!    session-less bridge, which reads the token file itself. A client that can
+//!    only hold a literal header (ZCode) is listed for a manual change.
 //!
 //! The token is never printed and never written into a harness config.
 
@@ -19,24 +22,39 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::cli::{AuthEnableArgs, InstallMcpArgs, McpClient};
+use crate::cli::{AuthEnableArgs, InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::install_mcp::{self, mcp_server_url_from_base};
 use crate::config::Config;
 use crate::local_auth::{self, HookCredential};
 use crate::server_profiles::{self, ProfileName};
 
-/// What happened to Claude Code's MCP registration.
+/// The MCP entry name `install-mcp` writes by default.
+const ENTRY_NAME: &str = "ai-memory";
+
+/// What happened to one client's `ai-memory` MCP entry. Clients without one
+/// are not listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClaudeWiring {
-    /// `--no-mcp`, or no Claude Code config to look at.
-    Skipped,
-    /// No `ai-memory` entry is registered.
-    NotRegistered,
+pub(crate) enum Wiring {
+    /// Re-registered through `install-mcp` so it reaches the token file.
+    Rewired,
     /// The entry targets another server; it is left alone.
     OtherServer(String),
-    /// The entry was re-registered as the stdio bridge.
-    Rewired,
+    /// It targets this server but could not be re-registered; the reason
+    /// says what to do by hand.
+    Manual(String),
 }
+
+/// One client's line in the outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientWiring {
+    pub(crate) client: McpClient,
+    pub(crate) path: PathBuf,
+    pub(crate) wiring: Wiring,
+}
+
+/// Where each client keeps its MCP config; injectable so tests never touch a
+/// real harness config.
+pub(crate) type ConfigLocator<'a> = &'a dyn Fn(McpClient) -> Option<PathBuf>;
 
 /// The result of one `auth enable`.
 #[derive(Debug)]
@@ -49,7 +67,7 @@ pub(crate) struct EnableOutcome {
     pub(crate) config_path: PathBuf,
     pub(crate) config_changed: bool,
     pub(crate) hooks: Option<HookCredential>,
-    pub(crate) claude: ClaudeWiring,
+    pub(crate) mcp: Vec<ClientWiring>,
 }
 
 /// Run `auth enable`.
@@ -58,12 +76,9 @@ pub(crate) struct EnableOutcome {
 /// Fails when a server profile named `default` would share the token file,
 /// when `servers.toml` or `config.toml` cannot be parsed, or on a failed write.
 pub fn run(config: &Config, args: &AuthEnableArgs, config_path: Option<&Path>) -> Result<()> {
-    let claude_config = if args.no_mcp {
-        None
-    } else {
-        install_mcp::mcp_config_path(McpClient::ClaudeCode).ok()
-    };
-    let outcome = enable(config, config_path, claude_config.as_deref())?;
+    let locate = |client: McpClient| install_mcp::mcp_config_path(client).ok();
+    let locator: Option<ConfigLocator<'_>> = (!args.no_mcp).then_some(&locate as _);
+    let outcome = enable(config, config_path, locator)?;
     print_outcome(&outcome);
     Ok(())
 }
@@ -71,7 +86,7 @@ pub fn run(config: &Config, args: &AuthEnableArgs, config_path: Option<&Path>) -
 pub(crate) fn enable(
     config: &Config,
     config_path: Option<&Path>,
-    claude_config: Option<&Path>,
+    locate: Option<ConfigLocator<'_>>,
 ) -> Result<EnableOutcome> {
     let data_dir = &config.data_dir;
     let config_path = config_path.map_or_else(|| data_dir.join("config.toml"), PathBuf::from);
@@ -88,7 +103,7 @@ pub(crate) fn enable(
             config_path,
             config_changed: false,
             hooks: None,
-            claude: ClaudeWiring::Skipped,
+            mcp: Vec::new(),
         });
     }
 
@@ -105,10 +120,7 @@ pub(crate) fn enable(
     enabled
         .auth
         .adopt_token_file(minted.path.clone(), minted.token.clone());
-    let claude = match claude_config {
-        Some(path) => rewire_claude_code(&enabled, path)?,
-        None => ClaudeWiring::Skipped,
-    };
+    let mcp = locate.map_or_else(Vec::new, |locate| rewire_clients(&enabled, locate));
 
     Ok(EnableOutcome {
         already_inline: false,
@@ -117,7 +129,7 @@ pub(crate) fn enable(
         config_path,
         config_changed,
         hooks: Some(hooks),
-        claude,
+        mcp,
     })
 }
 
@@ -197,60 +209,89 @@ fn record_token_file(config_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// The URL an existing Claude Code `ai-memory` entry targets: an HTTP entry's
-/// `url`, or the bridge's `--server-url`.
-fn claude_entry_url(path: &Path) -> Result<Option<String>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let root: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let Some(entry) = root.get("mcpServers").and_then(|s| s.get("ai-memory")) else {
-        return Ok(None);
-    };
-    if let Some(url) = entry.get("url").and_then(serde_json::Value::as_str) {
-        return Ok(Some(url.to_owned()));
-    }
-    let args: Vec<&str> = entry
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .map(|args| args.iter().filter_map(serde_json::Value::as_str).collect())
-        .unwrap_or_default();
-    Ok(args
+/// Clients `install-mcp --apply` writes a config file for. Pi has no MCP
+/// config (its extension reads the hook credential file) and DeepSeek
+/// Harness is print-only, so neither has an entry to re-point.
+fn rewirable_clients() -> impl Iterator<Item = McpClient> {
+    <McpClient as clap::ValueEnum>::value_variants()
         .iter()
-        .position(|arg| *arg == "--server-url")
-        .and_then(|i| args.get(i + 1))
-        .map(|url| (*url).to_owned()))
+        .copied()
+        .filter(|client| !matches!(client, McpClient::Pi | McpClient::Dsh))
 }
 
-fn rewire_claude_code(config: &Config, path: &Path) -> Result<ClaudeWiring> {
-    let Some(url) = claude_entry_url(path)? else {
-        return Ok(ClaudeWiring::NotRegistered);
-    };
-    // Only an entry for this install's server is re-pointed; one for a remote
-    // server has its own credential and must keep its destination.
-    let ours = mcp_server_url_from_base(&config.server_url);
-    let without_flavor = url.split('?').next().unwrap_or(&url);
-    if mcp_server_url_from_base(without_flavor) != ours {
-        return Ok(ClaudeWiring::OtherServer(url));
+/// The endpoint without a `?flavor=` (or any) query, normalised to `/mcp`.
+fn bare_endpoint(url: &str) -> String {
+    mcp_server_url_from_base(url.split('?').next().unwrap_or(url))
+}
+
+/// The schema flavor an existing entry's URL pinned, so re-registering keeps
+/// the dialect the operator chose with `--flavor`.
+fn pinned_flavor(url: &str) -> Option<SchemaFlavor> {
+    let query = url.split_once('?')?.1;
+    <SchemaFlavor as clap::ValueEnum>::value_variants()
+        .iter()
+        .copied()
+        .find(|flavor| {
+            query
+                .split('&')
+                .any(|pair| pair == format!("flavor={}", flavor.marker()))
+        })
+}
+
+/// Re-register every client whose `ai-memory` entry targets this server. One
+/// client failing never stops the others: it is reported as manual.
+fn rewire_clients(config: &Config, locate: ConfigLocator<'_>) -> Vec<ClientWiring> {
+    let ours = bare_endpoint(&config.server_url);
+    let mut outcome = Vec::new();
+    for client in rewirable_clients() {
+        let Some(path) = locate(client) else {
+            continue;
+        };
+        let wiring = match install_mcp::existing_entry_endpoint(client, &path, ENTRY_NAME) {
+            Ok(None) => continue,
+            Err(e) => Wiring::Manual(format!("{e:#}")),
+            Ok(Some(url)) if bare_endpoint(&url) != ours => Wiring::OtherServer(url),
+            Ok(Some(url)) => match rewire(config, client, &path, &ours, pinned_flavor(&url)) {
+                Ok(()) => Wiring::Rewired,
+                Err(e) => Wiring::Manual(format!("{e:#}")),
+            },
+        };
+        outcome.push(ClientWiring {
+            client,
+            path,
+            wiring,
+        });
     }
-    install_mcp::run(
-        config,
-        InstallMcpArgs {
-            client: McpClient::ClaudeCode,
-            server_url: Some(ours),
-            name: "ai-memory".to_owned(),
-            auth_token: None,
-            apply: true,
-            config_file: Some(path.to_path_buf()),
-            session_aware: true,
-            flavor: None,
-            token_env_var: false,
-        },
-    )?;
-    Ok(ClaudeWiring::Rewired)
+    outcome
+}
+
+fn rewire(
+    config: &Config,
+    client: McpClient,
+    path: &Path,
+    url: &str,
+    flavor: Option<SchemaFlavor>,
+) -> Result<()> {
+    let args = InstallMcpArgs {
+        client,
+        server_url: Some(url.to_owned()),
+        name: ENTRY_NAME.to_owned(),
+        auth_token: None,
+        apply: true,
+        config_file: Some(path.to_path_buf()),
+        session_aware: false,
+        flavor,
+        token_env_var: false,
+        stdio_bridge: false,
+    };
+    // Name the OpenCode major version outright: both share one file, and
+    // probing `opencode --version` here would pick one for both locations.
+    let dialect = match client {
+        McpClient::OpenCode => Some(ai_memory_workstream::OpenCodeDialect::V1),
+        McpClient::OpenCode2 => Some(ai_memory_workstream::OpenCodeDialect::V2),
+        _ => None,
+    };
+    install_mcp::run_with_opencode_dialect(config, args, dialect)
 }
 
 fn print_outcome(outcome: &EnableOutcome) {
@@ -289,22 +330,21 @@ fn print_outcome(outcome: &EnableOutcome) {
         ),
         None => {}
     }
-    match &outcome.claude {
-        ClaudeWiring::Rewired => {
-            println!(
-                "claude-code: MCP entry now runs `ai-memory mcp-bridge`, which reads the token file"
-            );
+    for line in &outcome.mcp {
+        let client = format!("{:?}", line.client);
+        match &line.wiring {
+            Wiring::Rewired => println!(
+                "mcp {client}: re-registered in {} so it reads the token without holding it",
+                line.path.display()
+            ),
+            Wiring::OtherServer(url) => {
+                println!("mcp {client}: targets {url}, another server; left unchanged");
+            }
+            Wiring::Manual(reason) => {
+                println!("mcp {client}: needs a manual change: {reason}");
+            }
         }
-        ClaudeWiring::OtherServer(url) => {
-            println!("claude-code: MCP entry targets {url}, another server; left unchanged");
-        }
-        ClaudeWiring::NotRegistered | ClaudeWiring::Skipped => {}
     }
-    println!(
-        "Other MCP clients: re-run `ai-memory install-mcp --client <client> --apply`. Codex and \
-         Prime Agent then read the token from $AI_MEMORY_AUTH_TOKEN; clients that only take a \
-         literal header are refused rather than given the token."
-    );
     println!("Restart the ai-memory server for it to require the token.");
 }
 
@@ -332,22 +372,6 @@ mod tests {
         .unwrap();
     }
 
-    fn claude_json(home: &Path, url: &str) -> PathBuf {
-        let path = home.join(".claude.json");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "mcpServers": {
-                    "ai-memory": {"type": "http", "url": url},
-                    "other": {"type": "http", "url": "https://other.example/mcp"}
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        path
-    }
-
     /// Every file under `root`, read as text where it is text.
     fn files_under(root: &Path) -> Vec<(PathBuf, String)> {
         let mut out = Vec::new();
@@ -365,10 +389,39 @@ mod tests {
         out
     }
 
-    /// `auth enable` on a pre-default install: token minted, the key recorded with
-    /// the operator's comments intact, the hooks given the token, Claude Code
-    /// re-registered as the bridge. Run twice, the second run changes nothing,
-    /// and the token appears in no harness config.
+    /// Every client `rewire_clients` considers, each wired the pre-default way
+    /// (`install-mcp --apply`, no token) into its own file under `home`.
+    fn wire_every_client_over_http(home: &Path, url: &str) -> Vec<(McpClient, PathBuf)> {
+        let open = Config::default();
+        rewirable_clients()
+            .map(|client| {
+                let ext = if matches!(client, McpClient::Codex | McpClient::Grok) {
+                    "toml"
+                } else {
+                    "json"
+                };
+                let path = home.join(format!("{client:?}.{ext}"));
+                rewire(&open, client, &path, url, None)
+                    .unwrap_or_else(|e| panic!("pre-default {client:?} install: {e:#}"));
+                (client, path)
+            })
+            .collect()
+    }
+
+    fn locator(files: &[(McpClient, PathBuf)]) -> impl Fn(McpClient) -> Option<PathBuf> + '_ {
+        move |client| {
+            files
+                .iter()
+                .find(|(c, _)| *c == client)
+                .map(|(_, path)| path.clone())
+        }
+    }
+
+    /// `auth enable` on a pre-default install: token minted, the key recorded
+    /// with the operator's comments intact, the hooks given the token, and
+    /// every client whose entry points at this server re-registered (ZCode,
+    /// which only takes a literal header, listed as manual). Run twice, the
+    /// second run changes nothing, and the token appears in no harness config.
     #[test]
     fn enable_twice_is_idempotent_and_leaks_the_token_into_no_harness_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -376,13 +429,23 @@ mod tests {
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         pre_a1_install(&data_dir);
-        let claude = claude_json(&home, "http://127.0.0.1:49374/mcp");
+        let files = wire_every_client_over_http(&home, "http://127.0.0.1:49374/mcp");
+        let locate = locator(&files);
 
-        let first = enable(&config_in(&data_dir), None, Some(&claude)).unwrap();
+        let first = enable(&config_in(&data_dir), None, Some(&locate)).unwrap();
         assert!(first.token_created);
         assert!(first.config_changed);
         assert_eq!(first.hooks, Some(HookCredential::Seeded));
-        assert_eq!(first.claude, ClaudeWiring::Rewired);
+        assert_eq!(first.mcp.len(), files.len(), "{:?}", first.mcp);
+        for line in &first.mcp {
+            match line.client {
+                McpClient::Zcode => assert!(
+                    matches!(&line.wiring, Wiring::Manual(reason) if reason.contains("ZCode")),
+                    "{line:?}"
+                ),
+                _ => assert_eq!(line.wiring, Wiring::Rewired, "{line:?}"),
+            }
+        }
 
         let token = crate::config::read_trimmed_secret(&first.token_path).unwrap();
         let config_text = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
@@ -396,22 +459,42 @@ mod tests {
             config_text.contains("bearer_token_file = \"auth-tokens/default\""),
             "{config_text}"
         );
-        let claude_after_first = std::fs::read_to_string(&claude).unwrap();
-        let entry: serde_json::Value = serde_json::from_str(&claude_after_first).unwrap();
+        let claude = &files
+            .iter()
+            .find(|(c, _)| *c == McpClient::ClaudeCode)
+            .unwrap()
+            .1;
+        let entry: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(claude).unwrap()).unwrap();
         let entry = &entry["mcpServers"]["ai-memory"];
         assert_eq!(entry["type"], "stdio");
-        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(entry["args"][0], "mcp-bridge");
         assert!(entry.get("env").is_none(), "no token env: {entry}");
+        let cursor = &files
+            .iter()
+            .find(|(c, _)| *c == McpClient::Cursor)
+            .unwrap()
+            .1;
+        let entry: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cursor).unwrap()).unwrap();
+        assert_eq!(
+            entry["mcpServers"]["ai-memory"]["args"][1],
+            "--no-session-id"
+        );
         assert_eq!(
             config_in(&data_dir).auth.bearer_token.as_deref(),
             Some(token.as_str())
         );
+        let after_first: Vec<String> = files
+            .iter()
+            .map(|(_, path)| std::fs::read_to_string(path).unwrap())
+            .collect();
 
-        let second = enable(&config_in(&data_dir), None, Some(&claude)).unwrap();
+        let second = enable(&config_in(&data_dir), None, Some(&locate)).unwrap();
         assert!(!second.token_created);
         assert!(!second.config_changed);
         assert_eq!(second.hooks, Some(HookCredential::Current));
-        assert_eq!(second.claude, ClaudeWiring::Rewired);
+        assert_eq!(second.mcp, first.mcp);
         assert_eq!(
             crate::config::read_trimmed_secret(&second.token_path),
             Some(token.clone())
@@ -420,10 +503,13 @@ mod tests {
             std::fs::read_to_string(data_dir.join("config.toml")).unwrap(),
             config_text
         );
-        assert_eq!(
-            std::fs::read_to_string(&claude).unwrap(),
-            claude_after_first
-        );
+        for ((client, path), before) in files.iter().zip(&after_first) {
+            assert_eq!(
+                &std::fs::read_to_string(path).unwrap(),
+                before,
+                "{client:?} changed on the second run"
+            );
+        }
 
         for (path, text) in files_under(&home) {
             assert!(
@@ -446,19 +532,32 @@ mod tests {
 
     /// Control: an entry for a remote server keeps its destination.
     #[test]
-    fn enable_leaves_a_claude_entry_for_another_server_alone() {
+    fn enable_leaves_an_entry_for_another_server_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         pre_a1_install(&data_dir);
-        let claude = claude_json(tmp.path(), "https://team.example/mcp");
-        let before = std::fs::read_to_string(&claude).unwrap();
+        let files = wire_every_client_over_http(tmp.path(), "https://team.example/mcp");
+        let before: Vec<String> = files
+            .iter()
+            .map(|(_, path)| std::fs::read_to_string(path).unwrap())
+            .collect();
+        let locate = locator(&files);
 
-        let outcome = enable(&config_in(&data_dir), None, Some(&claude)).unwrap();
-        assert_eq!(
-            outcome.claude,
-            ClaudeWiring::OtherServer("https://team.example/mcp".into())
-        );
-        assert_eq!(std::fs::read_to_string(&claude).unwrap(), before);
+        let outcome = enable(&config_in(&data_dir), None, Some(&locate)).unwrap();
+        assert_eq!(outcome.mcp.len(), files.len());
+        for line in &outcome.mcp {
+            assert!(
+                matches!(&line.wiring, Wiring::OtherServer(url) if url.starts_with("https://team.example/mcp")),
+                "{line:?}"
+            );
+        }
+        for ((client, path), before) in files.iter().zip(&before) {
+            assert_eq!(
+                &std::fs::read_to_string(path).unwrap(),
+                before,
+                "{client:?}"
+            );
+        }
     }
 
     /// A registered profile named `default` would read the same file as the

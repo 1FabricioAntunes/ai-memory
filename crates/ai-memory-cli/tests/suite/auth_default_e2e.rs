@@ -79,6 +79,9 @@ mod slow {
                 .env("AI_MEMORY_BACKFILL_ON_START", "false")
                 .env("AI_MEMORY_AUTO_IMPROVE__SCHEDULER__ENABLED", "false")
                 .env("RUST_LOG", "off")
+                // A developer (or agent) running these tests from Claude Code
+                // has its session id exported; a child must not inherit it.
+                .env_remove("CLAUDE_CODE_SESSION_ID")
                 .current_dir(&self.home);
             cmd
         }
@@ -338,10 +341,42 @@ mod slow {
     /// `initialize`, `notifications/initialized`, `tools/list`. Returns the
     /// `tools/list` reply. `check` runs while the bridge is alive.
     fn bridge_tools_list(install: &Install, base: &str, check: impl FnOnce(u32)) -> Value {
-        let mut child = install
-            .cmd()
-            .args(["mcp-bridge", "--server-url", base])
-            .env("CLAUDE_CODE_SESSION_ID", "authdef-bridge-session")
+        bridge_exchange(install, BridgeMode::SessionAware, base, None, check).0
+    }
+
+    /// How the bridge is launched, as the entry `install-mcp` writes runs it.
+    #[derive(Clone, Copy)]
+    enum BridgeMode {
+        /// Claude Code's entry: forwards `CLAUDE_CODE_SESSION_ID`.
+        SessionAware,
+        /// Every other client's entry: `--no-session-id`, no id in the env.
+        SessionLess,
+    }
+
+    /// `initialize`, `notifications/initialized`, `tools/list` and, when
+    /// given, one `tools/call`, through the bridge over stdio. Returns the
+    /// `tools/list` and `tools/call` replies; `check` runs while it is alive.
+    fn bridge_exchange(
+        install: &Install,
+        mode: BridgeMode,
+        base: &str,
+        call: Option<Value>,
+        check: impl FnOnce(u32),
+    ) -> (Value, Option<Value>) {
+        let mut cmd = install.cmd();
+        match mode {
+            BridgeMode::SessionAware => {
+                cmd.args(["mcp-bridge", "--server-url", base])
+                    .env("CLAUDE_CODE_SESSION_ID", "authdef-bridge-session");
+            }
+            BridgeMode::SessionLess => {
+                // A client started from a Claude Code terminal inherits that
+                // session's id; the session-less bridge must work regardless.
+                cmd.args(["mcp-bridge", "--no-session-id", "--server-url", base])
+                    .env("CLAUDE_CODE_SESSION_ID", "inherited-from-a-claude-terminal");
+            }
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -395,12 +430,53 @@ mod slow {
             json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
         );
         let tools = wait_for(2);
+        let called = call.map(|params| {
+            send(
+                &mut stdin,
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": params}),
+            );
+            wait_for(3)
+        });
         check(child.id());
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
-        tools
+        (tools, called)
     }
+
+    #[cfg(target_os = "linux")]
+    fn environ(pid: u32) -> String {
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', "\n"))
+            .unwrap_or_default()
+    }
+
+    /// The clients `install-mcp --apply` writes a config file for on a
+    /// token-file install, by their CLI names. Pi (an extension), DeepSeek
+    /// Harness (print-only) and ZCode (HTTP-only, refused) are not among them.
+    const WRITTEN_CLIENTS: &[&str] = &[
+        "claude-code",
+        "codex",
+        "opencode2",
+        "cursor",
+        "claude-desktop",
+        "gemini-cli",
+        "openclaw",
+        "omp",
+        "antigravity-cli",
+        "zero",
+        "devin",
+        "grok",
+        "kimi-code",
+        "kiro-cli",
+        "command-code",
+        "copilot-cli",
+        "swival",
+        "vscode-copilot",
+        "zed",
+        "muse",
+        "prime-agent",
+    ];
 
     /// A fresh `init`: every guarded route refuses an unauthenticated
     /// request, `/healthz` answers, and the hook, a CLI command and the MCP
@@ -477,22 +553,17 @@ mod slow {
             ],
             Some(&base),
         );
-        install.run_ok(
-            &["install-mcp", "--client", "claude-code", "--apply"],
-            Some(&base),
-        );
-        install.run_ok(
-            &["install-mcp", "--client", "codex", "--apply"],
-            Some(&base),
-        );
+        for client in WRITTEN_CLIENTS {
+            install.run_ok(&["install-mcp", "--client", client, "--apply"], Some(&base));
+        }
         let refused = install.run(
-            &["install-mcp", "--client", "cursor", "--apply"],
+            &["install-mcp", "--client", "zcode", "--apply"],
             Some(&base),
             None,
         );
         assert!(
             !refused.status.success(),
-            "a literal-header client is refused"
+            "ZCode, which only takes a literal header, is refused"
         );
         let first = install.run_ok(&["auth", "enable"], Some(&base));
         let config_after_first =
@@ -519,6 +590,98 @@ mod slow {
         }
         install.assert_token_confined(&token);
         drop(server);
+    }
+
+    /// The session-less bridge any non-Claude client runs: against a fresh
+    /// auth-on install it lists the tools and answers a `memory_query` with
+    /// explicit scope, with the token on neither its command line nor in its
+    /// environment. Controls: the session-aware bridge still refuses to start
+    /// without `CLAUDE_CODE_SESSION_ID`, and the static `memory_query` reaches
+    /// the project the hook wrote.
+    #[tokio::test]
+    async fn a_session_less_bridge_serves_any_client_without_holding_the_token() {
+        let install = Install::new();
+        install.run_ok(&["init"], None);
+        let token = install.root_token().unwrap();
+        let client = reqwest::Client::new();
+        let (_server, base) = install.serve(&client, "serve-bridge.log").await;
+        install.hook_prompt(&base, "authdef-bridge-hook");
+        assert_eq!(settled_sessions(&client, &base, &token, 1).await, 1);
+
+        let query = json!({
+            "name": "memory_query",
+            "arguments": {"q": "authdef hook prompt", "workspace": WORKSPACE, "project": PROJECT},
+        });
+        let (tools, called) = bridge_exchange(
+            &install,
+            BridgeMode::SessionLess,
+            &base,
+            Some(query),
+            |_pid| {
+                #[cfg(target_os = "linux")]
+                {
+                    assert!(!cmdline(_pid).contains(&token), "token in the bridge argv");
+                    assert!(!environ(_pid).contains(&token), "token in the bridge env");
+                }
+            },
+        );
+        assert!(
+            tools["result"]["tools"]
+                .as_array()
+                .is_some_and(|t| !t.is_empty()),
+            "{tools}"
+        );
+        let called = called.expect("memory_query reply");
+        assert!(called.get("error").is_none(), "{called}");
+        assert_ne!(called["result"]["isError"], json!(true), "{called}");
+
+        let out = install.run(&["mcp-bridge", "--server-url", &base], None, Some(""));
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("CLAUDE_CODE_SESSION_ID is missing"),
+            "the session-aware mode keeps failing closed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A bridge with no token against an auth-on server exits at once with
+    /// the refusal, before it serves stdio, so the client sees the server
+    /// exit rather than a session that never answers.
+    #[tokio::test]
+    async fn a_bridge_without_the_token_is_refused_cleanly_not_hung() {
+        let install = Install::new();
+        install.run_ok(&["init"], None);
+        let client = reqwest::Client::new();
+        let (_server, base) = install.serve(&client, "serve-refused.log").await;
+
+        let stranger = Install::new(); // no data dir token, no config
+        let mut child = stranger
+            .cmd()
+            .args(["mcp-bridge", "--no-session-id", "--server-url", &base])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("the bridge hung on a refused connection");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert!(!status.success());
+        assert!(stderr.contains("sent without a bearer token"), "{stderr}");
+        assert!(
+            stderr.contains("401") || stderr.to_ascii_lowercase().contains("unauthorized"),
+            "the refusal is surfaced: {stderr}"
+        );
     }
 
     /// The control, and the opt-in. An install that predates the default

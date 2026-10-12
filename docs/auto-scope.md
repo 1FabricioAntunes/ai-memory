@@ -186,6 +186,13 @@ subprocess the startup id rather than the resumed id. Restart Claude Code after
 when no `CLAUDE_CODE_SESSION_ID` is available instead of silently degrading to
 the shared single slot.
 
+The same binary also runs session-less, as `ai-memory mcp-bridge
+--no-session-id`: the stdio entry `install-mcp` writes for every other client
+when the server's token lives in `[auth].bearer_token_file`. It forwards no
+session id, not even an inherited `CLAUDE_CODE_SESSION_ID`, so those clients
+stay static MCP clients and pass `workspace` + `project`; they never touch a
+per-session pointer.
+
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as
 `X-Memory-Actor-Session-Id`, native MCP metadata as above, or `Mcp-Session-Id`. Otherwise

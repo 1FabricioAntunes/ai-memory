@@ -325,9 +325,11 @@ start them:
 export AI_MEMORY_AUTH_TOKEN="$(cat ~/.local/share/ai-memory/auth-tokens/default)"
 ```
 
-`install-mcp` refuses clients that can only hold a literal header rather
-than write the token into their config. Add those entries by hand if you
-accept that.
+Every other client `install-mcp` supports gets a local stdio entry that
+runs `ai-memory mcp-bridge --no-session-id`, which also reads the token file
+at launch, so `ai-memory` must be on the `PATH` the client sees. ZCode only
+takes HTTP entries and is refused; add its entry by hand with the header if
+you accept the token in its config.
 
 An install created before this default keeps running without auth.
 `ai-memory status` then shows `auth: none (loopback)`; run

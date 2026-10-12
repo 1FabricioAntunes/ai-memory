@@ -410,6 +410,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             session_aware: false,
             flavor: None,
             token_env_var: false,
+            stdio_bridge: false,
         });
     WireInstalls {
         opencode_dialect,
