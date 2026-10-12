@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the zero-LLM session page staying silent about abrupt endings. The
+  rule-based synthesis now adds a deterministic terminal-state line reusing
+  the automatic handoff's heuristics: "Session ended without a normal stop;
+  the final prompt was never answered." when the log ends on an unanswered
+  question, the equivalent line when file activity was never followed by a
+  stop, and a mid-task-exit line when a stop was recorded but no session
+  end arrived. A session with a normal stop and end gets no line. (#1221)
 - Fixed consolidation dropping the tail of a session from the compiled
   page. The single and batch prompts now carry explicit rules: say so when
   the observation log ends on an unanswered prompt or without a normal
