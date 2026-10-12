@@ -74,6 +74,7 @@ pub mod path_util;
 pub mod pending_writes;
 pub mod profile;
 pub mod project;
+pub mod project_init;
 pub mod project_registry;
 pub mod purge_preview;
 pub mod purge_project;
