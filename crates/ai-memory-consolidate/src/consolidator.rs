@@ -1303,7 +1303,11 @@ fn render_slot_snapshots(slots: &[SlotSnapshot], max_chars: usize) -> String {
 /// is plain-text-editable + version-controlled as a Markdown file
 /// alongside the code. Public so off-tree harnesses (`evals/`) can
 /// inspect the exact prompt without duplicating it.
-pub const BATCH_SYSTEM_PROMPT: &str = include_str!("../prompts/batch_consolidate_system.md");
+pub const BATCH_SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikilinks!(
+    include_str!("../prompts/batch_consolidate_system.md"),
+    "the observations or page body",
+    "the observations"
+);
 
 fn build_request(
     session_id: SessionId,
@@ -2005,7 +2009,11 @@ fn disambiguate_anchor_title(
 
 /// System prompt for single-page consolidation. Loaded at compile
 /// time from `prompts/single_consolidate_system.md`.
-const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.md");
+pub(crate) const SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikilinks!(
+    include_str!("../prompts/single_consolidate_system.md"),
+    "the observations or page body",
+    "the observations"
+);
 
 #[cfg(test)]
 mod tests {
