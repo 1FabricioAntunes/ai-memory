@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed consolidation inventing `[[_global:…]]` and `[[project:…]]` wikilinks to
+  pages that never existed, which `ai-memory lint` then reported as
+  `broken_link`. The single, batch and bootstrap prompts told the model that a
+  missing link target was acceptable and gave it no list of cross-scope pages,
+  so it invented targets to meet the 2-5 link guidance. They now allow a
+  `project:` or `_global:` link only when the exact wiki page path appears in
+  the input, which reduces but does not eliminate such links; a missing
+  same-project target stays a pending link. (#1207)
 - Fixed the web UI answering HTTP 500 when a signed-in viewer opened a project
   or page by a name that two projects answer to. The page and project routes
   now return a 400 that names the clash, matching the API and MCP surfaces.

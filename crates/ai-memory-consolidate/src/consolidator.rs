@@ -2955,6 +2955,22 @@ mod tests {
                 prompt.contains("JSON keys stay in English"),
                 "{name} prompt"
             );
+            // Lint reports a missing `project:` / `_global:` target as
+            // `broken_link`, so the prompt must not license inventing one.
+            assert!(
+                prompt.contains("Never invent project names or page paths"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("page body"), "{name} prompt");
+            assert!(prompt.contains("not a repo file path"), "{name} prompt");
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt"
+            );
+            assert!(
+                !prompt.contains("A link whose target does not exist yet is acceptable"),
+                "{name} prompt must scope the pending-link allowance to the same project"
+            );
         }
     }
 
