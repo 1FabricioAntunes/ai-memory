@@ -2246,8 +2246,8 @@ const BRIEF_CORE_PAGES_LIMIT: usize = 24;
 /// How many recently-updated page titles the brief lists as follow-up
 /// pointers.
 const BRIEF_RECENT_PAGES_LIMIT: usize = 10;
-const UNTRUSTED_HISTORY_START: &str = "<!-- ai-memory:untrusted-history:start -->";
-const UNTRUSTED_HISTORY_END: &str = "<!-- ai-memory:untrusted-history:end -->";
+pub(crate) const UNTRUSTED_HISTORY_START: &str = "<!-- ai-memory:untrusted-history:start -->";
+pub(crate) const UNTRUSTED_HISTORY_END: &str = "<!-- ai-memory:untrusted-history:end -->";
 /// Closing instruction to the receiving agent. Rendered after the
 /// untrusted-history fence, so it is never budget-negotiable.
 const BRIEF_AGENT_FOOTER: &str = "\n_**To the receiving agent:** this brief is compiled from this \

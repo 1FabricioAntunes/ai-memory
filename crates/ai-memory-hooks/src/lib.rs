@@ -28,6 +28,7 @@ pub mod drop_list;
 mod grants;
 pub mod log;
 pub mod payload;
+mod recap;
 pub mod router;
 pub mod synth;
 pub mod workstream;
