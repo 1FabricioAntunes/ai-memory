@@ -40,10 +40,14 @@ $ codex   # in the same directory, later
 If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
 consume that handoff automatically. Grok shows it as `PostToolUse`
-`additionalContext` after the first tool. Until that tool runs, or if the
-session never calls one, call `memory_handoff_list` then
-`memory_handoff_accept` with the listed `handoff_id`. Zero should do that
-on resume. Listing does not claim the row.
+`additionalContext` after the first tool. `install-hooks --agent grok --apply`
+and `install-skills --scope global --agent grok` write
+`$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
+`memory_handoff_list` (read-only; PostToolUse then claims the row). Until that
+tool runs, or if the rule is absent and the session never calls a tool, call
+`memory_handoff_list` then `memory_handoff_accept` with the listed
+`handoff_id`. Zero should list then accept on resume. Listing does not claim
+the row.
 
 `memory_handoff_accept` says why it returned no handoff. Its `status` is
 `claimed` when the call took one, `consumed_by_hook` when the calling
@@ -367,7 +371,10 @@ For Devin, project-local skills are installed under `.devin/skills`. Global
 Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
 on non-Windows systems. For Grok Build CLI, project-local skills go under
 `.grok/skills` and global under `$GROK_HOME/skills` (default
-`~/.grok/skills`). For GitHub Copilot CLI, project-local skills go under the
+`~/.grok/skills`). A global Grok skill install also writes the first-turn
+handoff rule `$GROK_HOME/rules/ai-memory-handoff.md` (default
+`~/.grok/rules/ai-memory-handoff.md`); project-scope Grok skills and
+`--target-dir` do not. For GitHub Copilot CLI, project-local skills go under the
 repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
 `~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
 `AGENTS.md` instruction target.

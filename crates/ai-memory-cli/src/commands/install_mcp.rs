@@ -1654,8 +1654,9 @@ fn render_grok(args: &InstallMcpArgs) -> Result<String> {
          #\n\
          # Native HTTP transport. Pair with:\n\
          #   ai-memory install-hooks --agent grok --apply\n\
-         # for lifecycle capture. Grok ignores SessionStart stdout, so\n\
-         # handoffs are recovered via MCP memory_handoff_accept.\n\
+         # for lifecycle capture. Grok ignores SessionStart stdout; the\n\
+         # first PostToolUse injects the handoff, and --apply also writes\n\
+         # the first-turn memory_handoff_list rule under $GROK_HOME/rules.\n\
          #\n\
          # CLI alternative:\n\
          #   grok mcp add --transport http {name} {url}\n\

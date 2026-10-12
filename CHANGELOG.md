@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Grok Build CLI first-turn handoff: `install-hooks --agent grok --apply`
+  and `install-skills --scope global --agent grok` write
+  `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
+  so the model calls `memory_handoff_list` on the first turn. Grok discards
+  SessionStart stdout, so that list is the first tool and PostToolUse still
+  claims the baton through GET `/handoff`. Project-scope Grok skills and
+  `--target-dir` leave the user rule alone. Unmanaged same-name files are
+  refused without `--force`; `install-hooks` warns and keeps the hook file.
+  `uninstall --only skills` and `--only hooks` remove the markered rule.
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,

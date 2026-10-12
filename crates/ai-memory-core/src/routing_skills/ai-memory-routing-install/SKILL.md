@@ -29,6 +29,8 @@ Every ai-memory-managed `SKILL.md` file contains this ownership marker.
 
 Installers and uninstallers should overwrite or remove same-name skill files only when that marker is present, unless the user supplied an explicit force option. If a same-name skill lacks the marker, skip it with an actionable message so user-authored skills are preserved.
 
+Global Grok installs also write `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`) with the ownership marker `<!-- ai-memory-managed: grok-handoff-rule -->`. Overwrite or uninstall that file only when the marker is present, unless the user supplied `--force`. Project-scope Grok skill installs leave that user rule alone.
+
 ## Skill install targets
 
 Managed skills are ordinary Agent Skills. Their relative file path is `<skill>/SKILL.md`, and the installer prepends the selected skill root.

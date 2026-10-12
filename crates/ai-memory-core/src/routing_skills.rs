@@ -2,9 +2,23 @@
 //!
 //! The installer-facing crates consume these definitions so every path that
 //! writes ai-memory routing skills uses the same metadata and `SKILL.md` bytes.
+//! The Grok first-turn handoff rule is a sibling always-on user rule, not an
+//! Agent Skill: Grok loads `$GROK_HOME/rules/*.md` before the first turn.
 
 /// Stable ownership marker embedded in every managed ai-memory skill file.
 pub const MANAGED_MARKER: &str = "<!-- ai-memory-managed: routing-skill -->";
+
+/// Stable ownership marker embedded in the managed Grok first-turn handoff rule.
+pub const GROK_HANDOFF_RULE_MARKER: &str = "<!-- ai-memory-managed: grok-handoff-rule -->";
+
+/// Grok user-rules directory below `$GROK_HOME` (default `~/.grok/rules`).
+pub const GROK_RULES_DIR: &str = "rules";
+
+/// Filename of the managed Grok first-turn handoff rule.
+pub const GROK_HANDOFF_RULE_FILENAME: &str = "ai-memory-handoff.md";
+
+/// Complete contents of the managed Grok first-turn handoff rule.
+pub const GROK_HANDOFF_RULE_CONTENT: &str = include_str!("routing_skills/grok-handoff-rule.md");
 
 /// Claude-compatible Agent Skill directory below a project or home root.
 pub const CLAUDE_SKILL_DIR: &str = ".claude";
@@ -25,7 +39,7 @@ pub const HERMES_SKILL_DIR: &str = ".hermes";
 pub const SKILLS_DIR: &str = "skills";
 
 const RETRIEVAL_DESCRIPTION: &str = "Use this skill for any request whose goal is read-only retrieval from ai-memory: project history, prior context, decisions, rules, gotchas, recent activity, full wiki pages, or status/briefing. Trigger by semantic intent rather than exact wording, including when ai-memory is not named.";
-const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording.";
+const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. On Grok, the first turn with no visible handoff should call memory_handoff_list before answering. Trigger by semantic intent rather than exact wording.";
 const MESSAGING_DESCRIPTION: &str = "Use this skill for cross-project agent-to-agent messaging: sending a request to another project's inbox, checking or popping this project's inbox, or retracting a message you sent. Trigger by semantic intent (delegate to another repo, check my inbox, tell the other agent) rather than exact wording.";
 const DURABLE_PAGES_DESCRIPTION: &str = "Use this skill for any explicit wiki mutation in ai-memory: saving durable or time-bounded project knowledge, recording a rule or annotation, updating a note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request.";
 const LEARNING_MAINTENANCE_DESCRIPTION: &str = "Use this skill for any ai-memory knowledge-base maintenance request: consolidating observations, reviewing session lessons, proposing durable learnings, auditing or linting the wiki, finding contradictions, pruning stale memory, or running auto-improvement. Trigger by semantic intent rather than exact wording.";
@@ -90,7 +104,10 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::{Component, Path};
 
-    use super::{MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill};
+    use super::{
+        GROK_HANDOFF_RULE_CONTENT, GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER,
+        GROK_RULES_DIR, MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill,
+    };
 
     const EXPECTED_SKILLS: &[&str] = &[
         "ai-memory-retrieval",
@@ -292,5 +309,52 @@ mod tests {
             .split('/')
             .next()
             .unwrap_or_else(|| panic!("{} has an empty relative path", skill.name))
+    }
+
+    #[test]
+    fn grok_handoff_rule_is_managed_and_mandates_first_turn_list() {
+        assert_eq!(GROK_RULES_DIR, "rules");
+        assert_eq!(GROK_HANDOFF_RULE_FILENAME, "ai-memory-handoff.md");
+        assert!(!GROK_HANDOFF_RULE_MARKER.is_empty());
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains(GROK_HANDOFF_RULE_MARKER));
+        assert!(!GROK_HANDOFF_RULE_CONTENT.contains('\r'));
+        assert!(GROK_HANDOFF_RULE_CONTENT.ends_with('\n'));
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("memory_handoff_list"));
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("first tool"));
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("static MCP client"));
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("`workspace` and `project` together"));
+        let list_at = GROK_HANDOFF_RULE_CONTENT
+            .find("memory_handoff_list")
+            .expect("list tool");
+        let accept_at = GROK_HANDOFF_RULE_CONTENT
+            .find("memory_handoff_accept")
+            .expect("accept tool named so the rule can forbid it as first");
+        assert!(
+            list_at < accept_at,
+            "the rule must mandate list before it mentions accept"
+        );
+        assert!(
+            GROK_HANDOFF_RULE_CONTENT
+                .contains("Do not call `memory_handoff_accept` as the first tool")
+        );
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("empty `handoffs` array"));
+    }
+
+    #[test]
+    fn grok_handoff_rule_does_not_embed_a_handoff_peek() {
+        for leak in [
+            "📥",
+            "Previous session",
+            "open_questions",
+            "files_touched",
+            "next_steps",
+            "You were working on",
+        ] {
+            assert!(
+                !GROK_HANDOFF_RULE_CONTENT.contains(leak),
+                "Grok rule must not embed a canned handoff peek; found {leak:?}"
+            );
+        }
+        assert!(!GROK_HANDOFF_RULE_CONTENT.contains(MANAGED_MARKER));
     }
 }

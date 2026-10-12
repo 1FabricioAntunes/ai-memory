@@ -18,7 +18,8 @@ use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
-    GROK_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+    GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
+    MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
 use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
 use anyhow::{Context, Result};
@@ -74,6 +75,7 @@ enum DeleteKind {
     OpenClawEntrypoint,
     KiroCliV3Hooks,
     ManagedSkill,
+    GrokHandoffRule,
     AutowireSentinel,
 }
 
@@ -89,6 +91,7 @@ impl DeleteKind {
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
             Self::KiroCliV3Hooks => "Kiro CLI v3 hook file",
             Self::ManagedSkill => "managed Agent Skill",
+            Self::GrokHandoffRule => "managed Grok first-turn handoff rule",
             Self::AutowireSentinel => "auto-wire sentinel",
         }
     }
@@ -506,6 +509,21 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
         }
     }
 
+    // The Grok first-turn rule is written by both `install-hooks --agent grok`
+    // and `install-skills --scope global --agent grok`. Sweep it with either
+    // concern so uninstall of hooks or skills does not leave the always-on rule.
+    if (want(crate::cli::UninstallOnly::Skills) || want(crate::cli::UninstallOnly::Hooks))
+        && let Ok(grok_home) = install_mcp::grok_home()
+    {
+        push_generated_delete(
+            &mut plan,
+            grok_home
+                .join(GROK_RULES_DIR)
+                .join(GROK_HANDOFF_RULE_FILENAME),
+            DeleteKind::GrokHandoffRule,
+        );
+    }
+
     // ---- Auto-wire sentinels (ai-memory's own state) ----
     // `ai-memory run` skips wiring while a sentinel exists, so one left behind
     // would stop the next managed launch from reinstalling what this removes.
@@ -622,6 +640,11 @@ fn apply_change(
             println!("✓ deleted {}", path.display());
             if *kind == DeleteKind::ManagedSkill {
                 remove_empty_skill_dirs(path)?;
+            }
+            if *kind == DeleteKind::GrokHandoffRule {
+                if let Some(parent) = path.parent() {
+                    remove_dir_if_empty(parent)?;
+                }
             }
         }
         PlannedChange::Rewrite { path, ops, .. } => {
@@ -1240,6 +1263,7 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                         })
             }),
         DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
+        DeleteKind::GrokHandoffRule => content.contains(GROK_HANDOFF_RULE_MARKER),
     }
 }
 
@@ -1581,6 +1605,40 @@ mod tests {
         std::fs::write(&managed, skill.content).unwrap();
         push_generated_delete(&mut plan, managed.clone(), DeleteKind::ManagedSkill);
         assert_eq!(plan.len(), 1, "the managed control must be planned");
+    }
+
+    #[test]
+    fn grok_handoff_rule_sweep_spares_unmanaged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("rules").join("ai-memory-handoff.md");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, "# my grok rule\n").unwrap();
+        let mut plan = Vec::new();
+        push_generated_delete(&mut plan, user.clone(), DeleteKind::GrokHandoffRule);
+        assert!(
+            plan.is_empty(),
+            "an unmanaged Grok rule must never be planned: {plan:?}"
+        );
+
+        let managed = tmp
+            .path()
+            .join("ours")
+            .join("rules")
+            .join("ai-memory-handoff.md");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, GROK_HANDOFF_RULE_MARKER).unwrap();
+        push_generated_delete(&mut plan, managed.clone(), DeleteKind::GrokHandoffRule);
+        assert_eq!(plan.len(), 1, "the managed Grok rule must be planned");
+    }
+
+    #[test]
+    fn generated_grok_handoff_rule_detection_requires_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-memory-handoff.md");
+        std::fs::write(&path, "# user rule\n").unwrap();
+        assert!(!generated_file_is_ours(&path, DeleteKind::GrokHandoffRule));
+        std::fs::write(&path, format!("{GROK_HANDOFF_RULE_MARKER}\n# rule\n")).unwrap();
+        assert!(generated_file_is_ours(&path, DeleteKind::GrokHandoffRule));
     }
 
     /// `install-skills --agent copilot-cli` writes `.github/skills` in the

@@ -1733,10 +1733,12 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
 Grok ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
-so those hooks do not accept the handoff. The first `PostToolUse` prints
+so those hooks do not accept the handoff. `install-hooks --agent grok --apply`
+also writes `$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
+`memory_handoff_list`. The first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
-`[briefing]`). The model sees it after that tool result, not before the
-first prompt. A session with no tool call leaves the handoff for
+`[briefing]`). The model sees it after that tool result. A session with no
+tool call and without that rule leaves the handoff for
 `memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed, ZCode,
 DeepSeek Harness (DSH), and Prime Agent are MCP-only here, so you'll need to
 nudge the model to call `memory_query` / `memory_handoff_accept` itself.
@@ -2465,15 +2467,15 @@ ai-memory install-skills --target-dir .custom/skills --force
 | `--scope <scope>` | Install into this project or the current user's global skill roots. Values: `project`, `global`. Defaults to `project`. |
 | `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, Grok's skill root, GitHub Copilot CLI's skill root, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `copilot-cli`, `both`. Defaults to `claude-code`. |
 | `--target-dir <dir>` | Write managed skill directories below an explicit root; `--scope` and `--agent` are ignored. |
-| `--print` | Print target paths and `SKILL.md` contents without writing files. |
-| `--force` | Replace unmanaged same-name skills; without it, user-authored same-name skills are preserved. |
+| `--print` | Print target paths and `SKILL.md` contents without writing files. A global Grok plan also prints `$GROK_HOME/rules/ai-memory-handoff.md`. |
+| `--force` | Replace unmanaged same-name skills (and, for global Grok, an unmanaged first-turn rule); without it, user-authored same-name files are preserved. |
 
 Default skill target roots:
 
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` |
 |---|---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`) | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 

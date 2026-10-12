@@ -2310,9 +2310,9 @@ pub enum AgentChoice {
     /// xAI Grok Build CLI — JSON-config hooks in
     /// `~/.grok/hooks/ai-memory.json`. Native `ai-memory hook --event`
     /// integration using Grok-specific hook scripts. NOTE: Grok ignores
-    /// hook stdout on `SessionStart`, so
-    /// capture works but handoff injection does not — recover the prior
-    /// session's handoff via the MCP `memory_handoff_accept` tool.
+    /// hook stdout on `SessionStart`; `--apply` also writes
+    /// `$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
+    /// `memory_handoff_list`, and the first `PostToolUse` injects the baton.
     Grok,
     /// Zero coding agent (Gitlawb/zero) — JSON-config lifecycle hooks in
     /// `$XDG_CONFIG_HOME/zero/hooks.json` (exec-form `command` + `args`,
@@ -2614,8 +2614,8 @@ pub enum McpClient {
     /// xAI Grok Build CLI — `~/.grok/config.toml` under
     /// `[mcp_servers.<name>]` with native HTTP `url` + `headers`.
     /// Pair with `install-hooks --agent grok` for lifecycle capture.
-    /// Grok ignores SessionStart stdout, so handoffs are recovered via
-    /// MCP `memory_handoff_accept` rather than hook injection.
+    /// Grok ignores SessionStart stdout; that apply also writes the
+    /// first-turn `memory_handoff_list` rule under `$GROK_HOME/rules`.
     Grok,
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
