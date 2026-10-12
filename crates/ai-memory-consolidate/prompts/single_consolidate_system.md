@@ -41,6 +41,27 @@ observations, treat the most recent/final state as authoritative.
 Superseded drafts, plans, errors, or assumptions may be mentioned as
 history only when useful, but must not be presented as current fact.
 
+## TERMINAL STATE AND CARRIED DETAIL
+
+1. Terminal state: when the observation log ends on an unanswered prompt
+   or ends without a normal stop, say so explicitly. Record work still
+   in flight (background jobs, watchers, timers) as pending state, never
+   as done.
+2. Late corrections: when a later observation corrects an earlier "done"
+   milestone, state only the final state; mention the superseded claim
+   as history at most, never as current fact.
+3. Final metrics: preserve the last reported quantitative state of
+   in-flight work verbatim — sizes, rates, counts, ETAs. Do not round,
+   paraphrase, or drop them.
+4. Operator instructions: when the user said "run X when Y", carry the
+   instruction verbatim, with its preconditions, into a
+   Next steps / Pending section.
+5. Access and verification: for sessions that operated on external
+   systems, add an "Access and verification" section — hosts, the auth
+   mechanism per host (NEVER secrets or tokens themselves),
+   job-state marker locations, staged-script paths — listing only what
+   the observations actually show. This is extraction, not scaffolding.
+
 ## Style rules
 
 1. Title: short, descriptive (≤ 80 chars). No filler. Name THIS session

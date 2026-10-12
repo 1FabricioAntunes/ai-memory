@@ -3010,6 +3010,63 @@ mod tests {
         }
     }
 
+    /// #1221: consolidation was losing the tail of a session — an
+    /// unanswered final prompt, a late correction to a "done" milestone,
+    /// the last reported metrics of in-flight work, operator "run X when Y"
+    /// instructions, and how to reach and verify external systems the
+    /// session touched. Each rule must be pinned in both prompts.
+    #[test]
+    fn consolidation_system_prompts_preserve_terminal_state_and_carried_detail() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            // 1. Terminal state: unanswered prompt / abnormal stop is said
+            //    explicitly; in-flight work is pending state, not done.
+            assert!(prompt.contains("Terminal state"), "{name} prompt");
+            assert!(
+                prompt.contains("ends on an unanswered prompt"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("without a normal stop"), "{name} prompt");
+            assert!(prompt.contains("pending state"), "{name} prompt");
+            // 2. Late corrections: final state only, superseded claim is
+            //    history at most.
+            assert!(prompt.contains("Late corrections"), "{name} prompt");
+            assert!(
+                prompt.contains("corrects an earlier \"done\""),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("state only the final state"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("as history at most"), "{name} prompt");
+            // 3. Final metrics of in-flight work, verbatim.
+            assert!(prompt.contains("Final metrics"), "{name} prompt");
+            assert!(
+                prompt.contains("sizes, rates, counts, ETAs"),
+                "{name} prompt"
+            );
+            // 4. Operator "run X when Y" instructions carried verbatim with
+            //    their preconditions into Next steps / Pending.
+            assert!(prompt.contains("Operator instructions"), "{name} prompt");
+            assert!(prompt.contains("run X when Y"), "{name} prompt");
+            assert!(prompt.contains("preconditions"), "{name} prompt");
+            assert!(prompt.contains("Next steps / Pending"), "{name} prompt");
+            // 5. Access and verification for external systems: extraction
+            //    grounded in the observations, never secrets themselves.
+            assert!(prompt.contains("Access and verification"), "{name} prompt");
+            assert!(
+                prompt.contains("NEVER secrets or tokens themselves"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("job-state marker"), "{name} prompt");
+            assert!(prompt.contains("staged-script paths"), "{name} prompt");
+            assert!(
+                prompt.contains("extraction, not scaffolding"),
+                "{name} prompt"
+            );
+        }
+    }
+
     #[test]
     fn build_request_elides_raw_observations_from_current_body() {
         let raw_dump = (0..2_000)
@@ -3232,9 +3289,14 @@ mod tests {
 
     /// The batch path must include schema and dynamic slot snapshots in its
     /// envelope instead of assuming a fixed number of slots.
+    ///
+    /// The budget sits above the validated floor so the optional-context
+    /// block reaches its clipping regime (a visible `[truncated]` marker)
+    /// rather than being dropped whole: at the floor the growing system
+    /// prompt leaves no optional-context room at all.
     #[test]
     fn batch_budget_accounts_for_many_slot_snapshots() {
-        let budgets = PromptBudgets::from_limits(6_500, 1_000);
+        let budgets = PromptBudgets::from_limits(8_000, 1_000);
         let observations = (0..64).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
         let slots = (0..100)
             .map(|index| SlotSnapshot {

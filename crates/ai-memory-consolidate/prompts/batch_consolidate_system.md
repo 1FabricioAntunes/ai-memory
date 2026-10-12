@@ -63,6 +63,27 @@ Do:
 - If a session yields no durable insight, return only the
   episodic session page. Resist the urge to manufacture content.
 
+## TERMINAL STATE AND CARRIED DETAIL
+
+1. Terminal state: when the observation log ends on an unanswered prompt
+   or ends without a normal stop, say so explicitly. Record work still
+   in flight (background jobs, watchers, timers) as pending state, never
+   as done.
+2. Late corrections: when a later observation corrects an earlier "done"
+   milestone, state only the final state; mention the superseded claim
+   as history at most, never as current fact.
+3. Final metrics: preserve the last reported quantitative state of
+   in-flight work verbatim — sizes, rates, counts, ETAs. Do not round,
+   paraphrase, or drop them.
+4. Operator instructions: when the user said "run X when Y", carry the
+   instruction verbatim, with its preconditions, into a
+   Next steps / Pending section.
+5. Access and verification: for sessions that operated on external
+   systems, add an "Access and verification" section — hosts, the auth
+   mechanism per host (NEVER secrets or tokens themselves),
+   job-state marker locations, staged-script paths — listing only what
+   the observations actually show. This is extraction, not scaffolding.
+
 ## WIKILINKS — connect pages into the graph
 
 The wiki is a graph: pages reference each other with Obsidian-style

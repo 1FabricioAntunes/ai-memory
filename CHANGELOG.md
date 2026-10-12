@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed consolidation dropping the tail of a session from the compiled
+  page. The single and batch prompts now carry explicit rules: say so when
+  the observation log ends on an unanswered prompt or without a normal
+  stop, and record in-flight work (background jobs, watchers, timers) as
+  pending state; when a later observation corrects an earlier "done"
+  milestone, state only the final state with the superseded claim as
+  history at most; preserve the last reported metrics of in-flight work
+  (sizes, rates, counts, ETAs) verbatim; carry operator "run X when Y"
+  instructions verbatim, with their preconditions, into a
+  Next steps / Pending section; and, for sessions that operated on
+  external systems, emit an "Access and verification" section — hosts,
+  the per-host auth mechanism (never secrets or tokens themselves),
+  job-state marker locations, staged-script paths — grounded only in what
+  the observations show. (#1221)
 - Softened the consolidation prompts' wikilink quota that pushed models to
   invent links. The single and batch prompts told the model "2-5 well-chosen
   links per page beat exhaustive linking; zero links should be rare", which
