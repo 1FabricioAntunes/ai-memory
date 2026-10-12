@@ -10,6 +10,7 @@ mod atomic;
 pub mod backup;
 mod confinement;
 mod error;
+mod frontmatter_yaml;
 mod git;
 mod ledger;
 mod markdown;

@@ -21,12 +21,6 @@ ignore = [
     # embeddings); no runtime code ships from it. Revisit when candle
     # replaces it upstream.
     "RUSTSEC-2024-0436",
-    # RUSTSEC-2024-0449: `unsafe-libyaml` is unmaintained (no known
-    # vulnerability). It is the parser under `serde_yaml` 0.9, which reads
-    # and writes every wiki page's frontmatter. Replacing it changes how
-    # existing frontmatter serializes, so it needs its own change with a
-    # round-trip test over real pages, not a drive-by swap.
-    "RUSTSEC-2024-0449",
 ]
 
 [licenses]

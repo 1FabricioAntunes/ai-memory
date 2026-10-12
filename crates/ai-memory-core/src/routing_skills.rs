@@ -277,7 +277,7 @@ mod tests {
         let Some((frontmatter, _body)) = rest.split_once("\n---\n") else {
             panic!("{} must close frontmatter", skill.name);
         };
-        serde_yaml::from_str(frontmatter)
+        serde_saphyr::from_str(frontmatter)
             .unwrap_or_else(|e| panic!("{} frontmatter must be valid YAML: {e}", skill.name))
     }
 
