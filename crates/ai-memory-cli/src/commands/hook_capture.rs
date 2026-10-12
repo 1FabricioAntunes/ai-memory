@@ -1016,6 +1016,26 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Shadows [`super::marker_query_suffix`] for every test in this module,
+    /// resolving against an empty operator home: the real one reads
+    /// `home_dir()`, and a developer's own `~/.ai-memory.toml` applies to
+    /// every cwd, so it would leak into the assertions. Tests that exercise a
+    /// home marker pass one to `routing_selection_with_home` themselves.
+    fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
+        let home = tempfile::TempDir::new().unwrap();
+        match super::super::super::marker::routing_selection_with_home(
+            cwd,
+            cwd,
+            Some(home.path()),
+            false,
+        ) {
+            Ok(selection) => {
+                marker_query_suffix_impl_from_selection(cwd, default_strategy, true, selection)
+            }
+            Err(_) => String::new(),
+        }
+    }
+
     async fn serve_once(status: &'static str, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
