@@ -25,7 +25,7 @@
 
 /// Slow tier: three process spawns per case (CLI render plus one Node run).
 mod slow_generated_runtime {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     use serde_json::Value;
@@ -221,23 +221,13 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
             .collect()
     }
 
-    /// Retained fixture root: `keep()` hands back the path and cancels the
-    /// delete-on-drop, so the generated plugin stays inspectable after a run.
-    fn fixture_root() -> PathBuf {
-        let dir = tempfile::tempdir().expect("fixture root").keep();
-        eprintln!(
-            "generated-plugin runtime fixture retained at {}",
-            dir.display()
-        );
-        dir
-    }
-
     #[test]
     fn generated_plugin_stops_capture_for_an_external_owner_but_still_fetches_context() {
         if !node_strip_types_available() {
             return;
         }
-        let dir = fixture_root();
+        let guard = tempfile::tempdir().expect("fixture root");
+        let dir = guard.path().to_path_buf();
         let mut port = free_port();
         write_fixture(&dir, port);
 
@@ -286,7 +276,8 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
         if !node_strip_types_available() {
             return;
         }
-        let dir = fixture_root();
+        let guard = tempfile::tempdir().expect("fixture root");
+        let dir = guard.path().to_path_buf();
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = taken.local_addr().unwrap().port();
         let mut port = busy;

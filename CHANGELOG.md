@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the management console retaining an Admin-only tab after account
   switching, and displayed cross-project handoff effects in deletion previews.
   (#1231)
+- Fixed the detached hook drainer recreating a deleted data directory. A
+  drainer started just before `ai-memory uninstall --purge-data` (or one
+  whose data directory was removed some other way) brought back an empty
+  `hook-spool/` with its lock file. The drainer now exits when the data
+  directory is gone. A spool directory the drainer creates is also private
+  (`0700`) now, as one created by a queued event always was; before, it
+  took the default permissions.
 
 ## [2.6.4] - 2026-10-12
 
