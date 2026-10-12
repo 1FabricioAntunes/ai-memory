@@ -1,7 +1,8 @@
-//! Opt-in post-fusion ranking signals for `hybrid_search`.
+//! Post-fusion ranking signals for `hybrid_search`.
 //!
-//! Bounded, independently switchable signals, all off by default so a
-//! store that never configures them ranks exactly as before:
+//! Bounded, independently switchable signals. All but the observation stream
+//! are off by default; with every one of them off a store ranks exactly as it
+//! did before any of them existed:
 //!
 //! * **Session-recall routing** — a zero-LLM lexical check that recognises
 //!   queries phrased as "find a past session / what did we do back then"
@@ -24,14 +25,16 @@
 //!   the evidence a question needs often lives only in the session's
 //!   sanitized observation bodies. Each session's best-ranked matching
 //!   observation votes once for that session's latest page; a session with
-//!   no page contributes nothing (the raw fallback still covers it).
+//!   no page contributes nothing (the raw fallback still covers it). On by
+//!   default since it met its measured success criteria.
 //!
 //! Every signal is reported in `SearchExplain`, so an `explain=true`
 //! query can account for the returned rank.
 
 use serde::{Deserialize, Serialize};
 
-/// Tunables for the opt-in ranking signals. `Default` disables all of them.
+/// Tunables for the ranking signals. `Default` enables only the observation
+/// stream.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalTuning {
@@ -59,8 +62,9 @@ pub struct RetrievalTuning {
     /// Add the observation-evidence stream to the RRF fusion (R1): search
     /// `observations_fts` in the same project and let each matching
     /// observation vote, once per session, for its session's latest
-    /// `sessions/<id>.md` page. Nothing is written. Ships OFF: it changes
-    /// ranking, and the maintainer decides default-on from measurements.
+    /// `sessions/<id>.md` page. Nothing is written. ON by default: on the
+    /// retrieval eval it lifted zero-LLM hit@5 without breaking the latency or
+    /// token budgets. `false` restores the previous ranking byte for byte.
     pub observation_stream: bool,
 }
 
@@ -79,7 +83,7 @@ impl Default for RetrievalTuning {
             // OFF by default: folding belief confidence into ranking is
             // R2-gated (see the field doc).
             belief_authority_weight: 0.0,
-            observation_stream: false,
+            observation_stream: true,
         }
     }
 }
@@ -180,12 +184,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_tuning_is_inert() {
+    fn default_tuning_enables_only_the_observation_stream() {
         let t = RetrievalTuning::default();
         assert!(!t.session_recall_routing);
         assert!(!t.abstract_vectors);
         assert_eq!(t.belief_authority_weight, 0.0);
-        assert!(!t.observation_stream);
+        assert!(t.observation_stream);
     }
 
     #[test]

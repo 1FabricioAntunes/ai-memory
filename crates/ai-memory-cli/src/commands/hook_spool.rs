@@ -2174,7 +2174,7 @@ impl<'a> ProfileTokens<'a> {
 /// a stale port in one is unambiguous — nothing else could have been meant. A
 /// remote host is left alone: re-pointing it would misdeliver a spool that was
 /// deliberately captured against another server.
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let rest = match url.split_once("://") {
         Some((_, rest)) => rest,
         None => url,

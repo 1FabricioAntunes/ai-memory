@@ -29,9 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory-web` crate now has a `clippy.toml` that forbids the `Wiki` write
   and destructive methods, so a write path in the web UI or `/api/v1` fails
   `cargo clippy -D warnings`.
-- Added an opt-in observation stream to `memory_query` ranking:
-  `[retrieval] observation_stream = true` (env
-  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`, default off). A zero-LLM
+- Added an observation stream to `memory_query` ranking:
+  `[retrieval] observation_stream` (env
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM`, on by default). A zero-LLM
   session page keeps only a short excerpt of each turn, so the detail a
   question asks about often lives only in the session's observations. With the
   flag on, project and `scopes` searches also run full-text search over
@@ -42,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `explain=true` reports an `observation` stream with the matched observation
   ids. Hits are still pages and nothing is written; sessions without a page
   keep the `raw_hits` fallback, and `global=true` search is unchanged.
+- Added a root-only `GET /admin/metrics` endpoint in Prometheus text format.
+  It exposes the hook admission and delivery counters, MCP tool calls split
+  into reads and writes, and fixed-bucket latency histograms for `POST /hook`
+  and `memory_query`. Every label comes from a fixed set: no query text, page
+  body, prompt, client or project name, scope or token appears in the output.
+  On a multi-user server only root can read it, like every `/admin/*` route.
+- Added a `timings` object to `memory_query` responses with `explain=true`:
+  each retrieval stream's wall time in milliseconds (`fts_ms`, `entity_ms`,
+  `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`), summed over `scopes`.
+  Streams that did not run are left out, and a query without `explain` reads
+  no clock for them.
 - Grok Build CLI first-turn handoff: `install-hooks --agent grok --apply`
   and `install-skills --scope global --agent grok` write
   `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
@@ -219,6 +230,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `memory_consolidate`, which ai-memory also has with different arguments. The
   check only reads; it never edits or deletes another tool's files. `doctor
   --json` carries the findings as `agentmemory_residue`.
+- Added `ai-memory auth enable`, which turns on bearer auth for an install
+  created without it. It reuses or creates an owner-only token at
+  `<data_dir>/auth-tokens/default`, records it in `config.toml`, gives the
+  installed hooks the token when they hold no other credential, and
+  re-registers every MCP client whose `ai-memory` entry points at this server
+  the way `install-mcp` now wires a token-file install. It lists each client
+  it changed, each entry for another server it left alone, and anything that
+  needs a manual change. Running it again changes nothing, and the token is
+  never printed or written into a harness config. Restart the server
+  afterwards.
+- Added `ai-memory mcp-bridge --no-session-id`, a plain stdio-to-HTTP MCP
+  bridge for any client that runs local commands. It authenticates with the
+  token from config (`AI_MEMORY_AUTH_TOKEN`, `[auth] bearer_token`, or the
+  file `[auth] bearer_token_file` names), forwards no session identity (the
+  client passes `workspace` and `project` like any static MCP client, and an
+  inherited `CLAUDE_CODE_SESSION_ID` is ignored), and exits at once with
+  `401 Unauthorized` when the server refuses it. Without the flag the bridge
+  keeps Claude Code's session forwarding and still refuses to start without
+  `CLAUDE_CODE_SESSION_ID`.
+- Added the `[auth] bearer_token_file` config key (env
+  `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`): a file holding the root bearer token,
+  read once at startup. A relative path resolves against the data dir.
+  `AI_MEMORY_AUTH_TOKEN` still takes precedence; setting the key together with
+  `[auth] bearer_token` is a startup error, and a server whose configured file
+  is missing or empty refuses to start. A token read from the file is never
+  written into a harness config: `install-mcp` registers Claude Code through
+  the session-aware `ai-memory mcp-bridge`, gives Codex and Prime Agent a
+  reference to `$AI_MEMORY_AUTH_TOKEN`, and writes every other client a stdio
+  entry for `ai-memory mcp-bridge --no-session-id` in that client's own config
+  format (OpenCode, OpenCode 2, Cursor, Claude Desktop, Gemini CLI, OpenClaw,
+  OMP, Antigravity CLI, Zero, Devin, Grok, Kimi Code, Kiro CLI, Command Code,
+  Copilot CLI, Swival, VS Code, Zed, Muse Code; DeepSeek Harness's printed
+  patch too). Only ZCode, whose config keeps HTTP entries only, is refused with
+  the manual option. `uninstall` recognises these entries.
+  `install-hooks --apply` stores the token in the hook credential files only.
+- `ai-memory status` and `ai-memory doctor` now show the server's auth
+  posture, and for an unauthenticated loopback server print
+  `auth: none (loopback)` with the fix, `ai-memory auth enable`.
 
 ### Changed
 - Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
@@ -226,6 +275,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
   the client's own documentation at a named version and has not yet been run
   end to end. Aider is not listed because it has no MCP support.
+- Changed `memory_query` ranking to include the observation stream by
+  default, after it raised hit@5 on the retrieval eval for both zero-LLM and
+  local-embedding search while staying inside its latency and context-token
+  budgets. `explain=true` lists `observation` in
+  `streams_active` whenever it runs. To keep the previous ranking, set
+  `[retrieval] observation_stream = false` (or
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`); ranking is then identical
+  to before.
+- Changed `ai-memory init` on a fresh data dir (no config file and no
+  database yet) to create a root bearer token at
+  `<data_dir>/auth-tokens/default` and record `[auth] bearer_token_file`, so
+  a new install's server requires the token on every route except `/healthz`.
+  The hooks, the CLI and `ai-memory mcp-bridge` read it from the data dir;
+  client commands of a packaged install, whose config lives outside the data
+  dir, find it there too when they read no config file and target a loopback
+  server. Existing installs are unchanged and keep running without auth until
+  `ai-memory auth enable`; so is an `init` that finds a database or a bearer
+  supplied another way. `uninstall` keeps this token, since it is the
+  server's credential. The Docker wrapper hands a host command (`install-hooks`,
+  `mcp-bridge`, `run`) the token of a server initialized on its volume as an
+  owner-only file that `install-hooks` copies from the volume, never on a
+  command line.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites

@@ -256,6 +256,9 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     };
     let (journal_pending, journal_degraded, journal_finish_failed, journal_error) =
         super::recovery::journal_summary(&config.data_dir);
+    // `/admin/status` answered. Without a credential that can only mean the
+    // server does not require one.
+    let auth_posture = crate::local_auth::AuthPosture::classify(ep.auth_token.is_none(), &ep.url);
 
     if args.json {
         println!(
@@ -269,6 +272,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 journal_error,
                 capture_mode,
                 &ep,
+                auth_posture,
             ))?
         );
     } else {
@@ -277,6 +281,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         println!("  data-dir:     {}", report.data_dir);
         println!("  db:           {}", report.db_path);
         println!("  bind:         {}", report.bind);
+        println!("  auth:         {}", auth_posture.line());
         println!(
             "  pages:        {} (all versions: {})",
             report.counts.pages_latest, report.counts.pages_all
@@ -496,6 +501,7 @@ fn json_report(
     journal_error: Option<String>,
     capture_mode: &str,
     endpoint: &ServerEndpoint,
+    auth_posture: crate::local_auth::AuthPosture,
 ) -> serde_json::Value {
     serde_json::json!({
         "version": report.version,
@@ -521,6 +527,7 @@ fn json_report(
         "capture_mode": capture_mode,
         "ingest": report.ingest,
         "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
     })
 }
 
@@ -615,7 +622,10 @@ mod tests {
             None,
             "denylist",
             &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
         );
+        assert_eq!(value["auth_posture"]["posture"], "none_loopback");
+        assert_eq!(value["auth_posture"]["fix"], "ai-memory auth enable");
         for key in [
             "version",
             "data_dir",

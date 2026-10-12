@@ -518,6 +518,9 @@ pub struct AiMemoryServer {
     /// burst costs the writer one tiny upsert batch, not one write per
     /// call (same reasoning as the M8 access-bump throttle).
     client_activity: Arc<std::sync::Mutex<ClientActivityBuffer>>,
+    /// Content-free process counters read by `GET /admin/metrics`: the
+    /// `memory_query` latency histogram and read/write tool-call totals.
+    mcp_metrics: Arc<crate::McpMetrics>,
     /// Shared "last client activity" clock (microseconds), bumped on every tool
     /// call. The B3 dream scheduler reads it to detect idle and to cancel a
     /// running pass the moment the operator returns — consolidation must never
@@ -654,9 +657,10 @@ struct QueryArgs {
     #[serde(default)]
     pin_first: Option<bool>,
     /// Attach `score_details` to project/scopes hits: per-stream ranks
-    /// (FTS5, entity, vector, graph), raw scores, and RRF contributions, plus a
-    /// top-level `streams_active` list. A `global=true` query uses a
-    /// different FTS-only ranker, so it reports only `streams_active`.
+    /// (FTS5, entity, vector, graph, observation), raw scores, and RRF
+    /// contributions, plus top-level `streams_active` and per-stream
+    /// `timings` (milliseconds). A `global=true` query uses a different
+    /// FTS-only ranker, so it reports only `streams_active` and its FTS time.
     /// Default false.
     #[serde(default)]
     explain: Option<bool>,
@@ -848,10 +852,19 @@ struct MemoryQueryResponse {
     /// Present only when `explain=true`: which retrieval streams ran for
     /// the primary search. Project/scopes retrieval always runs `fts` and
     /// `entity`, and `graph`; `vector` is present only when an embedder
-    /// produced a query vector. Cross-project `global=true` retrieval is FTS-only.
+    /// produced a query vector, and `observation` while `[retrieval]
+    /// observation_stream` is on (the default). Cross-project `global=true`
+    /// retrieval is FTS-only.
     /// An `as_of` query runs `entity` plus version-filtered `fts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     streams_active: Option<Vec<&'static str>>,
+    /// Present only when `explain=true`: wall time per retrieval stream for
+    /// the primary search (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`,
+    /// `observation_ms`, `rerank_ms`), summed over `scopes`; a stream that
+    /// did not run is omitted. `global=true` reports `fts_ms` only. Not
+    /// measured at all without `explain`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<ai_memory_store::StreamTimings>,
 }
 
 /// Response for `memory_recent`. `hits` carries the current project's recent
@@ -1795,6 +1808,7 @@ impl AiMemoryServer {
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
+            mcp_metrics: Arc::new(crate::McpMetrics::default()),
             activity_clock: ai_memory_consolidate::ActivityClock::new(
                 jiff::Timestamp::now().as_microsecond(),
             ),
@@ -2371,12 +2385,17 @@ impl AiMemoryServer {
         }
     }
 
+    /// One project's fused hits, plus per-stream timings when
+    /// `options.explain` asked for them.
     async fn search_project(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>> {
+    ) -> ai_memory_store::StoreResult<(
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Option<ai_memory_store::StreamTimings>,
+    )> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
@@ -2392,9 +2411,10 @@ impl AiMemoryServer {
             (Some(e), Some(_)) => (e.provider().to_string(), e.model_identity(), e.dim()),
             _ => (String::new(), String::new(), 0),
         };
-        let fused: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = if options.explain {
-            self.reader
-                .hybrid_search_explained(
+        if options.explain {
+            let (hits, timings) = self
+                .reader
+                .hybrid_search_explained_timed(
                     workspace_id,
                     project_id,
                     options.query.to_owned(),
@@ -2406,12 +2426,16 @@ impl AiMemoryServer {
                     expiry_cutoff,
                     options.include_superseded,
                 )
-                .await?
-                .into_iter()
-                .map(|(hit, details)| (hit, Some(details)))
-                .collect()
+                .await?;
+            Ok((
+                hits.into_iter()
+                    .map(|(hit, details)| (hit, Some(details)))
+                    .collect(),
+                Some(timings),
+            ))
         } else {
-            self.reader
+            let hits = self
+                .reader
                 .hybrid_search(
                     workspace_id,
                     project_id,
@@ -2424,12 +2448,9 @@ impl AiMemoryServer {
                     expiry_cutoff,
                     options.include_superseded,
                 )
-                .await?
-                .into_iter()
-                .map(|hit| (hit, None))
-                .collect()
-        };
-        Ok(fused)
+                .await?;
+            Ok((hits.into_iter().map(|hit| (hit, None)).collect(), None))
+        }
     }
 
     fn rerank_fetch_limit(&self, limit: usize) -> usize {
@@ -2572,6 +2593,13 @@ impl AiMemoryServer {
         out
     }
 
+    /// The process counters this server records into. `serve` hands the same
+    /// instance to the admin router so `GET /admin/metrics` reads them.
+    #[must_use]
+    pub fn mcp_metrics(&self) -> Arc<crate::McpMetrics> {
+        Arc::clone(&self.mcp_metrics)
+    }
+
     /// Attach a reranker. Without one, `memory_query` keeps its
     /// RRF-only, zero-LLM behaviour.
     #[must_use]
@@ -2693,7 +2721,8 @@ impl AiMemoryServer {
         score (lower rank = better match). Only latest page versions. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
-        project/scopes hits; it also returns `streams_active`. \
+        project/scopes hits; it also returns `streams_active` and per-stream \
+        `timings` in milliseconds. \
         Cross-project `global=true` search is FTS-only and therefore reports \
         `streams_active` without per-hit RRF details. \
         If compiled wiki search misses in default/project/`scopes` mode, \
@@ -2714,6 +2743,8 @@ impl AiMemoryServer {
         Parameters(args): Parameters<QueryArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        // Dropped on every return path, so errors are timed too.
+        let _latency = self.mcp_metrics.query_latency().start();
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
@@ -2745,6 +2776,7 @@ impl AiMemoryServer {
                     None,
                 ));
             }
+            let fts_started = explain.then(std::time::Instant::now);
             let global_hits = self
                 .reader
                 .search_pages_with_meta(
@@ -2755,6 +2787,10 @@ impl AiMemoryServer {
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let timings = fts_started.map(|started| ai_memory_store::StreamTimings {
+                fts_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
+                ..Default::default()
+            });
             return ok_json(&MemoryQueryResponse {
                 hits: Vec::new(),
                 answer: None,
@@ -2766,6 +2802,7 @@ impl AiMemoryServer {
                 global_hits,
                 global_scope_hits: Vec::new(),
                 streams_active: explain.then(|| vec!["fts"]),
+                timings,
             });
         }
         if !args.scopes.is_empty()
@@ -2835,6 +2872,8 @@ impl AiMemoryServer {
                 global_hits: Vec::new(),
                 global_scope_hits: Vec::new(),
                 streams_active: explain.then(|| vec!["entity", "fts"]),
+                // Time travel fuses inside one store call; no per-stream split.
+                timings: None,
             });
         }
 
@@ -2849,11 +2888,14 @@ impl AiMemoryServer {
                     .await?,
             )
         };
+        // Explain-only: per-stream timings of the primary search, summed over
+        // `scopes`. `None` on the normal path, which reads no clocks for it.
+        let mut timings: Option<ai_memory_store::StreamTimings> = None;
         let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
                 HashMap::new();
             for &(ws, proj) in scopes {
-                let hits = self
+                let (hits, scope_timings) = self
                     .search_project(
                         ws,
                         proj,
@@ -2868,6 +2910,11 @@ impl AiMemoryServer {
                     )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if let Some(scope_timings) = scope_timings {
+                    timings
+                        .get_or_insert_with(Default::default)
+                        .accumulate(&scope_timings);
+                }
                 for hit in hits {
                     hits_by_id
                         .entry(hit.0.id)
@@ -2912,9 +2959,17 @@ impl AiMemoryServer {
                 },
             )
             .await
+            .map(|(hits, project_timings)| {
+                timings = project_timings;
+                hits
+            })
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let rerank_started = (explain && self.reranker.is_some()).then(std::time::Instant::now);
         let hits = self.rerank_hits(&args.query, hits, limit).await;
+        if let (Some(timings), Some(started)) = (timings.as_mut(), rerank_started) {
+            timings.rerank_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
         let bump_actor = Self::bump_actor_from_parts(&parts);
         self.spawn_access_bump(
             hits.iter().map(|(h, _)| h.id).collect(),
@@ -2992,7 +3047,7 @@ impl AiMemoryServer {
                     if current == scope.as_tuple() {
                         Vec::new()
                     } else {
-                        let hits = self
+                        let (hits, _) = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
@@ -3061,7 +3116,7 @@ impl AiMemoryServer {
                     .await
                 {
                     Ok(Some(scope)) if scope.as_tuple() != current => {
-                        let hits = self
+                        let (hits, _) = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
@@ -3217,6 +3272,7 @@ impl AiMemoryServer {
             global_hits: Vec::new(),
             global_scope_hits,
             streams_active,
+            timings,
         };
         ok_json(&response)
     }
@@ -6930,6 +6986,7 @@ impl AiMemoryServer {
         self.activity_clock.mark(now_us);
         let day = now_us.div_euclid(US_PER_DAY);
         let is_write = tool_call_is_write(tool);
+        self.mcp_metrics.record_tool_call(is_write);
         let schedule_flush = {
             let mut buffer = self
                 .client_activity
@@ -10398,6 +10455,7 @@ mod tests {
         assert!(text.contains("foo.md"), "expected hit; got {text}");
         assert!(!text.contains("score_details"));
         assert!(!text.contains("streams_active"));
+        assert!(!text.contains("timings"), "{text}");
 
         let explained = server
             .memory_query(
@@ -10424,7 +10482,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
         assert_eq!(
             value["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
         let details = &value["hits"][0]["score_details"];
         assert_eq!(details["fts_rank"], 1);
@@ -10440,6 +10498,97 @@ mod tests {
         let fused = details["fused"].as_f64().unwrap();
         let authority = details["authority"].as_f64().unwrap();
         assert!((rank + fused * authority).abs() < f64::EPSILON);
+        // Explain times exactly the streams it reports as active: no
+        // embedder means no vector timing, no reranker means no rerank one.
+        let timings = value["timings"].as_object().expect("explain timings");
+        let mut keys: Vec<&str> = timings.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["entity_ms", "fts_ms", "graph_ms", "observation_ms"],
+            "{value}"
+        );
+        assert!(
+            timings
+                .values()
+                .all(|ms| ms.as_f64().is_some_and(|ms| ms >= 0.0)),
+            "{value}"
+        );
+    }
+
+    /// `rerank_ms` appears with a reranker attached, and only on an explained
+    /// query; global search reports its single FTS pass.
+    #[tokio::test]
+    async fn explain_timings_cover_the_reranker_and_global_search() {
+        let (_tmp, store, server, ws, pj) = setup_server().await;
+        // The reranker needs two candidates to be called at all.
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: pj,
+                path: PagePath::new("bar.md").unwrap(),
+                title: "Bar".into(),
+                body: "karpathy compiled wiki notes".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let (reranker, calls, _) = stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+        let ask = async |explain: bool, global: bool| -> serde_json::Value {
+            call_tool_json(
+                server
+                    .memory_query(
+                        Parameters(QueryArgs {
+                            query: "karpathy".into(),
+                            limit: Some(5),
+                            project: None,
+                            scopes: Vec::new(),
+                            workspace: None,
+                            global: global.then_some(true),
+                            include_expired: None,
+                            include_superseded: None,
+                            pin_first: None,
+                            explain: Some(explain),
+                            as_of: None,
+                            answer: None,
+                            reasoning: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        };
+
+        let explained = ask(true, false).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            explained["timings"]["rerank_ms"]
+                .as_f64()
+                .is_some_and(|ms| ms >= 0.0),
+            "{explained}"
+        );
+        let plain = ask(false, false).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(plain.get("timings").is_none(), "{plain}");
+
+        let global = ask(true, true).await;
+        let timings = global["timings"].as_object().expect("global timings");
+        assert_eq!(
+            timings.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["fts_ms"],
+            "{global}"
+        );
+        assert!(ask(false, true).await.get("timings").is_none());
     }
 
     /// With NO embedder configured — the default deployment —
@@ -10545,7 +10694,7 @@ mod tests {
         );
         assert_eq!(
             entity_hit["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
 
         let graph_hit = query("graphseed").await;
@@ -12848,7 +12997,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             value["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
         assert_eq!(
             value["hits"]

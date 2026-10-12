@@ -729,6 +729,59 @@ fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
 
+/// Per-query wall time of each retrieval stream, in milliseconds, for an
+/// `explain=true` query. Measured only on the explained path, so a normal
+/// query takes no clock readings for it. A `None` field is a stream that did
+/// not run (no query vector, stream turned off, no reranker). Summed across
+/// projects when one query searches several scopes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct StreamTimings {
+    /// Page FTS5 candidate search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fts_ms: Option<f64>,
+    /// Entity-match stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_ms: Option<f64>,
+    /// Stored-vector scans (the page vectors plus, when enabled, the abstract
+    /// vectors). Embedding the query itself is not included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_ms: Option<f64>,
+    /// Graph-neighbour expansion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_ms: Option<f64>,
+    /// Observation-evidence stream (`[retrieval] observation_stream`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_ms: Option<f64>,
+    /// Post-fusion reranker call. Filled by the MCP layer, which owns the
+    /// reranker; the store never sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_ms: Option<f64>,
+}
+
+impl StreamTimings {
+    /// Add `other` into `self`, field by field. A stream that ran in either
+    /// counts as having run.
+    pub fn accumulate(&mut self, other: &Self) {
+        fn add(into: &mut Option<f64>, from: Option<f64>) {
+            if let Some(ms) = from {
+                *into = Some(into.unwrap_or(0.0) + ms);
+            }
+        }
+        add(&mut self.fts_ms, other.fts_ms);
+        add(&mut self.entity_ms, other.entity_ms);
+        add(&mut self.vector_ms, other.vector_ms);
+        add(&mut self.graph_ms, other.graph_ms);
+        add(&mut self.observation_ms, other.observation_ms);
+        add(&mut self.rerank_ms, other.rerank_ms);
+    }
+}
+
+/// Milliseconds since `started`, or `None` when the clock was never read
+/// (the non-explained path passes `None`).
+fn elapsed_ms(started: Option<std::time::Instant>) -> Option<f64> {
+    started.map(|t| t.elapsed().as_secs_f64() * 1000.0)
+}
+
 /// Score transparency for one `memory_query` hit: where the hit ranked
 /// in each retrieval stream, the raw per-stream scores, and how the
 /// RRF fusion combined them. All ranks are 1-based; a `None` rank
@@ -5801,6 +5854,7 @@ impl ReaderPool {
                 include_superseded,
             )
             .await?
+            .0
             .into_iter()
             .map(|(hit, _)| hit)
             .collect())
@@ -5827,7 +5881,42 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, SearchExplain)>> {
-        let hits = self
+        Ok(self
+            .hybrid_search_explained_timed(
+                workspace_id,
+                project_id,
+                query,
+                query_vec,
+                provider,
+                model,
+                dim,
+                limit,
+                expiry_cutoff_us,
+                include_superseded,
+            )
+            .await?
+            .0)
+    }
+
+    /// [`Self::hybrid_search_explained`] plus the wall time of each stream.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_search_explained_timed(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        query_vec: Option<Vec<f32>>,
+        provider: String,
+        model: String,
+        dim: u32,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
+    ) -> StoreResult<(Vec<(PageHit, SearchExplain)>, StreamTimings)> {
+        let (hits, timings) = self
             .hybrid_search_inner(
                 workspace_id,
                 project_id,
@@ -5846,10 +5935,12 @@ impl ReaderPool {
         // `belief_factor`; P2, docs/design-hindsight-borrowings.md §3) are
         // populated inside the explained path of `hybrid_search_inner` from one
         // batched query — never per-hit — so no second pass is needed here.
-        Ok(hits
-            .into_iter()
-            .map(|(hit, explain)| (hit, explain.unwrap_or_default()))
-            .collect())
+        Ok((
+            hits.into_iter()
+                .map(|(hit, explain)| (hit, explain.unwrap_or_default()))
+                .collect(),
+            timings,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5866,8 +5957,11 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         explain: bool,
         include_superseded: bool,
-    ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
+    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings)> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        // Stream timings exist only for explain: `explain.then(Instant::now)`
+        // reads no clock on the normal path.
+        let mut timings = StreamTimings::default();
         // The routing decision is read off the query before the FTS call
         // consumes it; with routing disabled this is a no-op `false`.
         let tuning = self.tuning;
@@ -5881,6 +5975,7 @@ impl ReaderPool {
         // it. This avoids cloning a caller-controlled query on the hot path.
         // The default path uses the latest-only entry; the opt-in path reaches
         // superseded versions through the `_at` entry with no `as_of` instant.
+        let started = explain.then(std::time::Instant::now);
         let entity_hits = if include_superseded {
             self.entity_hits_for_project_at(
                 workspace_id,
@@ -5902,12 +5997,14 @@ impl ReaderPool {
             )
             .await?
         };
+        timings.entity_ms = elapsed_ms(started);
         // The stream-off hot path keeps moving the query without a clone.
         let observation_query = if tuning.observation_stream {
             query.clone()
         } else {
             String::new()
         };
+        let started = explain.then(std::time::Instant::now);
         let fts_candidates = self
             .search_page_candidates_for_project(
                 workspace_id,
@@ -5918,6 +6015,7 @@ impl ReaderPool {
                 include_superseded,
             )
             .await?;
+        timings.fts_ms = elapsed_ms(started);
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
             .map(|(hit, authority)| (hit.id, *authority))
@@ -5929,6 +6027,7 @@ impl ReaderPool {
         let mut vec_hits: Vec<(PageId, PagePath, f32)> = Vec::new();
         let mut abstract_hits: Vec<(PageId, PagePath, f32)> = Vec::new();
         if let Some(qv) = query_vec {
+            let started = explain.then(std::time::Instant::now);
             if tuning.abstract_vectors {
                 abstract_hits = self
                     .top_embedding_hits_in_table(
@@ -5958,6 +6057,7 @@ impl ReaderPool {
                     include_superseded,
                 )
                 .await?;
+            timings.vector_ms = elapsed_ms(started);
         }
 
         let mut seed_seen = std::collections::HashSet::new();
@@ -5987,6 +6087,7 @@ impl ReaderPool {
                 }
             }
         }
+        let started = explain.then(std::time::Instant::now);
         let graph_hits = self
             .graph_neighbors_for_project_explained(
                 workspace_id,
@@ -5997,17 +6098,22 @@ impl ReaderPool {
                 include_superseded,
             )
             .await?;
-        // R1: the observation-evidence stream, off by default. It votes only
-        // for latest session pages, so it does not seed graph expansion.
+        timings.graph_ms = elapsed_ms(started);
+        // R1: the observation-evidence stream. It votes only for latest
+        // session pages, so it does not seed graph expansion.
         let observation_votes = if tuning.observation_stream {
-            self.observation_stream_votes(
-                workspace_id,
-                project_id,
-                &observation_query,
-                candidate_limit,
-                cutoff,
-            )
-            .await?
+            let started = explain.then(std::time::Instant::now);
+            let votes = self
+                .observation_stream_votes(
+                    workspace_id,
+                    project_id,
+                    &observation_query,
+                    candidate_limit,
+                    cutoff,
+                )
+                .await?;
+            timings.observation_ms = elapsed_ms(started);
+            votes
         } else {
             Vec::new()
         };
@@ -6317,7 +6423,7 @@ impl ReaderPool {
                 hit.superseded = superseded.contains(&hit.id);
             }
         }
-        Ok(out)
+        Ok((out, timings))
     }
 
     /// The subset of `page_ids` that are superseded (non-latest) versions in
@@ -12165,6 +12271,67 @@ mod tests {
             .data_dir_free_bytes
             .expect("free space should be readable for a real temp dir");
         assert!(free > 0);
+    }
+
+    /// Stream timings are an explain-only surface: the normal path returns
+    /// none (it reads no clock for them), the explained path times every
+    /// stream that ran and leaves the rest out.
+    #[tokio::test]
+    async fn stream_timings_exist_only_on_the_explained_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = crate::Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let search = |explain: bool| {
+            store.reader.hybrid_search_inner(
+                ws,
+                proj,
+                "anything".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                5,
+                None,
+                explain,
+                false,
+            )
+        };
+        let (_, off) = search(false).await.unwrap();
+        assert_eq!(off, super::StreamTimings::default());
+        let (_, on) = search(true).await.unwrap();
+        assert!(on.fts_ms.is_some() && on.entity_ms.is_some() && on.graph_ms.is_some());
+        assert!(on.observation_ms.is_some(), "the stream is on by default");
+        assert!(on.vector_ms.is_none(), "no query vector, no vector scan");
+        assert!(on.rerank_ms.is_none(), "the store never reranks");
+    }
+
+    #[test]
+    fn stream_timings_accumulate_across_scopes() {
+        let mut total = super::StreamTimings::default();
+        total.accumulate(&super::StreamTimings {
+            fts_ms: Some(1.5),
+            ..Default::default()
+        });
+        total.accumulate(&super::StreamTimings {
+            fts_ms: Some(2.0),
+            graph_ms: Some(0.25),
+            ..Default::default()
+        });
+        assert_eq!(total.fts_ms, Some(3.5));
+        assert_eq!(total.graph_ms, Some(0.25));
+        assert_eq!(
+            total.vector_ms, None,
+            "a stream that never ran stays absent"
+        );
     }
 
     /// The single-scope manifest lookup the wiki resolves a new scope's

@@ -639,6 +639,21 @@ fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<Str
     }
 }
 
+/// A configured `[auth].bearer_token_file` that holds no token must stop the
+/// server: starting without one would serve every route unauthenticated, the
+/// opposite of what the key asks for.
+fn refuse_a_missing_token_file(auth: &AuthSettings) -> Result<()> {
+    if let Some(path) = auth.missing_token_file() {
+        anyhow::bail!(
+            "[auth].bearer_token_file names {}, which is missing or empty; refusing to serve \
+             without the bearer token it should hold. Run `ai-memory auth enable` to create a \
+             new one, or restore the file from backup.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Validate the trusted proxy's least-privilege credential and optional stable
 /// root identity before binding the server.
 fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
@@ -1113,6 +1128,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let mut shutdown = ShutdownSignals::install();
 
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    refuse_a_missing_token_file(&config.auth)?;
     config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -1566,6 +1582,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let admin = admin_router_with_sweep_tuning(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
+                    // The tool server's own instance, so /admin/metrics reads
+                    // what memory_query records.
+                    mcp_metrics: server.mcp_metrics(),
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),
                     wiki: wiki.clone(),

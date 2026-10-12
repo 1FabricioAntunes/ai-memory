@@ -272,10 +272,11 @@ The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
 without `--platform linux/amd64` emulation.
 
-The default quick-start has **no authentication**. The server binds
-to loopback only, so on a single-user laptop nothing else can reach
-it. Adding a bearer token is a one-line change once you're ready to
-expose the server on the LAN; see [Security](#security) below.
+The Docker quick-start below has **no authentication**: the container never
+runs `init`, so it starts without a token. The server binds to loopback only,
+so nothing outside the machine can reach it, but local processes and browser
+pages can. Native installs that run `ai-memory init` get a bearer token by
+default; see [Security](#security) below for that and for adding a token here.
 
 ```bash
 # 1. Install the ai-memory CLI wrapper (a small shell script that
@@ -516,8 +517,12 @@ data directory, never two.
 
 ## Security
 
-The quick-start default is loopback-only with no auth, so nothing outside
-your machine can reach it. From there, hardening is incremental: a bearer
+The server binds to loopback only by default. A fresh `ai-memory init` also
+mints a root bearer token into the data dir, which the hooks, the CLI and the
+`ai-memory mcp-bridge` stdio bridge read from there; it is never written into
+a harness config. An install created before that default (and the Docker
+quick-start) runs without auth until `ai-memory auth enable`, and
+`ai-memory status` says so. From there, hardening is incremental: a bearer
 token for the LAN, per-user accounts, OIDC device auth for hooks, TLS via
 a reverse proxy. Capture is sanitized at a typed privacy boundary before
 anything is stored, and per-repository `[capture]` rules can exclude

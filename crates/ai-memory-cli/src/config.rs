@@ -889,6 +889,21 @@ pub struct AuthSettings {
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// File holding the shared bearer token, one line, owner-only. A relative
+    /// path resolves against the data dir, so a container that mounts the data
+    /// dir at `/data` and a host client that sees it at its host path read the
+    /// same file. `ai-memory init` on a fresh data dir and `ai-memory auth
+    /// enable` set this to `auth-tokens/default`.
+    ///
+    /// Read once by [`Config::load`] into [`Self::bearer_token`].
+    /// `AI_MEMORY_AUTH_TOKEN` still wins over it; setting it together with
+    /// `bearer_token` is refused as ambiguous. A token read from here is never
+    /// written into a harness config (see [`Self::renderable_bearer_token`]).
+    pub bearer_token_file: Option<PathBuf>,
+    /// Where `bearer_token_file` resolved to and whether it held a token. Set
+    /// by [`Config::load`]; never read from or written to a config file.
+    #[serde(skip)]
+    pub(crate) token_file: Option<ResolvedTokenFile>,
     /// Create every new project `restricted` rather than `open` (#708).
     ///
     /// Off by default: a new project is open to every authenticated user, as
@@ -967,6 +982,8 @@ impl std::fmt::Debug for AuthSettings {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("bearer_token_file", &self.bearer_token_file)
+            .field("token_file", &self.token_file)
             .field("secure_cookie", &self.secure_cookie)
             .field("root_username", &self.root_username)
             .field("root_issuer", &self.root_issuer)
@@ -992,6 +1009,142 @@ impl std::fmt::Debug for AuthSettings {
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
+}
+
+/// `[auth].bearer_token_file` after [`Config::load`] resolved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedTokenFile {
+    /// Absolute path the token was read from.
+    pub(crate) path: PathBuf,
+    /// Whether the file held a non-blank token. A configured file that is
+    /// missing or blank leaves [`AuthSettings::bearer_token`] unset, and
+    /// `serve` refuses to start rather than run open.
+    pub(crate) loaded: bool,
+}
+
+impl AuthSettings {
+    /// The bearer an installer may write into a harness config or print in a
+    /// snippet: one the operator supplied inline (`[auth].bearer_token` or
+    /// `AI_MEMORY_AUTH_TOKEN`). A token read from `bearer_token_file` is
+    /// `None` here, because that file exists to keep the secret out of
+    /// harness configs (#552); those installs reach it through `ai-memory
+    /// mcp-bridge`, an env-var reference, or the hook credential files.
+    #[must_use]
+    pub fn renderable_bearer_token(&self) -> Option<&str> {
+        if self.token_file.as_ref().is_some_and(|file| file.loaded) {
+            return None;
+        }
+        self.bearer_token.as_deref()
+    }
+
+    /// The token file this install's bearer comes from, when it comes from
+    /// one (loaded or not).
+    #[must_use]
+    pub(crate) fn token_file_path(&self) -> Option<&Path> {
+        self.token_file.as_ref().map(|file| file.path.as_path())
+    }
+
+    /// The configured token file when it could not supply a token.
+    #[must_use]
+    pub(crate) fn missing_token_file(&self) -> Option<&Path> {
+        self.token_file
+            .as_ref()
+            .filter(|file| !file.loaded)
+            .map(|file| file.path.as_path())
+    }
+
+    /// Record a token read from `path`, the way [`Config::load`] would have.
+    /// For `auth enable`, which provisions the file after config was loaded and
+    /// re-renders wiring in the same process.
+    pub(crate) fn adopt_token_file(&mut self, path: PathBuf, token: String) {
+        self.bearer_token = Some(token);
+        self.token_file = Some(ResolvedTokenFile { path, loaded: true });
+    }
+}
+
+/// What [`apply_bearer_token_file`] needs to know about the load.
+struct TokenFileContext<'a> {
+    data_dir: &'a Path,
+    /// `AI_MEMORY_AUTH_TOKEN` was set (it already replaced `bearer_token`).
+    env_token: bool,
+    /// A config file exists at the path this load read.
+    config_file_exists: bool,
+    server_url: &'a str,
+}
+
+/// Resolve `[auth].bearer_token_file` against the final data dir and read it.
+///
+/// `AI_MEMORY_AUTH_TOKEN` already replaced `bearer_token` and wins here too,
+/// exactly as it wins over the inline key. Both keys set in config is
+/// refused: which one the server enforces must never be a guess.
+///
+/// With no key at all, see [`discover_root_token`].
+fn apply_bearer_token_file(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) -> Result<()> {
+    if ctx.env_token {
+        return Ok(());
+    }
+    let Some(raw) = auth
+        .bearer_token_file
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        discover_root_token(auth, ctx);
+        return Ok(());
+    };
+    if non_empty(auth.bearer_token.as_deref()).is_some() {
+        anyhow::bail!(
+            "[auth].bearer_token and [auth].bearer_token_file are both set; keep only one"
+        );
+    }
+    let path = if raw.is_absolute() {
+        raw.clone()
+    } else {
+        ctx.data_dir.join(raw)
+    };
+    let token = read_trimmed_secret(&path);
+    auth.token_file = Some(ResolvedTokenFile {
+        path,
+        loaded: token.is_some(),
+    });
+    auth.bearer_token = token;
+    Ok(())
+}
+
+/// Find this install's root bearer when the config this command loaded does
+/// not name it.
+///
+/// A packaged install keeps its config outside the data dir (`init --config
+/// ~/.config/ai-memory/config.toml`, the systemd unit passes the same path),
+/// while `install-mcp`, `status` and the bridge run without `--config` and so
+/// read no config file at all. They still need the token `init` minted at
+/// `<data_dir>/auth-tokens/default`. It is used, as a file-sourced token, only
+/// when every one of these holds:
+///
+/// - no bearer is configured any other way (env, inline key, file key);
+/// - no config file exists where this load looked, so no config chose to run
+///   without one (an existing install with a config keeps its behaviour);
+/// - the server URL is loopback, so the token can only reach this machine;
+/// - no server profile named `default` is registered, whose token file this
+///   would be (#992).
+fn discover_root_token(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) {
+    if non_empty(auth.bearer_token.as_deref()).is_some()
+        || ctx.config_file_exists
+        || !crate::commands::hook_spool::is_loopback_url(ctx.server_url)
+    {
+        return;
+    }
+    let path = crate::server_profiles::root_token_path(ctx.data_dir);
+    let Some(token) = read_trimmed_secret(&path) else {
+        return;
+    };
+    // An unreadable registry cannot prove the name is free.
+    let profile_named_default =
+        crate::server_profiles::root_token_name_is_registered(ctx.data_dir).unwrap_or(true);
+    if profile_named_default {
+        return;
+    }
+    auth.token_file = Some(ResolvedTokenFile { path, loaded: true });
+    auth.bearer_token = Some(token);
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
@@ -1636,13 +1789,14 @@ impl DreamSettings {
     }
 }
 
-/// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
-/// `memory_query`. Every default leaves ranking byte-identical to a store
+/// `[retrieval]` ranking signals layered on the RRF fusion in
+/// `memory_query`. Only `observation_stream` is on by default; with it
+/// turned off, every other default leaves ranking byte-identical to a store
 /// that never heard of this section.
 ///
 /// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
 /// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`,
-/// `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`.
+/// `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalSettings {
@@ -1667,7 +1821,7 @@ pub struct RetrievalSettings {
     /// Add the observation-evidence stream (R1) to the RRF fusion: matching
     /// observation bodies vote, once per session, for that session's latest
     /// `sessions/<id>.md` page in the same project. Read-only; the wiki is
-    /// not enlarged. OFF by default.
+    /// not enlarged. ON by default; `false` restores the previous ranking.
     pub observation_stream: bool,
 }
 
@@ -1990,6 +2144,15 @@ impl Config {
         }
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
+        apply_bearer_token_file(
+            &mut config.auth,
+            &TokenFileContext {
+                data_dir: &config.data_dir,
+                env_token: runtime_env.auth_token.is_some(),
+                config_file_exists: resolved_config_path.exists(),
+                server_url: &config.server_url,
+            },
+        )?;
         config.runtime_env = runtime_env;
 
         validate_run_profiles(&config.run)?;
@@ -3315,15 +3478,19 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_observation_stream_defaults_off_and_loads_from_toml() {
-        assert!(!Config::default().retrieval.tuning().observation_stream);
+    fn retrieval_observation_stream_defaults_on_and_loads_from_toml() {
+        assert!(Config::default().retrieval.tuning().observation_stream);
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "[retrieval]\nobservation_stream = true\n").unwrap();
+        std::fs::write(&config_path, "[retrieval]\nobservation_stream = false\n").unwrap();
         let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
-        assert!(config.retrieval.tuning().observation_stream);
+        assert!(!config.retrieval.tuning().observation_stream);
         // The other [retrieval] signals keep their defaults.
         assert!(!config.retrieval.tuning().abstract_vectors);
+        // A config that never names the key gets the default.
+        std::fs::write(&config_path, "[retrieval]\nabstract_vectors = false\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.retrieval.tuning().observation_stream);
     }
 
     #[test]
@@ -3332,9 +3499,9 @@ mod tests {
         if std::env::var_os(CHILD_MARKER).is_some() {
             let tmp = TempDir::new().unwrap();
             let config_path = tmp.path().join("config.toml");
-            std::fs::write(&config_path, "[retrieval]\nobservation_stream = false\n").unwrap();
+            std::fs::write(&config_path, "[retrieval]\nobservation_stream = true\n").unwrap();
             let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
-            assert!(config.retrieval.tuning().observation_stream);
+            assert!(!config.retrieval.tuning().observation_stream);
             println!("observation-stream-env-applied");
             return;
         }
@@ -3345,7 +3512,7 @@ mod tests {
             .arg("--test-threads=1")
             .arg("--nocapture")
             .env(CHILD_MARKER, "1")
-            .env("AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM", "true")
+            .env("AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM", "false")
             .output()
             .unwrap();
         assert!(
@@ -3409,6 +3576,194 @@ mod tests {
     /// A configured list parses verbatim and resolves to exactly those
     /// words (lowercased), replacing the default outright rather than
     /// extending it.
+    fn load_auth(data_dir: &Path, toml: &str, env_token: Option<&str>) -> Result<Config> {
+        let config_path = data_dir.join("config.toml");
+        std::fs::write(&config_path, toml).unwrap();
+        Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(data_dir.to_path_buf()),
+            RuntimeEnv {
+                auth_token: env_token.map(str::to_owned),
+                ..RuntimeEnv::default()
+            },
+        )
+    }
+
+    /// A relative `bearer_token_file` resolves against the data dir it was
+    /// loaded with, so a container (data dir `/data`) and a host client (the
+    /// host path of the same bind mount) read one file.
+    #[test]
+    fn a_relative_bearer_token_file_resolves_against_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        for dir in ["host", "container"] {
+            let dd = tmp.path().join(dir);
+            std::fs::create_dir_all(dd.join("auth-tokens")).unwrap();
+            std::fs::write(
+                dd.join("auth-tokens").join("default"),
+                format!("tok-{dir}\n"),
+            )
+            .unwrap();
+            let config = load_auth(
+                &dd,
+                "[auth]\nbearer_token_file = \"auth-tokens/default\"\n",
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                config.auth.bearer_token.as_deref(),
+                Some(format!("tok-{dir}").as_str())
+            );
+            assert_eq!(config.auth.renderable_bearer_token(), None);
+            assert_eq!(
+                config.auth.token_file_path(),
+                Some(config.data_dir.join("auth-tokens/default").as_path())
+            );
+            assert_eq!(config.auth.missing_token_file(), None);
+        }
+    }
+
+    #[test]
+    fn an_absolute_bearer_token_file_is_read_as_is() {
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = tmp.path().join("secret");
+        std::fs::write(&elsewhere, "abs-token").unwrap();
+        let toml = format!(
+            "[auth]\nbearer_token_file = {}\n",
+            toml_edit::Value::from(elsewhere.to_string_lossy().as_ref())
+        );
+        let config = load_auth(tmp.path(), &toml, None).unwrap();
+        assert_eq!(config.auth.bearer_token.as_deref(), Some("abs-token"));
+    }
+
+    /// A configured file that is missing or blank yields no bearer, never an
+    /// empty one, and is reported so `serve` can refuse to start open.
+    #[test]
+    fn a_missing_or_blank_bearer_token_file_is_reported_not_guessed() {
+        let tmp = TempDir::new().unwrap();
+        let toml = "[auth]\nbearer_token_file = \"auth-tokens/default\"\n";
+        let missing = load_auth(tmp.path(), toml, None).unwrap();
+        assert!(missing.auth.bearer_token.is_none());
+        assert!(missing.auth.missing_token_file().is_some());
+
+        std::fs::create_dir_all(tmp.path().join("auth-tokens")).unwrap();
+        std::fs::write(tmp.path().join("auth-tokens").join("default"), " \n").unwrap();
+        let blank = load_auth(tmp.path(), toml, None).unwrap();
+        assert!(blank.auth.bearer_token.is_none());
+        assert!(blank.auth.missing_token_file().is_some());
+    }
+
+    /// `AI_MEMORY_AUTH_TOKEN` wins over the file, as it wins over the inline
+    /// key, and then counts as an inline (renderable) token as before.
+    #[test]
+    fn the_env_token_wins_over_the_bearer_token_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("auth-tokens")).unwrap();
+        std::fs::write(tmp.path().join("auth-tokens").join("default"), "file-token").unwrap();
+        let config = load_auth(
+            tmp.path(),
+            "[auth]\nbearer_token_file = \"auth-tokens/default\"\n",
+            Some("env-token"),
+        )
+        .unwrap();
+        assert_eq!(config.auth.bearer_token.as_deref(), Some("env-token"));
+        assert_eq!(config.auth.renderable_bearer_token(), Some("env-token"));
+        assert_eq!(config.auth.token_file_path(), None);
+    }
+
+    #[test]
+    fn an_inline_bearer_and_a_bearer_token_file_together_are_refused() {
+        let tmp = TempDir::new().unwrap();
+        let err = load_auth(
+            tmp.path(),
+            "[auth]\nbearer_token = \"inline\"\nbearer_token_file = \"auth-tokens/default\"\n",
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("both set"), "{err:#}");
+    }
+
+    fn plant_root_token(data_dir: &Path) {
+        std::fs::create_dir_all(data_dir.join("auth-tokens")).unwrap();
+        std::fs::write(data_dir.join("auth-tokens").join("default"), "root-token\n").unwrap();
+    }
+
+    fn load_without_config(data_dir: &Path, runtime_env: RuntimeEnv) -> Config {
+        Config::load_with_runtime_env(None, Some(data_dir.to_path_buf()), runtime_env).unwrap()
+    }
+
+    /// A packaged install's client commands read no config file (it lives
+    /// outside the data dir) and still find the token `init` minted, as a
+    /// file-sourced token.
+    #[test]
+    fn a_client_without_a_config_file_discovers_the_root_bearer() {
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let config = load_without_config(tmp.path(), RuntimeEnv::default());
+        assert_eq!(config.auth.bearer_token.as_deref(), Some("root-token"));
+        assert_eq!(config.auth.renderable_bearer_token(), None);
+    }
+
+    /// Each guard on discovery, with the case above as the control.
+    #[test]
+    fn root_bearer_discovery_is_refused_outside_its_narrow_case() {
+        // A config file exists and names no token: that install runs open.
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let config = load_auth(tmp.path(), "[auth]\nsecure_cookie = false\n", None).unwrap();
+        assert!(
+            config.auth.bearer_token.is_none(),
+            "existing config keeps its posture"
+        );
+
+        // A remote server must never be handed this machine's root bearer.
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let remote = load_without_config(
+            tmp.path(),
+            RuntimeEnv {
+                server_url: Some("https://memory.example".into()),
+                ..RuntimeEnv::default()
+            },
+        );
+        assert!(remote.auth.bearer_token.is_none());
+
+        // A registered profile named `default` owns that file (#992).
+        let tmp = TempDir::new().unwrap();
+        let name = crate::server_profiles::ProfileName::parse("default").unwrap();
+        crate::server_profiles::add(tmp.path(), &name, "https://team.example", &[], Some("team"))
+            .unwrap();
+        let profiled = load_without_config(tmp.path(), RuntimeEnv::default());
+        assert!(
+            profiled.auth.bearer_token.is_none(),
+            "a profile token is not a root bearer"
+        );
+
+        // An explicit env token wins, as always.
+        let tmp = TempDir::new().unwrap();
+        plant_root_token(tmp.path());
+        let env = load_without_config(
+            tmp.path(),
+            RuntimeEnv {
+                auth_token: Some("env".into()),
+                ..RuntimeEnv::default()
+            },
+        );
+        assert_eq!(env.auth.bearer_token.as_deref(), Some("env"));
+        assert_eq!(env.auth.token_file_path(), None);
+    }
+
+    /// Control: a pre-default config (no key) loads exactly as before, inline
+    /// token renderable, no file consulted.
+    #[test]
+    fn a_config_without_a_bearer_token_file_loads_as_before() {
+        let tmp = TempDir::new().unwrap();
+        let open = load_auth(tmp.path(), "[auth]\nsecure_cookie = false\n", None).unwrap();
+        assert!(open.auth.bearer_token.is_none());
+        assert_eq!(open.auth.token_file_path(), None);
+        let inline = load_auth(tmp.path(), "[auth]\nbearer_token = \"inline\"\n", None).unwrap();
+        assert_eq!(inline.auth.renderable_bearer_token(), Some("inline"));
+    }
+
     #[test]
     fn hook_spool_max_attempts_config_and_runtime_override_precedence() {
         let tmp = TempDir::new().unwrap();

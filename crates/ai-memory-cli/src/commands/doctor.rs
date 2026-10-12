@@ -167,6 +167,9 @@ struct DoctorReport {
     marker_capture_problem: Option<MarkerCaptureProblem>,
     capture_owner_active: bool,
     identity: Option<OperatorIdentity>,
+    /// From `identity.level`: `anonymous` only when the server has no bearer
+    /// configured. `None` when the identity was unavailable.
+    auth_posture: Option<crate::local_auth::AuthPosture>,
     project_coordinate: Option<ProjectCoordinateReport>,
     /// Native "memory" stores found for harnesses that keep one, and whether
     /// the nearest marker would exclude a read of them (harness-issue
@@ -591,7 +594,11 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         }),
     );
 
+    let auth_posture = identity.as_ref().map(|identity| {
+        crate::local_auth::AuthPosture::classify(identity.level == "anonymous", &ep.url)
+    });
     let report = DoctorReport {
+        auth_posture,
         workspace,
         project,
         server: ep.url.clone(),
@@ -759,6 +766,9 @@ fn render_human(report: &DoctorReport) {
     } else {
         println!("  identity: unavailable");
     }
+    if let Some(posture) = report.auth_posture {
+        println!("  auth: {}", posture.line());
+    }
     if report.capture_owner_active {
         println!(
             "  AI_MEMORY_CAPTURE_OWNER is active: native capture is suppressed in this process.\n  \
@@ -895,6 +905,7 @@ mod tests {
             marker_capture_problem: None,
             capture_owner_active: false,
             identity: None,
+            auth_posture: None,
             project_coordinate: None,
             native_memory: Vec::new(),
             spool,

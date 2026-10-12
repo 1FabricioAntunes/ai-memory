@@ -56,8 +56,8 @@ Every HTTP request is resolved to one of four authentication tiers:
 
 | Rung | Trigger | What the request gets |
 |---|---|---|
-| **0 — Anonymous** | No `[auth].bearer_token` set. | Allowed, no identity. Same as pre-multi-user defaults. |
-| **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
+| **0 — Anonymous** | No root bearer configured (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token` or `[auth].bearer_token_file`). | Allowed, no identity. Same as pre-multi-user defaults. A fresh `ai-memory init` skips this rung by minting a root bearer; an older install stays here until `ai-memory auth enable`. |
+| **1 — Root** | Bearer matches the root bearer (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token`, or the token in `[auth].bearer_token_file`). | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
 | **1b — Proxy-asserted user** | Bearer matches the distinct `[auth].actor_proxy_bearer_token`. | Identity is taken from trusted `X-Memory-Actor-*` headers. The request is a **user** unless its OIDC issuer/subject pair exactly matches the configured root pair. Missing or malformed identity is rejected. |
 | **2 — DB user** | Bearer doesn't match root, matches an active `api_credentials.token_hash` (SHA-256 of the secret + `[auth].token_pepper`). Native keys use the `aim_` prefix. | Allowed as **that user** for normal read/write APIs. Native keys always resolve as `AuthLevel::User`, even when the owning identity is `role=root`. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
 | **3 — 401** | Bearer present but matches nothing. | Rejected. This closes the bypass: unknown bearers can't slip through as anonymous. |
@@ -261,6 +261,13 @@ distinct labels and folds additional labels into `other`. The endpoint takes
 no workspace or project because many MCP-only clients do not provide reliable
 per-call scope. Like every `/admin/*` route, it is root-only when the deployment
 distinguishes operators.
+
+`GET /admin/metrics` exposes the same read/write split as process-lifetime
+totals in Prometheus text format (`ai_memory_mcp_tool_calls_total{kind=...}`),
+next to the hook counters and the `/hook` and `memory_query` latency
+histograms. It carries no client name: a client label is caller-supplied text,
+and no metric label is ever drawn from a request. It is root-only under the same
+rule.
 
 ## Per-operator memory slots
 

@@ -568,11 +568,25 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         None
     };
     let server_url = effective_hook_server_url(config, &args, inferred.as_ref());
-    let auth_token_owned = args
+    // A token read from `[auth].bearer_token_file` may be persisted to the
+    // hook credential files below, but never rendered into the agent config
+    // or a printed snippet: that file exists to keep it out of them. Only an
+    // inline token (flag, `AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token`, or one
+    // inferred from an existing entry) may fall back to the inline form.
+    let token_file = config.auth.token_file_path();
+    let renderable_token = args
         .auth_token
         .clone()
-        .or_else(|| config.auth.bearer_token.clone())
-        .or_else(|| inferred.as_ref().and_then(|mcp| mcp.auth_token.clone()));
+        .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned))
+        .or_else(|| {
+            inferred
+                .as_ref()
+                .filter(|_| token_file.is_none())
+                .and_then(|mcp| mcp.auth_token.clone())
+        });
+    let auth_token_owned = renderable_token
+        .clone()
+        .or_else(|| token_file.and(config.auth.bearer_token.clone()));
     // #552: persist the bearer under the data dir (0600) and keep it OUT of
     // the rendered config. Before this it went onto every hook's command line —
     // as `--auth-token <token>` for native hooks, as an `AI_MEMORY_AUTH_TOKEN=`
@@ -607,6 +621,16 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                     config.data_dir.display()
                 )));
             }
+            Err(e) if renderable_token.is_none() => {
+                eprintln!(
+                    "[ai-memory] warning: could not persist the hook auth token under {} ({e}). \
+                     The token comes from [auth].bearer_token_file and is never embedded in an \
+                     agent config, so these hooks will not authenticate until the data dir is \
+                     writable and `install-hooks --apply` is re-run.",
+                    config.data_dir.display()
+                );
+                false
+            }
             Err(e) => {
                 eprintln!(
                     "[ai-memory] warning: could not persist the hook auth token under {} ({e}); \
@@ -628,7 +652,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     let auth = if persisted {
         None
     } else {
-        auth_token_owned.as_deref()
+        renderable_token.as_deref()
     };
     // P1.8 multi-user attribution: `--as-user` is metadata only — the
     // token stamped into the hook env block is whatever the operator
@@ -9553,6 +9577,55 @@ model = "gpt-5"
             crate::config::read_hook_auth_token(&config.data_dir),
             None,
             "the token must not have been persisted in the failure case"
+        );
+    }
+
+    /// New-install default: a token read from `[auth].bearer_token_file` is persisted for the
+    /// hooks, and when persisting fails it is NOT embedded the way an inline
+    /// token is (F5): that file exists to keep the token out of agent configs.
+    #[test]
+    fn a_file_sourced_token_is_persisted_but_never_embedded() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+        let token = "FILE-SOURCED-ROOT-BEARER";
+        let file_config = || {
+            let mut config =
+                crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+            let path = crate::server_profiles::root_token_path(&config.data_dir);
+            config.auth.adopt_token_file(path, token.to_owned());
+            config
+        };
+        let args = || InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(settings.clone()),
+            hooks_dir: Some(hooks_dir.clone()),
+            ..default_hook_args()
+        };
+
+        std::fs::write(&settings, "{}").unwrap();
+        let config = file_config();
+        run(&config, args()).unwrap();
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+            Some(token),
+            "the hooks get the token through their credential files"
+        );
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(!rendered.contains(token), "{rendered}");
+
+        // The F5 failure shape: the credential file cannot be written.
+        crate::config::clear_hook_auth_token(&config.data_dir).unwrap();
+        std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
+        std::fs::write(&settings, "{}").unwrap();
+        run(&config, args()).expect("a persist failure still installs the hooks");
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            !rendered.contains(token),
+            "a file-sourced token must not fall back to the inline form: {rendered}"
         );
     }
 

@@ -562,6 +562,56 @@ native_host_binary() {
   printf '%s\n' "${binary}"
 }
 
+# A server initialized on the named volume keeps its root bearer there
+# (/data/auth-tokens/default, named by `[auth].bearer_token_file`). The host
+# commands below run the native client against the host data dir, which cannot
+# see the volume, so the token is copied to an owner-only host file and the
+# client is pointed at it with AI_MEMORY_AUTH__BEARER_TOKEN_FILE. The client
+# then treats it as a token file: it authenticates with it, persists it for
+# hooks, and never writes it into a harness config. The token crosses only the
+# helper's stdout and a 0600 file, never an argv. A bind-mounted
+# AI_MEMORY_DATA_DIR needs none of this (the client reads the same files), and
+# an explicit token wins.
+VOLUME_TOKEN_FILE="${NATIVE_RUNNER_DIR}/server-token"
+
+volume_token_applies() {
+  [ -z "${AI_MEMORY_AUTH_TOKEN:-}" ] || return 1
+  [ -z "${AI_MEMORY_AUTH__BEARER_TOKEN_FILE:-}" ] || return 1
+  if [ -n "${AI_MEMORY_DATA_DIR:-}" ] && [ -d "${AI_MEMORY_DATA_DIR}" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Point the native client at the host copy, when there is one.
+use_volume_token() {
+  volume_token_applies || return 0
+  [ -s "${VOLUME_TOKEN_FILE}" ] || return 0
+  export AI_MEMORY_AUTH__BEARER_TOKEN_FILE="${VOLUME_TOKEN_FILE}"
+}
+
+# Refresh the host copy from the volume, then use it. Only `install-hooks`,
+# the setup step, does this: the managed host commands (`run`, `show`, ...)
+# and `mcp-bridge`, which starts with every agent session, never enter the
+# container engine, so they read the copy it leaves behind.
+refresh_volume_token() {
+  volume_token_applies || return 0
+  local token
+  token="$("${DOCKER}" run --rm -v "${DATA_VOLUME}:/data:ro" --entrypoint /bin/sh "${IMAGE}" -c \
+    'grep -qs "^[[:space:]]*bearer_token_file[[:space:]]*=[[:space:]]*\"auth-tokens/default\"" /data/config.toml && cat /data/auth-tokens/default' \
+    2>/dev/null)" || token=""
+  token="$(printf '%s' "${token}" | tr -d '\r\n')"
+  if [ -n "${token}" ]; then
+    (
+      umask 077
+      mkdir -p "${NATIVE_RUNNER_DIR}" \
+        && printf '%s\n' "${token}" >"${VOLUME_TOKEN_FILE}.tmp.$$" \
+        && mv -f "${VOLUME_TOKEN_FILE}.tmp.$$" "${VOLUME_TOKEN_FILE}"
+    ) 2>/dev/null || true
+  fi
+  use_volume_token
+}
+
 # ---- intercept wrapper-only subcommands ----------------------------------
 
 case "${1:-}" in
@@ -574,6 +624,7 @@ case "${1:-}" in
     NATIVE_HOST_COMMAND=$1
     shift
     NATIVE_HOST_BIN=$(native_host_binary)
+    use_volume_token
     exec "${NATIVE_HOST_BIN}" "${NATIVE_HOST_COMMAND}" "$@"
     ;;
   install-hooks)
@@ -585,6 +636,7 @@ case "${1:-}" in
       posix | windows) ;;
       *)
         NATIVE_HOST_BIN=$(native_host_binary)
+        refresh_volume_token
         exec "${NATIVE_HOST_BIN}" "$@"
         ;;
     esac
@@ -596,6 +648,7 @@ case "${1:-}" in
     # has no host networking), so the bridge must run on the host through
     # the same checksum-verified native client install-hooks uses.
     NATIVE_HOST_BIN=$(native_host_binary)
+    use_volume_token
     exec "${NATIVE_HOST_BIN}" "$@"
     ;;
 esac

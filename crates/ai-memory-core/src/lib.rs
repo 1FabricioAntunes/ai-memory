@@ -13,6 +13,8 @@ pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod latency;
+pub use latency::{LatencyHistogram, LatencySnapshot, LatencyTimer};
 pub mod log_ledger;
 pub mod message;
 pub mod observation;

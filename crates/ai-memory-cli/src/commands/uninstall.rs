@@ -795,8 +795,12 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
-    // reasoning applies; the registry of URLs stays.
-    if let Err(error) = crate::server_profiles::clear_tokens(&config.data_dir) {
+    // reasoning applies; the registry of URLs stays. The root bearer the
+    // server itself reads (`[auth].bearer_token_file`) is not a hook's and
+    // stays with the server's config.
+    if let Err(error) =
+        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+    {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
             config.data_dir.display()
@@ -1310,16 +1314,35 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
             return true;
         }
     }
+    // Our stdio bridge, in any client's shape (`command` + `args`, or
+    // OpenCode's single `command` array), aimed at this server.
+    if install_mcp::bridge_entry_url(entry) == Some(url) {
+        return true;
+    }
     if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
         let has_remote = args.iter().any(|a| a.as_str() == Some("mcp-remote"));
-        let has_session_bridge = entry.get("command").and_then(|v| v.as_str()) == Some("ai-memory")
-            && args.iter().any(|a| a.as_str() == Some("mcp-bridge"));
         let has_url = args.iter().any(|a| a.as_str() == Some(url));
-        if (has_remote || has_session_bridge) && has_url {
+        if has_remote && has_url {
             return true;
         }
     }
     false
+}
+
+/// A TOML `[mcp_servers.<name>]` table (Codex, Grok) aimed at `url`: an HTTP
+/// entry by its `url`, or our stdio bridge by `command` + `args`.
+fn toml_mcp_entry_targets(table: &dyn toml_edit::TableLike, url: &str) -> bool {
+    if table.get("url").and_then(|u| u.as_str()) == Some(url) {
+        return true;
+    }
+    let as_json = serde_json::json!({
+        "command": table.get("command").and_then(|c| c.as_str()),
+        "args": table
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+    });
+    install_mcp::bridge_entry_url(&as_json) == Some(url)
 }
 
 /// URL forms uninstall matches for `client`: the endpoint as given, plus
@@ -1465,10 +1488,8 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                 for k in keys {
                     let matches_url = servers
                         .get(&k)
-                        .and_then(|item| item.as_table())
-                        .and_then(|t| t.get("url"))
-                        .and_then(|u| u.as_str())
-                        == Some(url);
+                        .and_then(|item| item.as_table_like())
+                        .is_some_and(|t| toml_mcp_entry_targets(t, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -1481,9 +1502,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                     let matches_url = servers
                         .get(&k)
                         .and_then(|value| value.as_inline_table())
-                        .and_then(|table| table.get("url"))
-                        .and_then(|value| value.as_str())
-                        == Some(url);
+                        .is_some_and(|table| toml_mcp_entry_targets(table, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -2370,6 +2389,62 @@ mod tests {
         )
         .unwrap();
         assert!(removed.is_empty());
+    }
+
+    /// The stdio bridge entries `install-mcp` writes on a token-file install
+    /// are ours when they target this server, in every client shape, and a
+    /// bridge aimed at another server is not.
+    #[test]
+    fn bridge_entries_are_recognised_by_their_upstream_url() {
+        let url = "http://127.0.0.1:49374/mcp";
+        let bridge = |target: &str| {
+            serde_json::json!({
+                "type": "stdio",
+                "command": "ai-memory",
+                "args": ["mcp-bridge", "--no-session-id", "--server-url", target],
+            })
+        };
+        let opencode = serde_json::json!({
+            "type": "local",
+            "command": ["ai-memory", "mcp-bridge", "--no-session-id", "--server-url", url],
+            "enabled": true,
+        });
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &bridge(url),
+            Some("ai-memory"),
+            url
+        ));
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &opencode,
+            Some("ai-memory"),
+            url
+        ));
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &bridge("https://team.example/mcp"),
+            Some("ai-memory"),
+            url
+        ));
+        let foreign =
+            serde_json::json!({"command": "other", "args": ["mcp-bridge", "--server-url", url]});
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &foreign,
+            Some("ai-memory"),
+            url
+        ));
+
+        let toml = format!(
+            "[mcp_servers.ai-memory]\ncommand = \"ai-memory\"\nargs = [\"mcp-bridge\", \"--no-session-id\", \"--server-url\", \"{url}\"]\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+        );
+        let (out, removed) = strip_mcp_toml(&toml, Some("ai-memory"), url).unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        assert!(out.contains("[mcp_servers.other]"), "{out}");
+        let (_, kept) =
+            strip_mcp_toml(&toml, Some("ai-memory"), "https://team.example/mcp").unwrap();
+        assert!(kept.is_empty());
     }
 
     #[test]
