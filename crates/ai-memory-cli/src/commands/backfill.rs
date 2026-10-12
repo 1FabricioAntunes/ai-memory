@@ -635,6 +635,7 @@ pub(crate) async fn import_exact_session(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn import_exported_transcript(
     endpoint: &ServerEndpoint,
     workspace: &str,
