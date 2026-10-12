@@ -1641,7 +1641,8 @@ impl DreamSettings {
 /// that never heard of this section.
 ///
 /// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
-/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`.
+/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`,
+/// `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalSettings {
@@ -1663,6 +1664,11 @@ pub struct RetrievalSettings {
     /// `confidence` into its authority factor, inside the existing bounds.
     /// OFF by default: enabling it is gated on a positive R2 delta.
     pub belief_authority_weight: f64,
+    /// Add the observation-evidence stream (R1) to the RRF fusion: matching
+    /// observation bodies vote, once per session, for that session's latest
+    /// `sessions/<id>.md` page in the same project. Read-only; the wiki is
+    /// not enlarged. OFF by default.
+    pub observation_stream: bool,
 }
 
 impl Default for RetrievalSettings {
@@ -1673,6 +1679,7 @@ impl Default for RetrievalSettings {
             session_recall_bonus: base.session_recall_bonus,
             abstract_vectors: base.abstract_vectors,
             belief_authority_weight: base.belief_authority_weight,
+            observation_stream: base.observation_stream,
         }
     }
 }
@@ -1689,6 +1696,7 @@ impl RetrievalSettings {
             // supported pages; clamp it out so misconfiguration is inert, not
             // inverted.
             belief_authority_weight: self.belief_authority_weight.max(0.0),
+            observation_stream: self.observation_stream,
         }
     }
 }
@@ -3304,6 +3312,53 @@ mod tests {
                 "unexpected error for min={min} max={max}: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn retrieval_observation_stream_defaults_off_and_loads_from_toml() {
+        assert!(!Config::default().retrieval.tuning().observation_stream);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[retrieval]\nobservation_stream = true\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.retrieval.tuning().observation_stream);
+        // The other [retrieval] signals keep their defaults.
+        assert!(!config.retrieval.tuning().abstract_vectors);
+    }
+
+    #[test]
+    fn retrieval_observation_stream_env_overrides_config() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_OBSERVATION_STREAM_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[retrieval]\nobservation_stream = false\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert!(config.retrieval.tuning().observation_stream);
+            println!("observation-stream-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::retrieval_observation_stream_env_overrides_config")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("observation-stream-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]

@@ -3261,3 +3261,158 @@ async fn two_harnesses_of_one_operator_share_one_private_profile() {
         assert!(read.is_ok(), "an open project stays shared");
     }
 }
+
+/// R1 observation stream, per-project isolation (row 1). The stream maps an
+/// observation to `sessions/<id>.md` by session id, so the two lookups it
+/// joins are each a place a foreign scope could leak in: an observation from
+/// another project voting for this project's page, or this project's
+/// observation voting for a same-path page in another project. Both must be
+/// filtered to the queried `(workspace_id, project_id)`.
+#[tokio::test]
+async fn observation_stream_never_crosses_a_project_or_workspace() {
+    use super::retrieval_observation_stream::{observe, search, session, session_page, stream_on};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, home) = scope(&store).await;
+    let foreign = store
+        .writer
+        .get_or_create_project(ws, "foreign-app".to_string(), None)
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("other-ws".to_string())
+        .await
+        .unwrap();
+    let twin = store
+        .writer
+        .get_or_create_project(other_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+
+    // A home session whose evidence lives only in its observation. Pages at
+    // its session path exist in the foreign project and the cross-workspace
+    // twin, but not (yet) at home.
+    let sid = session(&store, ws, home).await;
+    // The foreign and twin scopes write before and after it, so home's
+    // observation sits inside their slice of the shared log and only the
+    // scope predicates can keep it out.
+    let foreign_sid = session(&store, ws, foreign).await;
+    let twin_sid = session(&store, other_ws, twin).await;
+    observe(&store, ws, foreign, foreign_sid, "foreign chatter before").await;
+    observe(&store, other_ws, twin, twin_sid, "twin chatter before").await;
+    let evidence = observe(&store, ws, home, sid, "the lynx password rotation plan").await;
+    observe(&store, ws, foreign, foreign_sid, "foreign chatter after").await;
+    observe(&store, other_ws, twin, twin_sid, "twin chatter after").await;
+    session_page(&store, ws, foreign, sid, "foreign copy").await;
+    session_page(&store, other_ws, twin, sid, "twin copy").await;
+
+    // Home's observation must not vote for a page outside home...
+    assert!(
+        search(&store, ws, home, "lynx").await.is_empty(),
+        "a home observation lifted a foreign page into home results"
+    );
+    // ...and the foreign scopes must not be lifted by home's observation.
+    assert!(
+        search(&store, ws, foreign, "lynx").await.is_empty(),
+        "another project's observation lifted this project's page"
+    );
+    assert!(
+        search(&store, other_ws, twin, "lynx").await.is_empty(),
+        "another workspace's observation lifted this workspace's page"
+    );
+
+    // A foreign session's own observation votes for its own page there, and
+    // never surfaces at home.
+    session_page(&store, ws, foreign, foreign_sid, "foreign session").await;
+    observe(&store, ws, foreign, foreign_sid, "ibex budget numbers").await;
+    assert!(search(&store, ws, home, "ibex").await.is_empty());
+    assert_eq!(search(&store, ws, foreign, "ibex").await.len(), 1);
+
+    // Control: once home has its own session page, home's observation lifts
+    // exactly that page.
+    session_page(&store, ws, home, sid, "home copy").await;
+    let hits = search(&store, ws, home, "lynx").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.path.as_str(), format!("sessions/{sid}.md"));
+    assert_eq!(hits[0].0.title, format!("sessions/{sid}.md"));
+    assert_eq!(hits[0].1.observation_ids, vec![evidence]);
+    let home_ids = store
+        .reader
+        .latest_page_ids_by_paths(ws, home, vec![format!("sessions/{sid}.md")])
+        .await
+        .unwrap();
+    assert_eq!(vec![hits[0].0.id], home_ids, "the vote went to home's page");
+}
+
+/// R1 observation stream, pages shared (row 5a, invariant #16). Operator B's
+/// session, page and observations in a shared project are evidence for
+/// operator A's query: neither the session owner nor `author_id` becomes a
+/// read filter on the stream.
+#[tokio::test]
+async fn another_operators_observations_lift_their_session_page_in_a_shared_project() {
+    use super::retrieval_observation_stream::{observe, search, stream_on};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store).await;
+    let operator_b = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "operator-b".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: Some("/repo".into()),
+            actor_user: Some(operator("operator-b")),
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            author_id: Some(operator_b),
+            ..page(
+                ws,
+                proj,
+                &format!("sessions/{sid}.md"),
+                "B's session",
+                "Operator B worked on the build.",
+            )
+        })
+        .await
+        .unwrap();
+    let evidence = observe(
+        &store,
+        ws,
+        proj,
+        sid,
+        "the walrus migration needs a backfill",
+    )
+    .await;
+
+    // Operator A's query carries no owner coordinate: hybrid search has none.
+    let hits = search(&store, ws, proj, "walrus backfill").await;
+    assert_eq!(hits.len(), 1, "B's session evidence must be visible to A");
+    assert_eq!(hits[0].0.path.as_str(), format!("sessions/{sid}.md"));
+    assert_eq!(hits[0].1.observation_ids, vec![evidence]);
+}

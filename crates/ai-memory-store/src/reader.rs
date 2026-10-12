@@ -328,6 +328,17 @@ const AUTHORITY_CANDIDATE_MULTIPLIER: usize = 4;
 const AUTHORITY_MIN_CANDIDATES: usize = 20;
 const AUTHORITY_MAX_EXTRA_CANDIDATES: usize = 300;
 
+/// Observation rows the R1 observation stream reads per stream candidate.
+/// Observations outnumber session pages by an order of magnitude and one
+/// session's turns often match together, so the window is wider than the
+/// page-candidate window it feeds; deduplication by session brings it back
+/// down to at most `candidate_limit` pages.
+const OBSERVATION_STREAM_ROWS_PER_CANDIDATE: usize = 4;
+/// Hard cap on observation rows read per query, whatever the limit.
+const OBSERVATION_STREAM_MAX_ROWS: usize = 1_000;
+/// Matched observation ids reported per page in `explain`.
+const OBSERVATION_STREAM_IDS_PER_PAGE: usize = 3;
+
 #[derive(Debug, Clone, Copy)]
 struct PageAuthority {
     factor: f64,
@@ -638,6 +649,20 @@ struct GraphNeighbor {
     edge: Option<String>,
 }
 
+/// One session page voted for by the R1 observation stream. Internal to
+/// hybrid search + explain.
+struct ObservationVote {
+    page_id: PageId,
+    path: PagePath,
+    title: String,
+    /// FTS5 snippet of the session's best-ranked matching observation.
+    /// Observations are sanitized and bounded on the way in, and the snippet
+    /// is a bounded window over that stored text.
+    snippet: String,
+    /// Best-ranked first, at most [`OBSERVATION_STREAM_IDS_PER_PAGE`].
+    observation_ids: Vec<ObservationId>,
+}
+
 /// Which seed page pulled a hit in via graph expansion, and the link
 /// direction. Part of [`SearchExplain`].
 #[derive(Debug, Clone, Serialize)]
@@ -670,6 +695,10 @@ pub struct RrfContributions {
     /// `[retrieval] abstract_vectors`; 0.0 when off or missed).
     #[serde(rename = "abstract", skip_serializing_if = "is_zero")]
     pub abstract_vector: f64,
+    /// Observation-evidence stream contribution (opt-in
+    /// `[retrieval] observation_stream`; 0.0 when off or missed).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub observation: f64,
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -718,6 +747,16 @@ pub struct SearchExplain {
     /// Entity names on this page that matched the query.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub matched_entities: Vec<String>,
+    /// 1-based rank in the observation-evidence stream (opt-in
+    /// `[retrieval] observation_stream`): where this session page's
+    /// best-matching observation placed among the matching sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_rank: Option<usize>,
+    /// The matching observations that voted for this session page, best
+    /// first and bounded. Only the best one contributes to `fused`; the
+    /// session counts once however many of its observations match.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub observation_ids: Vec<ObservationId>,
     /// Per-stream RRF contributions.
     pub rrf: RrfContributions,
     /// Total fused score (sum of the RRF contributions) — higher is
@@ -2765,6 +2804,173 @@ impl ReaderPool {
                 });
             }
             Ok(hits)
+        })
+        .await
+    }
+
+    /// The R1 observation stream: sessions whose observations match `query`,
+    /// mapped to their latest `sessions/<id>.md` page in the same scope and
+    /// ordered by each session's best-ranked observation.
+    ///
+    /// Both halves of the join are filtered to `(workspace_id, project_id)`:
+    /// an observation from another project never votes, and a same-path page
+    /// in another project never receives a vote. A session counts once
+    /// however many of its observations match. A session with no latest,
+    /// unexpired page in this scope contributes nothing; the raw-observation
+    /// fallback still covers live sessions. The two reads share one read
+    /// transaction so the mapping sees a single snapshot. Read-only.
+    async fn observation_stream_votes(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        candidate_limit: usize,
+        cutoff: i64,
+    ) -> StoreResult<Vec<ObservationVote>> {
+        let fts_query = normalize_fts_query(query, &self.fts_stopwords);
+        if fts_query.is_empty() || candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let row_limit = candidate_limit
+            .saturating_mul(OBSERVATION_STREAM_ROWS_PER_CANDIDATE)
+            .min(OBSERVATION_STREAM_MAX_ROWS);
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            // `observations_fts` spans every project, and bm25 runs for every
+            // match before the scope filter can drop it. The project's rowid
+            // span (one covering-index probe) bounds the index scan to the
+            // stretch of the log where this project wrote; the scope
+            // predicates below still decide membership inside it.
+            let span: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT MIN(rowid), MAX(rowid) FROM observations \
+                     WHERE workspace_id = ?1 AND project_id = ?2",
+                    params![workspace_id.as_bytes(), project_id.as_bytes()],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .map(|(lo, hi)| lo.zip(hi))?;
+            let Some((first_rowid, last_rowid)) = span else {
+                return Ok(Vec::new());
+            };
+            // Best-ranked observation first, grouped by session in first-seen
+            // order: the session's stream rank is its best observation's.
+            let mut sessions: Vec<(SessionId, String, Vec<ObservationId>)> = Vec::new();
+            {
+                // CROSS JOIN pins the FTS table as the outer loop: left to
+                // itself the planner drives from the observations scope index
+                // and re-enters FTS once per row, which is far slower.
+                let mut stmt = tx.prepare(
+                    "SELECT observations.id, observations.session_id, \
+                            snippet(observations_fts, 1, '<mark>', '</mark>', '…', 24) \
+                     FROM observations_fts \
+                     CROSS JOIN observations ON observations.rowid = observations_fts.rowid \
+                     WHERE observations_fts MATCH ?1 \
+                       AND observations_fts.rowid >= ?5 \
+                       AND observations_fts.rowid <= ?6 \
+                       AND observations.workspace_id = ?2 \
+                       AND observations.project_id = ?3 \
+                     ORDER BY observations_fts.rank \
+                     LIMIT ?4",
+                )?;
+                #[allow(clippy::cast_possible_wrap)]
+                let rows = stmt.query_map(
+                    params![
+                        fts_query,
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        row_limit as i64,
+                        first_rowid,
+                        last_rowid,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?;
+                let mut index: std::collections::HashMap<SessionId, usize> =
+                    std::collections::HashMap::new();
+                for row in rows {
+                    let (id_bytes, session_bytes, snippet) = row?;
+                    let id = ObservationId::from_slice(&id_bytes)?;
+                    let session_id = SessionId::from_slice(&session_bytes)?;
+                    match index.get(&session_id) {
+                        Some(&at) => {
+                            let ids = &mut sessions[at].2;
+                            if ids.len() < OBSERVATION_STREAM_IDS_PER_PAGE {
+                                ids.push(id);
+                            }
+                        }
+                        None => {
+                            index.insert(session_id, sessions.len());
+                            sessions.push((session_id, snippet, vec![id]));
+                        }
+                    }
+                }
+            }
+            if sessions.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut sql_params: Vec<Value> = Vec::with_capacity(sessions.len() + 3);
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(cutoff));
+            let mut placeholders = String::with_capacity(sessions.len() * 3);
+            for (idx, (session_id, _, _)) in sessions.iter().enumerate() {
+                if idx > 0 {
+                    placeholders.push_str(", ");
+                }
+                placeholders.push('?');
+                sql_params.push(Value::Text(format!("sessions/{session_id}.md")));
+            }
+            let sql = format!(
+                "SELECT pages.id, pages.path, pages.title \
+                 FROM pages \
+                 WHERE pages.workspace_id = ?1 \
+                   AND pages.project_id = ?2 \
+                   AND pages.is_latest = 1{not_expired} \
+                   AND pages.path IN ({placeholders})",
+                not_expired = not_expired("pages", "?3"),
+            );
+            let mut pages: std::collections::HashMap<String, (PageId, String)> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id_bytes, path, title) = row?;
+                    pages.insert(path, (PageId::from_slice(&id_bytes)?, title));
+                }
+            }
+            tx.finish()?;
+
+            let mut votes = Vec::new();
+            for (session_id, snippet, observation_ids) in sessions {
+                let path = format!("sessions/{session_id}.md");
+                let Some((page_id, title)) = pages.remove(&path) else {
+                    continue;
+                };
+                votes.push(ObservationVote {
+                    page_id,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    observation_ids,
+                });
+                if votes.len() == candidate_limit {
+                    break;
+                }
+            }
+            Ok(votes)
         })
         .await
     }
@@ -5621,6 +5827,12 @@ impl ReaderPool {
             )
             .await?
         };
+        // The stream-off hot path keeps moving the query without a clone.
+        let observation_query = if tuning.observation_stream {
+            query.clone()
+        } else {
+            String::new()
+        };
         let fts_candidates = self
             .search_page_candidates_for_project(
                 workspace_id,
@@ -5710,6 +5922,20 @@ impl ReaderPool {
                 include_superseded,
             )
             .await?;
+        // R1: the observation-evidence stream, off by default. It votes only
+        // for latest session pages, so it does not seed graph expansion.
+        let observation_votes = if tuning.observation_stream {
+            self.observation_stream_votes(
+                workspace_id,
+                project_id,
+                &observation_query,
+                candidate_limit,
+                cutoff,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
@@ -5719,6 +5945,10 @@ impl ReaderPool {
             snippet: String,
             score: f64,
             explain: Option<SearchExplain>,
+            /// 1-based FTS rank, kept to decide whose snippet explains the hit.
+            fts_rank: Option<usize>,
+            /// Observation-stream rank and the matching observation's snippet.
+            observation: Option<(usize, String)>,
         }
         let mut fused: std::collections::HashMap<PageId, Fused> = std::collections::HashMap::new();
 
@@ -5730,8 +5960,11 @@ impl ReaderPool {
                 snippet: h.snippet.clone(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
+                fts_rank: None,
+                observation: None,
             });
             entry.score += contrib;
+            entry.fts_rank = Some(rank + 1);
             if let Some(details) = &mut entry.explain {
                 details.fts_rank = Some(rank + 1);
                 details.fts_score = Some(h.rank);
@@ -5747,6 +5980,8 @@ impl ReaderPool {
                 snippet: String::new(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
+                fts_rank: None,
+                observation: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -5764,6 +5999,8 @@ impl ReaderPool {
                 snippet: String::new(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
+                fts_rank: None,
+                observation: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -5781,6 +6018,8 @@ impl ReaderPool {
                 snippet: e.hit.snippet.clone(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
+                fts_rank: None,
+                observation: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -5799,6 +6038,8 @@ impl ReaderPool {
                 snippet: n.hit.snippet.clone(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
+                fts_rank: None,
+                observation: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -5817,15 +6058,50 @@ impl ReaderPool {
             }
         }
 
+        for (rank, vote) in observation_votes.into_iter().enumerate() {
+            let contrib = 1.0 / (k + (rank + 1) as f64);
+            let entry = fused.entry(vote.page_id).or_insert_with(|| Fused {
+                path: vote.path,
+                title: String::new(),
+                snippet: String::new(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+                fts_rank: None,
+                observation: None,
+            });
+            entry.score += contrib;
+            if entry.title.is_empty() {
+                entry.title = vote.title;
+            }
+            entry.observation = Some((rank + 1, vote.snippet));
+            if let Some(details) = &mut entry.explain {
+                details.observation_rank = Some(rank + 1);
+                details.observation_ids = vote.observation_ids;
+                details.rrf.observation = contrib;
+                details.fused += contrib;
+            }
+        }
+
         let mut out: Vec<(PageHit, Option<SearchExplain>)> = fused
             .into_iter()
             .map(|(id, entry)| {
+                // The matching observation's excerpt explains the hit when
+                // the observation stream ranked the page ahead of FTS (or FTS
+                // missed it); otherwise the page keeps its own snippet.
+                let snippet = match entry.observation {
+                    Some((observation_rank, observation_snippet))
+                        if entry.fts_rank.is_none_or(|fts| observation_rank < fts) =>
+                    {
+                        observation_snippet
+                    }
+                    _ => entry.snippet,
+                };
                 (
                     PageHit {
                         id,
                         path: entry.path,
                         title: entry.title,
-                        snippet: entry.snippet,
+                        snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
                         superseded: false,
                         pinned: false,
