@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-10-12
+
 ### Fixed
 - Fixed Gemini CLI's `run_shell_command` and `read_many_files` tools being
   classified as unknown, so `[capture] ignore_paths` never checked them and a
@@ -9006,7 +9008,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...HEAD
+[2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/akitaonrails/ai-memory/compare/v2.6.1...v2.6.2
 [2.6.1]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...v2.6.1
