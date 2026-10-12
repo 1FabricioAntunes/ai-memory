@@ -57,7 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent, and ends with a read-only check of `/healthz`, `memory_status` and
   `doctor`. It shows the plan and asks first; without a terminal it changes
   nothing unless given `--yes`. A second run changes nothing. Windows has no
-  service step. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
+  service step. `ai-memory uninstall --apply` stops and removes that service,
+  but only a unit `setup` wrote and nobody edited since; any other unit at that
+  path is left alone and reported. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
   ai-memory for its user, and `scripts/onboarding-acceptance.sh` measures the
   path from a clean home to the first returned memory.
 - Added page history and session replay to the read-only web UI. Each page

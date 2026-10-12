@@ -143,6 +143,9 @@ case "$1" in
   enable) touch "$state/enabled" ;;
   is-enabled) [ -f "$state/enabled" ] ;;
   is-active) alive ;;
+  disable)
+    rm -f "$state/enabled"
+    if [ "$2" = "--now" ] && alive; then kill "$(cat "$state/pid")"; rm -f "$state/pid"; fi ;;
   restart)
     if alive; then kill "$(cat "$state/pid")"; sleep 0.2; fi
     line="$(sed -n 's/^ExecStart=//p' "$unit")"
@@ -238,7 +241,7 @@ esac
     /// passes its own self-check. A captured hook event reaches the server. A
     /// second run changes no file and makes no state-changing service call.
     #[tokio::test]
-    async fn setup_installs_wires_and_a_second_run_changes_nothing() {
+    async fn setup_installs_wires_is_idempotent_and_uninstall_removes_its_unit() {
         let sandbox = Sandbox::new();
         let service = Service::new(&sandbox.root);
         std::fs::create_dir_all(sandbox.home.join(".claude/projects")).unwrap();
@@ -396,5 +399,65 @@ esac
                 "--user is-enabled --quiet ai-memory.service",
             ]
         );
+
+        // uninstall stops and removes the unit setup wrote, and only once.
+        let unit_path = sandbox.home.join(".config/systemd/user/ai-memory.service");
+        let calls_before = service.calls().len();
+        let removed = uninstall(&sandbox, &service, port);
+        assert!(removed.status.success(), "{}", text(&removed));
+        assert!(
+            String::from_utf8_lossy(&removed.stdout)
+                .contains("stopped and removed the user service"),
+            "{}",
+            text(&removed)
+        );
+        assert!(!unit_path.exists());
+        assert_eq!(
+            service.calls()[calls_before..].to_vec(),
+            vec![
+                "--user disable --now ai-memory.service",
+                "--user daemon-reload",
+            ]
+        );
+        let calls_before = service.calls().len();
+        let again = uninstall(&sandbox, &service, port);
+        assert!(again.status.success(), "{}", text(&again));
+        assert_eq!(
+            service.calls().len(),
+            calls_before,
+            "a second uninstall called systemctl"
+        );
+    }
+
+    fn uninstall(sandbox: &Sandbox, service: &Service, port: u16) -> Output {
+        let mut cmd = sandbox.cmd(Some(port));
+        service.apply(&mut cmd);
+        cmd.args(["uninstall", "--apply", "--yes"])
+            .output()
+            .unwrap()
+    }
+
+    /// Adversarial control: a unit at the same path that `setup` did not
+    /// write (the packaged one copied by hand), or one edited after `setup`
+    /// wrote it, is neither stopped nor deleted, and uninstall says so.
+    #[test]
+    fn uninstall_leaves_a_unit_it_did_not_write() {
+        let sandbox = Sandbox::new();
+        let service = Service::new(&sandbox.root);
+        let unit_path = sandbox.home.join(".config/systemd/user/ai-memory.service");
+        std::fs::create_dir_all(unit_path.parent().unwrap()).unwrap();
+        let foreign = include_str!("../../../../packaging/systemd/ai-memory-user.service");
+        std::fs::write(&unit_path, foreign).unwrap();
+        let port = crate::e2e_support::free_port();
+
+        let out = uninstall(&sandbox, &service, port);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("did not write it"),
+            "{}",
+            text(&out)
+        );
+        assert_eq!(std::fs::read_to_string(&unit_path).unwrap(), foreign);
+        assert!(service.calls().is_empty(), "{:?}", service.calls());
     }
 }

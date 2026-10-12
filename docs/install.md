@@ -130,13 +130,20 @@ is never printed or passed on a command line, and no harness config holds it:
 hooks read the credential files `init` writes, and MCP clients reach the
 server through `ai-memory mcp-bridge`.
 
-`uninstall --apply` removes the hooks, MCP entries and skills `setup` wired,
-but not the service. Remove that by hand:
+`uninstall --apply` removes what `setup` wired, the service included. Every
+unit `setup` renders carries an identity line holding the SHA-256 of the rest of
+the file, and `uninstall` removes only a unit whose line is there and still
+matches: on Linux it runs `systemctl --user disable --now ai-memory.service`,
+deletes the file and runs `systemctl --user daemon-reload`; on macOS it boots
+the LaunchAgent out and deletes the plist. A unit `setup` did not write, or one
+edited since, is left in place and `uninstall` says so. If you need to remove
+such a unit, or the service manager refused, do it by hand:
 
 ```bash
 # Linux
 systemctl --user disable --now ai-memory.service
 rm ~/.config/systemd/user/ai-memory.service
+systemctl --user daemon-reload
 # macOS
 launchctl bootout "gui/$(id -u)/com.github.akitaonrails.ai-memory"
 rm ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist

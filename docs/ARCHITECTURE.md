@@ -794,7 +794,9 @@ session store or MCP config (the stores `doctor` scans). It finishes with a
 read-only self-check: `/healthz`, a `memory_status` call over MCP, and
 `doctor`. The service manager is reached through an injectable runner, so the
 unit rendering and the `systemctl`/`launchctl` calls are tested without a real
-session. Windows has no service step. A second run changes no file.
+session. Windows has no service step. A second run changes no file. Each
+rendered unit carries an identity line with the SHA-256 of the rest of the
+file; `uninstall` stops and removes only a unit whose digest still matches.
 `install.sh`, a release asset with its own `.sha256`, installs the release
 tarball under `~/.local` after checking it against the published checksum.
 

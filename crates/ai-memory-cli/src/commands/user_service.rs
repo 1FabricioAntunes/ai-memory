@@ -40,6 +40,12 @@ const SYSTEMD_CONFIG: &str = "%h/.config/ai-memory/config.toml";
 const LAUNCHD_BIN: &str = "<string>__AI_MEMORY_BIN__</string>";
 const LAUNCHD_HOME: &str = "<string>__HOME__/";
 
+/// Start of the identity line `setup` writes into every unit it renders. The
+/// rest of the line is the SHA-256 of the file without that line, so
+/// `uninstall` can tell a unit `setup` wrote, and nobody edited since, from a
+/// hand-written or hand-edited one, which it leaves alone.
+const IDENTITY_PREFIX: &str = "ai-memory-setup-unit sha256:";
+
 /// Which service manager this platform uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServiceManager {
@@ -176,23 +182,90 @@ fn render_systemd(spec: &ServiceSpec) -> Result<ServiceUnit> {
             1,
         );
     let body = SYSTEMD_USER_TEMPLATE.replacen(exec, &rendered_exec, 1);
-    let contents = format!(
+    let unstamped = format!(
         "# Written by `ai-memory setup` from packaging/systemd/ai-memory-user.service.\n\
-         # Re-run `ai-memory setup` instead of editing; it rewrites this file.\n{body}"
+         # Re-run `ai-memory setup` instead of editing; `ai-memory uninstall` removes it.\n{body}"
     );
-    let config_home = spec
-        .xdg_config_home
-        .clone()
-        .filter(|dir| dir.is_absolute())
-        .unwrap_or_else(|| spec.home.join(".config"));
     Ok(ServiceUnit {
         manager: ServiceManager::SystemdUser,
-        path: config_home
+        path: unit_path(
+            ServiceManager::SystemdUser,
+            &spec.home,
+            spec.xdg_config_home.as_deref(),
+        ),
+        contents: stamp(ServiceManager::SystemdUser, &unstamped),
+    })
+}
+
+/// Where `manager`'s unit for ai-memory lives: under `$XDG_CONFIG_HOME` (when
+/// absolute) or `~/.config` for systemd, `~/Library/LaunchAgents` for launchd.
+pub(crate) fn unit_path(
+    manager: ServiceManager,
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+) -> PathBuf {
+    match manager {
+        ServiceManager::SystemdUser => xdg_config_home
+            .filter(|dir| dir.is_absolute())
+            .map_or_else(|| home.join(".config"), Path::to_path_buf)
             .join("systemd")
             .join("user")
             .join(SYSTEMD_UNIT_NAME),
-        contents,
-    })
+        ServiceManager::Launchd => home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCHD_LABEL}.plist")),
+    }
+}
+
+fn identity_line(manager: ServiceManager, digest: &str) -> String {
+    match manager {
+        ServiceManager::SystemdUser => format!("# {IDENTITY_PREFIX}{digest}"),
+        ServiceManager::Launchd => format!("<!-- {IDENTITY_PREFIX}{digest} -->"),
+    }
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// Insert the identity line: first in a systemd unit, right after the XML
+/// declaration in a plist (which must stay first).
+fn stamp(manager: ServiceManager, unstamped: &str) -> String {
+    let line = identity_line(manager, &sha256_hex(unstamped));
+    match manager {
+        ServiceManager::SystemdUser => format!("{line}\n{unstamped}"),
+        ServiceManager::Launchd => match unstamped.split_once('\n') {
+            Some((declaration, rest)) => format!("{declaration}\n{line}\n{rest}"),
+            None => format!("{line}\n{unstamped}"),
+        },
+    }
+}
+
+/// Whether `text` is a unit `setup` rendered and nobody changed since: exactly
+/// one identity line, whose digest matches the rest of the file.
+pub(crate) fn is_rendered_by_setup(text: &str) -> bool {
+    let mut identities = text
+        .split_inclusive('\n')
+        .enumerate()
+        .filter(|(_, line)| line.contains(IDENTITY_PREFIX));
+    let (Some((index, line)), None) = (identities.next(), identities.next()) else {
+        return false;
+    };
+    let Some(digest) = line
+        .split_once(IDENTITY_PREFIX)
+        .map(|(_, rest)| rest.trim_end_matches(['\n', '\r', ' ', '>', '-']))
+    else {
+        return false;
+    };
+    let rest: String = text
+        .split_inclusive('\n')
+        .enumerate()
+        .filter(|(i, _)| *i != index)
+        .map(|(_, line)| line)
+        .collect();
+    digest.len() == 64 && sha256_hex(&rest) == digest
 }
 
 fn xml_text(text: &str) -> String {
@@ -228,12 +301,8 @@ fn render_launchd(spec: &ServiceSpec) -> Result<ServiceUnit> {
     }
     Ok(ServiceUnit {
         manager: ServiceManager::Launchd,
-        path: spec
-            .home
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{LAUNCHD_LABEL}.plist")),
-        contents,
+        path: unit_path(ServiceManager::Launchd, &spec.home, None),
+        contents: stamp(ServiceManager::Launchd, &contents),
     })
 }
 
@@ -420,6 +489,71 @@ fn start_launchd(unit: &ServiceUnit, runner: &dyn CommandRunner, loaded: bool) -
     let plist = unit.path.to_string_lossy();
     require(runner, "launchctl", &["bootstrap", &domain, &plist])?;
     Ok(())
+}
+
+/// What `uninstall` did about the user service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// There is no unit at the path `setup` writes.
+    Absent,
+    /// `setup`'s unit was stopped, disabled and deleted.
+    Removed(PathBuf),
+    /// A unit is there but `setup` did not write it, or it was edited since;
+    /// it was left alone.
+    NotOurs(PathBuf),
+}
+
+/// Whether the unit at `path` is one `uninstall` would remove; reads only.
+pub(crate) fn planned_removal(path: &Path) -> Removal {
+    match std::fs::read_to_string(path) {
+        Err(_) if !path.exists() => Removal::Absent,
+        Ok(text) if is_rendered_by_setup(&text) => Removal::Removed(path.to_path_buf()),
+        _ => Removal::NotOurs(path.to_path_buf()),
+    }
+}
+
+/// Stop, disable and delete the unit at `path` when `setup` wrote it and it
+/// is unedited; leave anything else alone. A second call finds nothing.
+///
+/// # Errors
+/// A service-manager command that fails (the file is then kept, so a still
+/// running service never loses its unit) or a failed delete.
+pub(crate) fn remove(
+    manager: ServiceManager,
+    path: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<Removal> {
+    let planned = planned_removal(path);
+    if !matches!(planned, Removal::Removed(_)) {
+        return Ok(planned);
+    }
+    match manager {
+        ServiceManager::SystemdUser => {
+            require(
+                runner,
+                "systemctl",
+                &["--user", "disable", "--now", SYSTEMD_UNIT_NAME],
+            )?;
+            delete_unit(path)?;
+            require(runner, "systemctl", &["--user", "daemon-reload"])?;
+        }
+        ServiceManager::Launchd => {
+            let domain = launchd_domain(runner)?;
+            if launchd_loaded(runner, &domain) {
+                require(
+                    runner,
+                    "launchctl",
+                    &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")],
+                )?;
+            }
+            delete_unit(path)?;
+        }
+    }
+    Ok(planned)
+}
+
+fn delete_unit(path: &Path) -> Result<()> {
+    std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -687,5 +821,118 @@ mod tests {
             ..FakeRunner::default()
         };
         assert!(launchd_domain(&runner).is_err());
+    }
+
+    #[test]
+    fn rendered_units_carry_an_identity_that_survives_only_unedited() {
+        for manager in [ServiceManager::SystemdUser, ServiceManager::Launchd] {
+            let unit = render(manager, &spec(Path::new("/srv/u"))).unwrap();
+            assert!(is_rendered_by_setup(&unit.contents), "{manager:?}");
+            // Hand-edited: any byte changed outside the identity line.
+            let edited = unit.contents.replacen("serve", "serve --verbose", 1);
+            assert!(!is_rendered_by_setup(&edited), "{manager:?} edited");
+            // A copied identity line on a different body, or two of them.
+            let line = unit
+                .contents
+                .lines()
+                .find(|l| l.contains(IDENTITY_PREFIX))
+                .unwrap();
+            assert!(!is_rendered_by_setup(&format!(
+                "{line}\n[Service]\nExecStart=/bin/evil\n"
+            )));
+            assert!(!is_rendered_by_setup(&format!("{line}\n{}", unit.contents)));
+        }
+        // The packaged template itself (what a package or a person installs)
+        // is not ours.
+        assert!(!is_rendered_by_setup(SYSTEMD_USER_TEMPLATE));
+        assert!(!is_rendered_by_setup(LAUNCHD_TEMPLATE));
+    }
+
+    #[test]
+    fn removing_our_systemd_unit_stops_disables_deletes_and_reloads_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = render(ServiceManager::SystemdUser, &spec(tmp.path())).unwrap();
+        write_unit(&unit).unwrap();
+        let runner = FakeRunner::default();
+        assert_eq!(
+            remove(ServiceManager::SystemdUser, &unit.path, &runner).unwrap(),
+            Removal::Removed(unit.path.clone())
+        );
+        assert!(!unit.path.exists());
+        assert_eq!(
+            runner.calls.borrow().clone(),
+            vec![
+                "systemctl --user disable --now ai-memory.service",
+                "systemctl --user daemon-reload",
+            ]
+        );
+
+        // A second removal finds nothing and calls nothing.
+        let again = FakeRunner::default();
+        assert_eq!(
+            remove(ServiceManager::SystemdUser, &unit.path, &again).unwrap(),
+            Removal::Absent
+        );
+        assert!(again.calls.borrow().is_empty());
+    }
+
+    /// Adversarial control: a unit `setup` did not write, or one edited after
+    /// it did, is neither stopped nor deleted.
+    #[test]
+    fn a_foreign_or_edited_unit_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = render(ServiceManager::SystemdUser, &spec(tmp.path())).unwrap();
+        std::fs::create_dir_all(unit.path.parent().unwrap()).unwrap();
+        for text in [
+            SYSTEMD_USER_TEMPLATE.to_owned(),
+            unit.contents
+                .replacen("Restart=on-failure", "Restart=always", 1),
+        ] {
+            std::fs::write(&unit.path, &text).unwrap();
+            let runner = FakeRunner::default();
+            assert_eq!(
+                remove(ServiceManager::SystemdUser, &unit.path, &runner).unwrap(),
+                Removal::NotOurs(unit.path.clone())
+            );
+            assert_eq!(std::fs::read_to_string(&unit.path).unwrap(), text);
+            assert!(runner.calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_failed_disable_keeps_the_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = render(ServiceManager::SystemdUser, &spec(tmp.path())).unwrap();
+        write_unit(&unit).unwrap();
+        let runner = FakeRunner {
+            failing: vec!["systemctl --user disable"],
+            ..FakeRunner::default()
+        };
+        assert!(remove(ServiceManager::SystemdUser, &unit.path, &runner).is_err());
+        assert!(unit.is_current());
+    }
+
+    #[test]
+    fn removing_our_launch_agent_boots_it_out_then_deletes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = render(ServiceManager::Launchd, &spec(tmp.path())).unwrap();
+        write_unit(&unit).unwrap();
+        let runner = FakeRunner {
+            stdout: vec![("id -u", "501\n")],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(ServiceManager::Launchd, &unit.path, &runner).unwrap(),
+            Removal::Removed(unit.path.clone())
+        );
+        assert!(!unit.path.exists());
+        assert_eq!(
+            runner.calls.borrow().clone(),
+            vec![
+                "id -u",
+                "launchctl print gui/501/com.github.akitaonrails.ai-memory",
+                "launchctl bootout gui/501/com.github.akitaonrails.ai-memory",
+            ]
+        );
     }
 }
