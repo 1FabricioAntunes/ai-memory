@@ -7,12 +7,163 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- Added `ai-memory project init`, an interactive command that creates a
-  checkout-local `.ai-memory.toml` with suggested workspace and project names
-  from the checkout's `upstream` or `origin` Git remote. (#1227)
+## [2.6.4] - 2026-10-12
 
 ### Fixed
+- Fixed Gemini CLI's `run_shell_command` and `read_many_files` tools being
+  classified as unknown, so `[capture] ignore_paths` never checked them and a
+  call reading an ignored file still had its output written to the local hook
+  spool and sent to the server, which then discarded it. `run_shell_command` is
+  now a shell tool, read like `Bash` and resolved from its `dir_path`, and
+  `read_many_files` is a file tool: the call is dropped when any of its
+  `include` globs names or could expand into an ignored path, and glob syntax
+  the matcher cannot evaluate makes it metadata-only. Gemini's
+  `list_directory` and the legacy `search_file_content` name are now search
+  tools, dropped under an active policy like `grep_search` and `glob`. A shell
+  command whose `**` glob could recurse into an ignored directory (zsh, or bash
+  with `globstar`) is now dropped too. A `read_many_files` entry naming a
+  directory above an ignored path (`docs`, `.`), which Gemini reads
+  recursively, is dropped as well. GitHub Copilot CLI's `view`, `create` and
+  `str_replace_editor` are now file tools, checked against `ignore_paths` like
+  `Read` and `Write`. Under an active or invalid policy, tools that read back
+  output of an earlier command (Claude Code `BashOutput`/`TaskOutput`, Codex
+  `write_stdin`, Hermes and OpenClaw `process`, Copilot CLI `read_bash` and
+  `write_bash`) and shell commands using brace expansion or a bracket class
+  are now metadata-only, since the matcher cannot prove they miss an ignored
+  path; upgrade the server before the clients, because an older server drops
+  those events. A script quoted inside a string-form shell command (an
+  `sh -c` argument, a command substitution in double quotes) is now read like
+  the rest of the command line, the path in a git object name (`REV:path`) is
+  checked, Antigravity's `run_command` resolves its arguments from its `Cwd`,
+  and ANSI-C strings and backslash-escaped letters are read the way the shell
+  reads them. Inline interpreter code (`python3 -c`, `node -e` and similar)
+  and further glob syntax the matcher does not evaluate (zsh glob groups,
+  extglobs, encoded escapes) are now metadata-only under an active policy.
+  Line continuations, parameter defaults, values glued to short flags,
+  `file:` URLs, `~+`, PowerShell and cmd escape characters, and shell or
+  interpreter options placed before the script or code are now read too, and
+  more script runners and interpreters are recognized. A path under a
+  directory only the running shell knows (`~-`, `~name`) makes the call
+  metadata-only, and on macOS paths match without regard to case, as its
+  default filesystem does, including non-ASCII letters and decomposed accents.
+  A checkout's `ignore_paths` now also hold for a file, search/list or shell
+  tool call made from another checkout or from an unmarked directory that
+  reaches one of its files, including through glob syntax in a directory
+  name, a search's path or file filter, or the files an `apply_patch` names.
+  Glob directories outside the event's own checkout are followed through the
+  directories on disk within fixed bounds of count and time; past them, or for
+  glob syntax that cannot be followed, the call is metadata-only, and so is a
+  file tool whose target cannot be read. A glob inside the event's own
+  checkout is not walked, so ordinary monorepo commands over many packages
+  (`cat packages/*/package.json`, `du -sh packages/*`) keep their output with
+  or without a marker, and neither are a large brace expansion that cannot
+  leave it (`touch test/file{1..200}.txt`) or the checkout's own subtree under
+  a `**` that starts above it. Each directory's marker is looked up once, so
+  many paths in a deep tree stay within the hook's time budget, and a
+  dotfiles `.git` in the home directory no longer counts as every project's
+  own checkout. A `..` after a `**`, a dot glob that older bash
+  expands to the parent directory (POSIX classes and extglobs included), a
+  brace expansion, a zsh glob group, an ANSI-C escape (also inside a
+  double-quoted `bash -c` or `eval` script), an indented `apply_patch` header
+  and Hermes `search_files`' `file_glob` filter can no longer hide which
+  checkout a call reaches. A broken
+  marker makes a search metadata-only, as it does a file or shell call.
+  Reading back a file a harness saved an earlier tool's output to
+  (Claude Code's saved large results and background task output, OpenCode's
+  and Pi's truncated output files), or a glob that could match one, is
+  metadata-only under an active or invalid policy, like `BashOutput`; an
+  ordinary log glob (`tail -n 50 log/*.log`, `cat /tmp/*.log`) is not taken
+  for one. A `file:` URL's query or fragment is no longer
+  read as part of its path, a parameter default nested deeper than the matcher
+  reads is metadata-only, and a backslash escape inside a default is read. A
+  quoted `~` (`git commit -m "fix ~approx"`) is no longer treated as a home
+  or user directory, so such commands are kept again.
+  In a Windows session, Git Bash, MSYS2 and Cygwin spellings (`/c/...`,
+  `/cygdrive/c/...`), a rooted path without a drive, the `\\?\`, `\\.\` and
+  `\\localhost\C$` prefixes, an alternate data stream suffix and trailing dots
+  or spaces are read as the file they open, so they no longer slip past a
+  pattern. The `cwd`, the marker's directory and an absolute pattern get the
+  same reading, so a session started from `\\?\C:\repo` or
+  `\\localhost\C$\repo` matches its relative patterns again. A bare or
+  double-quoted `\\server\share\...` or `\\?\C:\...` argument keeps both
+  backslashes, as PowerShell and cmd read it, and `/a/x` is also read from the
+  root of the `cwd`'s drive, as a native tool reads it. The generated
+  TypeScript marker reader no longer takes a line inside a multi-line array
+  (`["docs"]`) for a table header. Hermes `execute_code` is metadata-only under an active policy, like
+  `python3 -c`, and a shell command longer than 1 MiB is metadata-only instead
+  of being split. The generated TypeScript integrations now read a dotted
+  `capture.ignore_paths` key and quoted `[capture]` headers, reject the shapes
+  the native hook rejects (an inline `capture = { ... }` table among them),
+  recognize the same file tools (`read_file`, `patch`, `fs_read`, ...), and stop
+  reading a directory at the walk's entry bound. Checking a path of thousands
+  of wildcard segments for a saved output file no longer takes seconds.
+  In a Windows session, a shell argument or `workdir` that is drive-relative
+  (`C:docs\x`) or a device path naming no drive (`\\?\GLOBALROOT\...`) now
+  makes the command metadata-only instead of being skipped, a PowerShell
+  `FileSystem::` provider prefix is read as the path after it, and a Windows
+  marker holding a POSIX absolute pattern (`/c/repo/docs/**`), which matched
+  nothing, is now invalid and fails closed.
+  This applies to the native hook, the server, and the
+  generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
+- Fixed `ai-memory backfill`, including the automatic first-boot import, and
+  the `ai-memory run` workstream ledger not applying `[capture] ignore_paths`
+  to the harness transcripts they import, so the arguments and output of a
+  tool call on an ignored file could be stored even though live hooks drop
+  them. Both now apply the same decision as the live hook to every imported
+  tool call and its result: an excluded call is not imported at all, one the
+  policy cannot prove safe keeps only its tool family, and prompts and
+  assistant messages are imported as before, and under allowlist capture
+  mode a checkout without a marker imports nothing. Results recorded without an id
+  linking them to their call take the strictest decision of their turn.
+  A call the transcript names differently from the hook (Codex's shell tool) is
+  judged under the hook's name, each event is judged from the working directory
+  its own record names, and a call or event the live hook would deliver to
+  another checkout is imported only when that checkout would capture it and
+  sends to the same server and project; events recorded in, or calls reaching
+  into, a checkout of another project are left out instead of being filed
+  under the importing project, and so are events from a different
+  subdirectory of the same repository, which the server files under a
+  project of their own. The output of a Claude Code `!` shell command,
+  which live capture never receives, is no longer imported. Claude Code's
+  background-task notifications (a monitored command's output, a finished
+  background command or agent) are no longer imported as prompts, whatever the
+  case or spacing of their opening tag, and its compaction summary is
+  imported as a compaction record instead of a prompt.
+  A tool ai-memory does not recognize, such as an MCP tool, is imported as a
+  record that it ran without its arguments, output or name, which is all live
+  capture stores for it, and so is a result whose call is not in the
+  transcript. (GHSA-gcpc-88hm-3xqr)
+- Fixed a web page open in the operator's browser being able to act on an
+  unauthenticated server (the loopback default, no token), such as claiming a
+  project's pending handoff or starting admin jobs. With auth off, the machine
+  and admin routes now refuse browser requests that come from another site or
+  that are not script calls from a page, such as links and images; hooks, the
+  CLI, MCP clients and the built-in web UI are unaffected, and servers with a
+  bearer token are unchanged. Images in wiki pages rendered by the web UI are
+  also limited to relative paths that stay inside the UI. When an
+  unauthenticated server is reached through a non-loopback host name in its
+  allowlist (a LAN address or name, or `host.docker.internal`), where browsers
+  do not send the request metadata the check relies on, the session-start
+  handoff fetch now also requires an `X-AI-Memory-Client` header that every
+  ai-memory hook, CLI command and generated integration sends; the same holds
+  for a request that arrives through a forwarding proxy or CDN (any of the
+  common forwarding headers, including `CF-Connecting-IP`, `True-Client-IP`
+  and `X-Forwarded-Proto`), even one that rewrites
+  the host to the loopback address. Hooks on such a
+  server must be re-staged with `ai-memory install-hooks` (or
+  `ai-memory upgrade`); loopback installs need nothing.
+  (GHSA-6mc4-46pr-w82w)
+- Fixed `POST /auth/login` and `POST /auth/recovery` accepting request bodies
+  that are not declared as JSON, which a page on another site could use to
+  sign the operator's browser in or to try passwords when human sign-in is
+  enabled. Both routes now answer 415 unless the body is `application/json`;
+  the built-in login page and the documented `curl` recovery already send
+  that. (GHSA-6mc4-46pr-w82w)
+- Fixed the web UI allowing other sites to frame it. With auth off, a page
+  that framed `/web/pending` could trick a click on Approve or Reject, since
+  the framed page's own requests are same-origin. Every web page and API
+  response now sends `X-Frame-Options: DENY` and
+  `Content-Security-Policy: frame-ancestors 'none'`. (GHSA-6mc4-46pr-w82w)
 - Fixed the cross-project profile harvester treating pages the auto-improve
   scheduler auto-approved as curated human input: model output nobody
   reviewed fed the profile like a hand-written rule. A page stamped from an
@@ -98,7 +249,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[capture] ignore_paths` would drop the event, so an exclusion that names a
   path outside its checkout, or a source file read by a command whose
   `workdir` points at another project, is no longer judged only by the
-  destination's policy. (#1199)
+  destination's policy. When the payload `cwd`'s own capture policy is
+  invalid, an event aimed at another repository is no longer rerouted; it
+  stays with that source repository as metadata only. (#1199)
 
 - `scope_refusal` (the hooks-side mirror of the web surfaces
   `refusal_response` mapped in #1204) now answers `404 Not Found`
@@ -8855,7 +9008,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...HEAD
+[2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/akitaonrails/ai-memory/compare/v2.6.1...v2.6.2
 [2.6.1]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...v2.6.1

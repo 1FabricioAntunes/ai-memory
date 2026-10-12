@@ -29,6 +29,9 @@ const MAX_ANTIGRAVITY_HISTORY_LINE_BYTES: usize = 64 * 1024;
 /// of its `.db` being created.
 const ANTIGRAVITY_OPENING_PROMPT_WINDOW: Duration = Duration::from_secs(5);
 const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
+/// Event metadata key holding the working directory the event's own record
+/// was written in, when the harness records one per record.
+pub const RECORD_CWD_KEY: &str = "cwd";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,6 +671,7 @@ fn export_jsonl(
     let mut line = Vec::new();
     let mut events = Vec::new();
     let mut losses = Vec::new();
+    let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
         let read = reader.read_until(b'\n', &mut line)?;
@@ -706,6 +710,7 @@ fn export_jsonl(
         } else {
             source_id(&value).unwrap_or_else(|| format!("byte-{}", offset - read as u64))
         };
+        let first_event = events.len();
         match harness {
             ManagedHarness::Claude => parse_claude(
                 &value,
@@ -774,6 +779,21 @@ fn export_jsonl(
                 ));
             }
         }
+        let record_cwd = match harness {
+            ManagedHarness::Claude => value.get("cwd").and_then(Value::as_str),
+            ManagedHarness::Codex => {
+                if matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("session_meta" | "turn_context")
+                ) && let Some(cwd) = value.pointer("/payload/cwd").and_then(Value::as_str)
+                {
+                    codex_turn_cwd = Some(cwd.to_owned());
+                }
+                codex_turn_cwd.as_deref()
+            }
+            _ => None,
+        };
+        stamp_record_cwd(&mut events[first_event..], record_cwd);
     }
     if harness == ManagedHarness::Kimi {
         annotate_kimi_subagents(path, &mut losses);
@@ -790,6 +810,23 @@ fn export_jsonl(
         events,
         losses: deduplicate_losses(losses),
     })
+}
+
+/// Label each event with the working directory its record was written in.
+/// Claude Code records `cwd` on every line and Codex in each `turn_context`,
+/// and both follow the session as it moves, so the session's opening cwd can
+/// be the wrong base for a relative path. Imports resolve tool arguments and
+/// the capture policy from this label, as the live hook does from each event's
+/// own `cwd`.
+fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
+    let Some(cwd) = cwd.filter(|cwd| Path::new(cwd).is_absolute()) else {
+        return;
+    };
+    for event in events {
+        if let Some(metadata) = event.metadata.as_object_mut() {
+            metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
+        }
+    }
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -855,6 +892,30 @@ fn parse_claude(
         losses.push("Claude non-conversation message records were intentionally excluded".into());
         return;
     }
+    if role == "user" && value.get("isCompactSummary").is_some_and(truthy) {
+        // The summary Claude Code writes after compacting the conversation,
+        // recorded as a user turn the operator never typed.
+        let text = message.get("content").map(value_text).unwrap_or_default();
+        if !text.is_empty() {
+            push_event(
+                events,
+                AgentKind::ClaudeCode,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::Compaction,
+                Some("assistant"),
+                &text,
+                timestamp(value),
+                json!({}),
+            );
+        }
+        return;
+    }
+    if role == "user" && claude_task_notification(value, message) {
+        losses.push("Claude task notifications were intentionally excluded".into());
+        return;
+    }
     parse_content_blocks(
         AgentKind::ClaudeCode,
         session,
@@ -865,6 +926,66 @@ fn parse_claude(
         events,
         losses,
     );
+}
+
+/// A user turn Claude Code writes itself to report a background task: a
+/// monitored command's streamed output, a finished background command or
+/// agent and its result. No prompt hook fires for it, so live capture never
+/// stores it as a prompt. Recognized by an `origin.kind` of
+/// `task-notification` in any case, or by a first text block that opens with
+/// a `<task-notification>` tag in any case, attributes allowed, after any
+/// byte-order mark, zero-width character or whitespace.
+fn claude_task_notification(record: &Value, message: &Value) -> bool {
+    let origin = |value: &Value| {
+        value
+            .pointer("/origin/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("task-notification"))
+    };
+    if origin(record) || origin(message) {
+        return true;
+    }
+    let first_text = match message.get("content") {
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(Value::Array(blocks)) => blocks.iter().find_map(|block| {
+            block.as_str().or_else(|| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| first_string(block, &["text"]))
+                    .flatten()
+            })
+        }),
+        _ => None,
+    };
+    first_text.is_some_and(|text| {
+        const TAG: &str = "<task-notification";
+        let text = text.trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}'
+                )
+        });
+        text.get(..TAG.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(TAG))
+            && text[TAG.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+    })
+}
+
+/// A record flag Claude Code writes as `true`, and that a rewritten
+/// transcript may carry as `"true"` or `1`.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(text) => {
+            let text = text.trim();
+            text.eq_ignore_ascii_case("true") || text == "1"
+        }
+        _ => false,
+    }
 }
 
 fn parse_codex(
@@ -933,7 +1054,7 @@ fn parse_codex(
                 Some("assistant"),
                 &format!("{name}: {body}"),
                 timestamp(value),
-                json!({"tool": name}),
+                with_tool_use_id(json!({"tool": name}), first_string(payload, &["call_id"])),
             );
         }
         "function_call_output" | "custom_tool_call_output" | "tool_result" => {
@@ -948,7 +1069,7 @@ fn parse_codex(
                 Some("tool"),
                 body,
                 timestamp(value),
-                json!({}),
+                with_tool_use_id(json!({}), first_string(payload, &["call_id"])),
             );
         }
         "web_search_call" => {
@@ -1029,10 +1150,13 @@ fn parse_pi_family(
                         Some("tool"),
                         &body,
                         timestamp(value),
-                        json!({
-                            "tool": tool,
-                            "is_error": message.get("isError").or_else(|| message.get("is_error")).and_then(Value::as_bool).unwrap_or(false)
-                        }),
+                        with_tool_use_id(
+                            json!({
+                                "tool": tool,
+                                "is_error": message.get("isError").or_else(|| message.get("is_error")).and_then(Value::as_bool).unwrap_or(false)
+                            }),
+                            first_string(message, &["toolCallId", "tool_call_id"]),
+                        ),
                     );
                 }
                 _ => losses.push(format!(
@@ -2100,7 +2224,10 @@ fn parse_content_blocks(
                     Some("assistant"),
                     &format!("{name}: {input}"),
                     occurred_at.clone(),
-                    json!({"tool": name}),
+                    with_tool_use_id(
+                        json!({"tool": name}),
+                        first_string(block, &["id", "toolCallId", "tool_call_id", "call_id"]),
+                    ),
                 );
             }
             "tool_result" | "toolResult" => {
@@ -2122,7 +2249,13 @@ fn parse_content_blocks(
                     Some("tool"),
                     &body,
                     occurred_at.clone(),
-                    json!({"is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false)}),
+                    with_tool_use_id(
+                        json!({"is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false)}),
+                        first_string(
+                            block,
+                            &["tool_use_id", "toolCallId", "tool_call_id", "call_id"],
+                        ),
+                    ),
                 );
             }
             "thinking" | "reasoning" | "redacted_thinking" => {
@@ -4243,6 +4376,16 @@ fn value_text(value: &Value) -> String {
     }
 }
 
+/// Record the native id pairing a tool call with its result, so a transcript
+/// import can apply one capture decision to both halves (`backfill`, the
+/// `ai-memory run` ledger).
+fn with_tool_use_id(mut metadata: Value, id: Option<&str>) -> Value {
+    if let (Some(id), Some(object)) = (id, metadata.as_object_mut()) {
+        object.insert("tool_use_id".into(), Value::String(id.to_owned()));
+    }
+    metadata
+}
+
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
@@ -5004,6 +5147,65 @@ mod tests {
         assert_eq!(second.events[0].content, "ok");
     }
 
+    /// Claude Code writes `cwd` on every record and Codex in each
+    /// `turn_context`; each event carries the cwd of the record it came from,
+    /// so an import resolves relative tool arguments from where the call ran.
+    #[test]
+    fn jsonl_events_carry_their_record_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let docs = root.join("docs");
+        let claude = temp.path().join("claude.jsonl");
+        let record = |uuid: &str, cwd: &Path, content: Value| json!({"type":"assistant","uuid":uuid,"cwd":cwd,"message":{"role":"assistant","content":content}});
+        fs::write(
+            &claude,
+            [
+                record("one", &root, json!("at the root")),
+                record(
+                    "two",
+                    &docs,
+                    json!([{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}]),
+                ),
+                json!({"type":"assistant","uuid":"three","cwd":"relative","message":{"role":"assistant","content":"no usable cwd"}}),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let events = export_jsonl(ManagedHarness::Claude, &claude, "s", None)
+            .unwrap()
+            .events;
+        let cwds: Vec<_> = events
+            .iter()
+            .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
+            .collect();
+        assert_eq!(cwds, [root.to_str(), docs.to_str(), None], "{events:?}");
+        assert_eq!(events[1].metadata["tool"], "Bash");
+
+        let codex = temp.path().join("codex.jsonl");
+        let item = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        fs::write(
+            &codex,
+            [
+                json!({"type":"session_meta","payload":{"id":"s","cwd":root}}),
+                item("first turn"),
+                json!({"type":"turn_context","payload":{"cwd":docs}}),
+                item("second turn"),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let events = export_jsonl(ManagedHarness::Codex, &codex, "s", None)
+            .unwrap()
+            .events;
+        let cwds: Vec<_> = events
+            .iter()
+            .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
+            .collect();
+        assert_eq!(cwds, [root.to_str(), docs.to_str()], "{events:?}");
+    }
+
     #[test]
     fn incomplete_final_jsonl_record_does_not_advance_cursor() {
         let temp = tempfile::tempdir().unwrap();
@@ -5499,6 +5701,120 @@ mod tests {
         assert_eq!(
             losses,
             ["Claude synthetic/meta records were intentionally excluded"]
+        );
+    }
+
+    /// Claude Code writes background-task reports (a monitored command's
+    /// streamed output, a finished background agent's result) and its compact
+    /// summary as user turns. Neither is a prompt: the reports are excluded,
+    /// with or without the `origin` tag, and the summary becomes a compaction
+    /// event. A typed prompt, including one quoting the tag, stays a message.
+    #[test]
+    fn claude_adapter_keeps_task_notifications_and_compact_summaries_out_of_prompts() {
+        let user = |uuid: &str, extra: Value, content: Value| {
+            let mut record = json!({
+                "type":"user", "uuid":uuid,
+                "message":{"role":"user","content":content},
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                record[key] = value.clone();
+            }
+            record
+        };
+        let records = [
+            user(
+                "monitor",
+                json!({"origin":{"kind":"task-notification"}}),
+                "<task-notification>\n<event>MONITORSENTINEL line</event>\n</task-notification>"
+                    .into(),
+            ),
+            user(
+                "agent",
+                json!({}),
+                json!([{"type":"text","text":"<task-notification>\n<result>AGENTSENTINEL</result>\n</task-notification>"}]),
+            ),
+            user(
+                "tagged",
+                json!({"origin":{"kind":"task-notification","producer":"session-task"}}),
+                "[SYSTEM NOTIFICATION - TAGSENTINEL]".into(),
+            ),
+            user(
+                "summary",
+                json!({"isCompactSummary":true,"isVisibleInTranscriptOnly":true}),
+                "This session is being continued. SUMMARYSENTINEL".into(),
+            ),
+            user(
+                "typed",
+                json!({"origin":{"kind":"human"}}),
+                "why does <task-notification> show up?".into(),
+            ),
+            user(
+                "bom",
+                json!({}),
+                "\u{feff}\u{200b} <Task-Notification id=\"t1\">BOMSENTINEL</Task-Notification>"
+                    .into(),
+            ),
+            user(
+                "later-block",
+                json!({}),
+                json!([{"type":"image","source":{}},{"type":"text","text":"<TASK-NOTIFICATION>\nLATERSENTINEL"}]),
+            ),
+            user(
+                "origin-case",
+                json!({"origin":{"kind":"Task-Notification"}}),
+                "[ORIGINSENTINEL]".into(),
+            ),
+            user(
+                "summary-string",
+                json!({"isCompactSummary":"true"}),
+                "STRINGSUMMARY".into(),
+            ),
+            user(
+                "summary-number",
+                json!({"isCompactSummary":1}),
+                "NUMBERSUMMARY".into(),
+            ),
+            user(
+                "lookalike",
+                json!({"isCompactSummary":"false"}),
+                "<task-notifications are odd>".into(),
+            ),
+        ];
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        for record in &records {
+            let id = record["uuid"].as_str().unwrap();
+            parse_claude(record, "session", id, &mut events, &mut losses);
+        }
+        let messages: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::Message)
+            .map(|event| event.content.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "why does <task-notification> show up?",
+                "<task-notifications are odd>"
+            ]
+        );
+        let compactions: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == WorkstreamEventKind::Compaction)
+            .map(|event| event.content.as_str())
+            .collect();
+        assert_eq!(
+            compactions,
+            [
+                "This session is being continued. SUMMARYSENTINEL",
+                "STRINGSUMMARY",
+                "NUMBERSUMMARY"
+            ]
+        );
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert_eq!(
+            losses,
+            ["Claude task notifications were intentionally excluded"; 6]
         );
     }
 

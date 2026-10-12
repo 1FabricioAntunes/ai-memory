@@ -100,9 +100,11 @@ const port = Number(process.argv[2]);
 const directory = process.argv[3]!;
 const events: string[] = [];
 let handoffs = 0;
+const unmarked: string[] = [];
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   req.resume();
+  if (req.headers["x-ai-memory-client"] !== "open-code") unmarked.push(url.pathname);
   if (url.pathname === "/hook") {
     events.push(url.searchParams.get("event") ?? "?");
     res.writeHead(204);
@@ -134,7 +136,7 @@ const transformed: { system: string[] } = { system: [] };
 await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, transformed);
 await hooks.dispose();
 server.close();
-console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
+console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.system }));
 "#;
 
     /// One plugin run. `hermetic` drops every ambient `AI_MEMORY_*` var, and
@@ -247,6 +249,7 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
         assert_eq!(spooled_entries(&dir), 0, "owned run must spool nothing new");
         // Context delivery is a separate path and must survive the handover.
         assert_eq!(owned["handoffs"], 1, "{owned}");
+        assert_eq!(owned["unmarked"], serde_json::json!([]), "{owned}");
         assert_eq!(owned["system"][0], "HANDOFF_SENTINEL", "{owned}");
 
         // Controls: unset and whitespace-only are not an owner, so the same
@@ -262,6 +265,13 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
                 );
             }
             assert_eq!(captured["handoffs"], 1, "{label}: {captured}");
+            // An unauthenticated server reached by a LAN name refuses a
+            // handoff fetch without the client marker.
+            assert_eq!(
+                captured["unmarked"],
+                serde_json::json!([]),
+                "{label}: requests without the client marker: {captured}"
+            );
             assert_eq!(
                 captured["system"][0], "HANDOFF_SENTINEL",
                 "{label}: {captured}"

@@ -330,11 +330,43 @@ pub struct SplitWebRouters {
     pub html_auth: Option<Arc<crate::HtmlAuthRedirectConfig>>,
 }
 
+/// Refuse to be framed by any page. With auth off, a page inside an iframe
+/// makes same-origin requests the cross-origin guard rightly allows, so a
+/// foreign site could frame `/web/pending` and trick a click on Approve or
+/// Reject. Set only when a handler has not chosen its own value.
+async fn deny_framing(mut response: axum::response::Response) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let headers = response.headers_mut();
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static("frame-ancestors 'none'"));
+    response
+}
+
 /// Split the web surfaces so the host can attach different auth layers.
+/// Every web surface refuses framing (see [`deny_framing`]).
 ///
 /// # Errors
 /// Custom SPA `index.html` cannot be read.
 pub fn split_web_routers(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    let split = split_web_routers_unframed(enable_web, reader, wiki, spec)?;
+    let layer = || axum::middleware::map_response(deny_framing);
+    Ok(SplitWebRouters {
+        public: split.public.layer(layer()),
+        protected: split.protected.layer(layer()),
+        html_auth: split.html_auth,
+    })
+}
+
+fn split_web_routers_unframed(
     enable_web: bool,
     reader: ReaderPool,
     wiki: Wiki,
@@ -1186,6 +1218,55 @@ mod tests {
             html.contains(r#"<base href="/web/"><title>spa</title>"#),
             "the base href belongs in the head: {html}"
         );
+    }
+
+    /// Every web surface refuses framing: the built-in pages (the pending
+    /// writes page among them), the login page, and the API. A foreign site
+    /// that frames `/web/pending` on an auth-off server could otherwise trick
+    /// a click on Approve or Reject (GHSA-6mc4-46pr-w82w).
+    #[tokio::test]
+    async fn web_surfaces_refuse_to_be_framed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let base_href = web_base_href("", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: &base_href,
+                base_path: "",
+                trusted_proxy_identity: false,
+            },
+        )
+        .unwrap();
+        for uri in ["/web", "/web/pending", "/web/login", "/api/v1/projects"] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let headers = resp.headers();
+            assert_eq!(
+                headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+                Some("DENY"),
+                "{uri} ({})",
+                resp.status()
+            );
+            assert_eq!(
+                headers
+                    .get("content-security-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("frame-ancestors 'none'"),
+                "{uri}"
+            );
+        }
     }
 
     /// Regression for the prod 404: with `base_path=""` (host root) the custom
