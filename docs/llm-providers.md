@@ -366,7 +366,7 @@ The equivalent environment variables are
 `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`. Provider failures during an
 automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
 rule-based page; admission, storage, and scope errors still fail closed. The
-validated minimums are 6,000 input and 1,000 output tokens.
+validated minimums are 6,500 input and 1,000 output tokens.
 
 Every chat provider bounds each completion request at 300 seconds
 (`AI_MEMORY_LLM_TIMEOUT_SECS` to override, or `llm_timeout_secs = 900` in

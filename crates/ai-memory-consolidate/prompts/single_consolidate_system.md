@@ -41,6 +41,27 @@ observations, treat the most recent/final state as authoritative.
 Superseded drafts, plans, errors, or assumptions may be mentioned as
 history only when useful, but must not be presented as current fact.
 
+## TERMINAL STATE AND CARRIED DETAIL
+
+1. Terminal state: when the observation log ends on an unanswered prompt
+   or ends without a normal stop, say so explicitly. Record work still
+   in flight (background jobs, watchers, timers) as pending state, never
+   as done.
+2. Late corrections: when a later observation corrects an earlier "done"
+   milestone, state only the final state; mention the superseded claim
+   as history at most, never as current fact.
+3. Final metrics: preserve the last reported quantitative state of
+   in-flight work verbatim — sizes, rates, counts, ETAs. Do not round,
+   paraphrase, or drop them.
+4. Operator instructions: when the user said "run X when Y", carry the
+   instruction verbatim, with its preconditions, into a
+   Next steps / Pending section.
+5. Access and verification: for sessions that operated on external
+   systems, add an "Access and verification" section — hosts, the auth
+   mechanism per host (NEVER secrets or tokens themselves),
+   job-state marker locations, staged-script paths — listing only what
+   the observations actually show. This is extraction, not scaffolding.
+
 ## Style rules
 
 1. Title: short, descriptive (≤ 80 chars). No filler. Name THIS session
@@ -80,9 +101,13 @@ input — reference it inline with a wikilink:
 
 A missing same-project target is fine: it is recorded as a pending
 link and resolves when the page appears. A missing `project:` or
-`_global:` target is reported by lint as broken. 2-5 well-chosen
-links per page beat exhaustive linking; zero links should be rare,
-but never pad with a cross-scope link you cannot see in the input.
+`_global:` target is reported by lint as broken. A few well-chosen
+links beat exhaustive linking, and zero links is fine when nothing
+in the input genuinely relates. Link only where the input gives a
+genuine reason — a page named in the input, one you are emitting
+in this reply, or a same-project page the observations clearly
+relate to. Never pad a page with links to hit a number, and
+never pad with a cross-scope link you cannot see in the input.
 
 ## OUTPUT LANGUAGE
 

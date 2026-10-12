@@ -1415,7 +1415,7 @@ const MIN_OBSERVATION_RESERVE_CHARS: usize = 1_024;
 /// Smallest input budget that still leaves room for observations after
 /// the fixed prompts and structured-output schema. Below this the batch prompt
 /// can leave too little room for observations.
-pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_000;
+pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_500;
 
 /// Smallest useful structured-output allowance. Lower values are unlikely to
 /// fit even one concise batch update and its JSON framing.
@@ -3013,6 +3013,99 @@ mod tests {
         }
     }
 
+    /// #1219: a numeric quota ("2-5 links per page, zero links should be
+    /// rare") pressures the model to invent links to hit the number. The
+    /// prompts must state that zero links is a fine outcome, that links
+    /// need a genuine reason visible in the input, and that padding to
+    /// hit a number is never acceptable — while keeping the #1217
+    /// cross-scope restriction intact.
+    #[test]
+    fn consolidation_system_prompts_do_not_pressure_invented_links() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(
+                prompt.contains("zero links is fine"),
+                "{name} prompt must permit a linkless page"
+            );
+            assert!(
+                prompt.contains("genuine reason"),
+                "{name} prompt must require a genuine reason to link"
+            );
+            assert!(
+                prompt.contains("Never pad a page with links to hit a number"),
+                "{name} prompt must forbid quota padding"
+            );
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt must keep the #1217 cross-scope restriction"
+            );
+            assert!(
+                !prompt.contains("zero links should be rare"),
+                "{name} prompt must not stigmatise a linkless page"
+            );
+            assert!(
+                !prompt.contains("2-5"),
+                "{name} prompt must not carry a numeric link quota"
+            );
+        }
+    }
+
+    /// #1221: consolidation was losing the tail of a session — an
+    /// unanswered final prompt, a late correction to a "done" milestone,
+    /// the last reported metrics of in-flight work, operator "run X when Y"
+    /// instructions, and how to reach and verify external systems the
+    /// session touched. Each rule must be pinned in both prompts.
+    #[test]
+    fn consolidation_system_prompts_preserve_terminal_state_and_carried_detail() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            // 1. Terminal state: unanswered prompt / abnormal stop is said
+            //    explicitly; in-flight work is pending state, not done.
+            assert!(prompt.contains("Terminal state"), "{name} prompt");
+            assert!(
+                prompt.contains("ends on an unanswered prompt"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("without a normal stop"), "{name} prompt");
+            assert!(prompt.contains("pending state"), "{name} prompt");
+            // 2. Late corrections: final state only, superseded claim is
+            //    history at most.
+            assert!(prompt.contains("Late corrections"), "{name} prompt");
+            assert!(
+                prompt.contains("corrects an earlier \"done\""),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("state only the final state"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("as history at most"), "{name} prompt");
+            // 3. Final metrics of in-flight work, verbatim.
+            assert!(prompt.contains("Final metrics"), "{name} prompt");
+            assert!(
+                prompt.contains("sizes, rates, counts, ETAs"),
+                "{name} prompt"
+            );
+            // 4. Operator "run X when Y" instructions carried verbatim with
+            //    their preconditions into Next steps / Pending.
+            assert!(prompt.contains("Operator instructions"), "{name} prompt");
+            assert!(prompt.contains("run X when Y"), "{name} prompt");
+            assert!(prompt.contains("preconditions"), "{name} prompt");
+            assert!(prompt.contains("Next steps / Pending"), "{name} prompt");
+            // 5. Access and verification for external systems: extraction
+            //    grounded in the observations, never secrets themselves.
+            assert!(prompt.contains("Access and verification"), "{name} prompt");
+            assert!(
+                prompt.contains("NEVER secrets or tokens themselves"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("job-state marker"), "{name} prompt");
+            assert!(prompt.contains("staged-script paths"), "{name} prompt");
+            assert!(
+                prompt.contains("extraction, not scaffolding"),
+                "{name} prompt"
+            );
+        }
+    }
+
     #[test]
     fn build_request_elides_raw_observations_from_current_body() {
         let raw_dump = (0..2_000)
@@ -3235,9 +3328,14 @@ mod tests {
 
     /// The batch path must include schema and dynamic slot snapshots in its
     /// envelope instead of assuming a fixed number of slots.
+    ///
+    /// The budget sits above the validated floor so the optional-context
+    /// block reaches its clipping regime (a visible `[truncated]` marker)
+    /// rather than being dropped whole: at the floor the growing system
+    /// prompt leaves no optional-context room at all.
     #[test]
     fn batch_budget_accounts_for_many_slot_snapshots() {
-        let budgets = PromptBudgets::from_limits(6_500, 1_000);
+        let budgets = PromptBudgets::from_limits(8_000, 1_000);
         let observations = (0..64).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
         let slots = (0..100)
             .map(|index| SlotSnapshot {

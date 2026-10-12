@@ -521,6 +521,119 @@ async fn page_metadata_fields_are_never_candidates() {
     assert!(pages[0].1.contains("small focused commits"), "{pages:?}");
 }
 
+/// A curated page the auto-improve scheduler auto-approved is model output
+/// nobody reviewed (#1211): it never becomes a profile candidate. A page a
+/// human approved still counts, and a hand-written page counts (controls).
+#[tokio::test]
+async fn auto_approved_auto_improve_pages_are_never_candidates() {
+    use ai_memory_consolidate::auto_improve_schedule::AUTO_IMPROVE_AUTO_APPROVE_AGENT;
+    use ai_memory_store::{
+        AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun,
+    };
+
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+
+    // Hand-written control.
+    fx.wiki
+        .write_page(WritePageRequest {
+            workspace_id: fx.ws,
+            project_id: alpha,
+            path: PagePath::new("decisions/hand-written.md").unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "# Hand-written rule\n\nAlways run the smoke suite before tagging.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Two proposals: one auto-approved by the scheduler, one approved by a
+    // human.
+    let proposal = |path: &str, title: &str, body: &str| NewAutoImproveProposal {
+        operation: AutoImproveProposalOperation::Create,
+        target_path: PagePath::new(path).unwrap(),
+        kind: "rule".into(),
+        title: title.into(),
+        confidence: 0.9,
+        rationale: "because".into(),
+        evidence_json: serde_json::json!([]),
+        body_markdown: body.into(),
+        artifact_sha256: None,
+        edit_mode: None,
+        patch_json: None,
+        expected_base_body_sha256: None,
+    };
+    let staged = fx
+        .store
+        .writer
+        .stage_auto_improve_run_for_owner(
+            StageAutoImproveRun {
+                workspace_id: fx.ws,
+                project_id: alpha,
+                session_id: None,
+                proposals: vec![
+                    proposal(
+                        "decisions/auto-approved.md",
+                        "Auto-approved rule",
+                        "# Auto-approved rule\n\nAlways mock the clock in scheduler tests.",
+                    ),
+                    proposal(
+                        "decisions/human-approved.md",
+                        "Human-approved rule",
+                        "# Human-approved rule\n\nAlways squash migrations before a release.",
+                    ),
+                ],
+                proposal_actor: ActorContext::anonymous(),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                summary: None,
+                provider: None,
+                model: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    for (id, actor) in staged.proposal_ids.iter().zip([
+        ActorContext {
+            agent: Some(AUTO_IMPROVE_AUTO_APPROVE_AGENT.into()),
+            ..ActorContext::default()
+        },
+        ActorContext {
+            agent: Some("cli".into()),
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        },
+    ]) {
+        fx.wiki
+            .approve_auto_improve_proposal(fx.ws, alpha, *id, actor, None, None)
+            .await
+            .unwrap();
+    }
+
+    pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    assert!(
+        statements.iter().all(|s| !s.contains("mock the clock")),
+        "an auto-approved page became a candidate: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|s| s.contains("squash migrations")),
+        "the human-approved page was lost: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|s| s.contains("smoke suite")),
+        "the hand-written page was lost: {statements:?}"
+    );
+}
+
 /// `[profile] contribute = false` keeps a project out entirely; the same
 /// words in a contributing project are harvested (control).
 #[tokio::test]
