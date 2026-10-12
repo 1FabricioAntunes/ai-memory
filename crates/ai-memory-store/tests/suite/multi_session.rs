@@ -551,6 +551,52 @@ async fn existing_latest_paths_reports_exactly_the_live_paths() {
     assert!(found.is_empty());
 }
 
+/// The link guard's path probe is no existence oracle for a restricted
+/// project (#1218): a restricted target reports nothing whether or not the
+/// path exists, so a link that survives consolidation tells a reader of the
+/// source page nothing about a project they may not read. Reopening the
+/// project is the control: the same probe then sees the page.
+#[tokio::test]
+async fn existing_latest_paths_reports_nothing_for_a_restricted_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, _proj) = scope(&store).await;
+    let secret = store
+        .writer
+        .get_or_create_project(ws, "secret-app".to_string(), None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, secret, "notes/plan.md", "Plan", "private plan"))
+        .await
+        .unwrap();
+    let probe = || {
+        store.reader.existing_latest_paths(
+            ws,
+            secret,
+            vec!["notes/plan.md".to_string(), "notes/absent.md".to_string()],
+        )
+    };
+
+    store
+        .writer
+        .set_access_mode(secret, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    assert!(
+        probe().await.unwrap().is_empty(),
+        "a restricted project must answer the same for a real and an absent path"
+    );
+
+    store
+        .writer
+        .set_access_mode(secret, ai_memory_store::AccessMode::Open)
+        .await
+        .unwrap();
+    assert_eq!(probe().await.unwrap(), vec!["notes/plan.md"]);
+}
+
 /// Re-writing identical content must not churn a new version.
 ///
 /// Two harnesses syncing the same file would otherwise manufacture a version

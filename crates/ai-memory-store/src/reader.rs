@@ -8550,6 +8550,13 @@ impl ReaderPool {
     /// for callers that need to know *which* paths resolve — the consolidation
     /// link guard validates proposed cross-scope wikilinks against it (#1218).
     ///
+    /// A `restricted` project reports nothing, whatever it holds (the global
+    /// preferences project excepted, which every viewer may read). The link
+    /// guard runs with no viewer — background consolidation has none — and a
+    /// link it keeps lands on a page readers of the source project see, so
+    /// answering for a restricted project would let anyone who can plant an
+    /// observation learn which paths exist there.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn existing_latest_paths(
@@ -8569,9 +8576,15 @@ impl ReaderPool {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT path FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
-                   AND path IN ({placeholders})"
+                "SELECT pg.path FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1 \
+                   AND (p.access_mode <> 'restricted' \
+                        OR (w.name = '{global_ws}' AND p.name = '{global_proj}')) \
+                   AND pg.path IN ({placeholders})",
+                global_ws = ai_memory_core::DEFAULT_WORKSPACE_NAME,
+                global_proj = ai_memory_core::GLOBAL_SCOPE_PROJECT,
             );
             let mut stmt = conn.prepare(&sql)?;
             let ws_bytes = workspace_id.as_bytes();

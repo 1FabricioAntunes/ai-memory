@@ -55,7 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can no longer mint the dangling cross-project edge that `ai-memory lint`
   reports as `broken_link`. Resolved cross-scope links survive
   byte-identical, and same-project pending links stay untouched by design.
-  (#1218)
+  A link into a restricted project is always de-linked, so the result never
+  reveals which pages exist there. (#1218)
 - Fixed consolidation inventing `[[_global:…]]` and `[[project:…]]` wikilinks to
   pages that never existed, which `ai-memory lint` then reported as
   `broken_link`. The single, batch and bootstrap prompts told the model that a
