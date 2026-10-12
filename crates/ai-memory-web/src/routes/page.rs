@@ -32,6 +32,16 @@ pub(crate) async fn handler(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
+    // `created_at` is per version; the header's "Created" is the first one.
+    let created_at = match state
+        .reader
+        .page_first_created_at(meta.workspace_id, meta.project_id, &meta.path)
+        .await
+    {
+        Ok(first) => first.unwrap_or_else(|| meta.created_at.clone()),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
     let page_path = match PagePath::new(&path) {
         Ok(p) => p,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -83,7 +93,7 @@ pub(crate) async fn handler(
         tier: meta.tier,
         pinned: meta.pinned,
         updated_relative: humanize(&meta.updated_at),
-        created_relative: humanize(&meta.created_at),
+        created_relative: humanize(&created_at),
         supersedes_path,
         supersedes_href,
         body_html,

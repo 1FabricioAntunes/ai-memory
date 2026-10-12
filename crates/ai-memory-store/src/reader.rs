@@ -8432,6 +8432,41 @@ impl ReaderPool {
         .await
     }
 
+    /// Creation instant of the oldest version of a page, as ISO-8601.
+    ///
+    /// `pages.created_at` is per version, so [`PageMeta::created_at`] is when
+    /// the *latest* version was written. Every version of a page shares
+    /// `(workspace_id, project_id, path)`; this returns the earliest of them,
+    /// which is when the page itself first appeared. Keyed by ids, so a
+    /// same-path page in another project never contributes.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_first_created_at(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_path: &str,
+    ) -> StoreResult<Option<String>> {
+        let page_path = page_path.to_owned();
+        self.with_conn(move |conn| {
+            let first_us: Option<i64> = conn.query_row(
+                "SELECT MIN(created_at) FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+                params![
+                    workspace_id.as_bytes().to_vec(),
+                    project_id.as_bytes().to_vec(),
+                    page_path
+                ],
+                |row| row.get(0),
+            )?;
+            Ok(first_us
+                .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+                .map(|ts| ts.to_string()))
+        })
+        .await
+    }
+
     /// Fetch the latest version's stored body/title/frontmatter for a page by
     /// `(workspace_id, project_id, path)`. Used as a DB-backed fallback for
     /// `memory_read_page` when the on-disk markdown read fails (index/disk
