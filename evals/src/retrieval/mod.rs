@@ -35,7 +35,7 @@ mod ingest;
 mod qa;
 mod query;
 mod reachability;
-mod report;
+pub(crate) mod report;
 mod score;
 
 use std::collections::HashSet;
