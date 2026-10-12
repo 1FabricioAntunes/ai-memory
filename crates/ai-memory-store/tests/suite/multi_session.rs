@@ -574,6 +574,126 @@ async fn concurrent_writes_to_one_path_supersede_rather_than_destroy() {
     );
 }
 
+/// The batched path-existence probe the consolidation link guard validates
+/// proposed cross-scope wikilinks against (#1218): it reports exactly the
+/// paths with a latest row, in any input order, and never invents one.
+#[tokio::test]
+async fn existing_latest_paths_reports_exactly_the_live_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/real.md", "Real", "a real page"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, proj, "decisions/adr.md", "ADR", "a decision"))
+        .await
+        .unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/missing.md".to_string(),
+                "decisions/adr.md".to_string(),
+                "notes/real.md".to_string(),
+                // A duplicate must not double-report.
+                "notes/real.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["decisions/adr.md", "notes/real.md"]);
+
+    // A superseded path still counts: the latest version is the one a link
+    // resolves to.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/real.md", "Real", "rewritten"))
+        .await
+        .unwrap();
+    let found = store
+        .reader
+        .existing_latest_paths(ws, proj, vec!["notes/real.md".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(found, vec!["notes/real.md"]);
+
+    // A foreign scope never sees this project's pages.
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+    let found = store
+        .reader
+        .existing_latest_paths(ws, other_proj, vec!["notes/real.md".to_string()])
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+
+    // Empty input is a no-op, not an error.
+    let found = store
+        .reader
+        .existing_latest_paths(ws, proj, Vec::new())
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+}
+
+/// The link guard's path probe is no existence oracle for a restricted
+/// project (#1218): a restricted target reports nothing whether or not the
+/// path exists, so a link that survives consolidation tells a reader of the
+/// source page nothing about a project they may not read. Reopening the
+/// project is the control: the same probe then sees the page.
+#[tokio::test]
+async fn existing_latest_paths_reports_nothing_for_a_restricted_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, _proj) = scope(&store).await;
+    let secret = store
+        .writer
+        .get_or_create_project(ws, "secret-app".to_string(), None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, secret, "notes/plan.md", "Plan", "private plan"))
+        .await
+        .unwrap();
+    let probe = || {
+        store.reader.existing_latest_paths(
+            ws,
+            secret,
+            vec!["notes/plan.md".to_string(), "notes/absent.md".to_string()],
+        )
+    };
+
+    store
+        .writer
+        .set_access_mode(secret, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    assert!(
+        probe().await.unwrap().is_empty(),
+        "a restricted project must answer the same for a real and an absent path"
+    );
+
+    store
+        .writer
+        .set_access_mode(secret, ai_memory_store::AccessMode::Open)
+        .await
+        .unwrap();
+    assert_eq!(probe().await.unwrap(), vec!["notes/plan.md"]);
+}
+
 /// Re-writing identical content must not churn a new version.
 ///
 /// Two harnesses syncing the same file would otherwise manufacture a version

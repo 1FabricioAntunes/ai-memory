@@ -31,18 +31,21 @@ use ai_memory_core::profile::{
     ProfileEntry, ProfileGenerality, ProfileSettings, is_metadata_field,
 };
 use ai_memory_core::{
-    ActorContext, IdentityKey, PagePath, Tier, UserId, WorkspaceId, find_marker_line,
+    ActorContext, AutoImproveProposalId, IdentityKey, PagePath, Tier, UserId, WorkspaceId,
+    find_marker_line,
 };
 use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, complete_structured};
 use ai_memory_store::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_HARVEST_BATCH, ProfileCandidateRow,
-    ProfileHarvestProject, ProfileLedgerEntry, ProfileScopePage, ProjectAccess, ReaderPool,
-    ResolvedScope, WriterHandle,
+    ProfileHarvestProject, ProfileLedgerEntry, ProfilePageRow, ProfileScopePage, ProjectAccess,
+    ReaderPool, ResolvedScope, WriterHandle,
 };
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::auto_improve_schedule::AUTO_IMPROVE_AUTO_APPROVE_AGENT;
 
 /// Frontmatter value stamping a page the harvester wrote.
 pub const PROFILE_GENERATED_BY: &str = "profile-harvest";
@@ -1898,6 +1901,15 @@ async fn harvest_project(
             PROFILE_HARVEST_BATCH,
         )
         .await?;
+    // A page stamped from an auto-improve proposal the scheduler
+    // auto-approved is model output nobody reviewed (#1211): it never feeds
+    // the profile. A human-approved proposal page still counts, and a page
+    // whose proposal id resolves to no row (legacy, imported) stays curated.
+    let proposal_ids: Vec<AutoImproveProposalId> =
+        pages.iter().filter_map(auto_improve_proposal_of).collect();
+    let decided_by = reader
+        .auto_improve_decided_by(project.workspace_id, project.project_id, proposal_ids)
+        .await?;
     let mut mark = project.mark;
     let mut candidates = Vec::new();
     let (mut calls, mut fallbacks) = (0, 0);
@@ -1973,6 +1985,13 @@ async fn harvest_project(
     // otherwise.
     for page in &pages {
         mark.pages_until = mark.pages_until.max(page.updated_at);
+        if let Some(id) = auto_improve_proposal_of(page)
+            && decided_by
+                .get(&id)
+                .is_some_and(|agent| agent.as_deref() == Some(AUTO_IMPROVE_AUTO_APPROVE_AGENT))
+        {
+            continue;
+        }
         let Some(entry) =
             ProfileEntry::from_page(&page.path, &page.title, &page.body, &page.frontmatter)
         else {
@@ -2026,6 +2045,17 @@ async fn harvest_project(
         .record_profile_harvest(project.workspace_id, project.project_id, candidates, mark)
         .await?;
     Ok((added, calls, fallbacks))
+}
+
+/// The proposal a page was approved from, when its frontmatter carries a
+/// parseable `auto_improve_proposal_id` (stamped by
+/// `Wiki::approve_auto_improve_proposal`).
+fn auto_improve_proposal_of(page: &ProfilePageRow) -> Option<AutoImproveProposalId> {
+    page.frontmatter
+        .get("auto_improve_proposal_id")?
+        .as_str()?
+        .parse()
+        .ok()
 }
 
 fn candidate_from(

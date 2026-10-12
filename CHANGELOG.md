@@ -147,6 +147,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unedited files of an earlier export in place. (#1164)
 
 ### Fixed
+- Fixed the cross-project profile harvester treating pages the auto-improve
+  scheduler auto-approved as curated human input: model output nobody
+  reviewed fed the profile like a hand-written rule. A page stamped from an
+  auto-improve proposal is now skipped when the proposal's decider is the
+  scheduler's auto-approve actor; a page a human approved still counts, and a
+  page whose proposal id resolves to no row (legacy or imported) stays
+  curated. (#1211)
+- Fixed the zero-LLM session page staying silent about abrupt endings. The
+  rule-based synthesis now adds a deterministic terminal-state line reusing
+  the automatic handoff's heuristics: "Session ended without a normal stop;
+  the final prompt was never answered." when the log ends on an unanswered
+  question, the equivalent line when file activity was never followed by a
+  stop, and a mid-task-exit line when a stop was recorded but no session
+  end arrived. A session with a normal stop and end gets no line. (#1221)
+- Fixed consolidation dropping the tail of a session from the compiled
+  page. The single and batch prompts now carry explicit rules: say so when
+  the observation log ends on an unanswered prompt or without a normal
+  stop, and record in-flight work (background jobs, watchers, timers) as
+  pending state; when a later observation corrects an earlier "done"
+  milestone, state only the final state with the superseded claim as
+  history at most; preserve the last reported metrics of in-flight work
+  (sizes, rates, counts, ETAs) verbatim; carry operator "run X when Y"
+  instructions verbatim, with their preconditions, into a
+  Next steps / Pending section; and, for sessions that operated on
+  external systems, emit an "Access and verification" section — hosts,
+  the per-host auth mechanism (never secrets or tokens themselves),
+  job-state marker locations, staged-script paths — grounded only in what
+  the observations show. (#1221)
+- Softened the consolidation prompts' wikilink quota that pushed models to
+  invent links. The single, batch and bootstrap prompts told the model "2-5
+  well-chosen links per page beat exhaustive linking; zero links should be
+  rare", which
+  pressured it to add links just to hit the number. They now state that zero
+  links is fine when nothing in the input genuinely relates, require a genuine
+  reason visible in the input for every link, and forbid padding a page with
+  links to hit a number; the #1207 restriction on cross-scope links whose
+  target is not visible in the input is unchanged. The validated
+  `consolidation.max_input_tokens` floor moved from 6,000 to 6,500 tokens so
+  the larger prompts still leave room for observation evidence at the minimum.
+  (#1219)
+- Fixed consolidation still writing invented `[[_global:…]]` / `[[project:…]]`
+  wikilinks when a model ignored the #1207 prompt wording. The single-page,
+  batch and bootstrap apply paths now resolve every cross-scope wikilink
+  target against the store with no-create lookups before the write and
+  rewrite an unresolvable one to its plain label text (an unresolvable
+  `relations:` frontmatter entry is dropped), so a missing target
+  can no longer mint the dangling cross-project edge that `ai-memory lint`
+  reports as `broken_link`. Resolved cross-scope links survive
+  byte-identical, and same-project pending links stay untouched by design.
+  A link into a restricted project is always de-linked, so the result never
+  reveals which pages exist there. (#1218)
+- Fixed consolidation inventing `[[_global:…]]` and `[[project:…]]` wikilinks to
+  pages that never existed, which `ai-memory lint` then reported as
+  `broken_link`. The single, batch and bootstrap prompts told the model that a
+  missing link target was acceptable and gave it no list of cross-scope pages,
+  so it invented targets to meet the 2-5 link guidance. They now allow a
+  `project:` or `_global:` link only when the exact wiki page path appears in
+  the input, which reduces but does not eliminate such links; a missing
+  same-project target stays a pending link. (#1207)
 - Fixed the web UI answering HTTP 500 when a signed-in viewer opened a project
   or page by a name that two projects answer to. The page and project routes
   now return a 400 that names the clash, matching the API and MCP surfaces.
