@@ -2100,7 +2100,10 @@ mod tests {
                     async move {
                         let accepted = items.len();
                         captured.lock().unwrap().extend(items);
-                        axum::Json(serde_json::json!({ "accepted": accepted }))
+                        let results: Vec<_> = (0..accepted)
+                            .map(|index| serde_json::json!({ "index": index, "outcome": "stored" }))
+                            .collect();
+                        axum::Json(serde_json::json!({ "accepted": accepted, "results": results }))
                     }
                 },
             ),
@@ -2326,7 +2329,10 @@ mod tests {
                     async move {
                         let accepted = items.len();
                         captured.lock().unwrap().extend(items);
-                        axum::Json(serde_json::json!({ "accepted": accepted }))
+                        let results: Vec<_> = (0..accepted)
+                            .map(|index| serde_json::json!({ "index": index, "outcome": "stored" }))
+                            .collect();
+                        axum::Json(serde_json::json!({ "accepted": accepted, "results": results }))
                     }
                 },
             ),
