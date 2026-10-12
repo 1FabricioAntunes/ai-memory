@@ -457,6 +457,16 @@ and [0.x](docs/changelog/0.x.md).
   server built from the same commit, including a schema drift test that fails
   when an MCP tool changes without an SDK update. See
   `companions/ai-memory-ts/README.md` and `docs/design-client-sdk.md`. (#1165)
+- A prompt that starts with `reload context` (for example `reload context
+  after last compaction, then …`) now puts the stretch of the session that
+  its last compaction dropped back in front of the agent: the prompts typed
+  between the latest two compactions, verbatim; the last captured reply (with
+  the assistant-capture opt-in); and the project's open handoffs, listed
+  without claiming them. The new read-only `GET /recap` route builds it from
+  captured observations. Claude Code and Codex receive it with that prompt
+  through `UserPromptSubmit` `additionalContext`, OpenCode V1/V2 through the
+  plugin's system/context hook, and Grok Build on the next `PostToolUse`.
+  Nothing is written, so a reload never consumes a baton (#NNN).
 
 ### Changed
 - Documented the 2.x to 3.0 upgrade in `docs/upgrading-to-3.0.md`: what
