@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 use crate::e2e_support::hermetic;
@@ -17,6 +17,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
 /// A temp root holding the operator's home and a directory of fake tools.
 struct Sandbox {
     _tmp: tempfile::TempDir,
+    // Only the Linux service test reads it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     root: PathBuf,
     home: PathBuf,
 }
@@ -125,6 +127,7 @@ fn setup_without_yes_and_without_a_terminal_changes_nothing() {
 mod slow {
     use super::*;
     use serde_json::{Value, json};
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     /// `systemctl --user` stand-in. `restart` runs the unit's `ExecStart`

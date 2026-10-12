@@ -685,6 +685,8 @@ mod tests {
     /// A server that already answers with no unit of ours in place is not
     /// ours to replace; once our unit exists, a running server is the one it
     /// started and the unit is managed as usual.
+    // Windows skips the service step before this decision.
+    #[cfg(unix)]
     #[test]
     fn an_answering_server_without_our_unit_is_left_in_charge() {
         let tmp = tempfile::tempdir().unwrap();

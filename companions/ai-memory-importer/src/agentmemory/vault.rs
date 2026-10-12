@@ -496,7 +496,10 @@ pub(crate) mod tests {
             td.path(),
             "memories/m.md",
             // Split so secret scanners do not flag the fixture.
-            concat!("---\nid: \"ghp_", "1234567890abcdefghijklmnopqrstuvwxyzAB\"\n---\n# M"),
+            concat!(
+                "---\nid: \"ghp_",
+                "1234567890abcdefghijklmnopqrstuvwxyzAB\"\n---\n# M"
+            ),
         );
         assert!(plan(td.path(), &dest(), DEFAULT_DEST_PREFIX).is_err());
 

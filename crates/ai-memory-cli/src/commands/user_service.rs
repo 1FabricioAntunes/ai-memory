@@ -556,7 +556,9 @@ fn delete_unit(path: &Path) -> Result<()> {
     std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
 }
 
-#[cfg(test)]
+// The service step is Unix-only (systemd user units, launchd), and these
+// tests render and drive it with Unix paths.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
