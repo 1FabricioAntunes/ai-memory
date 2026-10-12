@@ -52,7 +52,16 @@ const NEW_PROJECT_LABEL: &str = "+ New project";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProjectRow {
+    /// Workspace id, when the server sent one. `Option` so an older server
+    /// that predates these fields still deserializes (they are additive on
+    /// the wire). (#1208)
+    #[serde(default)]
+    pub(crate) workspace_id: Option<String>,
     pub(crate) workspace_name: String,
+    /// Project id, the ambiguous-name escape hatch an operator can pass to
+    /// `--project-id` on the destructive admin commands. (#1208)
+    #[serde(default)]
+    pub(crate) project_id: Option<String>,
     pub(crate) project_name: String,
     pub(crate) page_count: u64,
     pub(crate) last_updated: Option<String>,

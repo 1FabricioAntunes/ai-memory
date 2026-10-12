@@ -155,6 +155,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unedited files of an earlier export in place. (#1164)
 
 ### Fixed
+- Fixed the admin project operations being unaddressable when a NAME is
+  ambiguous. `purge-project`, `rename-project` and `move-project` resolved
+  their target by name alone, so a legacy twin row whose name collides with
+  another project's `legacy_name` (the empty leftover an older migration
+  leaves behind) could not be reached: the lookup answered with whichever row
+  it found first. Each endpoint now also accepts `project_id` (a UUID) as an
+  alternative to `project`/`from`, and the CLI exposes it as `--project-id`,
+  mutually exclusive with the name flag. Sending both or neither is a 400, a
+  malformed UUID is a 400, and an id that names no row in the workspace is a
+  404, so a foreign-scope id is refused rather than guessed at.
+  `list-projects` now prints each project's id so an operator can copy it
+  into `--project-id`. (#1208)
 - Fixed the cross-project profile harvester treating pages the auto-improve
   scheduler auto-approved as curated human input: model output nobody
   reviewed fed the profile like a hand-written rule. A page stamped from an

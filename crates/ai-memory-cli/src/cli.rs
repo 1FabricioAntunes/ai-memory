@@ -1517,8 +1517,16 @@ pub struct PurgeProjectArgs {
     pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
+    /// Project id (UUID) to purge, as an alternative to `--project`.
+    ///
+    /// Use this when the NAME lookup is ambiguous: a legacy row whose name
+    /// collides with another project's `legacy_name` resolves to the wrong
+    /// row, so only the id reaches the intended one. Find it in the
+    /// `list-projects` output. Mutually exclusive with `--project`.
+    #[arg(long)]
+    pub project_id: Option<String>,
     /// REQUIRED for the purge to run. Without this flag the CLI errors
     /// out — purging is destructive and irreversible.
     ///
@@ -1607,8 +1615,16 @@ pub struct RenameProjectArgs {
     /// running `ai-memory rename-project --to new-name` from a dir
     /// that was JUST renamed (the basename will be the new name, so
     /// you'll want to pass --from explicitly in that workflow).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub from: Option<String>,
+    /// Project id (UUID) to rename, as an alternative to `--from`.
+    ///
+    /// Use this when the NAME lookup is ambiguous: a legacy row whose name
+    /// collides with another project's `legacy_name` resolves to the wrong
+    /// row, so only the id reaches the intended one. Find it in the
+    /// `list-projects` output. Mutually exclusive with `--from`.
+    #[arg(long)]
+    pub project_id: Option<String>,
     /// New project name. Must be non-empty and contain no slashes.
     #[arg(long)]
     pub to: String,
@@ -1624,8 +1640,16 @@ pub struct MoveProjectArgs {
     pub from_workspace: Option<String>,
     /// Project name to move. When omitted, auto-derived from the basename
     /// of the current git repo root (or CWD if no git repo).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
+    /// Project id (UUID) to move, as an alternative to `--project`.
+    ///
+    /// Use this when the NAME lookup is ambiguous: a legacy row whose name
+    /// collides with another project's `legacy_name` resolves to the wrong
+    /// row, so only the id reaches the intended one. Find it in the
+    /// `list-projects` output. Mutually exclusive with `--project`.
+    #[arg(long)]
+    pub project_id: Option<String>,
     /// Destination workspace. Auto-created if it doesn't exist.
     #[arg(long)]
     pub to_workspace: String,
@@ -4844,5 +4868,90 @@ mod tests {
         };
         assert_eq!(args.version.as_deref(), Some("v2.3.2"));
         assert!(args.force);
+    }
+
+    /// #1208: each destructive project op takes `--project-id` as an
+    /// alternative to its name flag, and the two are mutually exclusive so an
+    /// ambiguous request never reaches the server to be guessed at.
+    #[test]
+    fn project_id_flags_parse_and_conflict_with_their_name_flags() {
+        let id = "11111111-2222-3333-4444-555555555555";
+
+        let cli = Cli::try_parse_from(["ai-memory", "purge-project", "--project-id", id]).unwrap();
+        let Command::PurgeProject(args) = cli.command else {
+            panic!("expected purge-project");
+        };
+        assert_eq!(args.project_id.as_deref(), Some(id));
+        assert!(args.project.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "purge-project",
+                "--project",
+                "doomed",
+                "--project-id",
+                id,
+            ])
+            .is_err(),
+            "--project and --project-id must not both be accepted"
+        );
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "rename-project",
+            "--project-id",
+            id,
+            "--to",
+            "new",
+        ])
+        .unwrap();
+        let Command::RenameProject(args) = cli.command else {
+            panic!("expected rename-project");
+        };
+        assert_eq!(args.project_id.as_deref(), Some(id));
+        assert!(args.from.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "rename-project",
+                "--from",
+                "old",
+                "--project-id",
+                id,
+                "--to",
+                "new",
+            ])
+            .is_err(),
+            "--from and --project-id must not both be accepted"
+        );
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "move-project",
+            "--project-id",
+            id,
+            "--to-workspace",
+            "elsewhere",
+        ])
+        .unwrap();
+        let Command::MoveProject(args) = cli.command else {
+            panic!("expected move-project");
+        };
+        assert_eq!(args.project_id.as_deref(), Some(id));
+        assert!(args.project.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "move-project",
+                "--project",
+                "movable",
+                "--project-id",
+                id,
+                "--to-workspace",
+                "elsewhere",
+            ])
+            .is_err(),
+            "--project and --project-id must not both be accepted"
+        );
     }
 }

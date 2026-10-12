@@ -11,7 +11,14 @@ use crate::http_client::{ServerEndpoint, post_json};
 #[derive(Serialize)]
 struct MoveProjectRequest {
     from_workspace: String,
-    project: String,
+    /// Exactly one of `project` / `project_id` is `Some`. `--project-id`
+    /// bypasses the server's name/legacy/canonical lookup, which is the point:
+    /// a legacy row whose name collides with another project's `legacy_name`
+    /// is otherwise unreachable by name. (#1208)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
     to_workspace: String,
     confirm: bool,
     force: bool,
@@ -21,19 +28,41 @@ struct MoveProjectRequest {
 /// Run the `move-project` subcommand.
 ///
 /// Resolves the source project name (auto-derived from the git repo root
-/// when `--project` is omitted), requires `--confirm` before sending the
-/// request (a true-move re-stamp or a copy+purge merge, both irreversible),
-/// then prints the report.
+/// when `--project` is omitted) -- or, when `--project-id` is given, skips
+/// name resolution and moves that id directly, the only way to reach a legacy
+/// row whose name is shadowed by another project's `legacy_name` -- requires
+/// `--confirm` before sending the request (a true-move re-stamp or a
+/// copy+purge merge, both irreversible), then prints the report.
 ///
 /// # Errors
 /// Returns an error when `--confirm` is absent, the server is unreachable,
 /// or the server returns a non-2xx response.
 pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
-    let (from_workspace, project) = super::resolve_scope(
-        config,
-        args.from_workspace.as_deref(),
-        args.project.as_deref(),
-    )?;
+    let (from_workspace, project, project_id) = match args.project_id {
+        Some(id) => (
+            super::resolve_workspace(config, args.from_workspace.as_deref())?,
+            None,
+            Some(id),
+        ),
+        None => {
+            let (ws, project) = super::resolve_scope(
+                config,
+                args.from_workspace.as_deref(),
+                args.project.as_deref(),
+            )?;
+            (ws, Some(project), None)
+        }
+    };
+    let target_flag = match (&project, &project_id) {
+        (Some(project), _) => format!("--project {project}"),
+        (None, Some(id)) => format!("--project-id {id}"),
+        (None, None) => unreachable!("clap requires one of --project/--project-id"),
+    };
+    let target_label = match (&project, &project_id) {
+        (Some(project), _) => project.clone(),
+        (None, Some(id)) => id.clone(),
+        (None, None) => unreachable!("clap requires one of --project/--project-id"),
+    };
 
     if !args.confirm {
         bail!(
@@ -43,13 +72,13 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
              already has one, the pages are copied in and merged, then the \
              source is PURGED. Both are irreversible.\n\
              Re-run with --confirm to proceed:\n\n  \
-             ai-memory move-project --from-workspace {} --project {} \
+             ai-memory move-project --from-workspace {} {} \
              --to-workspace {} --confirm",
             from_workspace,
-            project,
+            target_flag,
             args.to_workspace,
             from_workspace,
-            project,
+            target_flag,
             args.to_workspace,
         );
     }
@@ -61,6 +90,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         &MoveProjectRequest {
             from_workspace: from_workspace.clone(),
             project: project.clone(),
+            project_id: project_id.clone(),
             to_workspace: args.to_workspace.clone(),
             confirm: true,
             force: args.force,
@@ -82,9 +112,9 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             config,
             &endpoint,
             &from_workspace,
-            &project,
+            &target_label,
             &args.to_workspace,
-            &project,
+            &target_label,
         )
     {
         eprintln!(
@@ -97,7 +127,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         println!(
             "Moved {}/{} → {}/{}: {pages} pages re-stamped (true move — \
              sessions, observations and history preserved).",
-            from_workspace, project, args.to_workspace, project,
+            from_workspace, target_label, args.to_workspace, target_label,
         );
     } else {
         // copy-purge (merge into an existing same-named project).
@@ -111,7 +141,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         println!(
             "Moved {}/{} → {}/{}: {pages} pages copied (merged into existing \
              project){tail}.",
-            from_workspace, project, args.to_workspace, project,
+            from_workspace, target_label, args.to_workspace, target_label,
         );
         if skipped_count > 0 {
             println!(
