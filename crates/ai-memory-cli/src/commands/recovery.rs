@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::RecoverArgs;
 use crate::commands::hook_spool::{self, DrainLockWait, MaxAttempts, RestoreOutcome};
+use crate::commands::transcript_capture::TranscriptCapture;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, ServerProbe, probe_server};
 
@@ -984,6 +985,7 @@ async fn recover_finish_failed(
         ai_memory_core::WorkstreamCheckpoint::default(),
         entry.exit_code,
         sanitizer,
+        &TranscriptCapture::for_checkout(&config.data_dir, Path::new(&entry.cwd)),
     )
     .await
     {
@@ -1073,6 +1075,7 @@ async fn recover_degraded_run(
         entry.source_cursor.as_deref(),
         final_cursor,
         expected_digests,
+        &TranscriptCapture::for_checkout(&config.data_dir, Path::new(&entry.cwd)),
     )
     .await
     {

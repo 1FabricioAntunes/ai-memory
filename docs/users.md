@@ -80,11 +80,11 @@ plus a separate CSRF cookie that the SPA must send on cookie-authenticated
 
 | Endpoint | Class | Notes |
 |---|---|---|
-| `POST /auth/login` | public | Rate-limited. Returns the `/auth/me` snapshot plus `Set-Cookie`. |
+| `POST /auth/login` | public | Rate-limited; `application/json` body only (415 otherwise). Returns the `/auth/me` snapshot plus `Set-Cookie`. |
 | `GET /auth/me` | session | Identity, `role`, `must_change_password`, capabilities. Anonymous only in zero-config loopback. |
 | `POST /auth/password` | session + CSRF | Changes password, revokes other sessions, rotates this one. |
 | `POST /auth/logout` | session + CSRF | Revokes the session and expires cookies. |
-| `POST /auth/recovery` | public | Break-glass for the configured `root_username`. Never issues a session. |
+| `POST /auth/recovery` | public | Break-glass for the configured `root_username`; `application/json` body only (415 otherwise). Never issues a session. |
 
 Passwords are Argon2id PHC strings, 12–1024 UTF-8 bytes, hashed off the writer
 actor. The last enabled root with a password cannot be disabled or demoted.

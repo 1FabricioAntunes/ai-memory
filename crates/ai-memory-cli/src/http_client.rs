@@ -24,6 +24,9 @@ use serde::de::DeserializeOwned;
 use crate::config::{Config, DEFAULT_SERVER_URL};
 use ai_memory_web::normalize_prefix;
 
+/// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] value for CLI subcommands.
+const CLI_CLIENT_KIND: &str = "cli";
+
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
 pub(crate) struct ServerResponseError {
@@ -238,8 +241,11 @@ impl ServerEndpoint {
         parsed.as_str().trim_end_matches('/').to_owned()
     }
 
-    /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
+    /// Mark a request to this server as first-party
+    /// ([`ai_memory_hooks::CLIENT_MARKER_HEADER`]) and attach the bearer when a
+    /// token is set.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.header(ai_memory_hooks::CLIENT_MARKER_HEADER, CLI_CLIENT_KIND);
         match &self.auth_token {
             Some(t) => req.bearer_auth(t),
             None => req,
@@ -849,7 +855,7 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn authenticate_no_token_leaves_request_unchanged() {
+    fn authenticate_no_token_sets_only_the_client_marker() {
         let ep = ServerEndpoint::from_pair(None, None);
         let client = reqwest::Client::new();
         // Build a request, authenticate it, then build to inspect.
@@ -861,6 +867,14 @@ mod tests {
         assert!(
             req.headers().get("authorization").is_none(),
             "no Authorization header expected"
+        );
+        // An unauthenticated server reached by a LAN name refuses a handoff
+        // fetch without the marker, so every CLI request carries it.
+        assert_eq!(
+            req.headers()
+                .get(ai_memory_hooks::CLIENT_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("cli")
         );
     }
 

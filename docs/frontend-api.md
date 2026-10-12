@@ -62,6 +62,9 @@ Content-Type: application/json
 {"username":"alice","password":"…"}
 ```
 
+`/auth/login` and `/auth/recovery` answer 415 to any other content type, so a
+form post or a `text/plain` request from another site cannot reach them.
+
 Do not put `AI_MEMORY_AUTH_TOKEN`, `aim_` keys, session values, or CSRF values
 in `localStorage`. Before any human password or completed bootstrap exists,
 deprecated GET-only browser compatibility may accept the root bearer through

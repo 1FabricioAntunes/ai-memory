@@ -1075,6 +1075,72 @@ PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOn
     && printf 'ok' || printf 'missing')
 assert_eq "powershell session-start handoff GET carries the briefing keys" "ok" "$PS_BRIEF_STATIC"
 
+# --- client marker header on every request ------------------------------
+# An unauthenticated server reached through a non-loopback host name refuses
+# a handoff fetch without `X-AI-Memory-Client`, which a web page cannot add.
+# Every curl branch (env token, header file, no auth) of the GET, the event
+# POST and the spool drain must send it. The stub logs one line per request:
+# "marked" or "UNMARKED".
+curl() {
+    _tmk=UNMARKED
+    _tdata=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -H) shift; [ "$#" -gt 0 ] || break
+                [ "$1" = "X-AI-Memory-Client: hook-sh" ] && _tmk=marked ;;
+            -X) shift ;;
+            --data-binary) shift; [ "$#" -gt 0 ] || break; _tdata="$1" ;;
+        esac
+        shift
+    done
+    [ "$_tdata" = "@-" ] && cat >/dev/null
+    printf '%s\n' "$_tmk" >>"$MARKER_LOG"
+    printf '200'
+    return 0
+}
+AI_MEMORY_DATA_DIR="$TMP/client-marker"
+export AI_MEMORY_DATA_DIR
+mkdir -p "$AI_MEMORY_DATA_DIR"
+MARKER_LOG="$AI_MEMORY_DATA_DIR/marker.log"
+: >"$MARKER_LOG"
+marker_round() {
+    # The hooks call it under `|| true`; without that, `set -e` stops at the
+    # missing auth-header file lookup inside it.
+    ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor" >/dev/null 2>&1 || true
+    printf '%s' '{"e":"marker"}' \
+        | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=stop&agent=cursor" >/dev/null 2>&1
+}
+marker_round                                   # no auth
+(umask 077; printf 'Authorization: Bearer file-token\n' >"$AI_MEMORY_DATA_DIR/auth-header")
+marker_round                                   # header file
+rm -f "$AI_MEMORY_DATA_DIR/auth-header"
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"m1"}'
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain without a token
+AI_MEMORY_AUTH_TOKEN=env-token
+export AI_MEMORY_AUTH_TOKEN
+marker_round                                   # env token
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"m2"}'
+unset AI_MEMORY_AUTH_TOKEN
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain with the spooled token
+unset -f curl
+assert_eq "client marker: every curl branch was exercised" "yes" \
+    "$([ "$(awk 'END { print NR + 0 }' "$MARKER_LOG")" -ge 8 ] && printf 'yes' || printf 'no')"
+assert_eq "client marker: no request went out without it" "0" \
+    "$(grep -c UNMARKED "$MARKER_LOG")"
+unset AI_MEMORY_DATA_DIR
+
+# The PowerShell helper builds its request headers in one hashtable per call
+# site; each must carry the marker, and every Invoke-WebRequest must pass one.
+PS_HELPER=hooks/lib/ai-memory-hook.ps1
+PS_HEADER_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders = @\{\}' "$PS_HELPER")
+PS_MARKED_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders\["X-AI-Memory-Client"\] = "hook-ps"' "$PS_HELPER")
+PS_REQUESTS=$(grep -c 'Invoke-WebRequest `' "$PS_HELPER")
+PS_REQUESTS_WITH_HEADERS=$(grep -A6 'Invoke-WebRequest `' "$PS_HELPER" | grep -Ec -- '-Headers \$[Hh]eaders')
+assert_eq "powershell: header tables found" "yes" \
+    "$([ "$PS_HEADER_TABLES" -ge 2 ] && printf 'yes' || printf 'no (%s)' "$PS_HEADER_TABLES")"
+assert_eq "powershell: every header table carries the client marker" "$PS_HEADER_TABLES" "$PS_MARKED_TABLES"
+assert_eq "powershell: every request passes the header table" "$PS_REQUESTS" "$PS_REQUESTS_WITH_HEADERS"
+
 # A spooled fixture event names this run's temp tree or targets the fake
 # `memory.test` host. Live sessions share the spool and may mention that host
 # in their own payloads, where it is JSON-escaped, so match only the URL field.

@@ -20,8 +20,9 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDisposition, CaptureMode, HookEvent, PolicyState, absolute_tool_location_paths,
-    repository_admits_capture,
+    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, GlobStep,
+    GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths, capture_lookup_locations,
+    glob_segment_matches, glob_walk, repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -33,8 +34,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
     build_client, canonical_context, capture_policy, extract_cwd, get_handoff, hook_scope,
-    marker_query_suffix, marker_query_suffix_without_briefing, marker_requests_briefing,
-    resolve_cwd_with_fallbacks, url_encode,
+    marker_capture_policy, marker_query_suffix, marker_query_suffix_without_briefing,
+    marker_requests_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -753,11 +754,19 @@ where
     let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
-        policy.inspect(
-            AgentKind::from_wire(&args.agent),
-            &json,
-            inspection_cwd.as_deref().unwrap_or(""),
-        )
+        let agent = AgentKind::from_wire(&args.agent);
+        let inspection_cwd = inspection_cwd.as_deref().unwrap_or("");
+        let decision = policy.inspect(agent, &json, inspection_cwd);
+        // Another checkout's `ignore_paths` protect its files from a call
+        // made here too (`cat ../other/secret.env`).
+        if decision.protocol().disposition() == CaptureDisposition::Drop {
+            return decision;
+        }
+        let own_marker = policy_cwd.as_deref().and_then(crate::marker::find_marker);
+        match foreign_capture_decision(agent, &json, inspection_cwd, own_marker.as_deref()) {
+            Some(foreign) => decision.stricter(foreign),
+            None => decision,
+        }
     });
     let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
@@ -767,14 +776,8 @@ where
         crate::cli::CaptureModeArg::mode,
     );
     let route = resolve_hook_route(&dd, policy_cwd.as_deref(), || std::env::current_dir().ok());
-    // Marker presence is the opt-in signal under allowlist mode. Resolved from
-    // the same upward walk the policy uses, so opting in needs no new file.
-    let marker_present = policy_cwd
-        .as_deref()
-        .is_some_and(|cwd| crate::marker::find_marker(cwd).is_some());
-    let routing_valid = policy_cwd
-        .as_deref()
-        .is_none_or(|cwd| crate::marker::routing_selection(cwd).is_ok());
+    let marker_present = marker_present(policy_cwd.as_deref());
+    let routing_valid = routing_valid(policy_cwd.as_deref());
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
@@ -850,6 +853,8 @@ where
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
+    // Read before a metadata-only rewrite drops the payload's own fields.
+    let subagent_payload = payload_is_subagent(&json);
     if let Some(decision) = decision {
         match decision.protocol().disposition() {
             CaptureDisposition::Drop => {
@@ -1143,7 +1148,7 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        if !shown.is_file() && !payload_is_subagent(&json) {
+        if !shown.is_file() && !subagent_payload {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id
@@ -1266,7 +1271,7 @@ fn file_route_anchor(cwd: &Path) -> FileRouteAnchor {
 /// source files while its `workdir` points elsewhere. Without a reroute the
 /// event stays with the payload cwd, whose policy then drops it exactly as it
 /// would have before any rerouting existed.
-fn tool_location_routing_cwd(
+pub(crate) fn tool_location_routing_cwd(
     agent: AgentKind,
     raw: &serde_json::Value,
     payload_cwd: &str,
@@ -1299,6 +1304,337 @@ fn tool_location_routing_cwd(
         .disposition()
         == CaptureDisposition::Keep;
     source_keeps.then(|| dir.to_string_lossy().into_owned())
+}
+
+/// How many markers other than the event's own one tool call may make
+/// [`foreign_capture_decision`] apply.
+const MAX_FOREIGN_MARKERS: usize = 16;
+/// How many directories, and directory entries read, following the glob
+/// syntax of one tool call's locations may cost, and how long: a hook has
+/// about 200 ms in all.
+const MAX_GLOB_DIRECTORIES: usize = 256;
+const MAX_GLOB_ENTRIES: usize = 32_768;
+const MAX_GLOB_TIME: Duration = Duration::from_millis(50);
+/// How many filesystem probes looking up the markers of one call's locations
+/// may cost; each directory's marker is found once ([`MarkerMemo`]), so only
+/// a tree built to be deep and wide reaches it.
+///
+/// [`MarkerMemo`]: crate::marker::MarkerMemo
+const MAX_LOOKUP_PROBES: usize = 16_384;
+
+/// The stricter decision of every other marker that governs a location the
+/// tool call names: a file-tool target, or a path a shell argument spells,
+/// resolved from the event's `cwd`. A checkout's `ignore_paths` must hold
+/// when the call is made from another checkout or an unmarked directory
+/// (`cat ../a/secret.env`), so each such marker's policy inspects the call
+/// as the event's own does. `None` when no other marker governs one.
+///
+/// Markers are found by the same lexical walk as the event's (no
+/// canonicalization), from the nearest existing directory of each location,
+/// with each directory's answer remembered for every lookup that passes it
+/// ([`MarkerMemo`]), so a deep tree costs one probe per directory. A location
+/// with glob syntax ([`glob_walk`]) is looked up from its literal root first,
+/// and, when that root lies outside the event's own checkout, every directory the
+/// glob could pass through below the root is checked for a marker of its
+/// own: each glob segment lists the child directories (never following a
+/// symlink), and a `**` lists the whole subtree except the own checkout's. A
+/// glob rooted inside the event's own checkout is not walked, so a monorepo's
+/// `packages/*/x` costs nothing; a checkout nested inside the event's own is
+/// not reached through one. The own checkout is the nearest `.git` root of
+/// the cwd unless that is the filesystem root or lies at or above the home
+/// directory ([`own_checkout`]).
+///
+/// The walk and the lookups share one budget of time, directories, entries
+/// and probes. Locations outside the own checkout come first: there a call
+/// naming more locations or markers than the bounds, a walk or lookup past
+/// the budget, glob syntax the walk cannot follow, or locations that cannot
+/// be read is unprovable and gets the fail-closed decision of an invalid
+/// policy. Inside the own checkout the own policy governs, so running out of
+/// budget there ends the lookup without failing closed.
+///
+/// [`MarkerMemo`]: crate::marker::MarkerMemo
+pub(crate) fn foreign_capture_decision(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    inspection_cwd: &str,
+    own_marker: Option<&Path>,
+) -> Option<CaptureDecision> {
+    foreign_decision_within(
+        agent,
+        raw,
+        inspection_cwd,
+        own_marker,
+        home_dir().as_deref(),
+        || GlobBudget::new(MAX_GLOB_TIME),
+    )
+}
+
+/// [`foreign_capture_decision`] with the home directory and the budget given;
+/// the budget is made once the event's own lookups are done.
+fn foreign_decision_within(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    inspection_cwd: &str,
+    own_marker: Option<&Path>,
+    home: Option<&Path>,
+    budget: impl FnOnce() -> GlobBudget,
+) -> Option<CaptureDecision> {
+    let unprovable = || {
+        Some(
+            CapturePolicy::resolve(CaptureSource::Invalid, inspection_cwd, None).inspect(
+                agent,
+                raw,
+                inspection_cwd,
+            ),
+        )
+    };
+    let Some(locations) =
+        capture_lookup_locations(agent, raw, inspection_cwd, home.and_then(Path::to_str))
+    else {
+        return unprovable();
+    };
+    let mut markers: Vec<PathBuf> = Vec::new();
+    let mut memo = crate::marker::MarkerMemo::with_home(home);
+    // The event's own lookups already paid for these, outside the budget; a
+    // location below the cwd then stops at it.
+    let cwd = Path::new(inspection_cwd);
+    let checkout = memo
+        .checkout_root(cwd, &mut || Some(()))
+        .flatten()
+        .filter(|root| own_checkout(root, home));
+    memo.remember(cwd, own_marker);
+    if cwd.is_dir() {
+        memo.note_directory(cwd);
+    }
+    let mut walk = budget();
+    // Locations outside the own checkout first: there another checkout's
+    // policy may apply, so running out of budget there is unprovable, and a
+    // long list inside the checkout must not spend it first. Inside it the
+    // own policy governs, as for a glob rooted there; a marker nested in it
+    // is found while the budget lasts, the shallowest locations first.
+    let (outside, mut inside): (Vec<String>, Vec<String>) =
+        locations.into_iter().partition(|location| {
+            checkout
+                .as_deref()
+                .is_none_or(|checkout| !Path::new(location).starts_with(checkout))
+        });
+    inside.sort_by_key(|location| Path::new(location).components().count());
+    let inside_from = outside.len();
+    for (index, location) in outside.into_iter().chain(inside).enumerate() {
+        // Past a bound, a location inside the own checkout ends the lookup;
+        // one outside it is unprovable.
+        let exhausted = || {
+            if index >= inside_from {
+                None
+            } else {
+                Some(unprovable())
+            }
+        };
+        let (lookup, steps) = match glob_walk(&location) {
+            GlobWalk::Literal => (location, None),
+            GlobWalk::Unprovable => return unprovable(),
+            GlobWalk::Walk { root, steps } => (root, Some(steps)),
+        };
+        // The literal root's marker first: a few probes, before a directory
+        // listing that may spend the rest of the time budget on its own.
+        let Some(dir) = memo.existing_dir(Path::new(&lookup), &mut || walk.probe()) else {
+            match exhausted() {
+                Some(decision) => return decision,
+                None => break,
+            }
+        };
+        let marker = match dir {
+            Some(dir) => {
+                let Some(marker) = memo.find_marker(&dir, &mut || walk.probe()) else {
+                    match exhausted() {
+                        Some(decision) => return decision,
+                        None => break,
+                    }
+                };
+                marker
+            }
+            None => None,
+        };
+        let below = match steps {
+            Some(steps) => {
+                let Some(found) =
+                    walk.markers_below(Path::new(&lookup), &steps, checkout.as_deref())
+                else {
+                    return unprovable();
+                };
+                found
+            }
+            None => Vec::new(),
+        };
+        for marker in marker.into_iter().chain(below) {
+            if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
+                continue;
+            }
+            if markers.len() == MAX_FOREIGN_MARKERS {
+                return unprovable();
+            }
+            markers.push(marker);
+        }
+    }
+    markers
+        .iter()
+        .map(|marker| {
+            marker_capture_policy(marker, inspection_cwd).inspect(agent, raw, inspection_cwd)
+        })
+        .reduce(CaptureDecision::stricter)
+}
+
+/// Whether a checkout root counts as the event's own for the rules that a
+/// glob rooted inside it is not walked and that its locations come last:
+/// not the filesystem root, and not at or above the home directory (a
+/// dotfiles repository in `$HOME` would otherwise make every other checkout
+/// under it "own"). It still counts as a checkout for marker lookups.
+fn own_checkout(root: &Path, home: Option<&Path>) -> bool {
+    let home = home.map(crate::marker::absolute_normalized);
+    root.parent().is_some() && !home.is_some_and(|home| home.starts_with(root))
+}
+
+/// What following one call's glob locations and looking up their markers
+/// has cost so far.
+struct GlobBudget {
+    directories: usize,
+    entries: usize,
+    probes: usize,
+    /// Time spent since the walk started; injectable so a test can stand in
+    /// for a slow filesystem.
+    elapsed: Box<dyn FnMut() -> Duration>,
+    limit: Duration,
+}
+
+impl GlobBudget {
+    fn new(limit: Duration) -> Self {
+        let started = std::time::Instant::now();
+        Self::with_clock(limit, Box::new(move || started.elapsed()))
+    }
+
+    fn with_clock(limit: Duration, elapsed: Box<dyn FnMut() -> Duration>) -> Self {
+        Self {
+            directories: 0,
+            entries: 0,
+            probes: 0,
+            elapsed,
+            limit,
+        }
+    }
+
+    /// Counts one more filesystem probe of the marker lookup; `None` past
+    /// [`MAX_LOOKUP_PROBES`] or the time budget the walk shares.
+    fn probe(&mut self) -> Option<()> {
+        self.probes += 1;
+        (self.probes <= MAX_LOOKUP_PROBES && (self.elapsed)() <= self.limit).then_some(())
+    }
+
+    /// Counts one more directory the glob reaches; `None` past the bound.
+    fn reach(&mut self) -> Option<()> {
+        self.directories += 1;
+        (self.directories <= MAX_GLOB_DIRECTORIES).then_some(())
+    }
+
+    /// The marker files of every directory `steps` can reach below `root`,
+    /// `root` itself excluded (its lookup is the caller's). Nothing when
+    /// `root` lies inside the event's own `checkout`, and a `**` lists
+    /// nothing inside it. `None` past the bounds.
+    /// A step that reaches no directory ends the walk: the glob then matches
+    /// nothing there.
+    fn markers_below(
+        &mut self,
+        root: &Path,
+        steps: &[GlobStep],
+        checkout: Option<&Path>,
+    ) -> Option<Vec<PathBuf>> {
+        let mut found = Vec::new();
+        if checkout.is_some_and(|checkout| root.starts_with(checkout)) {
+            return Some(found);
+        }
+        let mut current = vec![root.to_path_buf()];
+        for step in steps {
+            let mut next = Vec::new();
+            for dir in &current {
+                match step {
+                    GlobStep::Named(name) => {
+                        let child = dir.join(name);
+                        if child.is_dir() {
+                            next.push(child);
+                        }
+                    }
+                    GlobStep::Matching(segment) => {
+                        next.extend(self.child_directories(dir)?.into_iter().filter(|child| {
+                            child.file_name().is_some_and(|name| {
+                                glob_segment_matches(segment, &name.to_string_lossy())
+                            })
+                        }))
+                    }
+                    GlobStep::Any => next.extend(self.child_directories(dir)?),
+                    GlobStep::AnyDepth => {
+                        if checkout.is_some_and(|checkout| dir.starts_with(checkout)) {
+                            continue;
+                        }
+                        // Counted as listed: a deep tree must not cost a
+                        // full listing before the bound applies. The own
+                        // checkout's subtree is skipped, as a glob rooted
+                        // in it is.
+                        let outside = |path: &PathBuf| {
+                            checkout.is_none_or(|checkout| !path.starts_with(checkout))
+                        };
+                        let mut pending: Vec<PathBuf> = self
+                            .child_directories(dir)?
+                            .into_iter()
+                            .filter(outside)
+                            .collect();
+                        while let Some(below) = pending.pop() {
+                            self.reach()?;
+                            pending.extend(
+                                self.child_directories(&below)?.into_iter().filter(outside),
+                            );
+                            next.push(below);
+                        }
+                    }
+                }
+            }
+            for dir in &next {
+                if !matches!(step, GlobStep::AnyDepth) {
+                    self.reach()?;
+                }
+                let marker = dir.join(ai_memory_core::repository_identity::MARKER_FILENAME);
+                if marker.is_file() {
+                    found.push(marker);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            current = next;
+        }
+        Some(found)
+    }
+
+    /// The child directories of `dir`, symlinks left out. An unreadable
+    /// directory has none the glob could match either.
+    fn child_directories(&mut self, dir: &Path) -> Option<Vec<PathBuf>> {
+        if (self.elapsed)() > self.limit {
+            return None;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Some(Vec::new());
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            self.entries += 1;
+            if self.entries > MAX_GLOB_ENTRIES {
+                return None;
+            }
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                children.push(entry.path());
+            }
+        }
+        Some(children)
+    }
 }
 
 /// Where one event is delivered (#992).
@@ -1372,6 +1708,65 @@ fn resolve_hook_route(
     }
 }
 
+/// Whether the live hook would deliver events from `destination` to the same
+/// server as events from `source`, resolving each like [`resolve_hook_route`].
+/// A refused selection on either side delivers nowhere, so it never matches.
+/// A transcript import posts everything to one endpoint, so an event the hook
+/// would send elsewhere must not ride along.
+pub(crate) fn delivers_to_same_server(data_dir: &Path, source: &str, destination: &str) -> bool {
+    match (
+        resolve_hook_route(data_dir, Some(source), || None),
+        resolve_hook_route(data_dir, Some(destination), || None),
+    ) {
+        (HookRoute::InstallDefault, HookRoute::InstallDefault) => true,
+        (HookRoute::Profile(source), HookRoute::Profile(destination)) => source == destination,
+        _ => false,
+    }
+}
+
+/// Whether the live hook would file events from `destination` under the same
+/// project as events from `source`. Both must send the same routing hints
+/// ([`hook_scope`]). When those hints name no project or identity, the server
+/// derives one from the cwd itself. Under the default `basename` strategy it
+/// names the project after the cwd's own folder, and a cwd below a project
+/// anchored at its repository root (one first seen at that root) joins that
+/// project: the two agree in the same directory, or when `source` is the
+/// root of the repository and marker boundary `destination` lies in. Two
+/// subdirectories of one repository are two projects. Under `repo-root` it
+/// matches the cwd to the project that owns the enclosing repository: the
+/// two then agree inside one repository and marker boundary, or, outside any
+/// repository, in the same directory.
+/// A transcript import posts every event under one project, so an event the
+/// hook would file under another project must not ride along.
+pub(crate) fn routes_to_same_project(source: &str, destination: &str) -> bool {
+    let scope = hook_scope(source, None);
+    if scope != hook_scope(destination, None) {
+        return false;
+    }
+    if scope.names_the_project() {
+        return true;
+    }
+    let (source_dir, destination_dir) = (
+        lexical_capture_cwd(source),
+        lexical_capture_cwd(destination),
+    );
+    if source_dir == destination_dir {
+        return true;
+    }
+    let anchor = |cwd: &str| existing_target_dir(Path::new(cwd)).map(|dir| file_route_anchor(&dir));
+    let same_repository = || match (anchor(source), anchor(destination)) {
+        (Some(source), Some(destination)) => source.repository.is_some() && source == destination,
+        _ => false,
+    };
+    if scope.derives_from_repo_root() {
+        return same_repository();
+    }
+    let source_dir = Path::new(&source_dir);
+    Path::new(&destination_dir).starts_with(source_dir)
+        && crate::marker::checkout_root(source_dir).as_deref() == Some(source_dir)
+        && same_repository()
+}
+
 /// Normalize the raw hook `cwd` into the base `policy.inspect` joins a tool
 /// event's relative candidate path onto — lexically, via
 /// `marker::absolute_normalized`, NOT `fs::canonicalize` (#671).
@@ -1389,7 +1784,7 @@ fn resolve_hook_route(
 /// including for a candidate file that doesn't exist on disk (canonicalize
 /// would `Err` on that and silently fall back to the raw, un-normalized
 /// cwd).
-fn lexical_capture_cwd(cwd: &str) -> String {
+pub(crate) fn lexical_capture_cwd(cwd: &str) -> String {
     crate::marker::absolute_normalized(Path::new(cwd))
         .into_os_string()
         .into_string()
@@ -1405,6 +1800,27 @@ fn lexical_capture_cwd(cwd: &str) -> String {
 /// does so by construction rather than by preservation logic that a new render
 /// path could forget.
 pub(crate) const CAPTURE_MODE_FILE: &str = "capture-mode";
+
+/// Marker presence is the opt-in signal under allowlist mode. Resolved from
+/// the same upward walk the policy uses, so opting in needs no new file.
+fn marker_present(cwd: Option<&str>) -> bool {
+    cwd.is_some_and(|cwd| crate::marker::find_marker(cwd).is_some())
+}
+
+/// An unreadable routing marker emits nothing rather than guess a scope.
+fn routing_valid(cwd: Option<&str>) -> bool {
+    cwd.is_none_or(|cwd| crate::marker::routing_selection(cwd).is_ok())
+}
+
+/// The hook's repository admission gate (#446) for a transcript import from
+/// the checkout at `cwd`: this install's persisted capture mode, the marker
+/// opt-in, and a readable routing marker. `backfill` and the `ai-memory run`
+/// ledger import nothing — prompts included — from a checkout the live hook
+/// would emit nothing for.
+pub(crate) fn checkout_admits_capture(data_dir: &Path, cwd: &str) -> bool {
+    repository_admits_capture(persisted_capture_mode(data_dir), marker_present(Some(cwd)))
+        && routing_valid(Some(cwd))
+}
 
 /// Read the persisted capture mode. Anything unreadable, absent, or
 /// unrecognised means the historical default: this file can only ever tighten
@@ -3065,6 +3481,963 @@ mod tests {
         }
     }
 
+    /// Adversarial: checkout A's `ignore_paths` hold for a call made from
+    /// checkout B or from an unmarked directory, by a shell argument
+    /// (relative or absolute) or a file tool, whatever B's own policy says.
+    /// Controls: A's public files, and B's own files, are still captured.
+    #[tokio::test]
+    async fn another_checkouts_exclusions_hold_for_a_call_made_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let bare = tmp.path().join("unmarked");
+        let broken = tmp.path().join("broken");
+        for dir in [&a, &b, &bare, &broken] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(b.join(".ai-memory.toml"), "project = \"b\"\n").unwrap();
+        std::fs::write(broken.join(".ai-memory.toml"), "[capture\n").unwrap();
+        let event = |agent_cwd: &Path, tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "cross",
+                "cwd": agent_cwd,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let secret = a.join("secrets.env");
+        let cases = [
+            (
+                "relative shell",
+                "claude-code",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../a/secrets.env"}),
+                ),
+            ),
+            (
+                "absolute shell",
+                "claude-code",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": format!("cat {}", secret.display())}),
+                ),
+            ),
+            (
+                "unmarked hermes terminal",
+                "hermes",
+                event(
+                    &bare,
+                    "terminal",
+                    serde_json::json!({"command": format!("cat {}", secret.display())}),
+                ),
+            ),
+            (
+                "glob shell",
+                "claude-code",
+                event(&b, "Bash", serde_json::json!({"command": "cat ../a/*.env"})),
+            ),
+        ];
+        for (name, agent, raw) in cases {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            assert!(
+                spool_one(&data_dir, agent, None, &raw).await.is_empty(),
+                "{name}: A's exclusion must drop the event"
+            );
+        }
+        // A broken marker over the target fails closed: metadata-only.
+        let raw = event(
+            &b,
+            "Bash",
+            serde_json::json!({"command": "cat ../broken/x.md"}),
+        );
+        let entries = spool_one(&tmp.path().join("data-broken"), "claude-code", None, &raw).await;
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+            "{}",
+            entries[0].body
+        );
+        assert!(
+            entries[0].body.contains("\"metadata-only\""),
+            "{}",
+            entries[0].body
+        );
+        // More markers than the bound is unprovable: metadata-only.
+        let mut many = String::from("cat");
+        for index in 0..=MAX_FOREIGN_MARKERS {
+            let dir = tmp.path().join(format!("m{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".ai-memory.toml"), "project = \"m\"\n").unwrap();
+            many.push_str(&format!(" ../m{index}/x.md"));
+        }
+        let raw = event(&b, "Bash", serde_json::json!({"command": many}));
+        let entries = spool_one(&tmp.path().join("data-many"), "claude-code", None, &raw).await;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"));
+        // Controls.
+        for (name, raw) in [
+            (
+                "public shell",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../a/public.md README.md"}),
+                ),
+            ),
+            (
+                "own file",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat secrets.env"}),
+                ),
+            ),
+            (
+                "few markers",
+                event(
+                    &b,
+                    "Bash",
+                    serde_json::json!({"command": "cat ../m0/x.md ../m1/x.md"}),
+                ),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, "claude-code", None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}"
+            );
+        }
+    }
+
+    /// Adversarial: checkout A's `ignore_paths` also hold for a call from a
+    /// sibling checkout or an unmarked parent that reaches A through glob
+    /// syntax in a directory segment, through a search/list tool's path or
+    /// glob, or through an `apply_patch` header; glob syntax the lookup
+    /// cannot follow, and a file tool whose target cannot be read, fail
+    /// closed. Controls: public files, the event's own files and searches,
+    /// and ordinary globs are still captured whole.
+    #[tokio::test]
+    async fn globs_searches_and_unreadable_targets_answer_to_another_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("work");
+        let a = parent.join("a");
+        let b = parent.join("b");
+        for dir in [&a, &b, &b.join("src")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(b.join(".ai-memory.toml"), "project = \"b\"\n").unwrap();
+        let event = |agent_cwd: &Path, tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "cross-glob",
+                "cwd": agent_cwd,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let bash = |agent_cwd: &Path, command: &str| {
+            event(agent_cwd, "Bash", serde_json::json!({"command": command}))
+        };
+        let attacks = [
+            (
+                "sibling star",
+                "claude-code",
+                bash(&b, "cat ../*/secrets.env"),
+            ),
+            (
+                "parent star",
+                "claude-code",
+                bash(&parent, "cat */secrets.env"),
+            ),
+            ("brace", "claude-code", bash(&b, "cat ../{a,c}/secrets.env")),
+            ("bracket", "claude-code", bash(&b, "cat ../[a]/secrets.env")),
+            ("globstar", "claude-code", bash(&b, "cat ../**/secrets.env")),
+            (
+                "spanning brace",
+                "claude-code",
+                bash(&b, "cat ../{a/x,c}/secrets.env"),
+            ),
+            (
+                "grep path",
+                "claude-code",
+                event(
+                    &b,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "../a/secrets.env", "output_mode": "content"}),
+                ),
+            ),
+            (
+                "glob pattern",
+                "claude-code",
+                event(&b, "Glob", serde_json::json!({"pattern": "../a/*.env"})),
+            ),
+            (
+                "grep filter from the parent",
+                "claude-code",
+                event(
+                    &parent,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "glob": "*/secrets.env"}),
+                ),
+            ),
+            (
+                "gemini search",
+                "gemini-cli",
+                event(
+                    &b,
+                    "search_file_content",
+                    serde_json::json!({"pattern": "KEY", "dir_path": "../a"}),
+                ),
+            ),
+            (
+                "patch header",
+                "codex",
+                event(
+                    &b,
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Update File: ../a/secrets.env\n+KEY\n*** End Patch"}),
+                ),
+            ),
+            (
+                "unreadable target",
+                "claude-code",
+                event(&parent, "Read", serde_json::json!({})),
+            ),
+        ];
+        for (name, agent, raw) in attacks {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.body.contains("SENTINEL_MUST_NOT_BE_SPOOLED")),
+                "{name}: {entries:?}"
+            );
+        }
+        let controls = [
+            ("public glob", "claude-code", bash(&b, "cat ../*/public.md")),
+            ("own glob", "claude-code", bash(&b, "ls src/*")),
+            (
+                "own globstar",
+                "claude-code",
+                bash(&b, "cat src/**/main.rs"),
+            ),
+            (
+                "own grep",
+                "claude-code",
+                event(
+                    &b,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "src"}),
+                ),
+            ),
+            (
+                "own glob tool",
+                "claude-code",
+                event(&b, "Glob", serde_json::json!({"pattern": "**/*.rs"})),
+            ),
+            (
+                "public grep",
+                "claude-code",
+                event(
+                    &parent,
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "path": "b"}),
+                ),
+            ),
+            (
+                "own patch",
+                "codex",
+                event(
+                    &b,
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Add File: src/x.rs\n+fn x() {}\n*** End Patch"}),
+                ),
+            ),
+        ];
+        for (name, agent, raw) in controls {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}: {}",
+                entries[0].body
+            );
+        }
+    }
+
+    /// Regression: a glob rooted inside the event's own checkout is not
+    /// walked, so a monorepo with more matching directories than the walk's
+    /// bounds keeps its ordinary commands whole, with or without a policy of
+    /// its own (a search tool under an active policy is dropped by the search
+    /// rule, not by the walk). The sibling-checkout attack still drops.
+    #[tokio::test]
+    async fn a_monorepo_glob_inside_the_own_checkout_is_not_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let mono = work.join("mono");
+        let a = work.join("a");
+        std::fs::create_dir_all(mono.join(".git")).unwrap();
+        std::fs::create_dir_all(mono.join("log")).unwrap();
+        for index in 0..300 {
+            let package = mono.join("packages").join(format!("p{index}"));
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            std::fs::write(package.join("package.json"), "{}").unwrap();
+            std::fs::create_dir_all(mono.join("node_modules").join(format!("m{index}"))).unwrap();
+        }
+        const _: () = assert!(300 > MAX_GLOB_DIRECTORIES);
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let event = |tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "monorepo",
+                "cwd": mono,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let bash = |command: &str| event("Bash", serde_json::json!({"command": command}));
+        let shell = [
+            "cat packages/*/package.json",
+            "ls packages/*/src",
+            "du -sh packages/*",
+            "ls node_modules/*/package.json",
+            "for f in packages/*/package.json; do echo $f; done",
+            "tail -n 50 log/*.log",
+        ];
+        let searches = [
+            event(
+                "Glob",
+                serde_json::json!({"pattern": "packages/*/package.json"}),
+            ),
+            event(
+                "Grep",
+                serde_json::json!({"pattern": "x", "path": "packages", "glob": "*/package.json"}),
+            ),
+        ];
+        for policy in [None, Some("[capture]\nignore_paths = [\"private/**\"]\n")] {
+            if let Some(text) = policy {
+                std::fs::write(mono.join(".ai-memory.toml"), text).unwrap();
+            }
+            let label = if policy.is_some() { "active" } else { "none" };
+            for (index, command) in shell.iter().enumerate() {
+                let data_dir = tmp.path().join(format!("data-{label}-shell-{index}"));
+                let entries = spool_one(&data_dir, "claude-code", None, &bash(command)).await;
+                assert_eq!(entries.len(), 1, "{label}: {command}");
+                assert!(
+                    entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                    "{label}: {command}: {}",
+                    entries[0].body
+                );
+            }
+            for (index, raw) in searches.iter().enumerate() {
+                let data_dir = tmp.path().join(format!("data-{label}-search-{index}"));
+                let entries = spool_one(&data_dir, "claude-code", None, raw).await;
+                if policy.is_some() {
+                    assert!(entries.is_empty(), "{label}: {raw}");
+                } else {
+                    assert_eq!(entries.len(), 1, "{label}: {raw}");
+                    assert!(
+                        entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                        "{label}: {raw}: {}",
+                        entries[0].body
+                    );
+                }
+            }
+            for (index, command) in ["cat ../*/secrets.env", "cat ../a/*.env"]
+                .iter()
+                .enumerate()
+            {
+                let data_dir = tmp.path().join(format!("data-{label}-attack-{index}"));
+                let entries = spool_one(&data_dir, "claude-code", None, &bash(command)).await;
+                assert!(
+                    entries
+                        .iter()
+                        .all(|entry| !entry.body.contains("SENTINEL_MUST_NOT_BE_SPOOLED")),
+                    "{label}: {command}: {entries:?}"
+                );
+            }
+        }
+    }
+
+    /// A walk outside the event's own checkout stops, unprovable, past its
+    /// directory bound (counted while a `**` lists, not after) or its time
+    /// budget; under both it still finds a marker it reaches in time.
+    #[test]
+    fn a_glob_walk_outside_the_checkout_stops_at_its_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wide = tmp.path().join("wide");
+        for index in 0..=MAX_GLOB_DIRECTORIES {
+            std::fs::create_dir_all(wide.join(format!("d{index}"))).unwrap();
+        }
+        let narrow = tmp.path().join("narrow");
+        std::fs::create_dir_all(narrow.join("x").join("y")).unwrap();
+        std::fs::write(narrow.join("x").join(".ai-memory.toml"), "").unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        assert_eq!(
+            fast().markers_below(&wide, &[GlobStep::AnyDepth], None),
+            None
+        );
+        // The bound stops a deep tree's listing early, not after all of it.
+        let deep = tmp.path().join("deep");
+        for outer in 0..64 {
+            for inner in 0..64 {
+                std::fs::create_dir_all(deep.join(format!("d{outer}/e{inner}"))).unwrap();
+            }
+        }
+        let mut budget = fast();
+        assert_eq!(
+            budget.markers_below(&deep, &[GlobStep::AnyDepth], None),
+            None
+        );
+        assert!(budget.entries < 1_024, "{}", budget.entries);
+        assert_eq!(
+            fast().markers_below(&narrow, &[GlobStep::AnyDepth], None),
+            Some(vec![narrow.join("x").join(".ai-memory.toml")])
+        );
+        // Inside the event's own checkout nothing is walked at all.
+        assert_eq!(
+            fast().markers_below(&wide, &[GlobStep::AnyDepth], Some(tmp.path())),
+            Some(Vec::new())
+        );
+        // A filesystem slower than the budget fails closed.
+        let mut calls = 0;
+        let mut slow = GlobBudget::with_clock(
+            MAX_GLOB_TIME,
+            Box::new(move || {
+                calls += 1;
+                MAX_GLOB_TIME * calls
+            }),
+        );
+        assert_eq!(
+            slow.markers_below(&narrow, &[GlobStep::AnyDepth], None),
+            None
+        );
+    }
+
+    /// The payload of a Bash call made from `cwd`.
+    fn bash_call(cwd: &Path, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "lookup",
+            "cwd": cwd,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": "x"}
+        })
+    }
+
+    /// The disposition [`foreign_decision_within`] gives a call, `None` when no
+    /// other marker governs it.
+    fn foreign_disposition(
+        cwd: &Path,
+        command: &str,
+        own_marker: Option<&Path>,
+        home: Option<&Path>,
+        budget: impl FnOnce() -> GlobBudget,
+    ) -> Option<CaptureDisposition> {
+        let raw = bash_call(cwd, command);
+        foreign_decision_within(
+            AgentKind::ClaudeCode,
+            &raw,
+            &lexical_capture_cwd(&cwd.to_string_lossy()),
+            own_marker,
+            home,
+            budget,
+        )
+        .map(|decision| decision.protocol().disposition())
+    }
+
+    /// Regression (the docs promised it; v2.6.3 kept the call): a `**` that
+    /// starts above the event's checkout skips the checkout's own subtree, so
+    /// a checkout with more directories than the walk's bound keeps
+    /// `ls ../**/README.md`. Adversarial: the sibling checkout's policy still
+    /// drops `cat ../**/secrets.env`.
+    #[test]
+    fn a_globstar_above_the_checkout_skips_the_own_subtree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let own = work.join("own");
+        let a = work.join("a");
+        std::fs::create_dir_all(own.join(".git")).unwrap();
+        for index in 0..300 {
+            std::fs::create_dir_all(own.join(format!("d{index}"))).unwrap();
+        }
+        const _: () = assert!(300 > MAX_GLOB_DIRECTORIES);
+        std::fs::create_dir_all(&a).unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        assert_eq!(
+            fast().markers_below(&work, &[GlobStep::AnyDepth], Some(&own)),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            fast().markers_below(&work, &[GlobStep::AnyDepth], None),
+            None,
+            "without the skip the own subtree exceeds the bound"
+        );
+        assert_eq!(
+            foreign_disposition(&own, "ls ../**/README.md", None, None, fast),
+            None
+        );
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_disposition(&own, "cat ../**/secrets.env", None, None, fast),
+            Some(CaptureDisposition::Drop)
+        );
+    }
+
+    /// Regression (v2.6.3 answered in milliseconds): many paths inside a deep
+    /// tree look each directory's marker up once, not once per path and
+    /// level, and the lookup shares the walk's budget. Running out of it
+    /// inside the own checkout keeps the call (the own policy governs there);
+    /// outside it the call is unprovable. Adversarial: a location outside
+    /// the checkout is looked up first, so a long list inside it cannot spend
+    /// the budget before another checkout's policy is found, and inside it a
+    /// shallow nested marker is found before a deep list.
+    #[test]
+    fn marker_lookups_in_a_deep_tree_cost_one_probe_per_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let own = work.join("own");
+        let a = work.join("a");
+        let depth = 300;
+        let deep = (0..depth).fold(own.clone(), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(own.join(".git")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let spread: Vec<String> = (1..=depth)
+            .map(|level| format!("{}f", "d/".repeat(level)))
+            .collect();
+        let inside = format!("cat {}", spread.join(" "));
+        // A clock that counts its readings: one per probe or listing.
+        let counted = |readings: std::rc::Rc<std::cell::Cell<usize>>, expire_after: usize| {
+            move || {
+                GlobBudget::with_clock(
+                    MAX_GLOB_TIME,
+                    Box::new(move || {
+                        readings.set(readings.get() + 1);
+                        if readings.get() > expire_after {
+                            MAX_GLOB_TIME * 2
+                        } else {
+                            Duration::ZERO
+                        }
+                    }),
+                )
+            }
+        };
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(
+                &own,
+                &inside,
+                None,
+                None,
+                counted(readings.clone(), usize::MAX)
+            ),
+            None
+        );
+        assert!(
+            readings.get() < 5 * depth,
+            "{} probes for {depth} levels",
+            readings.get()
+        );
+        // Out of budget inside the own checkout: kept.
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &inside, None, None, counted(readings, 10)),
+            None
+        );
+        // Out of budget outside it: unprovable.
+        let outside = (0..depth).fold(work.join("elsewhere"), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(
+                &own,
+                &format!("cat {}/f", outside.display()),
+                None,
+                None,
+                counted(readings, 10)
+            ),
+            Some(CaptureDisposition::MetadataOnly)
+        );
+        // The other checkout's location comes first, whatever the order.
+        let attack = format!("{inside} ../a/secrets.env");
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &attack, None, None, counted(readings, 10)),
+            Some(CaptureDisposition::Drop)
+        );
+        // Inside the checkout the shallowest locations come first, so a
+        // marker nested near the top is found before a deep list spends the
+        // budget.
+        std::fs::create_dir_all(own.join("vendor")).unwrap();
+        std::fs::write(
+            own.join("vendor").join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let nested = format!("{inside} vendor/secrets.env");
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &nested, None, None, counted(readings, 10)),
+            Some(CaptureDisposition::Drop)
+        );
+    }
+
+    /// Adversarial: a `.git` at the home directory (a dotfiles repository)
+    /// does not make every checkout under home the event's own, so a glob
+    /// from `~/Projects` into a sibling checkout is still walked and that
+    /// checkout's policy drops the call. Control: a harmless glob is kept.
+    #[test]
+    fn a_dotfiles_checkout_at_home_is_not_the_own_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let projects = home.join("Projects");
+        let a = projects.join("a");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(projects.join("b")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        for command in [
+            "cat */secrets.env".to_owned(),
+            format!("cat {}/*/secrets.env", projects.display()),
+        ] {
+            assert_eq!(
+                foreign_disposition(&projects, &command, None, Some(&home), fast),
+                Some(CaptureDisposition::Drop),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            foreign_disposition(&projects, "cat */README.md", None, Some(&home), fast),
+            Some(CaptureDisposition::Keep)
+        );
+        assert!(!own_checkout(&home, Some(&home)));
+        assert!(!own_checkout(tmp.path(), Some(&home)));
+        assert!(!own_checkout(Path::new("/"), None));
+        assert!(own_checkout(&a, Some(&home)));
+    }
+
+    /// Adversarial: syntax that builds a step out of the event's checkout
+    /// reaches checkout A's policy: a `..` after a `**` (which can match no
+    /// directory), a brace that builds `..`, a zsh glob group, an ANSI-C
+    /// numeric escape, an indented patch header, and a Hermes `file_glob`.
+    /// Controls: the same shapes that stay inside the checkout are kept.
+    #[tokio::test]
+    async fn constructed_parent_steps_answer_to_another_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let a = work.join("a");
+        let b = work.join("b");
+        for dir in [&a, &b.join(".git"), &b.join("sub").join("x")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "project = \"a\"\n[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let event = |tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "session_id": "constructed",
+                "cwd": b,
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let bash = |command: &str| event("Bash", serde_json::json!({"command": command}));
+        let attacks = [
+            (
+                "globstar parent",
+                "claude-code",
+                bash("cat ./**/../a/secrets.env"),
+            ),
+            (
+                "globstar parent glob tool",
+                "claude-code",
+                event(
+                    "Glob",
+                    serde_json::json!({"pattern": "./**/../a/secrets.env"}),
+                ),
+            ),
+            (
+                "globstar parent grep filter",
+                "claude-code",
+                event(
+                    "Grep",
+                    serde_json::json!({"pattern": "KEY", "glob": "**/../a/secrets.env"}),
+                ),
+            ),
+            ("brace dot", "claude-code", bash("cat .{.,x}/a/secrets.env")),
+            (
+                "brace empty",
+                "claude-code",
+                bash("cat {.,}./a/secrets.env"),
+            ),
+            (
+                "brace twice",
+                "claude-code",
+                bash("cat .{.,.}/a/secrets.env"),
+            ),
+            (
+                "brace sequence",
+                "claude-code",
+                bash("cat .{-..0}/a/secrets.env"),
+            ),
+            ("zsh group", "claude-code", bash("cat ../(a)/secrets.env")),
+            (
+                "zsh alternation",
+                "claude-code",
+                bash("cat ../(a|c)/secrets.env"),
+            ),
+            (
+                "ansi-c hex",
+                "claude-code",
+                bash("cat ..$'\\x2f'a/secrets.env"),
+            ),
+            (
+                "ansi-c octal",
+                "claude-code",
+                bash("cat $'\\056\\056'/a/secrets.env"),
+            ),
+            ("dot star", "claude-code", bash("cat .*/a/secrets.env")),
+            (
+                "dot question",
+                "claude-code",
+                bash("cat ./.?/a/secrets.env"),
+            ),
+            (
+                "indented patch header",
+                "codex",
+                event(
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n*** Add File: sub/y.rs\n+y\n  *** Update File: ../a/secrets.env\n+KEY\n*** End Patch"}),
+                ),
+            ),
+            (
+                "hermes file glob",
+                "hermes",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "KEY", "path": "..", "file_glob": "a/*.env"}),
+                ),
+            ),
+            (
+                "ansi-c in a double-quoted script",
+                "claude-code",
+                bash("bash -c \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\""),
+            ),
+            (
+                "ansi-c in a double-quoted eval",
+                "claude-code",
+                bash("eval \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\""),
+            ),
+            (
+                "posix class dot glob",
+                "claude-code",
+                bash("cat .[[:punct:]]/a/secrets.env"),
+            ),
+            ("extglob at", "claude-code", bash("cat .@(.)/a/secrets.env")),
+            (
+                "extglob optional",
+                "claude-code",
+                bash("cat .?(.)/a/secrets.env"),
+            ),
+            (
+                "extglob star",
+                "claude-code",
+                bash("cat .*(.)/a/secrets.env"),
+            ),
+            (
+                "extglob plus",
+                "claude-code",
+                bash("cat .+(.)/a/secrets.env"),
+            ),
+            (
+                "brace dot glob",
+                "claude-code",
+                bash("cat .{*,x}/a/secrets.env"),
+            ),
+            (
+                "oversized brace sequence",
+                "claude-code",
+                bash("cat .{-..~}/a/secrets.env"),
+            ),
+        ];
+        for (name, agent, raw) in attacks {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.body.contains("SENTINEL_MUST_NOT_BE_SPOOLED")),
+                "{name}: {entries:?}"
+            );
+        }
+        let controls = [
+            (
+                "own globstar parent",
+                "claude-code",
+                bash("cat sub/**/../README.md"),
+            ),
+            ("own brace", "claude-code", bash("cat {sub,lib}/README.md")),
+            ("own sequence", "claude-code", bash("cat v{1..3}/README.md")),
+            ("subshell", "claude-code", bash("(cd sub && ls)")),
+            ("dot list", "claude-code", bash("ls .*")),
+            ("dot directory", "claude-code", bash("cat .config/x")),
+            ("dot glob", "claude-code", bash("cat .github/*.yml")),
+            (
+                "ansi-c own",
+                "claude-code",
+                bash("cat sub$'\\x2f'x/README.md"),
+            ),
+            (
+                "indented own patch",
+                "codex",
+                event(
+                    "apply_patch",
+                    serde_json::json!({"command": "*** Begin Patch\n  *** Add File: sub/x.rs\n+fn x() {}\n*** End Patch"}),
+                ),
+            ),
+            (
+                "hermes own file glob",
+                "hermes",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "KEY", "path": "sub", "file_glob": "x/*.rs"}),
+                ),
+            ),
+            (
+                "double-quoted script",
+                "claude-code",
+                bash("bash -c \"echo \\$HOME && cat ../a/README.md\""),
+            ),
+            ("posix class own", "claude-code", bash("ls .[[:alpha:]]*")),
+            (
+                "posix class own directory",
+                "claude-code",
+                bash("cat .[[:alpha:]]x/README.md"),
+            ),
+            // Regression (v2.6.3 kept these): an expansion too large to list
+            // that cannot leave the checkout.
+            (
+                "oversized brace",
+                "claude-code",
+                bash("touch test/file{1..200}.txt"),
+            ),
+            (
+                "oversized directory brace",
+                "claude-code",
+                bash("mkdir -p build/{1..100}/out"),
+            ),
+            (
+                "oversized dotted brace",
+                "claude-code",
+                bash("rm -f logs/app.{1..99}.log"),
+            ),
+            (
+                "oversized product",
+                "claude-code",
+                bash("cat data/{a..h}{1..9}.csv"),
+            ),
+        ];
+        for (name, agent, raw) in controls {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(
+                entries[0].body.contains("SENTINEL_MUST_NOT_BE_SPOOLED"),
+                "{name}: {}",
+                entries[0].body
+            );
+        }
+    }
+
+    /// Under the default `basename` strategy the server files two
+    /// subdirectories of one unmarked repository under two projects, so an
+    /// import from one must not take the other's events. The same directory
+    /// still agrees, a subdirectory joins a project rooted at the repository
+    /// root, and a `repo-root` marker keeps the whole repository together.
+    #[test]
+    fn subdirectories_of_one_repository_are_one_project_only_under_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (basename, repo_root) = (tmp.path().join("rr"), tmp.path().join("rt"));
+        for repo in [&basename, &repo_root] {
+            for sub in ["sub1", "sub2"] {
+                std::fs::create_dir_all(repo.join(sub)).unwrap();
+            }
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(repo)
+                .status()
+                .unwrap();
+            assert!(init.success());
+        }
+        std::fs::write(
+            repo_root.join(".ai-memory.toml"),
+            "project_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
+        let path = |dir: &Path| dir.to_string_lossy().into_owned();
+        assert!(!routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename.join("sub2"))
+        ));
+        assert!(!routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename)
+        ));
+        assert!(routes_to_same_project(
+            &path(&basename),
+            &path(&basename.join("sub1"))
+        ));
+        assert!(routes_to_same_project(
+            &path(&basename.join("sub1")),
+            &path(&basename.join("sub1").join("."))
+        ));
+        assert!(routes_to_same_project(
+            &path(&repo_root.join("sub1")),
+            &path(&repo_root.join("sub2"))
+        ));
+    }
+
     #[tokio::test]
     async fn shell_command_reading_an_ignored_path_is_dropped_before_spool() {
         for (command, spooled) in [("cat ./secret/*.md | head", 0), ("cat public/readme.md", 1)] {
@@ -3098,6 +4471,218 @@ mod tests {
                     spooled,
                     "{event}: {command}"
                 );
+            }
+        }
+    }
+
+    /// Gemini CLI's `run_shell_command` and `read_many_files` were unknown
+    /// tools, so the native hook spooled their raw output even when they read
+    /// an ignored path. Both events of each call are now dropped before the
+    /// spool; public calls are still spooled with their family recorded.
+    #[tokio::test]
+    async fn gemini_cli_shell_and_read_many_files_exclusions_drop_before_spool() {
+        let cases = [
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat secret/token.txt"}),
+                0,
+            ),
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat token.txt", "dir_path": "secret"}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["secret/token.txt"]}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["README.md", "secret/token.txt"]}),
+                0,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["**/*.txt"]}),
+                0,
+            ),
+            (
+                "run_shell_command",
+                serde_json::json!({"command": "cat README.md"}),
+                1,
+            ),
+            (
+                "read_many_files",
+                serde_json::json!({"include": ["README.md", "src/**/*.rs"]}),
+                1,
+            ),
+        ];
+        for (tool, input, spooled) in cases {
+            for event in ["pre-tool-use", "post-tool-use"] {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    tmp.path().join(".ai-memory.toml"),
+                    "[capture]\nignore_paths = [\"secret/**\"]\n",
+                )
+                .unwrap();
+                let data_dir = tmp.path().join("data");
+                let mut args = devin_hook_args(event);
+                args.agent = "gemini-cli".into();
+                let raw = serde_json::json!({
+                    "session_id": "gemini", "cwd": tmp.path(),
+                    "tool_name": tool, "tool_input": input,
+                    "tool_response": {"llmContent": "SENTINEL_CONTENT"},
+                });
+                run_with_payload(
+                    Some(data_dir.clone()),
+                    args,
+                    raw.to_string(),
+                    &mut Vec::new(),
+                    |_, _| panic!("tool events below the threshold must only spool"),
+                )
+                .await
+                .unwrap();
+                let spool = hook_spool::spool_dir(&data_dir);
+                let entries = if spool.exists() {
+                    read_spooled_entries(&spool)
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(entries.len(), spooled, "{event}: {tool} {input}");
+                for entry in &entries {
+                    let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                    let family = if tool == "read_many_files" {
+                        "file"
+                    } else {
+                        "non-file"
+                    };
+                    assert_eq!(
+                        body["_ai_memory_capture"]["tool_family"], family,
+                        "{event}: {tool}"
+                    );
+                    assert_eq!(
+                        body["_ai_memory_capture"]["disposition"], "keep",
+                        "{event}: {tool}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Calls that used to carry an excluded file's content into the spool: a
+    /// Gemini `read_many_files` directory entry (read as `entry/**`), Copilot
+    /// CLI's runtime `view`/`create`, tools reading back an earlier command's
+    /// output, and a shell word with brace expansion or a bracket class. Each
+    /// attempt is dropped or stripped to metadata before the spool; the
+    /// public controls still spool with their content.
+    #[tokio::test]
+    async fn excluded_content_cannot_reach_the_spool_through_unevaluated_tool_shapes() {
+        let cases = [
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["docs"]}),
+                None,
+            ),
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["."]}),
+                None,
+            ),
+            (
+                "gemini-cli",
+                "read_many_files",
+                serde_json::json!({"include": ["src"]}),
+                Some("keep"),
+            ),
+            (
+                "copilot-cli",
+                "view",
+                serde_json::json!({"path": "docs/adr/0001.md"}),
+                None,
+            ),
+            (
+                "copilot-cli",
+                "create",
+                serde_json::json!({"path": "docs/adr/0002.md", "file_text": "x"}),
+                None,
+            ),
+            (
+                "copilot-cli",
+                "view",
+                serde_json::json!({"path": "src/lib.rs"}),
+                Some("keep"),
+            ),
+            (
+                "copilot-cli",
+                "read_bash",
+                serde_json::json!({"shellId": "s1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "BashOutput",
+                serde_json::json!({"bash_id": "b1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "TaskOutput",
+                serde_json::json!({"task_id": "b1"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat docs/{adr,x}/0001.md"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat docs/ad[r]/0001.md"}),
+                Some("metadata-only"),
+            ),
+            (
+                "claude-code",
+                "Bash",
+                serde_json::json!({"command": "cat 'docs/{adr,x}/0001.md'"}),
+                Some("keep"),
+            ),
+        ];
+        for (agent, tool, input, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join(".ai-memory.toml"),
+                "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+            )
+            .unwrap();
+            let data_dir = tmp.path().join("data");
+            let raw = serde_json::json!({
+                "session_id": "gaps", "cwd": tmp.path(),
+                "tool_name": tool, "tool_input": input,
+                "tool_response": {"content": "SENTINEL_CONTENT"},
+                "tool_result": {"result_type": "success", "text_result_for_llm": "SENTINEL_CONTENT"},
+            });
+            let entries = spool_one(&data_dir, agent, None, &raw).await;
+            let label = format!("{agent} {tool} {input}");
+            match expected {
+                None => assert!(entries.is_empty(), "{label}: must not spool"),
+                Some(disposition) => {
+                    assert_eq!(entries.len(), 1, "{label}");
+                    let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+                    assert_eq!(
+                        body["_ai_memory_capture"]["disposition"], disposition,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        entries[0].body.contains("SENTINEL_CONTENT"),
+                        disposition == "keep",
+                        "{label}"
+                    );
+                }
             }
         }
     }
@@ -3409,6 +4994,165 @@ mod tests {
             assert!(!printed.contains("PRIVATE_CONTENT_SENTINEL"));
             assert!(!printed.contains("token.txt"));
             assert!(!data_dir.exists());
+        }
+    }
+
+    /// `--check-capture` is how an operator verifies what the native hook will
+    /// do, so its report must agree with what the same payload actually leaves
+    /// in the spool. Each marker variant runs through both paths with the same
+    /// payload cwd and capture mode: the event reaches the spool exactly when
+    /// `admits_capture` holds and the disposition is not `drop`, and a
+    /// `metadata-only` report means the spooled body is metadata only.
+    #[tokio::test]
+    async fn check_capture_report_matches_the_native_spool_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowlist = Some(crate::cli::CaptureModeArg::Allowlist);
+        // (name, marker, tool path, admits_capture, policy_admits_capture,
+        //  scope_resolution, disposition)
+        for (name, marker, path, admits, policy_admits, resolution, disposition) in [
+            (
+                "project-only",
+                Some("project = \"app\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "workspace-only",
+                Some("workspace = \"team\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "both",
+                Some("workspace = \"team\"\nproject = \"app\"\n"),
+                "public.txt",
+                true,
+                true,
+                "explicit",
+                "keep",
+            ),
+            // Names outside the recommended lowercase convention are forwarded
+            // as given; the hook does not judge them.
+            (
+                "unconventional-names",
+                Some("workspace = \"../evil\"\nproject = \"Bad Name!\"\n"),
+                "public.txt",
+                true,
+                true,
+                "explicit",
+                "keep",
+            ),
+            (
+                "empty-project",
+                Some("workspace = \"team\"\nproject = \"\"\n"),
+                "public.txt",
+                true,
+                false,
+                "partial",
+                "keep",
+            ),
+            (
+                "invalid-toml",
+                Some("workspace = \"team\nproject = [\n"),
+                "public.txt",
+                true,
+                true,
+                "server-derived",
+                "metadata-only",
+            ),
+            (
+                "capture-exclusion",
+                Some(
+                    "workspace = \"team\"\nproject = \"app\"\n\
+                     [capture]\nignore_paths = [\"secret/**\"]\n",
+                ),
+                "secret/token.txt",
+                true,
+                false,
+                "explicit",
+                "drop",
+            ),
+            (
+                "no-marker",
+                None,
+                "public.txt",
+                false,
+                false,
+                "server-derived",
+                "keep",
+            ),
+        ] {
+            let repo = tmp.path().join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+            }
+            let raw = serde_json::json!({
+                "cwd": repo,
+                "tool_name": "Edit",
+                "tool_input": {"path": path, "content": "PRIVATE_CONTENT_SENTINEL"}
+            });
+
+            let check_data = tmp.path().join(format!("check-{name}"));
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            args.capture_mode = allowlist;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(check_data.clone()),
+                args,
+                raw.to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            )
+            .await
+            .unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert!(!check_data.exists(), "{name}: inspection wrote state");
+            assert_eq!(report["admits_capture"], admits, "{name}: {report}");
+            assert_eq!(
+                report["policy_admits_capture"], policy_admits,
+                "{name}: {report}"
+            );
+            assert_eq!(report["scope_resolution"], resolution, "{name}: {report}");
+            assert_eq!(report["disposition"], disposition, "{name}: {report}");
+
+            let entries = spool_one(
+                &tmp.path().join(format!("spool-{name}")),
+                "devin",
+                allowlist,
+                &raw,
+            )
+            .await;
+            let reported_spool =
+                report["admits_capture"] == true && report["disposition"] != "drop";
+            assert_eq!(
+                entries.len(),
+                usize::from(reported_spool),
+                "{name}: check-capture reported {report} but the native hook spooled {}",
+                entries.len()
+            );
+            if let Some(entry) = entries.first() {
+                let metadata_only = entry.body.contains("\"disposition\":\"metadata-only\"");
+                assert_eq!(
+                    metadata_only,
+                    report["disposition"] == "metadata-only",
+                    "{name}: {}",
+                    entry.body
+                );
+                assert_eq!(
+                    entry.body.contains("PRIVATE_CONTENT_SENTINEL"),
+                    !metadata_only,
+                    "{name}: {}",
+                    entry.body
+                );
+            }
         }
     }
 
