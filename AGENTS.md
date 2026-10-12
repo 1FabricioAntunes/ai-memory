@@ -285,6 +285,11 @@ covers the same tests, slower, no tiers.
   ai-memory-web` downloads the pinned Tailwind CLI and rewrites
   `static/tailwind.css`; commit the result. CI regenerates it on Linux and
   fails if the committed file is stale, so nothing else needs the download.
+- **Management console.** When changing its frontend or management routes,
+  follow [`docs/management-ui.md`](docs/management-ui.md) for feature-enabled
+  Rust, frontend, and Chromium checks. Regenerate and commit
+  `crates/ai-memory-web/management-ui/dist/` with frontend source changes;
+  Cargo embeds these artifacts so ordinary builds remain self-contained.
 - Run each Cargo companion separately (`ai-memory-client`,
   `ai-memory-importer`, `ai-memory-relay`, and on `release/2.7`
   `ai-memory-wikisync`): `cargo fmt --check`, `cargo clippy --locked

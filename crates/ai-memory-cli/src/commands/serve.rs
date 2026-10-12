@@ -1085,6 +1085,17 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let mut shutdown = ShutdownSignals::install();
 
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-management-ui requires --transport http");
+    }
+
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && args.enable_web && normalize_prefix(&args.web_slug) == "/manage"
+    {
+        anyhow::bail!("the management console reserves /manage; choose a different --web-slug");
+    }
+
     config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -1752,6 +1763,27 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
                 )));
+            #[cfg(feature = "management-ui")]
+            let router = if args.enable_management_ui {
+                router
+                    .merge(ai_memory_web::management::router(&base_path))
+                    .merge(ai_memory_mcp::management::router(
+                        ai_memory_mcp::management::ManagementState {
+                            reader: store.reader.clone(),
+                            writer: store.writer.clone(),
+                            wiki: wiki.clone(),
+                            pepper: config
+                                .auth
+                                .token_pepper
+                                .clone()
+                                .filter(|p| !p.trim().is_empty())
+                                .map(TokenPepper::new),
+                        },
+                        auth_state.clone(),
+                    ))
+            } else {
+                router
+            };
             let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
@@ -3202,6 +3234,41 @@ fn host_without_port(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "management-ui")]
+    #[tokio::test]
+    async fn management_ui_rejects_invalid_mounts_before_opening_the_store() {
+        use clap::Parser;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            data_dir: tmp.path().join("unopened"),
+            ..Default::default()
+        };
+        for args in [
+            vec!["ai-memory", "serve", "--enable-management-ui"],
+            vec![
+                "ai-memory",
+                "serve",
+                "--transport",
+                "http",
+                "--enable-management-ui",
+                "--enable-web",
+                "--web-slug",
+                "/manage/",
+            ],
+        ] {
+            let parsed = crate::cli::Cli::try_parse_from(args).unwrap();
+            let crate::cli::Command::Serve(args) = parsed.command else {
+                panic!("serve")
+            };
+            let error = super::run(&config, args).await.unwrap_err();
+            assert!(
+                error.to_string().contains("--transport http")
+                    || error.to_string().contains("reserves /manage")
+            );
+            assert!(!config.data_dir.exists());
+        }
+    }
+
     use super::*;
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,

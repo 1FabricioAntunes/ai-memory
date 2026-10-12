@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added an opt-in React/Tailwind management console for user administration,
+  session inspection and deletion, and personal MCP API keys, reusing existing
+  authentication and SQLite storage. Required the `management-ui` Cargo feature
+  and `--enable-management-ui` runtime switch. Limited user deletion to owned
+  sessions and preserved shared knowledge. (#1231)
+
 ## [2.6.4] - 2026-10-12
 
 ### Fixed

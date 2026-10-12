@@ -103,6 +103,11 @@ into one ranking. Cross-agent handoffs pass the baton explicitly.
 The full design, including the invariants that keep multi-user and
 multi-session use safe, is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+An optional [React/Tailwind management console](docs/management-ui.md) provides
+user administration, session inspection and deletion, and personal MCP API keys.
+Build with `--features management-ui` and start `serve --transport http
+--enable-management-ui`; both compile-time and runtime opt-ins are required.
+
 ## Support matrix
 
 Every row below is a first-party integration (MCP registration, lifecycle

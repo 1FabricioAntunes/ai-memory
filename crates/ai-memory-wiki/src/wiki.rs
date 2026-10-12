@@ -1596,6 +1596,51 @@ impl Wiki {
         author_id: Option<UserId>,
         compaction: ai_memory_store::Compaction,
     ) -> WikiResult<PurgeSessionOutcome> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
+            None,
+        )
+        .await
+    }
+
+    /// Purge an operator's own session through the canonical disk/SQL mutation path.
+    /// Shared sessions and cross-project cascades require the admin path.
+    ///
+    /// # Errors
+    /// Returns store ownership/scope failures before removing files.
+    pub async fn purge_owned_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        owner: ai_memory_core::IdentityKey,
+        author_id: Option<UserId>,
+    ) -> WikiResult<PurgeSessionOutcome> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            ai_memory_store::Compaction::Skip,
+            Some(owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn purge_session_with_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<UserId>,
+        compaction: ai_memory_store::Compaction,
+        owner: Option<ai_memory_core::IdentityKey>,
+    ) -> WikiResult<PurgeSessionOutcome> {
         self.inspect_project_tree(workspace_id, project_id)?;
         let _guard = self.mutation_lock.write().await;
         self.inspect_project_tree(workspace_id, project_id)?;
@@ -1604,17 +1649,29 @@ impl Wiki {
         // `WriterHandle::purge_session` instead, bypassing this wrapper
         // entirely, so the file-removal loop below never runs over paths
         // that a preview only *predicts* would be removed.
-        let summary = self
-            .writer
-            .purge_session(
-                workspace_id,
-                project_id,
-                session_id,
-                author_id,
-                compaction,
-                ai_memory_store::PurgeMode::Commit,
-            )
-            .await?;
+        let summary = if let Some(owner) = owner {
+            self.writer
+                .purge_owned_session(
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    owner,
+                    author_id,
+                    ai_memory_store::PurgeMode::Commit,
+                )
+                .await?
+        } else {
+            self.writer
+                .purge_session(
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    author_id,
+                    compaction,
+                    ai_memory_store::PurgeMode::Commit,
+                )
+                .await?
+        };
         let mut files_deleted = Vec::with_capacity(summary.removed_paths.len());
         let mut files_failed = Vec::new();
         for path in &summary.removed_paths {

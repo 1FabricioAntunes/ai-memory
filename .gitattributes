@@ -1,3 +1,8 @@
 # These files are embedded verbatim by include_str!, so checkout EOLs become
 # part of the CLI and MCP payload contract.
 crates/ai-memory-core/src/routing_skills/*/SKILL.md text eol=lf
+
+# Vendored frontend output is rebuilt from the adjacent React/Tailwind sources.
+crates/ai-memory-web/management-ui/dist/** text=auto eol=lf linguist-generated=true
+crates/ai-memory-web/management-ui/dist/assets/*.woff2 binary linguist-generated=true
+crates/ai-memory-web/management-ui/dist/assets/*.webp binary linguist-generated=true

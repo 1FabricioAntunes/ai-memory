@@ -1,0 +1,253 @@
+@import "tailwindcss" source(none);
+@source "./**/*.{js,jsx}";
+
+@font-face {
+  font-family: "Instrument Sans Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400 700;
+  font-stretch: 75% 100%;
+  src: url("../node_modules/@fontsource-variable/instrument-sans/files/instrument-sans-latin-wdth-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Bricolage Grotesque Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 800;
+  font-stretch: 75% 100%;
+  src: url("../node_modules/@fontsource-variable/bricolage-grotesque/files/bricolage-grotesque-latin-standard-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Commit Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("../node_modules/@fontsource/commit-mono/files/commit-mono-latin-400-normal.woff2")
+    format("woff2");
+}
+
+@theme {
+  --font-sans: "Instrument Sans Variable", system-ui, sans-serif;
+  --font-display:
+    "Bricolage Grotesque Variable", "Instrument Sans Variable", system-ui,
+    sans-serif;
+  --font-mono: "Commit Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --color-canvas: oklch(98.5% 0.006 285);
+  --color-surface: oklch(100% 0 0);
+  --color-ink: oklch(15.5% 0.035 282);
+  --color-body: oklch(21% 0.045 282);
+  --color-muted: oklch(45% 0.035 282);
+  --color-line: oklch(88.5% 0.02 285);
+  --color-tint: oklch(95.8% 0.014 285);
+  --color-accent: oklch(81% 0.16 75);
+  --color-accent-hover: oklch(87% 0.15 85);
+  --color-on-accent: oklch(20% 0.05 60);
+  --color-success: oklch(47% 0.09 205);
+  --color-success-soft: oklch(95% 0.03 205);
+  --color-danger: oklch(47% 0.17 355);
+  --color-danger-soft: oklch(95% 0.03 355);
+}
+
+:root {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-canvas: oklch(15.5% 0.035 282);
+  --color-surface: oklch(20% 0.04 282);
+  --color-ink: oklch(95.5% 0.012 285);
+  --color-body: oklch(95.5% 0.012 285);
+  --color-muted: oklch(74% 0.03 285);
+  --color-line: oklch(33% 0.045 282);
+  --color-tint: oklch(24% 0.04 282);
+  --color-success: oklch(83% 0.11 205);
+  --color-success-soft: oklch(27% 0.05 205);
+  --color-danger: oklch(83% 0.1 355);
+  --color-danger-soft: oklch(27% 0.07 355);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+    --color-canvas: oklch(15.5% 0.035 282);
+    --color-surface: oklch(20% 0.04 282);
+    --color-ink: oklch(95.5% 0.012 285);
+    --color-body: oklch(95.5% 0.012 285);
+    --color-muted: oklch(74% 0.03 285);
+    --color-line: oklch(33% 0.045 282);
+    --color-tint: oklch(24% 0.04 282);
+    --color-success: oklch(83% 0.11 205);
+    --color-success-soft: oklch(27% 0.05 205);
+    --color-danger: oklch(83% 0.1 355);
+    --color-danger-soft: oklch(27% 0.07 355);
+  }
+}
+
+@layer base {
+  body {
+    @apply bg-canvas text-body font-sans antialiased;
+    font-size: 17px;
+  }
+  button {
+    @apply cursor-pointer disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  input,
+  select {
+    @apply rounded-xl border border-line bg-surface px-3 py-2.5 text-body;
+    transition:
+      border-color 150ms,
+      box-shadow 150ms;
+  }
+  input:not([type="checkbox"]):focus,
+  select:focus {
+    border-color: var(--color-success);
+  }
+  input[type="checkbox"] {
+    accent-color: var(--color-success);
+  }
+  input:focus-visible,
+  select:focus-visible,
+  button:focus-visible,
+  a:focus-visible {
+    @apply outline-2 outline-offset-3 outline-success;
+  }
+  h1,
+  h2 {
+    @apply font-display text-ink;
+    letter-spacing: -0.035em;
+  }
+  tbody tr {
+    transition: background-color 150ms;
+  }
+  tbody tr:hover {
+    background: color-mix(in oklch, var(--color-tint), transparent 55%);
+  }
+}
+
+@layer components {
+  .theme-picker {
+    @apply inline-flex gap-1 rounded-full border border-line bg-tint p-1;
+  }
+  .theme-picker button {
+    @apply rounded-full px-3 py-1.5 text-xs font-semibold text-muted hover:text-ink;
+  }
+  .theme-picker button[aria-pressed="true"] {
+    @apply bg-surface text-ink;
+  }
+  .console-shell {
+    background:
+      radial-gradient(
+        ellipse at 65% -15%,
+        oklch(78% 0.13 195 / 0.15),
+        transparent 50%
+      ),
+      radial-gradient(
+        ellipse at 100% 0%,
+        oklch(60% 0.22 300 / 0.08),
+        transparent 45%
+      ),
+      radial-gradient(
+        ellipse at 80% 15%,
+        oklch(70% 0.18 355 / 0.05),
+        transparent 45%
+      ),
+      var(--color-canvas);
+  }
+  .console-header {
+    backdrop-filter: blur(16px);
+  }
+  .brand-name {
+    @apply font-display text-ink;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.045em;
+  }
+  .brand-section {
+    @apply border-l border-line pl-4;
+  }
+  .role-badge {
+    font-size: 0.75rem;
+  }
+  .console-main {
+    padding-top: 2.5rem;
+    padding-bottom: 5rem;
+  }
+  .signed-out {
+    padding-top: clamp(3rem, 8vh, 6rem);
+  }
+  .section-heading {
+    font-size: 2rem;
+    font-weight: 640;
+    line-height: 1.2;
+  }
+  .panel {
+    @apply border border-line bg-surface p-6;
+    border-radius: 1.25rem;
+    box-shadow:
+      0 1px 2px oklch(21% 0.045 282 / 0.04),
+      0 12px 32px -12px oklch(21% 0.045 282 / 0.1);
+  }
+  .login-panel {
+    padding: 2rem;
+  }
+  .button-primary,
+  .button-secondary,
+  .button-danger {
+    @apply inline-flex items-center justify-center px-4 py-2.5 text-sm font-semibold;
+    border-radius: 999px;
+    white-space: nowrap;
+    transition:
+      background-color 150ms,
+      border-color 150ms,
+      transform 150ms;
+  }
+  .button-primary {
+    @apply bg-accent text-on-accent hover:bg-accent-hover;
+  }
+  .button-secondary {
+    @apply border border-line bg-surface text-body hover:bg-tint;
+  }
+  .button-danger {
+    @apply border border-danger/25 bg-surface text-danger hover:bg-danger-soft;
+  }
+  .nav-tab {
+    @apply rounded-full border border-transparent px-4 py-2.5 text-sm font-semibold text-muted hover:border-line hover:bg-surface hover:text-ink;
+    transition:
+      background-color 150ms,
+      color 150ms;
+  }
+  .nav-tab.is-active {
+    @apply border-line bg-surface text-ink;
+    box-shadow: 0 1px 3px oklch(21% 0.045 282 / 0.06);
+  }
+  .console-dialog {
+    box-shadow: 0 16px 80px oklch(21% 0.045 282 / 0.15);
+  }
+  .console-dialog::backdrop {
+    backdrop-filter: blur(5px);
+  }
+}
+
+@media (max-width: 640px) {
+  .brand-section {
+    @apply ml-0 border-0 pl-0;
+  }
+  .brand {
+    flex-wrap: wrap;
+  }
+  .console-main {
+    padding-top: 1.5rem;
+  }
+  .signed-out {
+    padding-top: 2rem;
+  }
+  .section-heading {
+    font-size: 1.75rem;
+  }
+  .panel {
+    padding: 1.25rem;
+  }
+}

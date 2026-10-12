@@ -31,6 +31,8 @@ use ai_memory_wiki::Wiki;
 use axum::Router;
 
 mod html_auth;
+#[cfg(feature = "management-ui")]
+pub mod management;
 mod markdown;
 pub mod mount;
 mod routes;

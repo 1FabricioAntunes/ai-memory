@@ -4,3 +4,6 @@
 
 mod pending;
 mod routes;
+
+#[cfg(feature = "management-ui")]
+mod management;

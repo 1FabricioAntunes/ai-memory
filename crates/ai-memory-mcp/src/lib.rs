@@ -14,6 +14,8 @@ pub mod admin_profile;
 pub mod auth;
 pub mod human_auth;
 pub mod identity;
+#[cfg(feature = "management-ui")]
+pub mod management;
 mod server;
 
 pub use actor::actor_from_headers;

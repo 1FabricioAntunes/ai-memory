@@ -37,3 +37,6 @@ mod read_page_related;
 mod retrieval_via_tools;
 mod slot_identity;
 mod stress_autoscope;
+
+#[cfg(feature = "management-ui")]
+mod management;

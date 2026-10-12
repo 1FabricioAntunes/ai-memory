@@ -1,0 +1,471 @@
+//! Adversarial management tests exercise real cookie/CSRF and writer isolation.
+use ai_memory_core::{
+    ActorContext, AgentKind, NewSession, NewUser, OwnerFilter, ProjectId, SessionId, UserId,
+    UserRole, WorkspaceId,
+};
+use ai_memory_mcp::{
+    HumanAuthRuntime,
+    auth::AuthState,
+    human_auth::LoginLimiter,
+    management::{ManagementState, router},
+};
+use ai_memory_store::{Store, TokenPepper, hash_session_secret};
+use ai_memory_wiki::{Wiki, WritePageRequest};
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode},
+};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use tempfile::TempDir;
+use tower::ServiceExt;
+
+struct Browser {
+    cookie: String,
+    csrf: String,
+    user: UserId,
+}
+struct Harness {
+    _tmp: TempDir,
+    store: Store,
+    wiki: Wiki,
+    router: Router,
+    alice: Browser,
+    bob: Browser,
+    root: Browser,
+    ws: WorkspaceId,
+    project: ProjectId,
+}
+
+async fn browser(store: &Store, name: &str, role: UserRole, must_change: bool) -> Browser {
+    let phc = ai_memory_store::password::hash_password("password-for-test".into())
+        .await
+        .unwrap();
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: name.into(),
+                name: None,
+                email: None,
+            },
+            role,
+            Some(phc.clone()),
+            must_change,
+        )
+        .await
+        .unwrap();
+    let secret = ai_memory_store::web_sessions::generate_session_secret().unwrap();
+    let csrf = ai_memory_store::web_sessions::generate_csrf_secret().unwrap();
+    store
+        .writer
+        .issue_web_session(
+            user,
+            phc,
+            role,
+            must_change,
+            hash_session_secret(&secret),
+            hash_session_secret(&csrf),
+        )
+        .await
+        .unwrap();
+    Browser {
+        user,
+        cookie: format!("ai_memory_session={secret}; ai_memory_csrf={csrf}"),
+        csrf,
+    }
+}
+async fn harness() -> Harness {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
+    let alice = browser(&store, "alice", UserRole::User, false).await;
+    let bob = browser(&store, "bob", UserRole::User, false).await;
+    let root = browser(&store, "root", UserRole::Root, false).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "app", None)
+        .await
+        .unwrap();
+    let auth = Arc::new(
+        AuthState::new(Some("root-bearer".into())).with_human(HumanAuthRuntime {
+            reader: store.reader.clone(),
+            writer: store.writer.clone(),
+            recovery_token_hash: None,
+            root_username: "root".into(),
+            root_name: None,
+            root_email: None,
+            reserved_passwords: vec![],
+            trusted_proxy_cidrs: vec![],
+            limiter: Arc::new(LoginLimiter::default()),
+        }),
+    );
+    let router = router(
+        ManagementState {
+            reader: store.reader.clone(),
+            writer: store.writer.clone(),
+            wiki: wiki.clone(),
+            pepper: Some(TokenPepper::new("test-pepper")),
+        },
+        auth,
+    );
+    Harness {
+        _tmp: tmp,
+        store,
+        wiki,
+        router,
+        alice,
+        bob,
+        root,
+        ws,
+        project,
+    }
+}
+async fn session(h: &Harness, owner: Option<&str>) -> SessionId {
+    let id = SessionId::new();
+    h.store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id,
+            workspace_id: h.ws,
+            project_id: h.project,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: owner.map(|name| format!("user:{name}")),
+        })
+        .await
+        .unwrap();
+    id
+}
+async fn call(
+    h: &Harness,
+    browser: Option<&Browser>,
+    method: &str,
+    uri: &str,
+    body: Value,
+    csrf: bool,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(browser) = browser {
+        request = request.header("cookie", &browser.cookie);
+        if csrf {
+            request = request.header("x-csrf-token", &browser.csrf);
+        }
+    }
+    let response = h
+        .router
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn management_refuses_foreign_ids_shared_deletion_and_missing_csrf_with_admin_control() {
+    let h = harness().await;
+    let alice = session(&h, Some("alice")).await;
+    let bob = session(&h, Some("bob")).await;
+    let shared = session(&h, None).await;
+    let uri = "/management/v1/sessions?workspace=default&project=app";
+    assert_eq!(
+        call(&h, None, "GET", uri, Value::Null, false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("authorization", "Bearer root-bearer")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "machine bearer cannot authenticate browser management"
+    );
+    let (status, listing) = call(&h, Some(&h.alice), "GET", uri, Value::Null, false).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = listing["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&alice.to_string().as_str()));
+    assert!(ids.contains(&shared.to_string().as_str()));
+    assert!(!ids.contains(&bob.to_string().as_str()));
+    assert_eq!(
+        call(&h, Some(&h.root), "GET", uri, Value::Null, false)
+            .await
+            .1["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let observations =
+        format!("/management/v1/sessions/{bob}/observations?workspace=default&project=app");
+    assert_eq!(
+        call(&h, Some(&h.alice), "GET", &observations, Value::Null, false)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    for sid in [bob, shared] {
+        for dry_run in [false, true] {
+            let uri = format!("/management/v1/sessions/{sid}/purge");
+            assert_eq!(call(&h, Some(&h.alice), "POST", &uri, json!({"workspace":"default", "project":"app", "confirm":true, "dry_run":dry_run}), true).await.0, StatusCode::NOT_FOUND);
+        }
+        assert!(
+            h.store
+                .reader
+                .session_summary_scoped(h.ws, h.project, sid, OwnerFilter::Any)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    let uri = format!("/management/v1/sessions/{alice}/purge");
+    let body = json!({"workspace":"default", "project":"app", "confirm":true});
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &uri, body.clone(), false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &h,
+            Some(&h.alice),
+            "POST",
+            &uri,
+            json!({"workspace":"default", "project":"app", "dry_run":true, "confirm":true}),
+            true
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        h.store
+            .reader
+            .session_summary_scoped(h.ws, h.project, alice, OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        call(
+            &h,
+            Some(&h.alice),
+            "POST",
+            &uri,
+            json!({"workspace":"default", "project":"app"}),
+            true
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    // A legitimate purge removes its summary but preserves maintained shared knowledge.
+    for (path, frontmatter) in [
+        (
+            format!("sessions/{alice}.md"),
+            json!({"session_id":alice.to_string()}),
+        ),
+        ("concepts/team.md".into(), json!({})),
+    ] {
+        h.wiki
+            .write_page(WritePageRequest {
+                workspace_id: h.ws,
+                project_id: h.project,
+                path: ai_memory_core::PagePath::new(path).unwrap(),
+                frontmatter,
+                body: "# Shared knowledge".into(),
+                tier: ai_memory_core::Tier::Semantic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: Some(h.alice.user),
+                actor: ActorContext::default(),
+                evidence: vec![],
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &uri, body.clone(), true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert!(
+        h.store
+            .reader
+            .session_summary_scoped(h.ws, h.project, alice, OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !h.wiki
+            .abs_path(
+                h.ws,
+                h.project,
+                &ai_memory_core::PagePath::new(format!("sessions/{alice}.md")).unwrap()
+            )
+            .exists()
+    );
+    assert!(
+        h.wiki
+            .abs_path(
+                h.ws,
+                h.project,
+                &ai_memory_core::PagePath::new("concepts/team.md").unwrap()
+            )
+            .exists()
+    );
+    assert_eq!(
+        call(
+            &h,
+            Some(&h.root),
+            "POST",
+            &format!("/management/v1/sessions/{bob}/purge"),
+            body,
+            true
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn management_project_and_credential_isolation_and_password_change_gate() {
+    let h = harness().await;
+    let bob = session(&h, Some("bob")).await;
+    h.store
+        .writer
+        .set_access_mode(h.project, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let projects = call(
+        &h,
+        Some(&h.alice),
+        "GET",
+        "/management/v1/projects",
+        Value::Null,
+        false,
+    )
+    .await
+    .1;
+    assert!(projects["projects"].as_array().unwrap().is_empty());
+    let uri = format!("/management/v1/sessions/{bob}/observations?workspace=default&project=app");
+    assert_eq!(
+        call(&h, Some(&h.alice), "GET", &uri, Value::Null, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&h, Some(&h.root), "GET", &uri, Value::Null, false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &h,
+            Some(&h.alice),
+            "GET",
+            "/management/v1/sessions?workspace=default&project=missing",
+            Value::Null,
+            false
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let key = call(
+        &h,
+        Some(&h.bob),
+        "POST",
+        "/management/v1/credentials",
+        json!({"label":"bob-only"}),
+        true,
+    )
+    .await;
+    assert_eq!(key.0, StatusCode::OK);
+    assert!(key.1["token"].as_str().unwrap().starts_with("aim_"));
+    let uri = format!(
+        "/management/v1/credentials/{}/revoke",
+        key.1["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &uri, json!({}), true)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        call(
+            &h,
+            Some(&h.alice),
+            "GET",
+            "/management/v1/credentials",
+            Value::Null,
+            false
+        )
+        .await
+        .1["credentials"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        call(&h, Some(&h.bob), "POST", &uri, json!({}), true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let pending = browser(&h.store, "pending", UserRole::User, true).await;
+    assert_eq!(
+        call(
+            &h,
+            Some(&pending),
+            "GET",
+            "/management/v1/projects",
+            Value::Null,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+}
