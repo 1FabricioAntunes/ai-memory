@@ -272,8 +272,10 @@ operator turns it on.
   `/admin/metrics` instead), the coordination tools (leases, actions,
   routines, signals, sentinels), mesh sync (the nearest equivalent is the
   git-based `ai-memory-wikisync` companion), image memory, the two-way Claude
-  `MEMORY.md` bridge, PaaS deploy templates, the `npx` one-line installer, and
-  the opt-in local cross-encoder reranker. The benchmark numbers are not
+  `MEMORY.md` bridge, PaaS deploy templates, an npm package (ai-memory 2.7
+  installs natively on Linux and macOS in two commands, `install.sh` and then
+  `ai-memory setup`, but has no `npx` route, and Windows gets no service
+  step), and the opt-in local cross-encoder reranker. The benchmark numbers are not
   like-for-like (component vs pipeline, see above). To move your data, the
   `ai-memory-importer` companion (2.7) reads agentmemory's Obsidian vault
   (`agentmemory-vault`) or its `ExportData` JSON (`agentmemory-export`), and

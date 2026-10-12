@@ -53,8 +53,8 @@ None of the competitors below has more than one or two of these; none has all.
 |---|---|---|---|
 | **mcp-memory-service** (fact-row twin) | **Yes** if you liked hook capture + typed edges + honest numbers | Files-as-truth (not opaque fact rows), handoffs, cross-project messaging, `as_of` temporal, a marginally better + reproducible number, and (new on 2.4) its aging set at parity done zero-LLM/reversible/off-by-default (per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access boosts, 0.4–0.75-band contradiction flagging) | Cloud/multi-backend replication (Cloudflare/Milvus), graph viz. (Belief-strength + clustering consolidation are no longer a give-up: ai-memory now ships both, clustering as a zero-LLM default-off pass, belief-strength off/R2-gated) |
 | **basic-memory** (file-first sibling) | **Yes** for multi-harness coding continuity; **no** for a personal Obsidian KB with live team co-edit | Ambient capture (no `write_note` ceremony), full lifecycle, handoffs/messaging, git-versioned truth, published numbers | Local zero-cost reranking, real-time collaborative editing, Postgres backend, `build_context` graph-walk, hosted mobile/web UX |
-| **agentmemory** (ideological sibling) | **Yes** for operability + data ownership | Self-contained binary (no `iii-engine` sidecar, no ELv2 runtime), files-as-truth, SQL indexes committed in-txn, zero-LLM summaries and handoffs, typed claim-once handoffs, a multi-user auth ladder (DB tokens, OIDC), native Windows without a manual sidecar download (ours is still "Experimental"), and a 2.7 importer for its vault and `ExportData`. Both now default to auth on for new installs (theirs since 0.9.30, ours in 2.7, unreleased) | Browser edit/forget (the 2.7 web UI adds page history/diff, a session timeline, a recall trace and a health panel, but stays read-only by design), the iii console's OTEL traces (we ship explain timings + Prometheus `/admin/metrics` in 2.7), a P2P mesh-sync primitive (`ai-memory-wikisync` is our git-based answer), the opt-in local cross-encoder reranker, the `npx` installer, ~31 more tools (54, all visible by default; mostly speculative). Benchmarks are not like-for-like: their 95.2% LongMemEval-S is a component measurement with the reranker disabled, ours is end-to-end; a joint evaluation is pending |
-| **Claude Code built-in memory** | **Yes** for teams / multi-machine / multi-harness; **not obviously** for a solo dev on one machine in Claude only | Cross-machine, cross-harness, team sharing, tool-lifecycle capture, real search | Zero setup: it's already on with no server to run (our one honest structural disadvantage for the solo case) |
+| **agentmemory** (ideological sibling) | **Yes** for operability + data ownership | Self-contained binary (no `iii-engine` sidecar, no ELv2 runtime), files-as-truth, SQL indexes committed in-txn, zero-LLM summaries and handoffs, typed claim-once handoffs, a multi-user auth ladder (DB tokens, OIDC), native Windows without a manual sidecar download (ours is still "Experimental"), and a 2.7 importer for its vault and `ExportData`. Both now default to auth on for new installs (theirs since 0.9.30, ours in 2.7, unreleased) | Browser edit/forget (the 2.7 web UI adds page history/diff, a session timeline, a recall trace and a health panel, but stays read-only by design), the iii console's OTEL traces (we ship explain timings + Prometheus `/admin/metrics` in 2.7), a P2P mesh-sync primitive (`ai-memory-wikisync` is our git-based answer), the opt-in local cross-encoder reranker, an npm/`npx` install (ours is a two-command native install on Linux and macOS in 2.7, no npm package), ~31 more tools (54, all visible by default; mostly speculative). Benchmarks are not like-for-like: their 95.2% LongMemEval-S is a component measurement with the reranker disabled, ours is end-to-end; a joint evaluation is pending |
+| **Claude Code built-in memory** | **Yes** for teams / multi-machine / multi-harness; **not obviously** for a solo dev on one machine in Claude only | Cross-machine, cross-harness, team sharing, tool-lifecycle capture, real search | Zero setup: it's already on with no server to run (our one honest structural disadvantage for the solo case; 2.7's `install.sh` + `ai-memory setup` cut ours to two commands on Linux and macOS, but there is still a server) |
 | **Hindsight** (pages-over-facts) | **Yes** for self-hosted/offline/team; **no** if you need their published accuracy + are fine with an LLM-required cloud | Zero-LLM, files you own, one binary, in-project team sharing (vs strict per-bank isolation), and (new on 2.4) a belief-strength `confidence` + an opt-in "dream" rewrite that borrow their model but never delete a source and keep the zero-LLM default | Their published headline accuracy, VLM/LLM extraction depth, and belief-strength that *actually moves ranking by default* (ours ships but is off/R2-gated until an eval proves it) |
 | **Zep/Graphiti** (temporal KG) | **Yes** for self-hosting coders avoiding Neo4j+LLM (Community Edition is discontinued); **no** for enterprise graph-query/world-time | One binary on SQLite, zero-LLM, files, coding-harness native, a supported self-host | True bi-temporal (world vs observed time), Cypher/BFS graph queries, custom entity/edge types, `minRating` |
 | **Mem0** | **Mostly no: different buyer** (app end-user personalization). Yes only if you (mis)used it as coding-session memory | Zero-LLM, per-repo, cross-harness, editable pages, no API spend | Mem0's SDK/integration ecosystem + managed cloud personalization |
@@ -156,13 +156,22 @@ implemented without a separate decision.** Ordered by leverage.
    `--prefer`, opt-in delete propagation, and a `sync --check` CI gate.
    `comparison.md` now says replication between servers is not automatic and
    names the companion.
-5. **Close the setup-friction gap vs the built-in.** This is our one structural
-   weakness for the solo user. Much is already done (`run` auto-wire, `doctor`,
-   `backfill`, `install-self-routing`); surface it as *the* onboarding path in the
-   README hero, add a one-line `ai-memory run claude` quickstart, and ship a
-   "coming from Claude built-in?" importer (the `~/.claude/.../memory/` format is
-   nearly identical markdown + `type` frontmatter, which makes it a cheap,
-   strong on-ramp).
+5. **Close the setup-friction gap vs the built-in: narrowed in 2.7.** This is
+   our one structural weakness for the solo user. Much was already done (`run`
+   auto-wire, `doctor`, `backfill`, `install-self-routing`), and 2.7
+   (unreleased) adds a two-command native install for Linux and macOS:
+   `install.sh` (a release asset with its own `.sha256`, verified before
+   unpacking, no root) and then `ai-memory setup`, which runs `init`, installs
+   a per-user systemd or launchd service, wires MCP, hooks and Agent Skills for
+   each detected agent, and checks the result; `uninstall` removes the service
+   it wrote. `scripts/onboarding-acceptance.sh` measured 2 commands and about
+   1.2 s from the first command to a returned memory, in a clean temporary
+   home with a debug build served as a local release and no model download.
+   That run drives the service step through a stand-in `systemctl`/`launchctl`,
+   not a real systemd or launchd, and Windows has no service step. Still open:
+   no npm package, and a "coming from Claude built-in?" importer (the
+   `~/.claude/.../memory/` format is nearly identical markdown + `type`
+   frontmatter, which makes it a cheap, strong on-ramp).
 6. **Smaller, competitor-specific closes: five now shipped on 2.4 (opt-in,
    defaults byte-identical):** the graph-walk retrieval tool (basic-memory's
    `build_context`/`memory://`, LiquidLM's `follow_references`/`get_related`)
@@ -241,7 +250,8 @@ implemented without a separate decision.** Ordered by leverage.
   read-only page history/diff, a session timeline, a recall trace and a
   root-only health panel in the web UI; explain timings and a content-free
   `/admin/metrics`; auth on by default for new installs with `auth enable`
-  for existing ones; MCP recipes for seven more clients; an importer for
+  for existing ones; a two-command native install for Linux and macOS
+  (`install.sh` + `ai-memory setup`); MCP recipes for seven more clients; an importer for
   agentmemory's vault and export plus a `doctor` check for its leftovers; and
   git-based wiki sync (`ai-memory-wikisync`).
 - **The real weakness was retrieval through capture**, and it was
