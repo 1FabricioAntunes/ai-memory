@@ -245,4 +245,56 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].project_name, "b");
     }
+
+    async fn serve(app: axum::Router) -> (ServerEndpoint, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ServerEndpoint::from_pair(Some(format!("http://{address}")), None),
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_server_without_the_web_ui_is_listed_through_the_admin_route() {
+        let app = axum::Router::new().route(
+            ADMIN_PROJECTS_PATH,
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({ "projects": [
+                    { "workspace_name": "team", "project_name": "zeta", "page_count": 1, "last_updated": null },
+                    { "workspace_name": "default", "project_name": "web", "page_count": 2, "last_updated": null },
+                    { "workspace_name": "team", "project_name": "alpha", "page_count": 3, "last_updated": null },
+                ]}))
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+
+        let all = fetch_sorted(&endpoint, None).await.expect("admin fallback");
+        let team = fetch_sorted(&endpoint, Some(" team "))
+            .await
+            .expect("filtered");
+        server.abort();
+
+        let names = |rows: &[ProjectRow]| {
+            rows.iter()
+                .map(|r| format!("{}/{}", r.workspace_name, r.project_name))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&all), ["default/web", "team/alpha", "team/zeta"]);
+        assert_eq!(names(&team), ["team/alpha", "team/zeta"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fallback_explains_how_to_fix_it() {
+        let (endpoint, server) = serve(axum::Router::new()).await;
+        let error = fetch_sorted(&endpoint, None)
+            .await
+            .expect_err("both routes 404");
+        server.abort();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("--enable-web"), "{message}");
+        assert!(message.contains(ADMIN_PROJECTS_PATH), "{message}");
+    }
 }
