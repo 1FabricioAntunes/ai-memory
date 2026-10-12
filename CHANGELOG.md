@@ -207,6 +207,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unknown or foreign-scope id, and `500` only for unexpected internal
   errors. New tests in `admin::tests` cover the unknown, foreign-scope,
   and unparsable cases for both `approve` and `reject`. (#1205)
+- Fixed Kimi Code sessions resumed after `SessionEnd` never receiving an
+  open handoff. Kimi Code reuses its native session id when a session is
+  resumed, so the receiver row already had `ended_at` set when the resumed
+  session asked for its handoff, and `accept_handoff` refused the claim with
+  "an ended session cannot accept a handoff" — an error the `/handoff` route
+  swallows as an empty 200, leaving the handoff open forever.
+  `AgentKind::reuses_session_id_after_end()` now covers Kimi Code alongside
+  Grok, so accepting reopens the ended receiver row. Every surrounding guard
+  is unchanged: an ended session of any other agent is still final, a
+  receiver in another project is still refused, and the claim-once guard
+  still stops the resumed session from taking a second baton. Covered by an
+  adversarial integration test in `multi_session.rs` and a unit test on the
+  predicate itself.
+- Fixed agents filing cross-project reports as wiki pages. Asked to "send a
+  report to the ai-memory inbox", an agent wrote pages into the target
+  project with `memory_write_page` instead of calling
+  `memory_message_send`, and the report never existed as a message. The
+  always-visible surfaces now carry the channel contrast in both
+  directions: `memory_message_send`'s tool description and its
+  MEMORY_INSTRUCTIONS bullet name the trigger phrasing ("send a report",
+  "notify", "leave a message for") and state it is the only tool that lands
+  in a project's inbox; `memory_write_page`'s description and bullet say a
+  page is not a message and redirect messaging to `memory_message_send`.
+  The routing snippet (full and compact) gained the same contrast, the
+  `memory_message_pop` bullet now forbids guessing the inbox's project
+  name, and `docs/agent-messaging.md` states the distinction.
 
 ## [2.6.3] - 2026-10-09
 
