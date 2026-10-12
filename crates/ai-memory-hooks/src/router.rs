@@ -2361,17 +2361,22 @@ fn render_brief_recent_section(recent: &[ai_memory_store::BriefingPage], budget:
 }
 
 fn escape_untrusted_history_tail(buf: &mut String, start: usize) {
-    let escaped = buf[start..]
-        .replace(
-            UNTRUSTED_HISTORY_START,
-            "&lt;!-- ai-memory:untrusted-history:start --&gt;",
-        )
-        .replace(
-            UNTRUSTED_HISTORY_END,
-            "&lt;!-- ai-memory:untrusted-history:end --&gt;",
-        );
+    let escaped = escape_untrusted_history_markers(&buf[start..]);
     buf.truncate(start);
     buf.push_str(&escaped);
+}
+
+/// Stored text with the untrusted-history fence markers neutralized, so it
+/// cannot close the block it is rendered in.
+pub(crate) fn escape_untrusted_history_markers(text: &str) -> String {
+    text.replace(
+        UNTRUSTED_HISTORY_START,
+        "&lt;!-- ai-memory:untrusted-history:start --&gt;",
+    )
+    .replace(
+        UNTRUSTED_HISTORY_END,
+        "&lt;!-- ai-memory:untrusted-history:end --&gt;",
+    )
 }
 
 /// Truncate to at most `max` bytes without splitting a UTF-8 char.
