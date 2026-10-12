@@ -598,7 +598,7 @@ async fn owner_stamp_for_event(
 /// the same way the auth middleware already treats it. Reading `user` alone
 /// would file every operator behind such a proxy as anonymous and hand them all
 /// one shared bucket.
-fn actor_identity(
+pub(crate) fn actor_identity(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
 ) -> Option<IdentityKey> {
     actor.and_then(|axum::Extension(ctx)| ctx.identity_key())
@@ -625,13 +625,15 @@ fn admission_skips(
     )
 }
 
-/// Build a router with `POST /hook` (event ingress) and `GET /handoff`
-/// (synchronous handoff-fetch for session-start hooks).
+/// Build a router with `POST /hook` (event ingress), `GET /handoff`
+/// (synchronous handoff-fetch for session-start hooks) and `GET /recap`
+/// (the read-only compaction recap for a "reload context" prompt).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
         .route("/hook", post(handle_hook))
         .route("/hook/batch", post(handle_hook_batch))
         .route("/handoff", get(handle_handoff))
+        .route("/recap", get(crate::recap::handle_recap))
         .with_state(Arc::new(state))
 }
 
@@ -4745,7 +4747,7 @@ const fn importance_for(event: HookEvent) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -6027,7 +6029,7 @@ mod tests {
         id
     }
 
-    async fn make_state(tmp: &TempDir) -> HookState {
+    pub(crate) async fn make_state(tmp: &TempDir) -> HookState {
         let store = Store::open(tmp.path()).unwrap();
         let ws = store
             .writer

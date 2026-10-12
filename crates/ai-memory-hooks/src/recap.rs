@@ -1,10 +1,144 @@
 //! `GET /recap`: the stretch of a session that its last compaction dropped,
 //! rebuilt from captured observations for a "reload context" prompt.
 
-use ai_memory_core::scaffolding::{looks_like_codex_instructions, looks_like_scaffolding};
-use ai_memory_store::ObservationRecord;
+use std::sync::Arc;
 
-use crate::router::{UNTRUSTED_HISTORY_END, UNTRUSTED_HISTORY_START};
+use ai_memory_core::scaffolding::{looks_like_codex_instructions, looks_like_scaffolding};
+use ai_memory_core::{HandoffState, IdentityKey, ObservationKind, OwnerFilter, SessionId, UserId};
+use ai_memory_store::{ObservationOrder, ObservationPage, ObservationRecord, ProjectAccess};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use serde::Deserialize;
+use tracing::warn;
+
+use crate::router::{HookState, UNTRUSTED_HISTORY_END, UNTRUSTED_HISTORY_START};
+
+/// Rows read for one recap, newest first. A window longer than this is
+/// recapped from its newest rows and says so.
+const RECAP_ROW_LIMIT: usize = 400;
+/// Open handoffs listed in a recap.
+const RECAP_HANDOFF_LIMIT: usize = 5;
+
+/// Query params for `GET /recap`. The recap is anchored on the session row,
+/// so no cwd or marker scope is needed.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RecapQuery {
+    /// The requesting harness, for logs; it does not change the recap.
+    pub agent: Option<String>,
+    /// The native session id the hook payload carried.
+    pub session_id: Option<String>,
+    /// Char budget; see [`clamp_budget`].
+    pub budget: Option<String>,
+}
+
+/// Read-only: answers a "reload context" prompt with the window of the
+/// session that ended at its latest compaction. It never claims a handoff,
+/// never publishes the active project and never records an observation, so
+/// a reload cannot take a baton a parallel session's successor needs.
+///
+/// `400` without a session id; `403` with the reason when the viewer may not
+/// read the session's project (the hook client never injects it); otherwise
+/// `200` with the recap, a notice, or an empty body on an internal error.
+pub(crate) async fn handle_recap(
+    State(state): State<Arc<HookState>>,
+    Query(query): Query<RecapQuery>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+) -> impl IntoResponse {
+    let Some(raw) = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "session_id is required".to_owned());
+    };
+    let actor = crate::router::actor_identity(actor_ext);
+    let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
+    let budget = clamp_budget(query.budget.as_deref());
+    match build_recap(&state, raw, budget, actor, viewer).await {
+        Ok(body) => (StatusCode::OK, body),
+        Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
+            Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
+            _ => {
+                warn!(error = %e, agent = ?query.agent, "recap failed");
+                (StatusCode::OK, String::new())
+            }
+        },
+    }
+}
+
+async fn build_recap(
+    state: &HookState,
+    raw_session_id: &str,
+    budget: usize,
+    actor: Option<IdentityKey>,
+    viewer: Option<UserId>,
+) -> anyhow::Result<String> {
+    let session_id = SessionId::from_native(raw_session_id);
+    let Some((ws, proj)) = state.reader.session_project_ids(session_id).await? else {
+        return Ok(no_session_notice());
+    };
+    crate::grants::authorize_resolved(&state.reader, Some((ws, proj)), viewer, ProjectAccess::Read)
+        .await?;
+    // The owner filter `/handoff` uses: one operator's session and batons are
+    // not another's to read, and an unowned (single-operator) one stays shared.
+    let owner_filter = match &actor {
+        Some(key) => OwnerFilter::User(key.storage_key()),
+        None => OwnerFilter::Unattributed,
+    };
+    if state
+        .reader
+        .session_summary_scoped(ws, proj, session_id, owner_filter.clone())
+        .await?
+        .is_none()
+    {
+        return Ok(no_session_notice());
+    }
+    let page = state
+        .reader
+        .session_observations_scoped(
+            ws,
+            proj,
+            session_id,
+            ObservationPage {
+                limit: RECAP_ROW_LIMIT,
+                offset: 0,
+                order: ObservationOrder::Desc,
+                kinds: Some(vec![
+                    ObservationKind::UserPrompt,
+                    ObservationKind::Stop,
+                    ObservationKind::PreCompact,
+                ]),
+                query: None,
+            },
+        )
+        .await?;
+    let limit_hit = page.records.len() >= RECAP_ROW_LIMIT;
+    let Some(window) = select_window(&page.records, limit_hit) else {
+        return Ok(no_compaction_notice(raw_session_id));
+    };
+    let handoffs: Vec<RecapHandoff> = state
+        .reader
+        .list_handoffs(
+            ws,
+            proj,
+            Some(HandoffState::Open),
+            owner_filter,
+            RECAP_HANDOFF_LIMIT,
+        )
+        .await?
+        .into_iter()
+        .map(|h| RecapHandoff {
+            own: h.origin.from_session_id == Some(session_id),
+            summary: h.content.summary,
+            next_steps: h.content.next_steps,
+            created_at: h.lifecycle.created_at.to_string(),
+        })
+        .collect();
+    Ok(compose_recap(raw_session_id, &window, &handoffs, budget))
+}
 
 /// Default recap size: under the 10,000-char cap Claude Code and Grok put on
 /// one `additionalContext` field.
@@ -547,5 +681,284 @@ mod tests {
         assert_eq!(clamp_budget(Some("1")), 2_000);
         assert_eq!(clamp_budget(Some("99999")), 9_500);
         assert_eq!(clamp_budget(Some("x")), 8_000);
+    }
+    mod endpoint {
+        use super::super::*;
+        use crate::router::HookState;
+        use ai_memory_core::{
+            AgentKind, AuthorizedViewer, NewHandoff, NewObservation, NewSession, ObservationKind,
+            Sanitized, Sanitizer, SessionId,
+        };
+        use axum::extract::{Query, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        const T0: i64 = 1_791_800_000_000_000;
+
+        async fn seed(
+            state: &HookState,
+            owner: Option<&str>,
+            rows: &[(ObservationKind, &str)],
+        ) -> SessionId {
+            let session_id = SessionId::new();
+            state
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: Some(T0),
+                    id: session_id,
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                    actor_user: owner
+                        .map(|name| ai_memory_core::IdentityKey::User(name.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+            for (i, (kind, body)) in rows.iter().enumerate() {
+                let offset = i64::try_from(i).unwrap() + 1;
+                state
+                    .writer
+                    .insert_observation(Sanitized::new(
+                        NewObservation {
+                            occurred_at: Some(T0 + offset * 60_000_000),
+                            session_id,
+                            workspace_id: state.workspace_id,
+                            project_id: state.project_id,
+                            kind: *kind,
+                            extension: None,
+                            source_event: None,
+                            title: kind.as_str().into(),
+                            body: (*body).into(),
+                            importance: 5,
+                        },
+                        &Sanitizer::builtin(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            session_id
+        }
+
+        fn compacted_rows() -> Vec<(ObservationKind, &'static str)> {
+            vec![
+                (ObservationKind::UserPrompt, "BEFORE-WINDOW"),
+                (ObservationKind::PreCompact, ""),
+                (ObservationKind::UserPrompt, "WINDOW-PROMPT"),
+                (ObservationKind::Stop, "WINDOW-REPLY"),
+                (ObservationKind::PreCompact, ""),
+                (ObservationKind::UserPrompt, "AFTER-WINDOW"),
+            ]
+        }
+
+        async fn recap(
+            state: &Arc<HookState>,
+            session_id: Option<String>,
+            budget: Option<&str>,
+            actor: Option<&str>,
+            viewer: Option<ai_memory_core::UserId>,
+        ) -> (StatusCode, String) {
+            let response = handle_recap(
+                State(state.clone()),
+                Query(RecapQuery {
+                    agent: Some("claude-code".into()),
+                    session_id,
+                    budget: budget.map(str::to_owned),
+                }),
+                actor.map(|name| {
+                    axum::Extension(ai_memory_core::ActorContext {
+                        user: Some(name.into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                }),
+                viewer.map(|user| axum::Extension(AuthorizedViewer(user))),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+
+        async fn handoff_in(state: &HookState, summary: &str) {
+            state
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    from_session_id: None,
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: None,
+                    summary: summary.into(),
+                    open_questions: Vec::new(),
+                    next_steps: Vec::new(),
+                    files_touched: Vec::new(),
+                    owner_user: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn open_handoff_exists(state: &HookState) -> bool {
+            state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        async fn stored_rows(state: &HookState, session_id: SessionId) -> u64 {
+            state
+                .reader
+                .session_observations_scoped(
+                    state.workspace_id,
+                    state.project_id,
+                    session_id,
+                    ai_memory_store::ObservationPage {
+                        limit: 0,
+                        offset: 0,
+                        order: ai_memory_store::ObservationOrder::Asc,
+                        kinds: None,
+                        query: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .total
+        }
+
+        /// The anonymous caller (a single-operator install, or a root token,
+        /// which carries no viewer and no actor) reads an unowned session.
+        #[tokio::test]
+        async fn recap_returns_the_window_and_writes_nothing() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let sid = seed(&state, None, &compacted_rows()).await;
+            handoff_in(&state, "BATON-SUMMARY").await;
+            let rows_before = stored_rows(&state, sid).await;
+
+            let (status, body) = recap(&state, Some(sid.to_string()), None, None, None).await;
+
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body.contains("WINDOW-PROMPT"), "{body}");
+            assert!(body.contains("WINDOW-REPLY"), "{body}");
+            assert!(body.contains("BATON-SUMMARY"), "{body}");
+            assert!(!body.contains("BEFORE-WINDOW"), "{body}");
+            assert!(!body.contains("AFTER-WINDOW"), "{body}");
+            assert!(
+                open_handoff_exists(&state).await,
+                "a reload claimed the baton"
+            );
+            assert_eq!(
+                stored_rows(&state, sid).await,
+                rows_before,
+                "a reload wrote rows"
+            );
+        }
+
+        #[tokio::test]
+        async fn recap_without_compaction_is_a_notice() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let sid = seed(&state, None, &[(ObservationKind::UserPrompt, "ONLY")]).await;
+            let (status, body) = recap(&state, Some(sid.to_string()), None, None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("no compaction"), "{body}");
+            assert!(!body.contains("ONLY"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn recap_for_unknown_session_is_a_notice() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let (status, body) = recap(&state, Some("never-seen".into()), None, None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("no session"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn missing_session_id_is_400() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let (status, _) = recap(&state, None, None, None, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, _) = recap(&state, Some("  ".into()), None, None, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn another_operator_cannot_read_an_owned_session() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let sid = seed(&state, Some("bob"), &compacted_rows()).await;
+            let (status, body) =
+                recap(&state, Some(sid.to_string()), None, Some("alice"), None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("no session"), "{body}");
+            assert!(!body.contains("WINDOW-PROMPT"), "leaked: {body}");
+        }
+
+        #[tokio::test]
+        async fn owner_reads_own_session() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let sid = seed(&state, Some("bob"), &compacted_rows()).await;
+            let (_, body) = recap(&state, Some(sid.to_string()), None, Some("bob"), None).await;
+            assert!(body.contains("WINDOW-PROMPT"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn db_user_without_grant_on_restricted_project_gets_403() {
+            use ai_memory_core::{NewUser, UserRole};
+            let tmp = TempDir::new().unwrap();
+            let state = crate::router::tests::make_state(&tmp).await;
+            state
+                .writer
+                .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+                .await
+                .unwrap();
+            let bob = state
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: "bob".into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            let state = Arc::new(state);
+            let sid = seed(&state, None, &compacted_rows()).await;
+            let (status, body) = recap(&state, Some(sid.to_string()), None, None, Some(bob)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("not authorized"), "{body}");
+            assert!(!body.contains("WINDOW-PROMPT"), "leaked: {body}");
+        }
+
+        #[tokio::test]
+        async fn budget_param_is_clamped() {
+            let tmp = TempDir::new().unwrap();
+            let state = Arc::new(crate::router::tests::make_state(&tmp).await);
+            let sid = seed(&state, None, &compacted_rows()).await;
+            let (status, body) = recap(&state, Some(sid.to_string()), Some("1"), None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("compaction recap"), "{body}");
+            assert!(body.chars().count() <= 2_000);
+        }
     }
 }
