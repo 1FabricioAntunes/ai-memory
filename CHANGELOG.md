@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written forms differently: a numeric-looking `title` or tag such as
   `007` is no longer used, a `!!timestamp`-tagged title fails that page's
   import, and a custom-tagged title (`!foo x`) imports as its plain text.
-- Fixed the web page header showing the date of the latest version as
-  "Created", so a page rewritten many times looked new. It now shows when the
-  first version was written. "Updated" is unchanged. (#1238)
+- Fixed the web page header and the `/api/v1` page response reporting the
+  date of the latest version as "Created", so a page rewritten many times
+  looked new. They now report when the oldest retained version was written.
+  "Updated" is unchanged. (#1238)
 
 ## [2.6.5] - 2026-10-12
 

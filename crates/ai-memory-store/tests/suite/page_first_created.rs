@@ -1,5 +1,5 @@
-//! `ReaderPool::page_first_created_at`: the page-level creation instant behind
-//! the web header's "Created".
+//! `PageMeta::created_at`: the page-level creation instant behind the web
+//! header's "Created" and the API's `created_at`.
 //!
 //! Invariants under test:
 //! - **Oldest version wins.** `pages.created_at` is per version, so a page
@@ -91,31 +91,28 @@ async fn first_created_is_the_oldest_version_and_stays_in_its_project() {
 
     let iso = |us: i64| jiff::Timestamp::from_microsecond(us).unwrap().to_string();
 
-    let first = store
-        .reader
-        .page_first_created_at(ws, app, "notes/a.md")
-        .await
-        .unwrap();
-    assert_eq!(first, Some(iso(now - 30 * DAY_US)));
+    let created = |project: &'static str, path: &'static str| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .page_meta("default", project, path)
+                .await
+                .unwrap()
+                .map(|m| m.created_at)
+        }
+    };
 
-    let single = store
-        .reader
-        .page_first_created_at(ws, app, "notes/single.md")
-        .await
-        .unwrap();
-    assert_eq!(single, Some(iso(now - 5 * DAY_US)));
-
-    let foreign = store
-        .reader
-        .page_first_created_at(ws, other, "notes/a.md")
-        .await
-        .unwrap();
-    assert_eq!(foreign, Some(iso(now - 90 * DAY_US)));
-
-    let missing = store
-        .reader
-        .page_first_created_at(ws, app, "notes/none.md")
-        .await
-        .unwrap();
-    assert_eq!(missing, None);
+    assert_eq!(
+        created("app", "notes/a.md").await,
+        Some(iso(now - 30 * DAY_US))
+    );
+    assert_eq!(
+        created("app", "notes/single.md").await,
+        Some(iso(now - 5 * DAY_US))
+    );
+    assert_eq!(
+        created("other", "notes/a.md").await,
+        Some(iso(now - 90 * DAY_US))
+    );
+    assert_eq!(created("app", "notes/none.md").await, None);
 }

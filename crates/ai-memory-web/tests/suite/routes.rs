@@ -4209,4 +4209,29 @@ async fn web_page_view_created_is_the_first_versions_date() {
         text.contains("Created just now"),
         "a single-version page keeps its own date: {text}"
     );
+
+    // The JSON API reads the same page-level date, so SPA clients agree.
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let resp = api
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/pages/notes/versions.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let created = json["created_at"].as_str().unwrap();
+    let updated = json["updated_at"].as_str().unwrap();
+    assert_ne!(
+        created, updated,
+        "API created_at is the first version's: {json}"
+    );
+    let created_us = created.parse::<jiff::Timestamp>().unwrap().as_microsecond();
+    assert_eq!(created_us, aged, "{json}");
 }
