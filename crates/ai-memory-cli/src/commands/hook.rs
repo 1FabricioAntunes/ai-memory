@@ -377,6 +377,11 @@ fn after_background_drain_event_enqueue(
 pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
     let runtime_env = RuntimeEnv::from_process();
     let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
+    if !dd.is_dir() {
+        // Purged (or never created): nothing was queued, and a warning has
+        // nowhere useful to go since `hook-drain.log` lived in that dir.
+        return Ok(());
+    }
     // The hook path never runs a full `Config::load` (see the fast-path
     // contract in `lib.rs`): an invalid config section elsewhere must not
     // fail the drainer. Only the spool retry policy is needed, loaded
