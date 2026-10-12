@@ -80,7 +80,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/cygdrive/c/...`), a rooted path without a drive, the `\\?\`, `\\.\` and
   `\\localhost\C$` prefixes, an alternate data stream suffix and trailing dots
   or spaces are read as the file they open, so they no longer slip past a
-  pattern. Hermes `execute_code` is metadata-only under an active policy, like
+  pattern. The `cwd`, the marker's directory and an absolute pattern get the
+  same reading, so a session started from `\\?\C:\repo` or
+  `\\localhost\C$\repo` matches its relative patterns again. A bare or
+  double-quoted `\\server\share\...` or `\\?\C:\...` argument keeps both
+  backslashes, as PowerShell and cmd read it, and `/a/x` is also read from the
+  root of the `cwd`'s drive, as a native tool reads it. The generated
+  TypeScript marker reader no longer takes a line inside a multi-line array
+  (`["docs"]`) for a table header. Hermes `execute_code` is metadata-only under an active policy, like
   `python3 -c`, and a shell command longer than 1 MiB is metadata-only instead
   of being split. The generated TypeScript integrations now read a dotted
   `capture.ignore_paths` key and quoted `[capture]` headers, reject the shapes

@@ -655,7 +655,7 @@ impl CapturePolicy {
                                 let readings = if extracted.globs {
                                     normalize_readings(path, cwd).ok().flatten()
                                 } else {
-                                    normalize_candidate(path, cwd).map(|c| vec![c])
+                                    normalize_candidates(path, cwd)
                                 };
                                 for candidate in readings.into_iter().flatten() {
                                     if output_spool(&candidate.path, &mut work)? {
@@ -734,9 +734,9 @@ impl CapturePolicy {
     fn match_paths(&self, paths: &[String], cwd: &str) -> Result<bool, ()> {
         let candidates: Option<Vec<_>> = paths
             .iter()
-            .map(|path| normalize_candidate(path, cwd))
+            .map(|path| normalize_candidates(path, cwd))
             .collect();
-        let candidates = candidates.ok_or(())?;
+        let candidates = candidates.ok_or(())?.into_iter().flatten();
         let mut work = 0_usize;
         for candidate in candidates {
             let candidate = self.fold_candidate(candidate);
@@ -2236,18 +2236,39 @@ impl ShellCommand<'_> {
     /// re-split paths with spaces and let one stray quote swallow the rest.
     ///
     /// `windows` also reads the command without PowerShell and cmd escapes
-    /// ([`without_windows_escapes`]).
+    /// ([`without_windows_escapes`]), and each reading again with its
+    /// backslashes kept as written ([`literal_shell_words`]): PowerShell and
+    /// cmd escape nothing with a backslash, so `\\srv\share\x` names a UNC
+    /// path there, not the `\srv\share\x` a POSIX shell reads.
     fn split(&self, windows: bool) -> ShellWords {
         let mut split = ShellWords::default();
+        // The readings of one command line or argv element.
+        let readings = |text: &str| -> Vec<(String, bool)> {
+            let mut texts = vec![text.to_owned()];
+            texts.extend(windows.then(|| without_windows_escapes(text)).flatten());
+            let mut readings = Vec::with_capacity(texts.len() * 2);
+            for text in texts {
+                let literal = windows && text.contains('\\');
+                readings.push((text.clone(), false));
+                if literal {
+                    readings.push((text, true));
+                }
+            }
+            readings
+        };
         match self {
             Self::Line(command) => {
                 split.opaque = has_unevaluated_expansion(command);
                 if split.opaque {
                     split.expanded.extend(shell_tokens(command, true));
                 }
-                push_nested_words(&marked_shell_words(command), MAX_SHELL_NESTING, &mut split);
-                if let Some(plain) = windows.then(|| without_windows_escapes(command)).flatten() {
-                    push_nested_words(&marked_shell_words(&plain), MAX_SHELL_NESTING, &mut split);
+                for (text, literal) in readings(command) {
+                    push_nested_words(
+                        &split_words(&text, literal),
+                        MAX_SHELL_NESTING,
+                        literal,
+                        &mut split,
+                    );
                 }
             }
             Self::Argv(items) => {
@@ -2262,9 +2283,8 @@ impl ShellCommand<'_> {
                     // An element reaches the program as is, so only a script
                     // a shell runs expands a tilde in it.
                     let script = is_shell_script(items, index);
-                    push_argv_item(item, script, &mut split);
-                    if let Some(plain) = windows.then(|| without_windows_escapes(item)).flatten() {
-                        push_argv_item(&plain, script, &mut split);
+                    for (text, literal) in readings(item) {
+                        push_argv_item(&text, script, literal, &mut split);
                     }
                 }
             }
@@ -2287,8 +2307,8 @@ impl ShellCommand<'_> {
     }
 }
 
-fn push_argv_item(item: &str, script: bool, split: &mut ShellWords) {
-    let tokens = marked_shell_words(item);
+fn push_argv_item(item: &str, script: bool, literal: bool, split: &mut ShellWords) {
+    let tokens = split_words(item, literal);
     if tokens.len() == 1 && tokens[0].0 == item {
         push_word(item, false, split);
         return;
@@ -2300,6 +2320,7 @@ fn push_argv_item(item: &str, script: bool, split: &mut ShellWords) {
     push_nested_words(
         &literal_tildes(tokens, script),
         MAX_SHELL_NESTING - 1,
+        literal,
         split,
     );
 }
@@ -2370,14 +2391,21 @@ fn expand_tilde(argument: String, tilde: bool, home: Option<&str>, cwd: &str) ->
 /// How many quoting levels a script inside a word is re-split.
 const MAX_SHELL_NESTING: usize = 4;
 
-fn push_nested_words(words: &[(String, bool)], depth: usize, split: &mut ShellWords) {
+/// `literal` re-splits each word with its backslashes kept
+/// ([`split_words`]).
+fn push_nested_words(
+    words: &[(String, bool)],
+    depth: usize,
+    literal: bool,
+    split: &mut ShellWords,
+) {
     let texts: Vec<&str> = words.iter().map(|(word, _)| word.as_str()).collect();
     if runs_inline_code(&texts) {
         split.opaque = true;
     }
     for (index, (word, tilde)) in words.iter().enumerate() {
         push_word(word, *tilde, split);
-        let tokens = marked_shell_words(word);
+        let tokens = split_words(word, literal);
         if tokens.len() == 1 && tokens[0].0 == *word {
             continue;
         }
@@ -2393,7 +2421,7 @@ fn push_nested_words(words: &[(String, bool)], depth: usize, split: &mut ShellWo
             split.opaque = true;
             split.expanded.extend(shell_tokens(word, true));
         }
-        push_nested_words(&literal_tildes(tokens, script), depth, split);
+        push_nested_words(&literal_tildes(tokens, script), depth, literal, split);
     }
 }
 
@@ -2763,6 +2791,28 @@ fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
 /// word (`docs/(a|b)/x`, `(a|b)/x`) instead of splitting it as a subshell, and
 /// the numeric and control escapes of an ANSI-C string are decoded.
 fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
+    tokenize(command, expand, false)
+}
+
+/// [`marked_shell_words`] with every backslash an ordinary character, as
+/// PowerShell and cmd read it: `\\srv\share\x`, bare or double-quoted, keeps
+/// both leading backslashes.
+fn literal_shell_words(command: &str) -> Vec<(String, bool)> {
+    tokenize(command, false, true)
+}
+
+/// The words of `command` read with POSIX quoting ([`shell_tokens`]), or,
+/// with `literal`, with backslashes kept as written ([`literal_shell_words`]).
+fn split_words(command: &str, literal: bool) -> Vec<(String, bool)> {
+    if literal {
+        literal_shell_words(command)
+    } else {
+        marked_shell_words(command)
+    }
+}
+
+/// [`shell_tokens`]; `literal` reads every backslash as an ordinary character.
+fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, bool)> {
     let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`');
     let mut words = Vec::new();
     let mut word = String::new();
@@ -2774,16 +2824,18 @@ fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
         match (quote, c) {
             (Some('\'' | '$'), '\'') | (Some('"'), '"') => quote = None,
             // A backslash-newline outside single quotes continues the line.
-            (Some('"') | None, '\\') if chars.peek() == Some(&'\n') => {
+            (Some('"') | None, '\\') if !literal && chars.peek() == Some(&'\n') => {
                 chars.next();
             }
             // Inside double quotes a backslash escapes `"`, `\`, `$` and a
             // backquote, so a script a shell re-reads (`bash -c "cat \$'…'"`)
             // sees the `$` itself.
-            (Some('"'), '\\') if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
+            (Some('"'), '\\')
+                if !literal && matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) =>
+            {
                 word.extend(chars.next());
             }
-            (Some('$'), '\\') => match chars.next() {
+            (Some('$'), '\\') if !literal => match chars.next() {
                 Some(escape) => match ansi_c_escape(escape).or_else(|| {
                     expand
                         .then(|| ansi_c_numeric_escape(escape, &mut chars))
@@ -2811,9 +2863,12 @@ fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
                 in_word = true;
             }
             (None, '\\')
-                if chars.peek().is_some_and(|next| {
-                    next.is_whitespace() || is_operator(*next) || matches!(next, '\'' | '"' | '\\')
-                }) =>
+                if !literal
+                    && chars.peek().is_some_and(|next| {
+                        next.is_whitespace()
+                            || is_operator(*next)
+                            || matches!(next, '\'' | '"' | '\\')
+                    }) =>
             {
                 word.extend(chars.next());
                 in_word = true;
@@ -3034,12 +3089,23 @@ struct Normalized {
     path: String,
     flavor: Flavor,
 }
+/// [`normalize_candidates`]'s first reading.
 fn normalize_candidate(candidate: &str, cwd: &str) -> Option<Normalized> {
-    let (raw, flavor) = candidate_raw(candidate, cwd)?;
-    Some(Normalized {
-        path: normalize_segments(&raw)?,
-        flavor,
-    })
+    normalize_candidates(candidate, cwd)?.into_iter().next()
+}
+
+/// Every normalized path a candidate can name ([`candidate_raw`]); `None`
+/// when it is not a usable path.
+fn normalize_candidates(candidate: &str, cwd: &str) -> Option<Vec<Normalized>> {
+    let (raws, flavor) = candidate_raw(candidate, cwd)?;
+    raws.iter()
+        .map(|raw| {
+            Some(Normalized {
+                path: normalize_segments(raw)?,
+                flavor,
+            })
+        })
+        .collect()
 }
 
 /// Upper bound on the readings [`normalize_readings`] gives one glob.
@@ -3056,10 +3122,25 @@ const MAX_GLOBSTAR_READINGS: usize = 16;
 /// when the candidate is not a usable path; `Err` past
 /// [`MAX_GLOBSTAR_READINGS`], which proves nothing.
 fn normalize_readings(candidate: &str, cwd: &str) -> Result<Option<Vec<Normalized>>, ()> {
-    let Some((raw, flavor)) = candidate_raw(candidate, cwd) else {
+    let Some((raws, flavor)) = candidate_raw(candidate, cwd) else {
         return Ok(None);
     };
-    let Some((root, tail)) = split_root(&raw) else {
+    let mut all = Vec::new();
+    for raw in &raws {
+        let Some(readings) = raw_readings(raw, flavor)? else {
+            return Ok(None);
+        };
+        all.extend(readings);
+        if all.len() > MAX_GLOBSTAR_READINGS {
+            return Err(());
+        }
+    }
+    Ok(Some(all))
+}
+
+/// [`normalize_readings`] for one joined path.
+fn raw_readings(raw: &str, flavor: Flavor) -> Result<Option<Vec<Normalized>>, ()> {
+    let Some((root, tail)) = split_root(raw) else {
         return Ok(None);
     };
     let segments: Vec<&str> = tail
@@ -3320,8 +3401,9 @@ impl ClassMember {
 }
 
 /// A candidate joined to `cwd` when relative, with the flavor its matching
-/// uses, before segment normalization.
-fn candidate_raw(candidate: &str, cwd: &str) -> Option<(String, Flavor)> {
+/// uses, before segment normalization: every path it can name, more than one
+/// only for an ambiguous Windows spelling ([`windows_spellings`]).
+fn candidate_raw(candidate: &str, cwd: &str) -> Option<(Vec<String>, Flavor)> {
     if candidate.trim().is_empty()
         || candidate.chars().count() > MAX_CANDIDATE_PATH_CHARS
         || is_drive_relative(candidate)
@@ -3330,7 +3412,7 @@ fn candidate_raw(candidate: &str, cwd: &str) -> Option<(String, Flavor)> {
     }
     let cwd = normalize_root(cwd).ok()?;
     if flavor_of(&cwd) == Flavor::Windows {
-        return Some((windows_spelling(candidate, &cwd)?, Flavor::Windows));
+        return Some((windows_spellings(candidate, &cwd)?, Flavor::Windows));
     }
     // Flavor must come from the host (the cwd), never from the candidate
     // string alone: on a POSIX host a leading `//` is an ordinary doubled
@@ -3351,7 +3433,7 @@ fn candidate_raw(candidate: &str, cwd: &str) -> Option<(String, Flavor)> {
         raw
     };
     let flavor = flavor_of(&raw);
-    Some((raw, flavor))
+    Some((vec![raw], flavor))
 }
 /// The absolute path Windows opens for `candidate` from the normalized
 /// Windows `cwd`, spelled with `/`, its `.` and `..` segments still in place.
@@ -3368,12 +3450,20 @@ fn candidate_raw(candidate: &str, cwd: &str) -> Option<(String, Flavor)> {
 ///   `name::$DATA`, the file's own content) and the trailing dots and spaces
 ///   of every segment (`private.md.`, `secrets. `).
 ///
-/// A native tool reads `/c/x` as `C:\c\x`; only the MSYS reading is kept, so
-/// a pattern under a one-letter top-level directory misses that spelling.
+/// [`windows_spellings`]'s first reading: Git Bash's for `/c/x`.
 fn windows_spelling(candidate: &str, cwd: &str) -> Option<String> {
+    windows_spellings(candidate, cwd)?.into_iter().next()
+}
+
+/// Every path Windows can open for `candidate` ([`windows_spelling`]): Git
+/// Bash, MSYS2 and Cygwin read `/c/x` and `/cygdrive/c/x` as `C:\x`, but a
+/// native tool reads them from the root of the cwd's drive (`C:\c\x` from
+/// any directory on `C:`), so those spellings give both paths.
+fn windows_spellings(candidate: &str, cwd: &str) -> Option<Vec<String>> {
     let one_letter =
         |segment: &str| segment.len() == 1 && segment.as_bytes()[0].is_ascii_alphabetic();
     let mut path = candidate.replace('\\', "/");
+    let mut alternate = None;
     if let Some(rest) = ["//?/", "//./", "/??/"]
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
@@ -3407,20 +3497,30 @@ fn windows_spelling(candidate: &str, cwd: &str) -> Option<String> {
         let forward = candidate.starts_with('/');
         let (first, after) = rest.split_once('/').unwrap_or((rest, ""));
         let cygdrive = after.split_once('/').unwrap_or((after, ""));
-        path = if forward && one_letter(first) {
-            format!("{}:/{after}", first.to_ascii_uppercase())
+        let (root, _) = split_root(cwd)?;
+        let native = format!("{}{path}", root.trim_end_matches('/'));
+        if forward && one_letter(first) {
+            path = format!("{}:/{after}", first.to_ascii_uppercase());
+            alternate = Some(native);
         } else if forward && first.eq_ignore_ascii_case("cygdrive") && one_letter(cygdrive.0) {
-            format!("{}:/{}", cygdrive.0.to_ascii_uppercase(), cygdrive.1)
+            path = format!("{}:/{}", cygdrive.0.to_ascii_uppercase(), cygdrive.1);
+            alternate = Some(native);
         } else {
-            let (root, _) = split_root(cwd)?;
-            format!("{}{path}", root.trim_end_matches('/'))
-        };
+            path = native;
+        }
     } else if !is_absolute(&path) {
         path = join(cwd, &path);
     }
-    let (root, tail) = split_root(&path)?;
-    let parts: Vec<&str> = tail.into_iter().filter_map(windows_segment).collect();
-    Some(join_segments(root, &parts))
+    let segments = |path: &str| -> Option<String> {
+        let (root, tail) = split_root(path)?;
+        let parts: Vec<&str> = tail.into_iter().filter_map(windows_segment).collect();
+        Some(join_segments(root, &parts))
+    };
+    let mut spellings = vec![segments(&path)?];
+    if let Some(native) = alternate {
+        spellings.push(segments(&native)?);
+    }
+    Some(spellings)
 }
 
 /// One segment as Windows reads it ([`windows_spelling`]); `None` when nothing
@@ -3481,9 +3581,19 @@ fn compile(
                 join(&marker, source)
             };
             let flavor = flavor_of(&expanded);
-            let path = normalize_segments(&expanded).ok_or_else(|| {
-                format!("ignore_paths entry {source:?} could not be normalized into a path")
-            })?;
+            // A Windows pattern is spelled like the candidates it is compared
+            // with ([`windows_spelling`]): `\\?\C:\repo\x\**` is `C:/repo/x/**`.
+            let spelled = if flavor == Flavor::Windows {
+                windows_spelling(&expanded, "")
+            } else {
+                Some(expanded)
+            };
+            let path = spelled
+                .as_deref()
+                .and_then(normalize_segments)
+                .ok_or_else(|| {
+                    format!("ignore_paths entry {source:?} could not be normalized into a path")
+                })?;
             Ok(CompiledPattern {
                 literal_prefix: literal_prefix(&path).into(),
                 directory_base: path.strip_suffix("/**").map(|base| {
@@ -3580,11 +3690,20 @@ fn is_drive_relative(path: &str) -> bool {
         && path.as_bytes()[1] == b':'
         && (!path.as_bytes()[0].is_ascii_alphabetic() || !is_absolute(path))
 }
+/// An absolute directory (a cwd, the marker directory, home), normalized. A
+/// Windows one is read as Windows opens it ([`windows_spelling`]), so it shares
+/// one spelling with every candidate and pattern resolved from it: from
+/// `\\?\C:\repo`, `docs/x` and `C:\repo\docs\x` must name the same file.
 fn normalize_root(path: &str) -> Result<String, ()> {
-    (is_absolute(path) && !is_drive_relative(path))
-        .then(|| normalize_segments(path))
-        .flatten()
-        .ok_or(())
+    if !is_absolute(path) || is_drive_relative(path) {
+        return Err(());
+    }
+    if flavor_of(path) == Flavor::Windows {
+        // Absolute, so no cwd is consulted.
+        let spelled = windows_spelling(path, "").ok_or(())?;
+        return normalize_segments(&spelled).ok_or(());
+    }
+    normalize_segments(path).ok_or(())
 }
 fn normalize_segments(path: &str) -> Option<String> {
     let (root, tail) = split_root(path)?;
@@ -4752,8 +4871,17 @@ mod tests {
     fn windows_spelling_fixture_vectors() {
         let fixture: Value =
             serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
-        for name in ["windows", "windows_posix_controls"] {
-            let section = &fixture[name];
+        let sections = ["windows", "windows_posix_controls"]
+            .iter()
+            .map(|name| (*name, &fixture[*name]))
+            .chain(
+                fixture["windows_scopes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|section| ("windows_scopes", section)),
+            );
+        for (name, section) in sections {
             let cwd = section["cwd"].as_str().unwrap();
             let config = CaptureConfig {
                 ignore_paths: section["ignore_paths"]
@@ -4783,7 +4911,7 @@ mod tests {
                 assert_eq!(
                     serde_json::to_value(decision.protocol().disposition()).unwrap(),
                     vector["disposition"],
-                    "{name}: {vector}"
+                    "{name} ({cwd}): {vector}"
                 );
             }
         }

@@ -645,7 +645,16 @@ path without a drive (`/repo/x`, `\repo\x`) is on the `cwd`'s drive; the
 alternate data stream suffix (`private.md::$DATA`, `private.md:stream`) and the
 trailing dots and spaces of each segment (`private.md.`, `secrets. \x`) are
 dropped. Any other device path (`\\.\pipe\x`) makes a file tool
-metadata-only. None of this applies to a POSIX session, where `/c/x`, a
+metadata-only. A native tool reads `/c/x` from the root of the `cwd`'s drive
+(`D:\c\x` from `D:\repo`) rather than as Git Bash does, so both readings are
+checked and either one matching drops the call. The `cwd`, the marker's
+directory and an absolute pattern are read the same way, so a session started
+from `\\?\C:\repo`, `\\?\UNC\server\share\repo` or `\\localhost\C$\repo`
+matches `docs/private/**` against `C:\repo\docs\private\a.md`, and a pattern
+spelled `\\?\C:\repo\docs\private\**` matches it from `C:\repo`. PowerShell
+and cmd do not escape with a backslash, so a shell command is also read with
+every backslash kept: `Get-Content \\server\share\x`, bare or double-quoted,
+names the UNC path. None of this applies to a POSIX session, where `/c/x`, a
 trailing dot or a colon is part of the name.
 
 A checkout's exclusions protect its files wherever a call is made from. For
@@ -763,9 +772,10 @@ can be mentioned.
 - a value glued to a short flag is read after the flag's first letter only,
   not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
   are not decoded;
-- in a Windows session `/c/x` is read only as Git Bash reads it
-  (`C:\x`), so a native tool's reading of it (`C:\c\x`, under a one-letter
-  top-level directory) is not matched;
+- in a Windows session a shell tool's `workdir` spelled `/c/x` is read only
+  as Git Bash reads it (`C:\x`), so arguments resolved from it miss a native
+  tool's reading (`D:\c\x` from a `cwd` on `D:`); a file-tool path or shell
+  argument spelled that way is read both ways;
 - the generated TypeScript integrations check the `[capture]` table as
   strictly as the native hook but do not validate the rest of the marker's
   TOML, so a syntax error elsewhere in the file invalidates the policy only in
