@@ -262,6 +262,13 @@ no workspace or project because many MCP-only clients do not provide reliable
 per-call scope. Like every `/admin/*` route, it is root-only when the deployment
 distinguishes operators.
 
+`GET /admin/metrics` exposes the same read/write split as process-lifetime
+totals in Prometheus text format (`ai_memory_mcp_tool_calls_total{kind=...}`),
+next to the hook counters and the `/hook` and `memory_query` latency
+histograms. It carries no client name: a client label is caller-supplied text,
+and no metric label is ever drawn from a request. It is root-only under the same
+rule.
+
 ## Per-operator memory slots
 
 The "absent means shared" rule extends to memory slots, so a single-operator

@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `explain=true` reports an `observation` stream with the matched observation
   ids. Hits are still pages and nothing is written; sessions without a page
   keep the `raw_hits` fallback, and `global=true` search is unchanged.
+- Added a root-only `GET /admin/metrics` endpoint in Prometheus text format.
+  It exposes the hook admission and delivery counters, MCP tool calls split
+  into reads and writes, and fixed-bucket latency histograms for `POST /hook`
+  and `memory_query`. Every label comes from a fixed set: no query text, page
+  body, prompt, client or project name, scope or token appears in the output.
+  On a multi-user server only root can read it, like every `/admin/*` route.
 - Added a `timings` object to `memory_query` responses with `explain=true`:
   each retrieval stream's wall time in milliseconds (`fts_ms`, `entity_ms`,
   `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`), summed over `scopes`.

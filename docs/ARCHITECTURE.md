@@ -686,6 +686,22 @@ The deprecated Basic/cookie path stops immediately when human auth becomes
 active; restart is not required. `/web` SPA HTML is public static; the builtin
 wiki browser and JSON APIs stay behind the route class above.
 
+### `GET /admin/metrics`
+
+A Prometheus text-format scrape (`text/plain; version=0.0.4`) of process
+lifetime counters: hook admissions by result and completed deliveries by
+outcome (the `IngestMetrics` atomics `/admin/status` already reports), the
+last-persisted timestamp, MCP tool calls split into `read` and `write`, and
+fixed-bucket latency histograms for `POST /hook` (time to answer, not the
+spawned processing) and `memory_query` (wall time, errors included). Buckets
+run from 1 ms to 10 s plus `+Inf`. Each observation is a bounded bucket scan and
+relaxed atomic adds, with no lock and no allocation. Every label comes from a
+closed, compile-time set (`result`, `outcome`, `kind`, `le`), so no query text,
+page body, prompt, client name, scope or project name, or token can appear in a
+series, and scope is never a label. The route sits behind the same
+`require_root_for_multiuser_admin` gate as every `/admin/*` route: root-only once
+the deployment distinguishes operators. Counters reset on restart.
+
 ## CLI subcommand surface
 
 ```

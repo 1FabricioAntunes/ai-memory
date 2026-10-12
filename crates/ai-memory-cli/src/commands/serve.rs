@@ -1566,6 +1566,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let admin = admin_router_with_sweep_tuning(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
+                    // The tool server's own instance, so /admin/metrics reads
+                    // what memory_query records.
+                    mcp_metrics: server.mcp_metrics(),
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),
                     wiki: wiki.clone(),

@@ -518,6 +518,9 @@ pub struct AiMemoryServer {
     /// burst costs the writer one tiny upsert batch, not one write per
     /// call (same reasoning as the M8 access-bump throttle).
     client_activity: Arc<std::sync::Mutex<ClientActivityBuffer>>,
+    /// Content-free process counters read by `GET /admin/metrics`: the
+    /// `memory_query` latency histogram and read/write tool-call totals.
+    mcp_metrics: Arc<crate::McpMetrics>,
     /// Shared "last client activity" clock (microseconds), bumped on every tool
     /// call. The B3 dream scheduler reads it to detect idle and to cancel a
     /// running pass the moment the operator returns — consolidation must never
@@ -1805,6 +1808,7 @@ impl AiMemoryServer {
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
+            mcp_metrics: Arc::new(crate::McpMetrics::default()),
             activity_clock: ai_memory_consolidate::ActivityClock::new(
                 jiff::Timestamp::now().as_microsecond(),
             ),
@@ -2589,6 +2593,13 @@ impl AiMemoryServer {
         out
     }
 
+    /// The process counters this server records into. `serve` hands the same
+    /// instance to the admin router so `GET /admin/metrics` reads them.
+    #[must_use]
+    pub fn mcp_metrics(&self) -> Arc<crate::McpMetrics> {
+        Arc::clone(&self.mcp_metrics)
+    }
+
     /// Attach a reranker. Without one, `memory_query` keeps its
     /// RRF-only, zero-LLM behaviour.
     #[must_use]
@@ -2732,6 +2743,8 @@ impl AiMemoryServer {
         Parameters(args): Parameters<QueryArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        // Dropped on every return path, so errors are timed too.
+        let _latency = self.mcp_metrics.query_latency().start();
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
@@ -6973,6 +6986,7 @@ impl AiMemoryServer {
         self.activity_clock.mark(now_us);
         let day = now_us.div_euclid(US_PER_DAY);
         let is_write = tool_call_is_write(tool);
+        self.mcp_metrics.record_tool_call(is_write);
         let schedule_flush = {
             let mut buffer = self
                 .client_activity
