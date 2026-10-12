@@ -95,6 +95,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recognize the same file tools (`read_file`, `patch`, `fs_read`, ...), and stop
   reading a directory at the walk's entry bound. Checking a path of thousands
   of wildcard segments for a saved output file no longer takes seconds.
+  In a Windows session, a shell argument or `workdir` that is drive-relative
+  (`C:docs\x`) or a device path naming no drive (`\\?\GLOBALROOT\...`) now
+  makes the command metadata-only instead of being skipped, a PowerShell
+  `FileSystem::` provider prefix is read as the path after it, and a Windows
+  marker holding a POSIX absolute pattern (`/c/repo/docs/**`), which matched
+  nothing, is now invalid and fails closed.
   This applies to the native hook, the server, and the
   generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
 - Fixed `ai-memory backfill`, including the automatic first-boot import, and

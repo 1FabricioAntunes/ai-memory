@@ -654,7 +654,17 @@ matches `docs/private/**` against `C:\repo\docs\private\a.md`, and a pattern
 spelled `\\?\C:\repo\docs\private\**` matches it from `C:\repo`. PowerShell
 and cmd do not escape with a backslash, so a shell command is also read with
 every backslash kept: `Get-Content \\server\share\x`, bare or double-quoted,
-names the UNC path. None of this applies to a POSIX session, where `/c/x`, a
+names the UNC path. PowerShell's provider prefix is dropped first:
+`FileSystem::C:\repo\x` and `Microsoft.PowerShell.Core\FileSystem::C:\repo\x`
+(any case) name `C:\repo\x`. A shell argument or `workdir` the matcher cannot
+place makes the command metadata-only: a drive-relative path (`C:docs\x`, or a
+bare `C:`), which Windows resolves from that drive's own current directory, and
+a device path that names no drive or share (`\\?\GLOBALROOT\Device\...`,
+`\\.\HarddiskVolume3\...`, `\\?\Volume{...}\...`). A flag such as `/s`, a URL
+and an ordinary path stay placeable. A Windows marker cannot hold a POSIX
+absolute pattern (`/c/repo/docs/**`, `/docs/**`): no Windows candidate could
+match it, so the marker is invalid and fails closed; spell it relative to the
+marker or with a drive (`C:/repo/docs/**`). None of this applies to a POSIX session, where `/c/x`, a
 trailing dot or a colon is part of the name.
 
 A checkout's exclusions protect its files wherever a call is made from. For
@@ -777,9 +787,24 @@ can be mentioned.
   tool's reading (`D:\c\x` from a `cwd` on `D:`); a file-tool path or shell
   argument spelled that way is read both ways;
 - the generated TypeScript integrations check the `[capture]` table as
-  strictly as the native hook but do not validate the rest of the marker's
-  TOML, so a syntax error elsewhere in the file invalidates the policy only in
-  the native hook;
+  strictly as the native hook and reject the marker's structural errors
+  anywhere in the file (a line that is neither a header nor a key/value pair,
+  an array or inline table left open), but they do not validate other values'
+  TOML (an unquoted `x = nope`, a duplicate key in another table), so such an
+  error invalidates the policy only in the native hook;
+- on Windows only `localhost` and `127.0.0.1` are read as the local machine:
+  another loopback or host alias for an administrative share (`\\127.0.0.2\c$`,
+  `\\127.1\c$`, `\\<hostname>\c$`) or a `\\wsl$\...` path is matched as the
+  UNC path it spells, not as the drive it reaches (administrative shares
+  usually need an elevated process);
+- Windows matching folds ASCII case only, so a pattern and a path that differ
+  in the case of a non-ASCII letter (`É` and `é`) do not match on Windows;
+- in a Windows session a drive-relative argument counts as placed when the
+  same command also holds a placeable path whose POSIX-shell reading (each
+  backslash escaping the next character) spells it, the way Git Bash reads
+  `C:\repo\x` as `C:repox`; and a harmless word shaped like `X:y`
+  (`sed s:a:b:`) or a device path such as `\\.\NUL` or `\\.\pipe\x` makes a
+  Windows command metadata-only;
 - tools the matcher does not list keep their current behavior.
 
 For a project whose content must never be captured, use allowlist capture mode

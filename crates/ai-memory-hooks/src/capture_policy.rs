@@ -696,13 +696,20 @@ impl CapturePolicy {
                 // fails closed like an unprovable file candidate.
                 ToolFamily::NonFile => match extracted.command.as_ref().map(|command| {
                     let base = command_base(extracted.workdir.as_deref(), cwd);
+                    // A Windows shell started in a directory the matcher
+                    // cannot place resolves every relative argument from it.
+                    let unplaced = windows_session(cwd)
+                        && extracted
+                            .workdir
+                            .as_deref()
+                            .is_some_and(|dir| windows_unplaceable(dir, cwd));
                     // PowerShell's backquote and cmd's caret escape the next
                     // character, so their commands also get a reading
                     // without them.
                     let split =
                         command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
                     self.match_command(&split.words, &base)
-                        .map(|(matched, spool)| (matched, split.opaque || spool))
+                        .map(|(matched, spool)| (matched, split.opaque || spool || unplaced))
                 }) {
                     Some(Ok((true, _)) | Err(())) => (CaptureDisposition::Drop, extracted.state),
                     // Syntax the matcher does not evaluate (brace expansion,
@@ -767,20 +774,41 @@ impl CapturePolicy {
     /// or executed: variables, command substitution, and `cd` are not
     /// followed, so this narrows the leak rather than closing every alias.
     /// Also reports whether an argument names a harness's saved tool output
-    /// ([`output_spool`]).
+    /// ([`output_spool`]) or, in a Windows session, a file the matcher cannot
+    /// place ([`windows_unplaceable`]); neither proves a miss.
     fn match_command(&self, words: &[(String, bool)], cwd: &str) -> Result<(bool, bool), ()> {
         let mut work = 0_usize;
         let mut spool = false;
+        let windows = windows_session(cwd);
+        // A POSIX shell's reading of a native path (`C:\repo\x` read as
+        // `C:repox`) is drive-relative too; it proves nothing while the
+        // literal spelling it came from is placeable. Only doubled
+        // backslashes, which no native spelling of a placeable path holds,
+        // read as a device path, so that reading is never excused.
+        let mut drive_relative = Vec::new();
+        let mut placed = std::collections::HashSet::new();
         for (word, tilde) in words {
             for (argument, from_root) in shell_arguments(word) {
                 let expanded = expand_tilde(argument, *tilde, self.home.as_deref(), cwd);
+                if windows {
+                    if !windows_unplaceable(&expanded, cwd) {
+                        if expanded.contains('\\') {
+                            placed.insert(without_backslash_escapes(&expanded));
+                        }
+                    } else if valid_drive_prefix(strip_powershell_provider(&expanded)) {
+                        drive_relative.push(expanded.clone());
+                    } else {
+                        spool = true;
+                    }
+                }
                 // Git reads `REV:path` from the repository root, which only
                 // the marker directory approximates; try the cwd as well.
                 let root = (from_root && !is_absolute(&expanded))
                     .then_some(self.root.as_deref())
                     .flatten();
                 for base in std::iter::once(cwd).chain(root) {
-                    // Not a usable path (drive-relative, oversized, bad cwd).
+                    // Not a usable path (drive-relative, a device namespace,
+                    // oversized, bad cwd).
                     let Some(readings) = normalize_readings(&expanded, base)? else {
                         continue;
                     };
@@ -793,6 +821,7 @@ impl CapturePolicy {
                 }
             }
         }
+        spool |= drive_relative.iter().any(|word| !placed.contains(word));
         Ok((false, spool))
     }
     /// `candidate` as this host compares it.
@@ -2118,6 +2147,7 @@ fn command_base(workdir: Option<&str>, cwd: &str) -> String {
     if let Some(dir) = workdir
         && let Ok(root) = normalize_root(cwd)
         && flavor_of(&root) == Flavor::Windows
+        && let dir = strip_powershell_provider(dir)
         && !is_drive_relative(dir)
         && let Some(base) = windows_spelling(dir, &root)
     {
@@ -2434,19 +2464,26 @@ fn push_nested_words(
 fn push_word(word: &str, tilde: bool, split: &mut ShellWords) {
     push_word_reading(word, tilde, split);
     if word.contains('\\') {
-        let mut plain = String::with_capacity(word.len());
-        let mut chars = word.chars();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                plain.extend(chars.next());
-            } else {
-                plain.push(c);
-            }
-        }
+        let plain = without_backslash_escapes(word);
         if plain != word {
             push_word_reading(&plain, tilde, split);
         }
     }
+}
+
+/// `word` as a POSIX shell reads its unquoted backslashes: each escapes the
+/// next character.
+fn without_backslash_escapes(word: &str) -> String {
+    let mut plain = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            plain.extend(chars.next());
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
 }
 
 fn push_word_reading(word: &str, tilde: bool, split: &mut ShellWords) {
@@ -3404,15 +3441,19 @@ impl ClassMember {
 /// uses, before segment normalization: every path it can name, more than one
 /// only for an ambiguous Windows spelling ([`windows_spellings`]).
 fn candidate_raw(candidate: &str, cwd: &str) -> Option<(Vec<String>, Flavor)> {
-    if candidate.trim().is_empty()
-        || candidate.chars().count() > MAX_CANDIDATE_PATH_CHARS
-        || is_drive_relative(candidate)
-    {
+    if candidate.trim().is_empty() || candidate.chars().count() > MAX_CANDIDATE_PATH_CHARS {
         return None;
     }
     let cwd = normalize_root(cwd).ok()?;
     if flavor_of(&cwd) == Flavor::Windows {
+        let candidate = strip_powershell_provider(candidate);
+        if is_drive_relative(candidate) {
+            return None;
+        }
         return Some((windows_spellings(candidate, &cwd)?, Flavor::Windows));
+    }
+    if is_drive_relative(candidate) {
+        return None;
     }
     // Flavor must come from the host (the cwd), never from the candidate
     // string alone: on a POSIX host a leading `//` is an ordinary doubled
@@ -3435,6 +3476,58 @@ fn candidate_raw(candidate: &str, cwd: &str) -> Option<(Vec<String>, Flavor)> {
     let flavor = flavor_of(&raw);
     Some((vec![raw], flavor))
 }
+/// The path a PowerShell provider-qualified spelling names: PowerShell opens
+/// `FileSystem::C:\x` and `Microsoft.PowerShell.Core\FileSystem::C:\x` (any
+/// case) as `C:\x`. Only a Windows session reads it this way.
+fn strip_powershell_provider(path: &str) -> &str {
+    const PREFIXES: [&str; 3] = [
+        "microsoft.powershell.core\\filesystem::",
+        "microsoft.powershell.core/filesystem::",
+        "filesystem::",
+    ];
+    let mut rest = path;
+    while let Some(prefix) = PREFIXES.iter().find(|prefix| {
+        rest.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }) {
+        rest = &rest[prefix.len()..];
+    }
+    rest
+}
+
+/// Whether `cwd` (a session's cwd or a shell's base directory) is a Windows
+/// one.
+fn windows_session(cwd: &str) -> bool {
+    normalize_root(cwd).is_ok_and(|root| flavor_of(&root) == Flavor::Windows)
+}
+
+/// Whether a Windows shell word names a file the matcher cannot place, so a
+/// command holding it proves no miss: a drive-relative path (`C:docs\x`, a
+/// bare `C:`), which Windows resolves from that drive's own current directory
+/// that only the shell knows, or a device-namespace path naming no drive or
+/// share (`\\?\GLOBALROOT\Device\...`, `\\.\HarddiskVolume3\...`,
+/// `\\?\Volume{GUID}\...`). A flag (`/s`), a URL and an ordinary path are
+/// placeable.
+fn windows_unplaceable(word: &str, cwd: &str) -> bool {
+    let word = strip_powershell_provider(word);
+    let bytes = word.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && !matches!(bytes.get(2), Some(b'/' | b'\\'))
+    {
+        return true;
+    }
+    let path = word.replace('\\', "/");
+    ["//?/", "//./", "/??/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        && normalize_root(cwd)
+            .ok()
+            .and_then(|cwd| windows_spellings(word, &cwd))
+            .is_none()
+}
+
 /// The absolute path Windows opens for `candidate` from the normalized
 /// Windows `cwd`, spelled with `/`, its `.` and `..` segments still in place.
 /// Every spelling of one file comes out the same, because an ignore pattern
@@ -3581,6 +3674,15 @@ fn compile(
                 join(&marker, source)
             };
             let flavor = flavor_of(&expanded);
+            // Every candidate of a Windows session is Windows-flavored, so a
+            // POSIX pattern (`/c/repo/x/**`, `/x/**`) would match nothing
+            // while the policy reports active: fail closed instead.
+            if flavor == Flavor::Posix && flavor_of(&marker) == Flavor::Windows {
+                return Err(format!(
+                    "ignore_paths entry {source:?} is a POSIX absolute path in a Windows \
+                     repository; spell it relative to the marker or with a drive (C:/...)"
+                ));
+            }
             // A Windows pattern is spelled like the candidates it is compared
             // with ([`windows_spelling`]): `\\?\C:\repo\x\**` is `C:/repo/x/**`.
             let spelled = if flavor == Flavor::Windows {
@@ -4914,6 +5016,39 @@ mod tests {
                     "{name} ({cwd}): {vector}"
                 );
             }
+        }
+    }
+
+    /// A Windows marker's POSIX absolute pattern would match no Windows
+    /// candidate while reporting active, so it is rejected; the same pattern
+    /// in a POSIX marker, and a drive or relative pattern in a Windows one,
+    /// stay active.
+    #[test]
+    fn windows_marker_rejects_posix_absolute_patterns() {
+        let config = |pattern: &str| CaptureConfig {
+            ignore_paths: vec![pattern.to_owned()],
+        };
+        for pattern in ["/c/repo/docs/private/**", "/docs/private/**"] {
+            let reason = describe_invalid_capture_config(&config(pattern), r"C:\repo", None);
+            assert!(
+                reason.as_deref().is_some_and(|r| r.contains("POSIX")),
+                "{pattern}: {reason:?}"
+            );
+            let policy =
+                CapturePolicy::resolve(CaptureSource::Parsed(&config(pattern)), r"C:\repo", None);
+            assert_eq!(policy.state(), PolicyState::Invalid, "{pattern}");
+            let posix =
+                CapturePolicy::resolve(CaptureSource::Parsed(&config(pattern)), "/repo", None);
+            assert_eq!(posix.state(), PolicyState::Active, "{pattern}");
+        }
+        for pattern in [
+            "C:/repo/docs/private/**",
+            r"docs\private\**",
+            "docs/private/**",
+        ] {
+            let policy =
+                CapturePolicy::resolve(CaptureSource::Parsed(&config(pattern)), r"C:\repo", None);
+            assert_eq!(policy.state(), PolicyState::Active, "{pattern}");
         }
     }
 
