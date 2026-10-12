@@ -338,6 +338,11 @@ const OBSERVATION_STREAM_ROWS_PER_CANDIDATE: usize = 4;
 const OBSERVATION_STREAM_MAX_ROWS: usize = 1_000;
 /// Matched observation ids reported per page in `explain`.
 const OBSERVATION_STREAM_IDS_PER_PAGE: usize = 3;
+/// Token window of the observation excerpt shown as a hit's snippet. Session
+/// pages are short, so their own FTS snippets rarely fill the 24-token page
+/// window; an observation body usually does, and a full window made each
+/// excerpt-backed hit cost more context than the page hit it stands in for.
+const OBSERVATION_SNIPPET_TOKENS: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct PageAuthority {
@@ -2859,9 +2864,10 @@ impl ReaderPool {
                 // CROSS JOIN pins the FTS table as the outer loop: left to
                 // itself the planner drives from the observations scope index
                 // and re-enters FTS once per row, which is far slower.
-                let mut stmt = tx.prepare(
+                let mut stmt = tx.prepare(&format!(
                     "SELECT observations.id, observations.session_id, \
-                            snippet(observations_fts, 1, '<mark>', '</mark>', '…', 24) \
+                            snippet(observations_fts, 1, '<mark>', '</mark>', '…', \
+                                    {OBSERVATION_SNIPPET_TOKENS}) \
                      FROM observations_fts \
                      CROSS JOIN observations ON observations.rowid = observations_fts.rowid \
                      WHERE observations_fts MATCH ?1 \
@@ -2871,7 +2877,7 @@ impl ReaderPool {
                        AND observations.project_id = ?3 \
                      ORDER BY observations_fts.rank \
                      LIMIT ?4",
-                )?;
+                ))?;
                 #[allow(clippy::cast_possible_wrap)]
                 let rows = stmt.query_map(
                     params![
@@ -5945,10 +5951,11 @@ impl ReaderPool {
             snippet: String,
             score: f64,
             explain: Option<SearchExplain>,
-            /// 1-based FTS rank, kept to decide whose snippet explains the hit.
-            fts_rank: Option<usize>,
-            /// Observation-stream rank and the matching observation's snippet.
-            observation: Option<(usize, String)>,
+            /// Whether page FTS matched this page, which decides whose
+            /// snippet explains the hit.
+            fts_matched: bool,
+            /// The best matching observation's excerpt (observation stream).
+            observation_snippet: Option<String>,
         }
         let mut fused: std::collections::HashMap<PageId, Fused> = std::collections::HashMap::new();
 
@@ -5960,11 +5967,11 @@ impl ReaderPool {
                 snippet: h.snippet.clone(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
-                fts_rank: None,
-                observation: None,
+                fts_matched: false,
+                observation_snippet: None,
             });
             entry.score += contrib;
-            entry.fts_rank = Some(rank + 1);
+            entry.fts_matched = true;
             if let Some(details) = &mut entry.explain {
                 details.fts_rank = Some(rank + 1);
                 details.fts_score = Some(h.rank);
@@ -5980,8 +5987,8 @@ impl ReaderPool {
                 snippet: String::new(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
-                fts_rank: None,
-                observation: None,
+                fts_matched: false,
+                observation_snippet: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -5999,8 +6006,8 @@ impl ReaderPool {
                 snippet: String::new(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
-                fts_rank: None,
-                observation: None,
+                fts_matched: false,
+                observation_snippet: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -6018,8 +6025,8 @@ impl ReaderPool {
                 snippet: e.hit.snippet.clone(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
-                fts_rank: None,
-                observation: None,
+                fts_matched: false,
+                observation_snippet: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -6038,8 +6045,8 @@ impl ReaderPool {
                 snippet: n.hit.snippet.clone(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
-                fts_rank: None,
-                observation: None,
+                fts_matched: false,
+                observation_snippet: None,
             });
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
@@ -6066,14 +6073,14 @@ impl ReaderPool {
                 snippet: String::new(),
                 score: 0.0,
                 explain: explain.then(SearchExplain::default),
-                fts_rank: None,
-                observation: None,
+                fts_matched: false,
+                observation_snippet: None,
             });
             entry.score += contrib;
             if entry.title.is_empty() {
                 entry.title = vote.title;
             }
-            entry.observation = Some((rank + 1, vote.snippet));
+            entry.observation_snippet = Some(vote.snippet);
             if let Some(details) = &mut entry.explain {
                 details.observation_rank = Some(rank + 1);
                 details.observation_ids = vote.observation_ids;
@@ -6082,17 +6089,20 @@ impl ReaderPool {
             }
         }
 
+        // Pages whose snippet is the observation excerpt; the descriptor fill
+        // below must not overwrite it.
+        let mut observation_excerpts: std::collections::HashSet<PageId> =
+            std::collections::HashSet::new();
         let mut out: Vec<(PageHit, Option<SearchExplain>)> = fused
             .into_iter()
             .map(|(id, entry)| {
-                // The matching observation's excerpt explains the hit when
-                // the observation stream ranked the page ahead of FTS (or FTS
-                // missed it); otherwise the page keeps its own snippet.
-                let snippet = match entry.observation {
-                    Some((observation_rank, observation_snippet))
-                        if entry.fts_rank.is_none_or(|fts| observation_rank < fts) =>
-                    {
-                        observation_snippet
+                // A page FTS matched keeps its own snippet. The observation
+                // excerpt stands in only when FTS missed the page, so the
+                // hit still shows the text that matched.
+                let snippet = match entry.observation_snippet {
+                    Some(excerpt) if !entry.fts_matched => {
+                        observation_excerpts.insert(id);
+                        excerpt
                     }
                     _ => entry.snippet,
                 };
@@ -6125,7 +6135,9 @@ impl ReaderPool {
             for (hit, _) in &mut out {
                 if let Some((title, descriptor)) = descriptors.get(&hit.id) {
                     hit.title = title.clone();
-                    hit.snippet = descriptor.clone();
+                    if !observation_excerpts.contains(&hit.id) {
+                        hit.snippet = descriptor.clone();
+                    }
                 }
             }
         }

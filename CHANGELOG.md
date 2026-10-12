@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag on, project and `scopes` searches also run full-text search over
   observations in the same project, and each matching session votes once,
   through its best-matching observation, for its own latest
-  `sessions/<id>.md` page as one more RRF stream. The matching excerpt becomes
-  the hit's snippet when it ranks ahead of the page's own match, and
+  `sessions/<id>.md` page as one more RRF stream. When page search did not
+  match the page itself, the matching excerpt becomes the hit's snippet, and
   `explain=true` reports an `observation` stream with the matched observation
   ids. Hits are still pages and nothing is written; sessions without a page
   keep the `raw_hits` fallback, and `global=true` search is unchanged.

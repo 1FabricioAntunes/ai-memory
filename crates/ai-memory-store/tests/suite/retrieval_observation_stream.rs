@@ -381,3 +381,65 @@ async fn stream_off_ranks_byte_identically_to_a_store_without_observations() {
         }
     }
 }
+
+/// A session page with an empty title is still described by the page
+/// descriptor fill, but that fill must not replace the observation excerpt
+/// that explains why the page surfaced.
+#[tokio::test]
+async fn an_untitled_session_page_keeps_the_observation_excerpt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let sid = session(&store, ws, proj).await;
+    let mut untitled = page(ws, proj, &format!("sessions/{sid}.md"), "short excerpt");
+    untitled.title = String::new();
+    store.writer.upsert_page(untitled).await.unwrap();
+    observe(&store, ws, proj, sid, "the heron nested by the old mill").await;
+
+    let hits = search(&store, ws, proj, "heron").await;
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].0.snippet.contains("<mark>heron</mark>"),
+        "{}",
+        hits[0].0.snippet
+    );
+}
+
+/// When page FTS matched the session page itself, the page keeps its own
+/// snippet; the observation excerpt stands in only for a page FTS missed.
+#[tokio::test]
+async fn a_page_fts_matched_keeps_its_own_snippet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let sid = session(&store, ws, proj).await;
+    session_page(&store, ws, proj, sid, "User mentioned the puffin colony.").await;
+    // A denser page takes FTS rank 1, so the session page's observation vote
+    // (stream rank 1) outranks its own FTS match (rank 2).
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/puffins.md", "puffin puffin puffin"))
+        .await
+        .unwrap();
+    observe(
+        &store,
+        ws,
+        proj,
+        sid,
+        "a long assistant reply about the puffin colony and its nesting season",
+    )
+    .await;
+
+    let hits = search(&store, ws, proj, "puffin").await;
+    let session_path = format!("sessions/{sid}.md");
+    let (hit, details) = hits
+        .iter()
+        .find(|(h, _)| h.path.as_str() == session_path)
+        .unwrap();
+    assert_eq!(details.fts_rank, Some(2));
+    assert_eq!(details.observation_rank, Some(1));
+    assert!(hit.snippet.contains("colony"), "{}", hit.snippet);
+    assert!(!hit.snippet.contains("assistant"), "{}", hit.snippet);
+}

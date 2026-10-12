@@ -996,9 +996,10 @@ belief_authority_weight = 0.0     # fold read-time belief-strength confidence (P
 observation_stream = false        # R1 observation-evidence stream: FTS over observations_fts
                                   # in the queried project; each matching session votes ONCE
                                   # (best observation) for its own latest sessions/<id>.md
-                                  # page as one more RRF stream. Its excerpt may become the
-                                  # snippet; explain reports `observation_rank` +
-                                  # `observation_ids`. Read-only; sessions without a page keep
+                                  # page as one more RRF stream. Its excerpt is the snippet
+                                  # only when page FTS missed that page; explain reports
+                                  # `observation_rank` + `observation_ids`. Read-only;
+                                  # sessions without a page keep
                                   # the raw_hits fallback; global=true unchanged. DEFAULT OFF.
                                   # Env: AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true
 
