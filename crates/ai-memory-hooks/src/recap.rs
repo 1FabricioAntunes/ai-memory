@@ -201,8 +201,9 @@ pub(crate) fn clamp_budget(raw: Option<&str>) -> usize {
 }
 
 /// Pick the window from `user-prompt`, `stop` and `pre-compact` rows read
-/// newest first: everything between the latest `pre-compact` and the one
-/// before it (or the oldest row read). `None` when the session has no
+/// newest first: everything between the latest compaction and the one before
+/// it (or the oldest row read), where adjacent `pre-compact` rows with no
+/// prompt between them are one compaction. `None` when the session has no
 /// compaction. `limit_hit` says the read stopped at its row limit, so a
 /// window without a starting boundary may be missing its oldest rows.
 pub(crate) fn select_window(
@@ -210,11 +211,22 @@ pub(crate) fn select_window(
     limit_hit: bool,
 ) -> Option<RecapWindow> {
     let boundary = rows_desc.iter().position(|r| r.kind == "pre-compact")?;
+    // One compaction can leave several boundaries with no prompt between
+    // them (OpenCode V1 records it before and after its summary; a retried
+    // `/compact` does too). The window starts below the last of them.
+    let mut collect_from = boundary + 1;
+    for (offset, row) in rows_desc[boundary + 1..].iter().enumerate() {
+        match row.kind.as_str() {
+            "user-prompt" => break,
+            "pre-compact" => collect_from = boundary + 1 + offset + 1,
+            _ => {}
+        }
+    }
     let mut prompts = Vec::new();
     let mut last_reply = None;
     let mut started_at = None;
     let mut reached_start = false;
-    for row in &rows_desc[boundary + 1..] {
+    for row in &rows_desc[collect_from..] {
         match row.kind.as_str() {
             "pre-compact" => {
                 started_at = Some(row.created_at.clone());
@@ -228,7 +240,7 @@ pub(crate) fn select_window(
             _ => {}
         }
     }
-    if !reached_start && rows_desc.len() > boundary + 1 {
+    if !reached_start && rows_desc.len() > collect_from {
         started_at = rows_desc.last().map(|r| r.created_at.clone());
     }
     prompts.reverse();
@@ -515,6 +527,28 @@ mod tests {
         assert_eq!(window.boundary_at, "2026-10-12T02:55:02Z");
         assert_eq!(window.started_at.as_deref(), Some("2026-10-12T00:55:25Z"));
         assert!(!window.truncated);
+    }
+
+    /// OpenCode V1 records one compaction twice (before and after its
+    /// summary), and a retried `/compact` does the same: boundaries with no
+    /// prompt between them are one boundary.
+    #[test]
+    fn consecutive_boundaries_count_as_one() {
+        let rows = vec![
+            row("pre-compact", "", "2026-10-12T02:56:10Z"),
+            row("stop", "r1", "2026-10-12T02:55:30Z"),
+            row("pre-compact", "", "2026-10-12T02:55:02Z"),
+            row("stop", "r0", "2026-10-12T01:30:00Z"),
+            row("user-prompt", "p1", "2026-10-12T01:00:57Z"),
+            row("pre-compact", "", "2026-10-12T00:55:25Z"),
+            row("pre-compact", "", "2026-10-12T00:55:01Z"),
+            row("user-prompt", "older", "2026-10-12T00:40:00Z"),
+        ];
+        let window = select_window(&rows, false).unwrap();
+        assert_eq!(prompts(&window), ["p1"]);
+        assert_eq!(window.last_reply.as_ref().unwrap().text, "r0");
+        assert_eq!(window.boundary_at, "2026-10-12T02:56:10Z");
+        assert_eq!(window.started_at.as_deref(), Some("2026-10-12T00:55:25Z"));
     }
 
     #[test]
