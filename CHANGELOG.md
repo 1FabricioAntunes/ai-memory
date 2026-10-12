@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory is gone. A spool directory the drainer creates is also private
   (`0700`) now, as one created by a queued event always was; before, it
   took the default permissions.
+- Fixed the profile harvest writing a fresh copy of a stack preference on
+  every pass. A statement classified `stack` (for example "Use Rust by default
+  for everything else.") lives in `profile/stack/` beside the per-language
+  stack entries, and the step that finds an entry's existing page skipped that
+  whole directory, so each harvest saw no page and wrote another `-2`, `-3`,
+  … copy, each one shown in the session-start profile digest. Only the
+  per-language pages (`profile/stack/rust.md` and the like) are skipped now.
+  Copies already written stay until they are deleted.
 
 ## [2.6.4] - 2026-10-12
 
