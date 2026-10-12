@@ -907,6 +907,147 @@ async fn accept_reopens_an_ended_receiver_session_but_keeps_claim_once() {
     );
 }
 
+/// Kimi Code reuses its native session id when a session is resumed after
+/// SessionEnd (observed in production 2026-10: one kimi session row carried a
+/// SessionEnd and then fresh session-start/user-prompt observations under the
+/// same id), so it needs the same reopen exemption as Grok — without weakening
+/// any guard around it: other agents stay final-after-end, a receiver in a
+/// different project is still refused, and claim-once still binds the resumed
+/// session.
+#[tokio::test]
+async fn accept_reopens_an_ended_kimi_receiver_but_keeps_every_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let new_handoff = |summary: &str| NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_agent: AgentKind::ClaudeCode,
+        to_agent: None,
+        from_session_id: None,
+        summary: summary.into(),
+        next_steps: Vec::new(),
+        open_questions: Vec::new(),
+        files_touched: Vec::new(),
+        cwd: None,
+        owner_user: None,
+    };
+    let accept = |id, agent: AgentKind, session: SessionId, ws, proj| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: agent,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    // Adversarial control: an ended Claude Code session is still final — the
+    // reuse exemption must not leak to agents that never reuse ids.
+    let claude = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    store.writer.end_session(claude, None).await.unwrap();
+    let claude_baton = store
+        .writer
+        .insert_handoff(new_handoff("claude control"))
+        .await
+        .unwrap();
+    let err = store
+        .writer
+        .accept_handoff(accept(
+            claude_baton,
+            AgentKind::ClaudeCode,
+            claude,
+            ws,
+            proj,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::InvalidState(_)),
+        "an ended claude-code session must still be refused: {err}"
+    );
+
+    // The resumed kimi-code session: ended at SessionEnd, then the same
+    // native id comes back on resume and must be able to take the baton.
+    let kimi = open_session(&store, ws, proj, AgentKind::KimiCode).await;
+    store.writer.end_session(kimi, None).await.unwrap();
+
+    let id = store
+        .writer
+        .insert_handoff(new_handoff("resume after restart"))
+        .await
+        .unwrap();
+    let claimed = store
+        .writer
+        .accept_handoff(accept(id, AgentKind::KimiCode, kimi, ws, proj))
+        .await
+        .unwrap();
+    assert!(
+        claimed,
+        "a resumed kimi-code session must be able to accept the handoff"
+    );
+
+    // The receiver row was reopened (ended_at cleared), not left a corpse.
+    let kimi_bytes = kimi.as_bytes().to_vec();
+    let ended_at: Option<i64> = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                rusqlite::params![kimi_bytes],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(
+        ended_at.is_none(),
+        "accepting a handoff must reopen the ended kimi-code receiver session"
+    );
+
+    // Claim-once still binds kimi: the same resumed session must not take a
+    // second baton.
+    let second = store
+        .writer
+        .insert_handoff(new_handoff("a second baton"))
+        .await
+        .unwrap();
+    let claimed_again = store
+        .writer
+        .accept_handoff(accept(second, AgentKind::KimiCode, kimi, ws, proj))
+        .await
+        .unwrap();
+    assert!(
+        !claimed_again,
+        "a kimi-code session that already claimed a handoff must not claim another"
+    );
+
+    // Adversarial control: a kimi-code session living in a DIFFERENT project
+    // must not claim this project's baton (scope isolation).
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+    let foreign = open_session(&store, ws, other_proj, AgentKind::KimiCode).await;
+    let third = store
+        .writer
+        .insert_handoff(new_handoff("foreign attempt"))
+        .await
+        .unwrap();
+    let err = store
+        .writer
+        .accept_handoff(accept(third, AgentKind::KimiCode, foreign, ws, proj))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::InvalidState(_)),
+        "a kimi-code session from another project must be refused: {err}"
+    );
+}
+
 /// Parallel live sessions in one directory each own a turn-checkpoint baton.
 /// One session's checkpoint, and a receiver claiming it, must leave the other
 /// live session's baton open: before this held, every completed turn retired
