@@ -103,14 +103,29 @@ pub(crate) fn run_with_opencode_dialect(
             |entry| entry.mcp_url.clone(),
         )
     };
-    let args = InstallMcpArgs {
+    // A token read from `[auth].bearer_token_file` is never copied into a
+    // harness config: that file exists to keep it out of them (#552). An
+    // inferred literal from an old entry is ignored then too, since it would
+    // re-embed a stale credential.
+    let token_file = config.auth.token_file_path();
+    let auth_token = args
+        .auth_token
+        .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned))
+        .or_else(|| {
+            inferred
+                .filter(|_| token_file.is_none())
+                .and_then(|entry| entry.auth_token)
+        });
+    let mut args = InstallMcpArgs {
         server_url: Some(server_url),
-        auth_token: args
-            .auth_token
-            .or_else(|| config.auth.bearer_token.clone())
-            .or_else(|| inferred.and_then(|entry| entry.auth_token)),
+        auth_token,
         ..args
     };
+    if args.auth_token.is_none()
+        && let Some(token_file) = token_file
+    {
+        route_file_token(&mut args, token_file)?;
+    }
     validate_args(&args)?;
     if args.apply {
         return apply_to_config_file(&args);
@@ -143,6 +158,36 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::PrimeAgent => render_prime_agent(&args)?,
     };
     println!("{snippet}");
+    Ok(())
+}
+
+/// Wire a client to a server whose bearer lives in `[auth].bearer_token_file`
+/// without writing the token into the client's config.
+///
+/// - Claude Code gets the `ai-memory mcp-bridge` stdio entry: the bridge is
+///   our own process, loads config like every other subcommand, and so reads
+///   the token from the file at launch.
+/// - Codex and Prime Agent reference `AI_MEMORY_AUTH_TOKEN` by name, a form
+///   both document; the operator exports it where they launch the client.
+/// - Every other client is refused. Its config can only carry a literal
+///   header, and copying the token there is exactly what the file prevents.
+fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> {
+    match args.client {
+        McpClient::ClaudeCode => args.session_aware = true,
+        McpClient::Codex | McpClient::PrimeAgent => args.token_env_var = true,
+        _ => bail!(
+            "this server's bearer token lives in {path} and ai-memory does not copy it into \
+             another program's config. {client:?} can only take it as a literal header, so \
+             it is not registered automatically. Options: register Claude Code (it runs the \
+             `ai-memory mcp-bridge` stdio bridge, which reads the file), Codex or Prime Agent \
+             (they reference ${env} by name); or add the entry by hand with the header read \
+             from that file; or pass the token explicitly with \
+             `{env}=... ai-memory install-mcp ...` if you accept it being stored in that config.",
+            path = token_file.display(),
+            client = args.client,
+            env = PRIME_AGENT_TOKEN_ENV,
+        ),
+    }
     Ok(())
 }
 
@@ -697,9 +742,16 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
             ApplyOutcome::NoOp => "already up to date",
         }
     );
-    if matches!(args.client, McpClient::PrimeAgent) && args.auth_token.is_some() {
+    if matches!(args.client, McpClient::PrimeAgent)
+        && (args.auth_token.is_some() || args.token_env_var)
+    {
         println!(
             "  Prime Agent reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch prime-agent."
+        );
+    }
+    if matches!(args.client, McpClient::Codex) && args.token_env_var {
+        println!(
+            "  Codex reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex."
         );
     }
     Ok(())
@@ -1328,7 +1380,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             // which is ignored).
             entry.insert("type".into(), json!("http"));
             entry.insert("url".into(), json!(server_url));
-            if args.auth_token.is_some() {
+            if args.auth_token.is_some() || args.token_env_var {
                 entry.insert("bearerTokenEnvVar".into(), json!(PRIME_AGENT_TOKEN_ENV));
             }
         }
@@ -1497,7 +1549,9 @@ fn codex_upsert_mcp_server(
     // override per-tool — see Codex's `[mcp_servers.X.tools]`
     // map.
     server["default_tools_approval_mode"] = value("approve");
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
+    if args.token_env_var {
+        server["bearer_token_env_var"] = value(PRIME_AGENT_TOKEN_ENV);
+    } else if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
         let mut headers = Table::new();
         headers["Authorization"] = value(b);
         server["http_headers"] = Item::Table(headers);
@@ -1628,7 +1682,12 @@ fn render_codex(args: &InstallMcpArgs) -> String {
         name = args.name,
         url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
     );
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
+    if args.token_env_var {
+        out.push_str(&format!(
+            "bearer_token_env_var = \"{PRIME_AGENT_TOKEN_ENV}\"\n\
+             # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
+        ));
+    } else if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
         out.push_str(&format!(
             "\n[mcp_servers.{name}.http_headers]\n\
              Authorization = \"{b}\"\n\
@@ -1801,7 +1860,7 @@ fn render_muse(args: &InstallMcpArgs) -> Result<String> {
 }
 
 fn render_prime_agent(args: &InstallMcpArgs) -> Result<String> {
-    let auth = if args.auth_token.is_some() {
+    let auth = if args.auth_token.is_some() || args.token_env_var {
         format!(
             "# The token is not written: the entry names ${PRIME_AGENT_TOKEN_ENV}\n\
              # (bearerTokenEnvVar), so export it where you launch prime-agent.\n\
@@ -2091,6 +2150,7 @@ mod tests {
             config_file: None,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
         }
     }
 
@@ -2104,6 +2164,7 @@ mod tests {
             config_file: None,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
         }
     }
 
@@ -3253,6 +3314,117 @@ mod tests {
             McpClient::Dsh => render_dsh(&args).unwrap(),
             McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
         }
+    }
+
+    const FILE_TOKEN: &str = "file-token-0123456789abcdef";
+
+    /// A config whose bearer came from `[auth].bearer_token_file`, as
+    /// `Config::load` leaves it on a new install.
+    fn file_token_config(dir: &Path) -> Config {
+        let mut config = Config::default();
+        config
+            .auth
+            .adopt_token_file(dir.join("auth-tokens").join("default"), FILE_TOKEN.into());
+        config
+    }
+
+    fn apply_with(config: &Config, client: McpClient, file: &Path) -> Result<()> {
+        let mut args = args_for(client);
+        args.apply = true;
+        args.config_file = Some(file.to_path_buf());
+        run_with_opencode_dialect(config, args, None)
+    }
+
+    /// New-install default: a token read from the token file is never written into a harness
+    /// config. Claude Code gets the stdio bridge (which reads the file
+    /// itself); Codex and Prime Agent reference the variable by name.
+    #[test]
+    fn a_file_sourced_token_is_wired_without_entering_any_harness_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = file_token_config(tmp.path());
+
+        let claude = tmp.path().join("claude.json");
+        apply_with(&config, McpClient::ClaudeCode, &claude).unwrap();
+        let text = std::fs::read_to_string(&claude).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let entry = &entry["mcpServers"]["ai-memory"];
+        assert_eq!(entry["type"], "stdio", "{text}");
+        assert_eq!(entry["args"][0], "mcp-bridge", "{text}");
+        assert!(entry.get("env").is_none(), "{text}");
+        assert!(entry.get("headers").is_none(), "{text}");
+
+        let codex = tmp.path().join("codex.toml");
+        apply_with(&config, McpClient::Codex, &codex).unwrap();
+        let text = std::fs::read_to_string(&codex).unwrap();
+        assert!(
+            text.contains("bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\""),
+            "{text}"
+        );
+        assert!(!text.contains("http_headers"), "{text}");
+
+        let prime = tmp.path().join("prime.json");
+        apply_with(&config, McpClient::PrimeAgent, &prime).unwrap();
+        let text = std::fs::read_to_string(&prime).unwrap();
+        assert!(text.contains("\"bearerTokenEnvVar\""), "{text}");
+
+        for file in [&claude, &codex, &prime] {
+            let text = std::fs::read_to_string(file).unwrap();
+            assert!(
+                !text.contains(FILE_TOKEN),
+                "token leaked into {}",
+                file.display()
+            );
+        }
+    }
+
+    /// Clients that can only hold a literal header are refused, and nothing
+    /// is written, rather than being given the token.
+    #[test]
+    fn a_file_sourced_token_refuses_literal_header_clients() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = file_token_config(tmp.path());
+        for client in [
+            McpClient::Cursor,
+            McpClient::GeminiCli,
+            McpClient::OpenCode2,
+            McpClient::Grok,
+            McpClient::VsCodeCopilot,
+        ] {
+            let file = tmp.path().join(format!("{client:?}.cfg"));
+            let err = apply_with(&config, client, &file).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("does not copy it"),
+                "{client:?}: {err:#}"
+            );
+            assert!(!file.exists(), "{client:?} wrote {}", file.display());
+        }
+    }
+
+    /// Controls: an inline token (pre-default install, `AI_MEMORY_AUTH_TOKEN`) and
+    /// an explicit `--auth-token` keep embedding exactly as before.
+    #[test]
+    fn inline_and_explicit_tokens_still_embed_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inline = Config::default();
+        inline.auth.bearer_token = Some("inline-token".into());
+        let cursor = tmp.path().join("cursor.json");
+        apply_with(&inline, McpClient::Cursor, &cursor).unwrap();
+        assert!(
+            std::fs::read_to_string(&cursor)
+                .unwrap()
+                .contains("Bearer inline-token")
+        );
+
+        let config = file_token_config(tmp.path());
+        let explicit = tmp.path().join("explicit.json");
+        let mut args = args_for(McpClient::Cursor);
+        args.apply = true;
+        args.config_file = Some(explicit.clone());
+        args.auth_token = Some("explicit-token".into());
+        run_with_opencode_dialect(&config, args, None).unwrap();
+        let text = std::fs::read_to_string(&explicit).unwrap();
+        assert!(text.contains("Bearer explicit-token"), "{text}");
+        assert!(!text.contains(FILE_TOKEN), "{text}");
     }
 
     #[test]

@@ -732,6 +732,9 @@ profile
 
 Run `ai-memory --help` for the full tree.
 
+`auth enable` turns on the root bearer for an install created before
+new installs got one; see [`[auth]` root bearer](#auth-root-bearer).
+
 `auto-improve-report` is read-only by default; `--stage` creates one pending
 telemetry report page for audit/approval without staging learning-memory edits.
 
@@ -1276,6 +1279,42 @@ and calls Copilot's `/embeddings` endpoint with the same `vscode-chat`
 integration headers as chat. That endpoint's wire shape follows the
 OpenAI-compatible contract Copilot documents for chat, not a published
 embeddings spec, and is not covered by a live test against Copilot here.
+
+### `[auth]` root bearer
+
+```toml
+[auth]
+bearer_token_file = "auth-tokens/default"   # written by `init` on a fresh data dir
+                                            # and by `ai-memory auth enable`
+# bearer_token = "..."                      # inline alternative; never both
+```
+
+The root bearer comes from, in order: `AI_MEMORY_AUTH_TOKEN`, then
+`[auth].bearer_token` or `[auth].bearer_token_file` (setting both is a startup
+error). `Config::load` reads the file once. A relative path resolves against
+the data dir, so a container that mounts it at `/data` and a host client that
+sees the host path read the same file. A configured file that is missing or
+blank leaves no bearer, and `serve` then refuses to start. Env:
+`AI_MEMORY_AUTH__BEARER_TOKEN_FILE`.
+
+`ai-memory init` mints the token (32 random bytes, hex, `0600` under a `0700`
+`auth-tokens/`) only on a fresh data dir: no config file and no database yet,
+and no bearer supplied another way. An existing install keeps the loopback
+no-auth behaviour until `ai-memory auth enable`, which is idempotent: it reuses
+or mints the file, records the key, copies the token into the hook credential
+files (`auth-token`, `auth-header`) when none are stored, and re-registers
+Claude Code's MCP entry for this server as the `mcp-bridge` stdio bridge.
+
+A token read from the file is never written into a harness config or onto a
+command line. `install-mcp` gives Claude Code the `ai-memory mcp-bridge` stdio
+entry, which reads the file itself; Codex and Prime Agent reference
+`AI_MEMORY_AUTH_TOKEN` by name; clients that only accept a literal header are
+refused. `install-hooks --apply` persists it to the hook credential files and
+never inlines it. Client commands of a packaged install, whose config lives
+outside the data dir and so is not read without `--config`, use
+`<data_dir>/auth-tokens/default` when no config file exists where they look,
+the server URL is loopback and no `default` server profile is registered.
+`/healthz` stays unauthenticated.
 
 ## Future work
 

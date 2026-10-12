@@ -215,6 +215,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `memory_consolidate`, which ai-memory also has with different arguments. The
   check only reads; it never edits or deletes another tool's files. `doctor
   --json` carries the findings as `agentmemory_residue`.
+- Added `ai-memory auth enable`, which turns on bearer auth for an install
+  created without it. It reuses or creates an owner-only token at
+  `<data_dir>/auth-tokens/default`, records it in `config.toml`, gives the
+  installed hooks the token when they hold no other credential, and
+  re-registers Claude Code's MCP entry for this server as the
+  `ai-memory mcp-bridge` stdio bridge. Running it again changes nothing, and
+  the token is never printed or written into a harness config. Restart the
+  server afterwards.
+- Added the `[auth] bearer_token_file` config key (env
+  `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`): a file holding the root bearer token,
+  read once at startup. A relative path resolves against the data dir.
+  `AI_MEMORY_AUTH_TOKEN` still takes precedence; setting the key together with
+  `[auth] bearer_token` is a startup error, and a server whose configured file
+  is missing or empty refuses to start. A token read from the file is never
+  written into a harness config: `install-mcp` registers Claude Code through
+  `ai-memory mcp-bridge`, gives Codex and Prime Agent a reference to
+  `$AI_MEMORY_AUTH_TOKEN`, and refuses clients that can only hold a literal
+  header; `install-hooks --apply` stores it in the hook credential files only.
+- `ai-memory status` and `ai-memory doctor` now show the server's auth
+  posture, and for an unauthenticated loopback server print
+  `auth: none (loopback)` with the fix, `ai-memory auth enable`.
 
 ### Changed
 - Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
@@ -230,6 +251,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[retrieval] observation_stream = false` (or
   `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`); ranking is then identical
   to before.
+- Changed `ai-memory init` on a fresh data dir (no config file and no
+  database yet) to create a root bearer token at
+  `<data_dir>/auth-tokens/default` and record `[auth] bearer_token_file`, so
+  a new install's server requires the token on every route except `/healthz`.
+  The hooks, the CLI and `ai-memory mcp-bridge` read it from the data dir;
+  client commands of a packaged install, whose config lives outside the data
+  dir, find it there too when they read no config file and target a loopback
+  server. Existing installs are unchanged and keep running without auth until
+  `ai-memory auth enable`; so is an `init` that finds a database or a bearer
+  supplied another way. `uninstall` keeps this token, since it is the
+  server's credential. The Docker wrapper hands a host command (`install-hooks`,
+  `mcp-bridge`, `run`) the token of a server initialized on its volume as an
+  owner-only file that `install-hooks` copies from the volume, never on a
+  command line.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites

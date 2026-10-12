@@ -772,8 +772,12 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
-    // reasoning applies; the registry of URLs stays.
-    if let Err(error) = crate::server_profiles::clear_tokens(&config.data_dir) {
+    // reasoning applies; the registry of URLs stays. The root bearer the
+    // server itself reads (`[auth].bearer_token_file`) is not a hook's and
+    // stays with the server's config.
+    if let Err(error) =
+        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+    {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
             config.data_dir.display()

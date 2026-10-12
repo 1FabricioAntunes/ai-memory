@@ -12,6 +12,15 @@ Factory Droid, Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
 > is enabled. The MCP wire protocol expects the `/mcp` path suffix on the URL.
 
+> **Token kept in the data dir.** When this install's bearer comes from
+> `[auth].bearer_token_file` (every fresh `ai-memory init`, and
+> `ai-memory auth enable`), `install-mcp` never writes it into a client's
+> config. Claude Code gets the `ai-memory mcp-bridge` stdio entry, which reads
+> the file at launch; Codex (`bearer_token_env_var`) and Prime Agent
+> (`bearerTokenEnvVar`) name `AI_MEMORY_AUTH_TOKEN`, which you export where you
+> start them; every other client is refused. Passing `--auth-token` explicitly
+> (or `AI_MEMORY_AUTH_TOKEN`) keeps the snippets below, header included.
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
 > required), so any client that points a remote URL at `/mcp`, including

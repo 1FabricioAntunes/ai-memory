@@ -312,7 +312,11 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
     } = targets;
     let infer_opencode_transition = opencode_dialect.is_some() && !config.server_url_configured();
     let server_url = (!infer_opencode_transition).then(|| config.server_url.clone());
-    let auth_token = config.auth.bearer_token.clone();
+    // Only an inline token is handed to the installers as an explicit value.
+    // One read from `[auth].bearer_token_file` stays out of rendered configs:
+    // hook install persists it to the hook credential files, and MCP install
+    // routes it through the bridge or an env-var reference (#552).
+    let auth_token = config.auth.renderable_bearer_token().map(str::to_owned);
     let hook_install = |config_file: Option<PathBuf>| InstallHooksArgs {
         agent,
         hooks_dir: overrides.hooks_dir.clone(),
@@ -405,6 +409,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             config_file: mcp_file,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
         });
     WireInstalls {
         opencode_dialect,

@@ -2,9 +2,22 @@
 
 > The full security model. Moved from the README front page; the README keeps a summary.
 
-Loopback-only (`127.0.0.1:49374`) with no auth is the default because
-it is safe for a single-user laptop: no process outside the machine can
-reach the server.
+A new install requires a bearer token. `ai-memory init` on a fresh data
+dir writes a random root bearer to `<data_dir>/auth-tokens/default` (owner
+only) and records `[auth].bearer_token_file`; the server then refuses every
+route except `/healthz` without it. The hooks, the CLI and the
+`ai-memory mcp-bridge` stdio bridge read it from the data dir, so the token is
+never pasted into a harness config or passed on a command line. Codex and
+Prime Agent reference it as `$AI_MEMORY_AUTH_TOKEN`; MCP clients that only
+take a literal header are not registered automatically.
+
+An install created before this default keeps its loopback-only
+(`127.0.0.1:49374`), no-auth behaviour. That stays safe from the network, but
+every local process and browser page can reach the server. `ai-memory status`
+and `ai-memory doctor` show `auth: none (loopback)` with the fix,
+`ai-memory auth enable`, which mints the token, records it in config, gives
+the hooks the token and re-registers Claude Code through the bridge. Restart
+the server afterwards.
 
 Unauthenticated non-loopback HTTP now fails closed. Set
 `AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an

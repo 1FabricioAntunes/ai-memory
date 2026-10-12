@@ -80,7 +80,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     };
     let args = SetupAgentArgs {
         server_url,
-        auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
+        // Only an inline token may be printed into snippets; one read from
+        // `[auth].bearer_token_file` stays out of rendered configs (#552).
+        auth_token: args
+            .auth_token
+            .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned)),
         ..args
     };
     if matches!(
@@ -388,6 +392,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
                 config_file: None,
                 session_aware: false,
                 flavor: None,
+                token_env_var: false,
             },
             Some(dialect),
         )?;

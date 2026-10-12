@@ -311,12 +311,27 @@ $EDITOR ~/.config/ai-memory/config.toml
 $EDITOR ~/.config/ai-memory/env
 ```
 
-For a loopback-only local service, bearer auth is optional. If you want one:
+`init` on a fresh data dir also writes a random root bearer token to
+`~/.local/share/ai-memory/auth-tokens/default` (owner-only) and records
+`bearer_token_file = "auth-tokens/default"` in the config, so the service
+requires it on every route except `/healthz`. You never copy it by hand:
+`install-hooks --apply` and `install-mcp --apply` find it in the data dir,
+the hooks read it from there, and Claude Code is registered as the
+`ai-memory mcp-bridge` stdio bridge, which reads the file at launch. Codex and
+Prime Agent reference `$AI_MEMORY_AUTH_TOKEN` instead; export it where you
+start them:
 
 ```bash
-TOKEN=$(ai-memory generate-auth-token)
-printf 'AI_MEMORY_AUTH_TOKEN=%s\n' "$TOKEN" >> ~/.config/ai-memory/env
+export AI_MEMORY_AUTH_TOKEN="$(cat ~/.local/share/ai-memory/auth-tokens/default)"
 ```
+
+`install-mcp` refuses clients that can only hold a literal header rather
+than write the token into their config. Add those entries by hand if you
+accept that.
+
+An install created before this default keeps running without auth.
+`ai-memory status` then shows `auth: none (loopback)`; run
+`ai-memory auth enable` and restart the service to turn the token on.
 
 Start and inspect the service:
 
@@ -336,8 +351,9 @@ loginctl enable-linger "$USER"
 Verify the HTTP server:
 
 ```bash
-curl http://127.0.0.1:49374/mcp
-# Expect a JSON-RPC error, which means the server is reachable.
+curl -s http://127.0.0.1:49374/healthz
+# Expect {"status":"ok"}. /healthz needs no token; `curl -sI http://127.0.0.1:49374/mcp`
+# answers 401 without one.
 ```
 
 ### System-level service
@@ -366,6 +382,17 @@ sudoedit /etc/ai-memory/env
 
 The package installs `/etc/ai-memory/env` as root-readable only because it may
 hold API keys. Keep that file out of backups or logs that other users can read.
+
+`init` also wrote the root bearer token to
+`/var/lib/ai-memory/auth-tokens/default`, readable only by the `ai-memory`
+user. To wire your own login's agents to this server, copy it into your
+user's data dir once; `install-mcp` and `install-hooks` then find it there:
+
+```bash
+install -d -m 0700 ~/.local/share/ai-memory/auth-tokens
+sudo cat /var/lib/ai-memory/auth-tokens/default \
+  | install -m 0600 /dev/stdin ~/.local/share/ai-memory/auth-tokens/default
+```
 
 For LAN exposure, set a non-loopback bind and allowed hosts in
 `/etc/ai-memory/config.toml`, and set a bearer token in `/etc/ai-memory/env`:
@@ -2943,7 +2970,16 @@ address you published to. The `-p` above is therefore doing the real work: it
 is what keeps this container loopback-only. If you change it to publish on a
 LAN address, set `AI_MEMORY_AUTH_TOKEN` as well.
 
-Then wire up the agent CLI. Both commands default to no auth and
+A container started this way has no token, since it never ran `init`. To
+require one, run `ai-memory auth enable` through the wrapper (it writes the
+token into the volume), `docker restart ai-memory`, then re-run
+`ai-memory install-hooks --agent <agent> --apply` so the host hooks get it.
+`install-hooks` copies the token from the volume to an owner-only file under
+`~/.local/share/ai-memory/native-runner/`, and the commands the wrapper runs
+natively (`install-hooks`, `mcp-bridge`, `run`) read it from there, never from
+a command line.
+
+Then wire up the agent CLI. Both commands default to
 `http://127.0.0.1:49374` - no extra flags needed for the local case:
 
 ```bash

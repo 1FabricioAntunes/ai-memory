@@ -519,8 +519,10 @@ Additional boundary rules:
 
 ## Security considerations
 
-- **Default posture:** loopback-only bind (`127.0.0.1:49374`), no auth —
-  safe for a single-user machine. Any non-loopback bind should set a
+- **Default posture:** loopback-only bind (`127.0.0.1:49374`). A fresh
+  `ai-memory init` mints a root bearer into `<data_dir>/auth-tokens/default`
+  (`[auth].bearer_token_file`); an install created before that keeps no
+  auth until `ai-memory auth enable`. Any non-loopback bind should set a
   bearer token (`AI_MEMORY_AUTH_TOKEN`) and `AI_MEMORY_ALLOWED_HOSTS`
   (DNS-rebinding guard). TLS is deliberately delegated to a reverse
   proxy (see `docs/https-via-proxy.md`).
