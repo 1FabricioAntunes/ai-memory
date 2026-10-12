@@ -4145,3 +4145,60 @@ async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
         "a cursor cannot retain access after its user's grant is revoked"
     );
 }
+
+// ── Accessibility basics: skip link, labelled search inputs, breadcrumb semantics ──
+
+#[tokio::test]
+async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/bar.md", "# Bar\n\nbody"))
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+
+    // (uri, search input id, whether the page has a breadcrumb)
+    let cases = [
+        ("/", "header-search", false),
+        ("/w/default/scratch", "header-search", true),
+        ("/w/default/scratch/p/notes/bar.md", "header-search", true),
+        ("/w/default/scratch/p/notes/", "header-search", true),
+        ("/search?q=bar", "search-q", false),
+    ];
+    for (uri, input_id, breadcrumb) in cases {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert!(text.contains(r##"href="#content""##), "{uri}: skip link");
+        assert!(text.contains(r#"<main id="content""#), "{uri}: skip target");
+        assert!(
+            text.contains(&format!(r#"<label for="{input_id}""#)),
+            "{uri}: label for {input_id}"
+        );
+        assert!(
+            text.contains(&format!(r#"id="{input_id}""#)),
+            "{uri}: input id {input_id}"
+        );
+        if breadcrumb {
+            assert!(text.contains(r#"aria-label="Breadcrumb""#), "{uri}");
+            assert!(text.contains(r#"aria-current="page""#), "{uri}");
+        }
+    }
+}

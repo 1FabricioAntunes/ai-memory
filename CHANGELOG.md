@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written forms differently: a numeric-looking `title` or tag such as
   `007` is no longer used, a `!!timestamp`-tagged title fails that page's
   import, and a custom-tagged title (`!foo x`) imports as its plain text.
+- Fixed keyboard and screen reader support in the web UI. Every page now has
+  a "Skip to content" link, the search fields have labels, and breadcrumbs
+  are a labelled landmark that marks the current page. Footer text, page
+  paths and relative dates now meet AA contrast in both themes. (#NNNN)
 
 ## [2.6.5] - 2026-10-12
 

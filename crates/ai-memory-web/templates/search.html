@@ -14,7 +14,9 @@
 </div>
 
 <form action="search" method="get" class="mb-8 flex gap-2">
+  <label for="search-q" class="sr-only">Search pages</label>
   <input
+    id="search-q"
     name="q"
     type="search"
     value="{{ query }}"
@@ -40,7 +42,7 @@
       {{ hit.title }}
     </a>
     <div class="text-sm text-slate-600 dark:text-slate-400 mb-1">{{ hit.snippet|safe }}</div>
-    <div class="text-xs text-slate-400 dark:text-slate-500">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
   </li>
   {% endfor %}
 </ul>
