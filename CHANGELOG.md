@@ -318,6 +318,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
   the client's own documentation at a named version and has not yet been run
   end to end. Aider is not listed because it has no MCP support.
+- Published `docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md`, which
+  splits the LongMemEval-S retrieval number into capture cost, ranking quality
+  and harness artifacts, and records what the observation stream recovered
+  (zero-LLM FTS `hit@5` 0.666 → 0.868 on all 470 questions). The benchmark,
+  evals and comparison docs no longer blame the 2 KB excerpt cap for the gap
+  (pages holding exactly the captured text score 0.968 against 0.972 for whole
+  sessions) and no longer attribute agentmemory's 0.967 to LongMemEval-S: it is
+  the grep baseline on agentmemory's in-house corpus, and its LongMemEval-S
+  figure is 95.2% from a component harness with the reranker disabled, not
+  like-for-like with ai-memory's pipeline numbers. `docs/comparison.md` gains a
+  "From agentmemory" migration note.
 - Changed `memory_query` ranking to include the observation stream by
   default, after it raised hit@5 on the retrieval eval for both zero-LLM and
   local-embedding search while staying inside its latency and context-token

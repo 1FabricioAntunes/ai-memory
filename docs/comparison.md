@@ -23,7 +23,9 @@ What sets it apart:
   (Claude Code, Codex, Cursor, Gemini, OpenCode, Kimi, …) feed and read the
   same memory. Quit one agent, open another in the same repo, and you get a
   handoff. Handoffs are a typed protocol (owned, claimed exactly once) instead
-  of a note file.
+  of a note file. Replication between servers is not automatic; in 2.7
+  (unreleased) the `ai-memory-wikisync` companion adds two-way,
+  conflict-aware sync between a server's wiki and a git repository.
 - **Zero-LLM default.** Capture, FTS5 + entity + graph retrieval, local
   embeddings, and rule-based summaries all work with **no API key**. An LLM is
   opt-in for richer consolidation; nothing requires one.
@@ -37,13 +39,20 @@ What sets it apart:
 - **One self-contained binary.** Bundled SQLite, vendored libgit2; no external
   services to stand up. It runs on a laptop, a homelab box, or a LAN server.
 
-It also publishes numbers: **LongMemEval-S hit@5 0.823** (local-embeddings
-default; 0.668 zero-LLM), produced by the in-repo harness with full provenance.
-For context on the same dataset, mcp-memory-service
-reports 0.804 R@5 and agentmemory 0.967 R@5 (hybrid + reranking). ai-memory is
-comparable to the former and below the latter, and it documents *why*
-(the pipeline pays a real 2 KB privacy-capture cost the raw-log retrievers do
-not). See [where we're behind](#where-were-behind-or-different-by-choice).
+It also publishes numbers, produced by the in-repo harness with full
+provenance and measured end to end through the shipped capture pipeline:
+**LongMemEval-S hit@5 about 0.82** with the default local embeddings (0.823 and
+0.815 in the two published full-set runs) and 0.666 zero-LLM. The observation stream in 2.7
+(unreleased, on by default) raises zero-LLM to **0.868** on all 470 questions.
+With capture skipped and each raw session indexed whole (component mode,
+ranking only), zero-LLM FTS scores 0.972; the
+[decomposition report](benchmarks/longmemeval-s-decomposition-2026-10-12.md)
+explains the difference. For context on the same dataset, mcp-memory-service
+reports 0.804 R@5, and agentmemory publishes 95.2% `recall_any@5` from a
+component harness (whole raw sessions, BM25 plus vectors, reranker disabled).
+Pipeline and component numbers are not like-for-like, and a joint evaluation
+with agentmemory is pending, so this page claims no ranking between them. See
+[where we're behind](#where-were-behind-or-different-by-choice).
 
 ## By camp
 
@@ -58,7 +67,7 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 | Paper-backed pages | **Hindsight** (Vectorize) | "Mental models" = living markdown pages an agent boots from; belief-strength consolidation; a preprint | Postgres/pgvector-primary, LLM-required; strict per-bank isolation (no team-sharing within a project). ai-memory now ships belief-strength `confidence` + an opt-in LLM "dream" rewrite, both zero-LLM-default-preserving, off by default, and R2-gated before default-on |
 | Closest sibling (fact-row twin) | doobidoo/mcp-memory-service | SQLite(+vec), local ONNX, hook capture, typed edges, honest numbers | What ai-memory would be if it chose fact-rows over wiki **pages** |
 | Platform-native | Claude Code auto-memory | Zero setup, on by default | Machine-local, **no sync**, single-agent, repo-scoped, no tool-lifecycle capture, no team |
-| **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | Below the reranking leaders on raw R@5; LLM-optional means no VLM fact-extraction sophistication |
+| **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | No local reranker yet; LLM-optional means no VLM fact-extraction sophistication |
 | File-first wiki (LLM-leaning) | **memU**, **EverOS** | Markdown source of truth + derived vector/SQLite(+LanceDB) indexes; offline consolidation; skill distillation from session history | LLM-required for the core capture/distill flow (no zero-LLM default); Python multi-service + a hosted-cloud option, vs one self-contained zero-LLM binary; memU patches host instruction files rather than exposing a git-diffable wiki |
 | Self-hosted coding-agent store | **Engram** | Single Go binary, SQLite+FTS5, MCP stdio, project-scoped, `mem_session_summary` handoffs, git-sync across machines | Structured rows the agent saves through MCP tools (SQLite is the truth, git-syncs compressed chunks), not a hand-editable git-markdown wiki captured automatically from lifecycle hooks |
 | Governed multi-agent / fleet memory | **Caura** | Shared fleet memory: agent/team/org visibility scopes, four trust tiers, audit log, PII flagging, contradiction/supersession, auto knowledge graph | Fleet-governance-first on Postgres+pgvector (LLM extraction), hosted option; ai-memory optimizes one project's git-backed wiki with `pages shared, batons owned`, not org-scale fleet governance |
@@ -69,7 +78,8 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 This is a crowded, fast-moving field, and **every tool
 compared here is actively maintained** (as of 2026-09-18, all had commits within
 the last ~10 days, and none was stale or archived; the five new-entrant rows below
-were verified 2026-09-22). Raw GitHub popularity, though,
+were verified 2026-09-22, and the agentmemory row was re-checked 2026-10-10).
+Raw GitHub popularity, though,
 tracks funding and app-developer reach more than coding-agent fitness. The
 star leaders are the app-personalization and hosted-context players (a different
 buyer), while the tools closest to ai-memory's file-first, self-hosted,
@@ -82,7 +92,7 @@ coding-continuity niche are smaller by design.
 | Zep/Graphiti | 31.0k | 2026-09-08 | active |
 | Cognee | 30.8k | 2026-09-15 | active |
 | Supermemory | 30.1k | 2026-08-17 | active |
-| agentmemory | 28.6k | 2026-08-16 | active |
+| agentmemory | 29.3k | v0.9.30 (2026-10-06) | active |
 | TencentDB Agent Memory | 27.2k | v2.0.1 (2026-08-25) | active |
 | Letta | 24.8k | 2026-05-14 | active (releases lag code) |
 | Hindsight | 23.9k | 2026-09-14 | active |
@@ -167,8 +177,10 @@ ai-memory's own zero-LLM, file-first terms (design of record:
 Two of these, belief-strength folded into ranking and the dream pass, change
 behavior only where a provider is configured and the operator opts in,
 and both are **off by default and gated on a recall eval (R2) before they may
-default on**. No such eval has been run yet, so ai-memory claims *parity of
-mechanism, not a measured quality win*: the code ships, switched off.
+default on**. No eval has shown a gain yet (the zero-LLM benchmark corpus
+has no consolidation evidence for belief-strength to act on), so ai-memory
+claims *parity of mechanism, not a measured quality win*: the code ships,
+switched off.
 Everything else here is zero-LLM, reversible, and off by default until an
 operator turns it on.
 
@@ -243,6 +255,31 @@ operator turns it on.
   file-first, zero-LLM, single-binary project memory, use ai-memory. (Caura's
   trust-tier governance is a real capability we do not match; see
   [`competitive-parity.md`](competitive-parity.md).)
+- **From agentmemory:** the closest sibling in intent: automatic hook capture
+  for coding agents, keyless by default. You gain markdown in git as the
+  source of truth (agentmemory keeps its state in iii-engine's KV store,
+  file-backed or Redis, with a one-way Obsidian export), session summaries and
+  handoffs without an LLM key (agentmemory's summarize step does nothing
+  without one), one process instead of a Node worker plus the iii-engine
+  binary, workspace/project isolation with adversarial tests, per-user auth
+  with DB tokens and OIDC, claim-once handoffs and cross-project messaging,
+  guarded backup/restore/purge, and no runtime dependency under the Elastic
+  License (iii-engine's engine is ELv2). You give up editing and forgetting
+  memories in a browser (the 2.7 web UI adds page history with diffs, a
+  session timeline, a recall trace and a health panel, but stays read-only by
+  design), the iii console's OpenTelemetry traces (ai-memory 2.7 has
+  per-stream timings in `explain=true` and a root-only Prometheus
+  `/admin/metrics` instead), the coordination tools (leases, actions,
+  routines, signals, sentinels), mesh sync (the nearest equivalent is the
+  git-based `ai-memory-wikisync` companion), image memory, the two-way Claude
+  `MEMORY.md` bridge, PaaS deploy templates, the `npx` one-line installer, and
+  the opt-in local cross-encoder reranker. The benchmark numbers are not
+  like-for-like (component vs pipeline, see above). To move your data, the
+  `ai-memory-importer` companion (2.7) reads agentmemory's Obsidian vault
+  (`agentmemory-vault`) or its `ExportData` JSON (`agentmemory-export`), and
+  `ai-memory doctor` flags agentmemory MCP entries and rules-file guideline
+  blocks left behind; see
+  [Coming from agentmemory](cookbook.md#coming-from-agentmemory).
 - **From TencentDB Agent Memory (proxy fan-in server):** you trade a Node
   three-service proxy that intercepts each harness's API base URL (distilling
   Chat Memory / Skill / Wiki / CodeGraph assets) for a file-first binary that
@@ -254,11 +291,16 @@ operator turns it on.
 
 ## Where we're behind, or different by choice
 
-- **Raw retrieval score, and no local reranker.** 0.823 hit@5 on LongMemEval-S
-  is comparable to mcp-memory-service and below agentmemory's 0.967 (hybrid +
-  reranking). Part of the gap is deliberate: a 2 KB privacy cap on captured excerpts puts
-  evidence deep inside one long turn out of the index's reach, and the benchmark
-  measures the *shipped, sanitized* system instead of an idealized retriever. The only
+- **Retrieval through capture, and no local reranker.** Through the shipped
+  pipeline, LongMemEval-S hit@5 is about 0.82 with local embeddings and 0.666
+  zero-LLM (2.6); the 2.7 observation stream raises zero-LLM to 0.868. Ranking
+  the same raw sessions whole scores 0.972 zero-LLM. The
+  [decomposition](benchmarks/longmemeval-s-decomposition-2026-10-12.md) traced
+  the gap to capture, and within capture not to the 2 KB privacy cap (pages holding exactly the captured text
+  score 0.968) but the zero-LLM session page, which indexed only short turn
+  titles. agentmemory's published 95.2% is a component number with its
+  reranker disabled, so it is not like-for-like with ours; a joint evaluation
+  is pending. The only
   reranker is LLM-as-judge, so the zero-LLM default path has none; the opt-in
   `answer=true` dialectic synthesis (2.4) is likewise LLM-required, off by
   default, and its end-to-end QA-accuracy result is early and small-sample (see
@@ -268,7 +310,7 @@ operator turns it on.
   The 2.4 memory-aging set includes the two pieces that could move retrieval
   *quality*, folding belief-strength `confidence` into ranking authority and
   the LLM "dream" rewrite of cold clusters, but both are **off by default and
-  gated on a recall eval (R2) that has not been run**. We claim parity of
+  gated on a recall eval (R2) that has not shown a gain yet**. We claim parity of
   *mechanism* with Hindsight/mcp-memory-service here, not a measured recall or
   QA improvement. Until R2 shows a positive delta the accurate statement is
   "shipped, opt-in, unproven," and the default path is unchanged.

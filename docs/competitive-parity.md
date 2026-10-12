@@ -42,7 +42,10 @@ None of the competitors below has more than one or two of these; none has all.
   "both agents read the same files."
 - **Multi-user shared-within-project** ("pages shared, batons owned", invariant
   #16), self-hosted, with no paid tier.
-- **A single honest, reproducible benchmark** (0.823 hit@5 local; 0.668 zero-LLM).
+- **Honest, reproducible benchmarks**: LongMemEval-S hit@5 about 0.82 local and
+  0.666 zero-LLM through the shipped pipeline, 0.868 zero-LLM with the 2.7
+  observation stream, and a published pipeline-vs-component decomposition
+  ([`benchmarks/`](benchmarks/README.md)).
 
 ## Migration verdicts, by competitor
 
@@ -50,7 +53,7 @@ None of the competitors below has more than one or two of these; none has all.
 |---|---|---|---|
 | **mcp-memory-service** (fact-row twin) | **Yes** if you liked hook capture + typed edges + honest numbers | Files-as-truth (not opaque fact rows), handoffs, cross-project messaging, `as_of` temporal, a marginally better + reproducible number, and (new on 2.4) its aging set at parity done zero-LLM/reversible/off-by-default (per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access boosts, 0.4–0.75-band contradiction flagging) | Cloud/multi-backend replication (Cloudflare/Milvus), graph viz. (Belief-strength + clustering consolidation are no longer a give-up: ai-memory now ships both, clustering as a zero-LLM default-off pass, belief-strength off/R2-gated) |
 | **basic-memory** (file-first sibling) | **Yes** for multi-harness coding continuity; **no** for a personal Obsidian KB with live team co-edit | Ambient capture (no `write_note` ceremony), full lifecycle, handoffs/messaging, git-versioned truth, published numbers | Local zero-cost reranking, real-time collaborative editing, Postgres backend, `build_context` graph-walk, hosted mobile/web UX |
-| **agentmemory** (ideological sibling) | **Yes** for operability + data ownership | Self-contained binary (no `iii-engine` sidecar), files-as-truth, SQL indexes committed in-txn, typed handoffs, Windows parity, fuller auth | ~13 pts raw R@5 (they rerank), a P2P mesh-sync primitive, ~31 tools of (mostly speculative) surface |
+| **agentmemory** (ideological sibling) | **Yes** for operability + data ownership | Self-contained binary (no `iii-engine` sidecar, no ELv2 runtime), files-as-truth, SQL indexes committed in-txn, zero-LLM summaries and handoffs, typed claim-once handoffs, a multi-user auth ladder (DB tokens, OIDC), native Windows without a manual sidecar download (ours is still "Experimental"), and a 2.7 importer for its vault and `ExportData`. Both now default to auth on for new installs (theirs since 0.9.30, ours in 2.7, unreleased) | Browser edit/forget (the 2.7 web UI adds page history/diff, a session timeline, a recall trace and a health panel, but stays read-only by design), the iii console's OTEL traces (we ship explain timings + Prometheus `/admin/metrics` in 2.7), a P2P mesh-sync primitive (`ai-memory-wikisync` is our git-based answer), the opt-in local cross-encoder reranker, the `npx` installer, ~31 more tools (54, all visible by default; mostly speculative). Benchmarks are not like-for-like: their 95.2% LongMemEval-S is a component measurement with the reranker disabled, ours is end-to-end; a joint evaluation is pending |
 | **Claude Code built-in memory** | **Yes** for teams / multi-machine / multi-harness; **not obviously** for a solo dev on one machine in Claude only | Cross-machine, cross-harness, team sharing, tool-lifecycle capture, real search | Zero setup: it's already on with no server to run (our one honest structural disadvantage for the solo case) |
 | **Hindsight** (pages-over-facts) | **Yes** for self-hosted/offline/team; **no** if you need their published accuracy + are fine with an LLM-required cloud | Zero-LLM, files you own, one binary, in-project team sharing (vs strict per-bank isolation), and (new on 2.4) a belief-strength `confidence` + an opt-in "dream" rewrite that borrow their model but never delete a source and keep the zero-LLM default | Their published headline accuracy, VLM/LLM extraction depth, and belief-strength that *actually moves ranking by default* (ours ships but is off/R2-gated until an eval proves it) |
 | **Zep/Graphiti** (temporal KG) | **Yes** for self-hosting coders avoiding Neo4j+LLM (Community Edition is discontinued); **no** for enterprise graph-query/world-time | One binary on SQLite, zero-LLM, files, coding-harness native, a supported self-host | True bi-temporal (world vs observed time), Cypher/BFS graph queries, custom entity/edge types, `minRating` |
@@ -92,10 +95,13 @@ remaining risk is that borrowed ideas sit **dormant** until the eval harness (R2
 | Contradiction detection (0.4–0.75 band) | mcp-memory-service | **SHIPPED (parity), advisory-only** | 2.4 (#814) surfaces likely conflicts in `memory_lint` from existing embeddings; zero-LLM, never edits/deletes/persists an edge |
 | Surprisal-first + idle/cancel dream scheduling | Honcho (Dreamer) / Supermemory | **SHIPPED (parity), opt-in** | 2.4 (#816) idle-scheduled, cancels on activity, orders most-novel-first; off by default, observable `DreamReport` per run |
 | Git-as-snapshot | agentmemory | **BETTER** | The wiki files *are* the truth (diffable), not a `state.json` dump |
+| Viewer: version diff, session timeline/replay, health | agentmemory | **SHIPPED (2.7), read-only by design** | Page history with server-side diffs (superseded versions included, so a concurrent write's loser stays visible), a paged session timeline, and a root-only health panel with the same fix lines as `ai-memory status`. Edit/forget in the browser is declined (#482); a `clippy.toml` forbids `Wiki` writes in the web crate |
+| Recall tracing / metrics | agentmemory (via the iii console's OTEL) | **SHIPPED (2.7), different shape** | No OTEL exporter: `explain=true` reports per-stream timings, `/web/search` shows a recall trace with per-stream ranks and RRF contributions, and root-only `/admin/metrics` exposes Prometheus counters and latency histograms with no content or scope in any label |
+| Auth on by default | agentmemory (0.9.30) | **SHIPPED (2.7), new installs only** | `init` on a fresh data dir creates an owner-only root token and the server requires it; existing installs keep working and opt in with `ai-memory auth enable`, which rewires hooks and MCP clients without writing the token into a harness config |
 | Pages-over-facts / living pages | Hindsight | **PARITY** (native) | Same architecture, file-first vs their Postgres-first; `settled_first` briefing shipped |
 | Cross-session experience/abstraction pass | Letta/Hindsight/surveys | **REAL, ~parity** | ≥2-session evidence guard is real, but the pass is LLM-required and **off by default** |
 | Typed relation edges | graph camp | **PARTLY SHIPPED** | Link-neighbours are now a first-class retrieval surface: `memory_read_page include_related` walks the `page_links` graph outward (bounded BFS, #775). Retrieval **RANK weighting by edge type is still not done** (edge kind stays explain-only in `memory_query`) |
-| Belief-strength consolidation | Hindsight / mcp-memory-service | **SHIPPED, off by default (parity of mechanism, unproven)** | 2.4 (#815) computes a read-time, zero-LLM `confidence` over `page_evidence` (distinct-session breadth, recency, live `contradicts`, capped `[0,0.95]`), exposed inertly in `explain`/`status`; foldable into ranking authority behind a **default-0.0, R2-gated** weight. Our improvement over Hindsight's documented **entrenchment** failure: breadth-not-raw-count weighting, recency shading, a confidence cap, and **supersession always wins** regardless of evidence. Not yet default-on; no R2 delta run |
+| Belief-strength consolidation | Hindsight / mcp-memory-service | **SHIPPED, off by default (parity of mechanism, unproven)** | 2.4 (#815) computes a read-time, zero-LLM `confidence` over `page_evidence` (distinct-session breadth, recency, live `contradicts`, capped `[0,0.95]`), exposed inertly in `explain`/`status`; foldable into ranking authority behind a **default-0.0, R2-gated** weight. Our improvement over Hindsight's documented **entrenchment** failure: breadth-not-raw-count weighting, recency shading, a confidence cap, and **supersession always wins** regardless of evidence. Not yet default-on; the R2 run on the zero-LLM corpus measured 0.000, because only consolidation writes the evidence it reads |
 | LLM merge/rewrite "dream" pass | Hindsight (Dreamer) / Supermemory ("dreaming") | **SHIPPED, opt-in/off (parity of mechanism, unproven)** | 2.4 (#816) rewrites cold clusters into one page via the gated `apply_batch` path, `dry_run` first, JSON-schema output; **never deletes a source** (superseded with a merge-note stub, `restore-page` recovers), off by default, provider-less stores keep the zero-LLM A3 path. Off until an R2 quality delta is shown |
 | bi-temporal-lite | Zep/Graphiti | **BEHIND by design** | Ingestion-time only; world-time validity deferred (because dating facts needs an LLM and breaks the zero-LLM path) |
 
@@ -104,20 +110,29 @@ remaining risk is that borrowed ideas sit **dormant** until the eval harness (R2
 These are documented recommendations only. **Nothing here is scheduled or to be
 implemented without a separate decision.** Ordered by leverage.
 
-1. **R2 reproducible eval harness, now built (#771/#772).** It was the
+1. **R2 reproducible eval harness, built (#771/#772) and run.** It was the
    meta-blocker: belief-strength ranking, typed-edge rank weighting, and a
    published accuracy/latency/context-tokens *triple* were all gated on "prove it
-   with a number." The harness now measures that triple **and** end-to-end
-   QA-accuracy (LLM-as-judge), so the gate is open; what remains is running the
-   full-500 matrix and then activating the dormant substrate below against it.
-   Illustrative sample-20 numbers are in
-   [`benchmarks/retrieval-ab-r2.md`](benchmarks/retrieval-ab-r2.md); the
-   published full-500 triple is still pending.
-2. **A zero-LLM / local reranker (candle cross-encoder).** The most-cited
-   weakness: our only reranker is LLM-as-judge, so the zero-LLM default path,
-   which is our headline, has *no* reranking, while basic-memory ships a local one and
-   agentmemory/Hindsight's score lead is largely reranking (0.823 vs 0.952 same
-   dataset). This would close a gap on our own keyless turf. Gate on R2.
+   with a number." The full-set FTS→local triple was published on 2026-09-21
+   ([`benchmarks/retrieval-ab-r2.md`](benchmarks/retrieval-ab-r2.md)), and the
+   2026-10-12 decomposition
+   ([`benchmarks/longmemeval-s-decomposition-2026-10-12.md`](benchmarks/longmemeval-s-decomposition-2026-10-12.md))
+   split the pipeline number into capture cost, ranking and harness
+   artifacts, which led to the 2.7 observation stream (zero-LLM FTS hit@5
+   0.666 → 0.868). What is still unrun is the dormant substrate below: the
+   belief-strength weight cannot move a zero-LLM corpus (every page's
+   confidence is 0.0 without consolidation evidence, so the measured delta
+   was 0.000 FTS), so it needs an LLM-consolidated corpus; typed-edge rank
+   weighting is not built.
+2. **A zero-LLM / local reranker (candle cross-encoder).** Our only reranker is
+   LLM-as-judge, so the zero-LLM default path has *no* reranking, while
+   basic-memory ships a local one and agentmemory ships one opt-in (off by
+   default, and disabled in its published LongMemEval-S run). The
+   decomposition narrowed the case: FTS already ranks whole raw sessions at
+   0.972 hit@5, so a reranker's headroom on hit@5 is small; what is left is
+   hit@1 (0.885 on whole sessions) and recall on multi-evidence questions.
+   Re-scope any reranker work to those metrics, measured with the observation
+   stream on.
 3. **Activate the dormant substrate: belief-strength now wired, off by
    default (2.4, #815).** `page_evidence` confidence is now computed at read
    time (zero-LLM) and can be folded into `PageAuthority` behind a clamped,
@@ -126,17 +141,21 @@ implemented without a separate decision.** Ordered by leverage.
    the anti-entrenchment guards built in. It is exposed inertly in
    `memory_query explain` and `memory_status` today; **it does not move ranking
    until an operator sets the weight, and turning it on is gated on a positive
-   R2 delta that has not been run.** Still behind: **typed-edge rank
+   R2 delta, which the zero-LLM benchmark corpus cannot produce (no
+   consolidation evidence, so the measured delta was 0.000).** Still behind: **typed-edge rank
    weighting** (edge kind stays explain-only) and a `contradicts` *authority*
    cap; A5 (#814) surfaces contradictions in `memory_lint` but does not yet
    feed rank.
-4. **Sharpen the cross-machine story.** `comparison.md`'s "cross-machine *by
-   construction*" is overstated: it's one shared server + manual git/rsync, with
-   **no automatic replication** (agentmemory ships a P2P primitive; mcp-memory-
-   service has Cloudflare/Milvus). Either reframe as "one server, many machines"
-   + an explicit git/rsync note, or design a bounded `ai-memory sync` over the git
-   wiki (push/pull the source-of-truth dir, rebuild the index), which would be
-   a cleaner, file-first P2P story than an opaque KV LWW.
+4. **Sharpen the cross-machine story: partly done in 2.7.** `comparison.md`'s
+   "cross-machine *by construction*" meant one shared server + manual git/rsync,
+   with **no automatic replication** (agentmemory ships a P2P primitive; mcp-memory-
+   service has Cloudflare/Milvus). 2.7 (unreleased) adds the file-first answer:
+   the `ai-memory-wikisync` companion syncs a server's wiki with a git
+   repository both ways through the public MCP write path, with conditional
+   writes (`expected_page_id`/`create_only`, #986), conflicts that need
+   `--prefer`, opt-in delete propagation, and a `sync --check` CI gate.
+   `comparison.md` now says replication between servers is not automatic and
+   names the companion.
 5. **Close the setup-friction gap vs the built-in.** This is our one structural
    weakness for the solo user. Much is already done (`run` auto-wire, `doctor`,
    `backfill`, `install-self-routing`); surface it as *the* onboarding path in the
@@ -178,10 +197,15 @@ implemented without a separate decision.** Ordered by leverage.
    preferences page already covers the useful user-prefs slice).
 7. **Fix doc staleness the audit surfaced** (accuracy, not features):
    `research-basic-memory.md` understates basic-memory's shipped cross-encoder
-   reranking + Teams tier; `research-agentmemory.md` says 53 tools / 124 endpoints
-   (now 54 / 130); `comparison.md` attributes agentmemory's `0.967` to
-   LongMemEval-S when it's their in-house `coding-agent-life-v1` (the like-for-like
-   LongMemEval-S is 0.952 vs our 0.823).
+   reranking + Teams tier. The agentmemory items were corrected on 2026-10-12:
+   `comparison.md`, `benchmarks/README.md` and `evals/README.md` no longer
+   attribute the `0.967` (the grep baseline on their 15-query
+   `coding-agent-life-v1` corpus) to LongMemEval-S, where they publish 95.2%
+   `recall_any@5` without a reranker; and `research-agentmemory.md` /
+   `issues-agentmemory.md` now carry a dated-snapshot header (54 tools, all
+   visible by default; 138 REST endpoints, per their README as of 2026-10-10).
+   Their 95.2% is a component measurement and our 0.82 a pipeline one, so
+   neither pairing is like-for-like; a joint evaluation is pending.
 8. **Fleet-scale trust governance: a real gap vs Caura (issue #810).** Our
    multi-user story is per-project (`pages shared, batons owned`, invariant #16)
    with a root→DB-user→OIDC auth ladder and an audit log, and it is deliberately
@@ -212,16 +236,24 @@ implemented without a separate decision.** Ordered by leverage.
   **file-first**, and **R2/opt-in discipline** on anything that touches ranking
   or calls an LLM. The R2 harness that gates the quality work now exists and
   measures the accuracy+latency+context-tokens triple plus end-to-end
-  QA-accuracy (illustrative sample-20 only so far).
-- **The real weakness is still retrieval quality**, and it remains
-  *self-inflicted by discipline, not by copying*: no local zero-LLM reranker
-  exists, belief-strength (`page_evidence`) is now wired but **default-off**,
-  typed-edge **RANK** weighting is still not built, and the published
-  *full-dataset* triple is still pending (only illustrative sample-20 numbers so
-  far). No R2 delta has been run, so nothing quality-affecting defaults on. The
-  gate (R2) is now
-  open, so the next step is to **activate what's already there against a
-  full-500 run.**
+  QA-accuracy (the QA column is still illustrative sample-20 only).
+- **2.7 (unreleased) closes several agentmemory-specific gaps** the same way:
+  read-only page history/diff, a session timeline, a recall trace and a
+  root-only health panel in the web UI; explain timings and a content-free
+  `/admin/metrics`; auth on by default for new installs with `auth enable`
+  for existing ones; MCP recipes for seven more clients; an importer for
+  agentmemory's vault and export plus a `doctor` check for its leftovers; and
+  git-based wiki sync (`ai-memory-wikisync`).
+- **The real weakness was retrieval through capture**, and it was
+  *self-inflicted, not copied*: the decomposition showed the zero-LLM session
+  page indexed only 80-character turn titles and no assistant text, while
+  ranking whole sessions scored 0.972. The 2.7 observation stream, on by
+  default after a measured R2 delta, recovered about two thirds
+  of that (0.666 → 0.868 zero-LLM FTS on the full set; 0.800 → 0.867 local on
+  a 90-question sample). Still open: no local zero-LLM reranker, a full-set
+  local run with the stream, belief-strength (`page_evidence`) wired but
+  **default-off** and unmeasurable without an LLM-consolidated corpus, and
+  typed-edge **RANK** weighting not built.
 - **Migration answer:** for the self-hosted, multi-harness, team, zero-LLM,
   own-your-data coding-memory user, yes: we do the basics and add what they
   can't get elsewhere. For app personalization, enterprise graph queries, agent
