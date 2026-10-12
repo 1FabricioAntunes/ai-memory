@@ -25,8 +25,9 @@ use tracing::warn;
 /// module handles.
 pub(crate) type LinkKey = (Option<String>, Option<String>, String);
 
-/// Collect the cross-scope wikilink targets across `bodies` that do NOT
-/// resolve to an existing latest page in the store.
+/// Collect the cross-scope link targets across `pages` — body wikilinks and
+/// typed `relations:` frontmatter entries — that do NOT resolve to an
+/// existing latest page in the store.
 ///
 /// Lookups are no-create and batched: each named scope is resolved once via
 /// [`lookup_existing_scope`], then every path under it is checked in a
@@ -42,11 +43,14 @@ pub(crate) type LinkKey = (Option<String>, Option<String>, String);
 pub(crate) async fn unresolved_cross_scope_links(
     reader: &ReaderPool,
     source_workspace_id: WorkspaceId,
-    bodies: &[(&PagePath, &str)],
+    pages: &[(&PagePath, &str, &serde_json::Value)],
 ) -> Result<BTreeSet<LinkKey>, ScopeResolutionError> {
     let mut targets: BTreeSet<LinkKey> = BTreeSet::new();
-    for (page_path, body) in bodies {
-        for link in ai_memory_wiki::extract_links(body, page_path) {
+    for (page_path, body, frontmatter) in pages {
+        let links = ai_memory_wiki::extract_links(body, page_path)
+            .into_iter()
+            .chain(ai_memory_wiki::extract_relation_links(frontmatter));
+        for link in links {
             if link.project.is_some() {
                 targets.insert((link.workspace, link.project, link.path.as_str().to_string()));
             }
@@ -124,4 +128,87 @@ pub(crate) fn delink_body<'a>(
     Cow::Owned(ai_memory_wiki::delink_wikilinks(
         body, page_path, unresolved,
     ))
+}
+
+/// Drop every `relations:` entry whose target is in `unresolved`, then any
+/// relation left empty, then an empty `relations` map. Entries are matched
+/// through [`ai_memory_wiki::extract_relation_links`], so a target is keyed
+/// exactly as the write boundary will parse it.
+pub(crate) fn prune_relations(frontmatter: &mut serde_json::Value, unresolved: &BTreeSet<LinkKey>) {
+    if unresolved.is_empty() {
+        return;
+    }
+    let Some(relations) = frontmatter
+        .get_mut("relations")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for (relation, targets) in relations.iter_mut() {
+        let Some(list) = targets.as_array_mut() else {
+            continue;
+        };
+        list.retain(|entry| {
+            let probe = serde_json::json!({ "relations": { relation.as_str(): [entry] } });
+            ai_memory_wiki::extract_relation_links(&probe)
+                .into_iter()
+                .all(|link| {
+                    !unresolved.contains(&(
+                        link.workspace,
+                        link.project,
+                        link.path.as_str().to_string(),
+                    ))
+                })
+        });
+    }
+    relations.retain(|_, targets| targets.as_array().is_none_or(|list| !list.is_empty()));
+    if relations.is_empty()
+        && let Some(map) = frontmatter.as_object_mut()
+    {
+        map.remove("relations");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(project: &str, path: &str) -> LinkKey {
+        (None, Some(project.to_string()), path.to_string())
+    }
+
+    #[test]
+    fn prune_relations_drops_only_unresolved_cross_scope_entries() {
+        let mut fm = serde_json::json!({
+            "title": "t",
+            "relations": {
+                "causes": ["ghost:notes/missing.md", "billing:notes/live.md", "local/page.md"],
+                "fixes": ["ghost:other"],
+            },
+        });
+        prune_relations(
+            &mut fm,
+            &BTreeSet::from([key("ghost", "notes/missing.md"), key("ghost", "other.md")]),
+        );
+        assert_eq!(
+            fm["relations"]["causes"],
+            serde_json::json!(["billing:notes/live.md", "local/page.md"])
+        );
+        assert!(
+            fm["relations"].get("fixes").is_none(),
+            "an emptied relation is removed"
+        );
+    }
+
+    #[test]
+    fn prune_relations_removes_an_emptied_map_and_ignores_an_empty_set() {
+        let original = serde_json::json!({ "relations": { "causes": ["ghost:x.md"] } });
+        let mut untouched = original.clone();
+        prune_relations(&mut untouched, &BTreeSet::new());
+        assert_eq!(untouched, original);
+
+        let mut fm = original;
+        prune_relations(&mut fm, &BTreeSet::from([key("ghost", "x.md")]));
+        assert!(fm.get("relations").is_none());
+    }
 }

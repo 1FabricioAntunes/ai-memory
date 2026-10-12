@@ -325,20 +325,21 @@ impl Consolidator {
             page.title = new_title;
         }
 
-        // #1218: a cross-scope wikilink the model invented must not be
-        // written — resolve each against the store and de-link the ones that
-        // do not land on an existing page, so the write cannot mint a
-        // dangling cross-project edge the lint pass would flag.
+        // #1218: a cross-scope link the model invented — body wikilink or
+        // `relations:` entry — must not be written. Resolve each against the
+        // store; de-link unresolved body links and drop unresolved relations,
+        // so the write cannot mint a dangling cross-project edge the lint
+        // pass would flag.
+        let mut frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let unresolved = crate::link_guard::unresolved_cross_scope_links(
             &self.reader,
             ws,
-            &[(&path, page.body_markdown.as_str())],
+            &[(&path, page.body_markdown.as_str(), &frontmatter)],
         )
         .await?;
         page.body_markdown =
             crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved).into_owned();
-
-        let frontmatter = build_frontmatter(&page, session_id, agent_kind);
+        crate::link_guard::prune_relations(&mut frontmatter, &unresolved);
         let id = self
             .wiki
             .write_page(WritePageRequest {
@@ -831,11 +832,11 @@ impl Consolidator {
         // De-linking rewrites in memory only; `apply_batch` below stays the
         // single atomic write.
         let unresolved = {
-            let bodies: Vec<(&PagePath, &str)> = requests
+            let pages: Vec<(&PagePath, &str, &serde_json::Value)> = requests
                 .iter()
-                .map(|req| (&req.path, req.body.as_str()))
+                .map(|req| (&req.path, req.body.as_str(), &req.frontmatter))
                 .collect();
-            crate::link_guard::unresolved_cross_scope_links(&self.reader, ws, &bodies).await?
+            crate::link_guard::unresolved_cross_scope_links(&self.reader, ws, &pages).await?
         };
         if !unresolved.is_empty() {
             for (req, outcome) in requests.iter_mut().zip(outcomes_preview.iter_mut()) {
@@ -843,6 +844,7 @@ impl Consolidator {
                     crate::link_guard::delink_body(&req.body, &req.path, &unresolved).into_owned();
                 req.body = rewritten.clone();
                 outcome.new_body_markdown = rewritten;
+                crate::link_guard::prune_relations(&mut req.frontmatter, &unresolved);
             }
         }
 
@@ -5873,5 +5875,54 @@ mod tests {
         assert!(stored.body.contains("otherproj:notes/missing.md"));
         assert!(stored.body.contains("[[otherproj:notes/exists.md]]"));
         assert!(stored.body.contains("[[notes/pending.md]]"));
+    }
+
+    /// #1218 covers typed `relations:` edges too: an unresolved cross-scope
+    /// relation target is dropped before the write (an emptied relation goes
+    /// with it), while a live cross-scope target and a same-project target
+    /// stay, so frontmatter cannot mint the dangling edge the body guard
+    /// prevents.
+    #[tokio::test]
+    async fn single_page_drops_unresolved_cross_scope_relations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+
+        let response = serde_json::json!({
+            "title": "Relation cleanup",
+            "body_markdown": "No links in the body.",
+            "tags": [],
+            "relations": {
+                "causes": ["otherproj:notes/missing.md", "otherproj:notes/exists.md", "notes/local.md"],
+                "fixes": ["ghostproj:x.md"],
+            },
+        });
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(
+            stored.frontmatter["relations"]["causes"],
+            serde_json::json!(["otherproj:notes/exists.md", "notes/local.md"]),
+            "{}",
+            stored.frontmatter
+        );
+        assert!(stored.frontmatter["relations"].get("fixes").is_none());
     }
 }

@@ -51,7 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wikilinks when a model ignored the #1207 prompt wording. The single-page,
   batch and bootstrap apply paths now resolve every cross-scope wikilink
   target against the store with no-create lookups before the write and
-  rewrite an unresolvable one to its plain label text, so a missing target
+  rewrite an unresolvable one to its plain label text (an unresolvable
+  `relations:` frontmatter entry is dropped), so a missing target
   can no longer mint the dangling cross-project edge that `ai-memory lint`
   reports as `broken_link`. Resolved cross-scope links survive
   byte-identical, and same-project pending links stay untouched by design.

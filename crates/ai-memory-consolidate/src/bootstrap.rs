@@ -649,11 +649,11 @@ impl Bootstrap {
         // bootstrap page cannot mint a dangling cross-project edge either.
         // In-memory rewrite only; `apply_batch` stays the single atomic write.
         let unresolved = {
-            let bodies: Vec<(&PagePath, &str)> = requests
+            let pages: Vec<(&PagePath, &str, &serde_json::Value)> = requests
                 .iter()
-                .map(|req| (&req.path, req.body.as_str()))
+                .map(|req| (&req.path, req.body.as_str(), &req.frontmatter))
                 .collect();
-            crate::link_guard::unresolved_cross_scope_links(&self.reader, cfg.workspace_id, &bodies)
+            crate::link_guard::unresolved_cross_scope_links(&self.reader, cfg.workspace_id, &pages)
                 .await?
         };
         if !unresolved.is_empty() {
