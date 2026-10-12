@@ -1474,6 +1474,7 @@ mod tests {
         serde_json::to_string(&*posted.lock().unwrap()).unwrap()
     }
 
+    #[cfg(unix)]
     fn marked_checkout(marker: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".ai-memory.toml"), marker).unwrap();
@@ -1536,6 +1537,7 @@ mod tests {
     }
 
     /// A Claude Code transcript record: `content` is the message content.
+    #[cfg(unix)]
     fn claude_record(
         sid: &str,
         uuid: &str,
@@ -1550,10 +1552,12 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn claude_tool(name: &str, id: &str, input: serde_json::Value) -> serde_json::Value {
         serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
     }
 
+    #[cfg(unix)]
     fn claude_output(id: &str, text: &str) -> serde_json::Value {
         serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": text})
     }
