@@ -1965,7 +1965,8 @@ mod tests {
 
     #[test]
     fn sanitized_redaction_markers_survive_utf8_byte_caps_in_bodies_and_titles() {
-        let root = tempdir().unwrap().keep();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
         for (role, cap) in [
             ("user", MAX_USER_MESSAGE_BYTES),
             ("assistant", MAX_EXTENSION_MESSAGE_BYTES),
@@ -1976,7 +1977,7 @@ mod tests {
                 {"role":role, "content":format!("{prefix}abcdefghijklmnop\u{1b}[0m\u{202e}")},
                 {"role":"assistant", "content":format!("{} token=abcdefghijklmnop", "x".repeat(145))}
             ]});
-            let file = write_conversation(&root, source);
+            let file = write_conversation(root, source);
             let plan = plan_external_conversation(&file, "w", DEFAULT_SERVER_URL).unwrap();
             for event in &plan.events {
                 ai_memory_client::check_body(&event.body).unwrap();
