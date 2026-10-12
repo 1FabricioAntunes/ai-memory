@@ -67,12 +67,9 @@ Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff
     }
 
     /// Run the helper once under `owner`. `None` leaves the variable unset.
-    ///
-    /// The sandbox is kept, not dropped: these fixtures are small, recoverable
-    /// and worth reading after a CI failure, and nothing here should delete a
-    /// tree on its own.
     fn run(owner: Option<&str>) -> Run {
-        let tmp = tempfile::tempdir().unwrap().keep();
+        let sandbox = tempfile::tempdir().unwrap();
+        let tmp = sandbox.path().to_path_buf();
         let driver = tmp.join("driver.ps1");
         let log = tmp.join("requests.log");
         std::fs::write(&driver, DRIVER).unwrap();

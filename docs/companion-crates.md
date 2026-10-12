@@ -131,6 +131,16 @@ Initial source support is intentionally narrow:
   `session_id`, and bounded `role`/`content` messages), replayed through the
   public ordered hook-batch surface. Product-specific export adapters remain
   outside this repository.
+- agentmemory exports: its Obsidian vault (`agentmemory-vault`) and its
+  `ExportData` JSON file (`agentmemory-export`, with a required project
+  mapping file). Both write through MCP `memory_write_page` with explicit
+  scope, every write conditional (`create_only`, then `expected_page_id` per
+  later version), refuse servers older than 2.7, and land under
+  `imported/agentmemory/`, outside every reserved family. Each page version
+  carries a stable UUIDv5 ingest key, so a rerun skips what is already there.
+  Observations are dropped unless replayed as `external-import` sessions
+  through `/hook/batch`; records with no ai-memory counterpart are counted in
+  the manifest. Details are in the importer README.
 
 Future sources can include:
 
@@ -217,9 +227,11 @@ Re-home by kind:
   idempotency keys, and send the dedicated `external-import` wire identity
   rather than impersonating a live coding harness.
 - Surface all destructive actions in dry-run output before live mode.
-- Treat non-overwrite checks as best-effort unless/until core exposes a generic
-  compare-and-write seam; companion v1 re-checks before each write but cannot make
-  `/admin/write-page` atomic with that read.
+- Treat non-overwrite checks on `/admin/write-page` as best-effort: the OMC
+  route re-checks before each write but cannot make that endpoint atomic with
+  the read. The agentmemory routes use the conditional MCP write seam that
+  shipped in 2.7 instead, so the server refuses a page that appeared or
+  changed.
 - Keep LLM normalization optional; deterministic import should work with no LLM.
 - Keep provider-specific performance tweaks, such as model parameter changes, out
   of importer PRs. If ai-memory core needs a provider bugfix or optimization,

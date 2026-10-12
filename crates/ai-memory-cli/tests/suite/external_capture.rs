@@ -47,7 +47,8 @@ fn hook(root: &Path, agent: &str, event: &str, owner: Option<&str>, check: bool)
 #[test]
 fn external_capture_owner_suppresses_only_the_opted_in_process() {
     for owner in [None, Some(""), Some(" \t\n"), Some("orchestrator-a")] {
-        let tmp = tempfile::tempdir().unwrap().keep();
+        let guard = tempfile::tempdir().unwrap();
+        let tmp = guard.path().to_path_buf();
         let output = hook(
             tmp.as_path(),
             "claude-code",
@@ -75,7 +76,8 @@ fn external_capture_owner_suppresses_only_the_opted_in_process() {
 
 #[test]
 fn external_devin_end_still_clears_native_identity() {
-    let root = tempfile::tempdir().unwrap().keep();
+    let guard = tempfile::tempdir().unwrap();
+    let root = guard.path().to_path_buf();
     let state = root.join("data/hook-state/devin-session-id");
     std::fs::create_dir_all(state.parent().unwrap()).unwrap();
     std::fs::write(&state, "completed-execution").unwrap();
@@ -92,7 +94,8 @@ fn external_devin_end_still_clears_native_identity() {
 
 #[test]
 fn capture_inspection_reports_external_ownership_without_side_effects() {
-    let tmp = tempfile::tempdir().unwrap().keep();
+    let guard = tempfile::tempdir().unwrap();
+    let tmp = guard.path().to_path_buf();
     std::fs::write(
         tmp.join(".ai-memory.toml"),
         "workspace = \"demo\"\nproject = \"app\"\n",
@@ -136,6 +139,8 @@ mod slow {
         root: PathBuf,
         client: reqwest::Client,
         base: String,
+        // Last field: drops after the server has stopped using the tree.
+        _guard: tempfile::TempDir,
     }
 
     fn command(root: &Path) -> Command {
@@ -163,7 +168,8 @@ mod slow {
 
     impl Fixture {
         async fn start() -> Self {
-            let root = tempfile::tempdir().unwrap().keep();
+            let guard = tempfile::tempdir().unwrap();
+            let root = guard.path().to_path_buf();
             for dir in ["home", "data", "project"] {
                 std::fs::create_dir(root.as_path().join(dir)).unwrap();
             }
@@ -201,6 +207,7 @@ mod slow {
                 root,
                 client,
                 base,
+                _guard: guard,
             }
         }
 

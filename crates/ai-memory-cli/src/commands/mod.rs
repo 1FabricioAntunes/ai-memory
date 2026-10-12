@@ -26,6 +26,7 @@ pub(crate) fn is_scope_ambiguous(error: &anyhow::Error) -> bool {
         })
 }
 
+pub(crate) mod agentmemory_residue;
 pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;

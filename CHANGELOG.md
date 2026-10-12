@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added page history and session replay to the read-only web UI. Each page
+  links to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version,
+  newest first, superseded ones included, so a version a concurrent write
+  replaced stays visible, with timestamps and the author of attributed writes,
+  plus a server-side unified diff between any two versions (by default the
+  latest against the version it replaced). Expired versions are hidden, and a
+  page whose TTL has passed shows no history. The same data is available as JSON
+  at `GET /api/v1/workspaces/{ws}/projects/{proj}/history/{*path}`. The version
+  list is capped at 200 per request, and the diff refuses inputs over 512 KiB,
+  10,000 lines or 1,000 changed lines and stops at 2,000 output lines. The
+  project page lists recent sessions, and each opens a timeline
+  (`/web/w/<ws>/<proj>/s/<session-id>`) that pages through its observations in
+  capture order with first/prev/next/last links and a jump field; with
+  JavaScript, a slider and `j`/`k` keys step one observation at a time. It uses
+  the same readers, owner filter and caps as the `/api/v1` session routes, and
+  observations render as escaped text. Both views follow the per-project read
+  rule: a non-grantee of a restricted project gets a 403, and a version id or
+  session id from another project or workspace reads as not found. The
+  `ai-memory-web` crate now has a `clippy.toml` that forbids the `Wiki` write
+  and destructive methods, so a write path in the web UI or `/api/v1` fails
+  `cargo clippy -D warnings`.
+- Added an opt-in observation stream to `memory_query` ranking:
+  `[retrieval] observation_stream = true` (env
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`, default off). A zero-LLM
+  session page keeps only a short excerpt of each turn, so the detail a
+  question asks about often lives only in the session's observations. With the
+  flag on, project and `scopes` searches also run full-text search over
+  observations in the same project, and each matching session votes once,
+  through its best-matching observation, for its own latest
+  `sessions/<id>.md` page as one more RRF stream. When page search did not
+  match the page itself, the matching excerpt becomes the hit's snippet, and
+  `explain=true` reports an `observation` stream with the matched observation
+  ids. Hits are still pages and nothing is written; sessions without a page
+  keep the `raw_hits` fallback, and `global=true` search is unchanged.
 - Grok Build CLI first-turn handoff: `install-hooks --agent grok --apply`
   and `install-skills --scope global --agent grok` write
   `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
@@ -16,11 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claims the baton through GET `/handoff`. The rule names Grok's invocation —
   `use_tool` with the qualified catalog key `ai-memory__memory_handoff_list` —
   because Grok reaches MCP tools only through that meta-tool, and keeps scope
-  resolution inside the current repository so it cannot consume the turn. Project-scope Grok skills and
-  `--target-dir` leave the user rule alone. Unmanaged same-name files are
-  refused without `--force`; `install-hooks` warns and keeps the hook file.
-  `uninstall --only skills` and `--only hooks` remove the markered rule.
-  (#1228)
+  resolution inside the current repository so it cannot consume the turn.
+  Project-scope Grok skills and `--target-dir` leave the user rule alone.
+  Unmanaged same-name files are refused without `--force`; `install-hooks`
+  warns and keeps the hook file. `uninstall --only skills` and `--only hooks`
+  remove the markered rule. (#1228)
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,
@@ -157,8 +191,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a Cordis profile patch rather than a fixed config file, so the command prints a
   ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
   refuses `--apply`. (#1193)
+- The `ai-memory-importer` companion imports agentmemory data. `agentmemory-vault`
+  reads its Obsidian vault export; `agentmemory-export` reads its `ExportData`
+  JSON file, from disk only, and needs a mapping file from agentmemory's
+  project names (or exact session working directories) to ai-memory
+  workspaces and projects. `--apply` refuses to run while any record is
+  unmapped. Pages land under `imported/agentmemory/` (`--dest-prefix`), never
+  under `sessions/` or another reserved family, and links to pages that were
+  not imported become plain text. Every write goes through `memory_write_page`
+  with `create_only` or `expected_page_id`, and the importer refuses servers
+  older than 2.7. A memory's versions are written oldest first so ai-memory
+  keeps the supersession chain, and `forgetAfter` becomes `expires_at`. Each
+  page carries a stable UUIDv5 ingest key, so an interrupted import resumes
+  without duplicates and a rerun writes nothing. Text is redacted before
+  anything is planned or sent. Observations are dropped unless
+  `--replay-observations` replays them as `external-import` sessions through
+  `/hook/batch`, and records with no ai-memory counterpart are counted in the
+  manifest. The cookbook has a "Coming from agentmemory" section.
+- `ai-memory doctor` reports agentmemory configuration left behind after a
+  migration: an MCP server entry in any harness config `install-mcp` knows (or
+  in a project's `.mcp.json`, `.cursor/mcp.json`, `.gemini/settings.json` or
+  `.vscode/mcp.json`), and agentmemory guideline blocks in rules files such as
+  `AGENTS.md`, `GEMINI.md`, `.cursor/rules/` and `.kiro/steering/`. It names
+  each file and the key or lines, prints the fix, and warns when a block names
+  `memory_consolidate`, which ai-memory also has with different arguments. The
+  check only reads; it never edits or deletes another tool's files. `doctor
+  --json` carries the findings as `agentmemory_residue`.
 
 ### Changed
+- Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
+  Code, Goose, Qwen Code and OpenHuman in `docs/install.md`, and listed them
+  in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
+  the client's own documentation at a named version and has not yet been run
+  end to end. Aider is not listed because it has no MCP support.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites
@@ -174,6 +239,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Replaced the unmaintained YAML library (`serde_yaml` and its
+  `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
+  reads existing page frontmatter to exactly the same values as before. One
+  formatting change: when a page is next saved, a frontmatter value that needs
+  quoting (a title containing `: `, for example) is written in double quotes
+  instead of single quotes. `ai-memory-importer` reads three rare
+  hand-written forms differently: a numeric-looking `title` or tag such as
+  `007` is no longer used, a `!!timestamp`-tagged title fails that page's
+  import, and a custom-tagged title (`!foo x`) imports as its plain text.
+
+## [2.6.5] - 2026-10-12
+
+### Fixed
+- Fixed the detached hook drainer recreating a deleted data directory. A
+  drainer started just before `ai-memory uninstall --purge-data` (or one
+  whose data directory was removed some other way) brought back an empty
+  `hook-spool/` with its lock file. The drainer now exits when the data
+  directory is gone. A spool directory the drainer creates is also private
+  (`0700`) now, as one created by a queued event always was; before, it
+  took the default permissions.
+- Fixed the profile harvest writing a fresh copy of a stack preference on
+  every pass. A statement classified `stack` (for example "Use Rust by default
+  for everything else.") lives in `profile/stack/` beside the per-language
+  stack entries, and the step that finds an entry's existing page skipped that
+  whole directory, so each harvest saw no page and wrote another `-2`, `-3`,
+  … copy, each one shown in the session-start profile digest. Only the
+  per-language pages (`profile/stack/rust.md` and the like) are skipped now.
+  Copies already written stay until they are deleted.
 
 ## [2.6.4] - 2026-10-12
 
@@ -9176,7 +9269,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...HEAD
+[2.6.5]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/akitaonrails/ai-memory/compare/v2.6.1...v2.6.2

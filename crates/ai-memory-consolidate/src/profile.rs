@@ -1174,6 +1174,17 @@ fn evidence_of(members: &[Member<'_>]) -> Vec<EntryEvidence> {
         .collect()
 }
 
+/// Whether `path` is a per-language stack-signal entry
+/// (`profile/stack/<language>.md`). A statement the classifier files under
+/// `stack` lives in the same directory, so the directory alone does not tell
+/// them apart: matching on it hid every stack statement's own page from the
+/// next pass, which then wrote another `-N` copy each harvest.
+fn is_stack_signal_path(path: &str) -> bool {
+    LANGUAGE_TAGS
+        .iter()
+        .any(|tag| path == format!("{PROFILE_PATH_PREFIX}stack/{}.md", slugify(tag)))
+}
+
 fn unique_path(base: &str, taken: &BTreeSet<String>) -> String {
     if !taken.contains(base) {
         return base.to_owned();
@@ -1370,7 +1381,7 @@ pub fn converge(
         // Match the group to the page that already holds its topic.
         let matched = existing
             .iter()
-            .filter(|e| !claimed.contains(&e.path) && !e.path.starts_with("profile/stack/"))
+            .filter(|e| !claimed.contains(&e.path) && !is_stack_signal_path(&e.path))
             .map(|e| {
                 let score = group
                     .iter()
@@ -2868,6 +2879,63 @@ mod tests {
         let again = converge(&[&a], &[page], &[], 2, 1);
         assert!(again.writes.is_empty());
         assert_eq!(again.unchanged, 1);
+    }
+
+    /// A statement classified `stack` lives under `profile/stack/` beside the
+    /// per-language stack signals. The next pass must find its own page there
+    /// instead of writing a `-2` copy every harvest, and must still never take
+    /// over a stack-signal page (control).
+    #[test]
+    fn a_stack_statement_finds_its_own_page_on_the_next_pass() {
+        let mut said = row(
+            "alpha",
+            "Use Rust by default for everything else.",
+            day(1),
+            ProfileGenerality::General,
+        );
+        said.candidate.category = "stack".to_owned();
+        let stack = |project: &str| {
+            let mut r = row(project, "rust", day(1), ProfileGenerality::Project);
+            r.candidate.source = ProfileCandidateSource::Stack;
+            r.candidate.source_ref = "stack:rust".to_owned();
+            r.candidate.topic_key = "rust".to_owned();
+            r.candidate.category = "stack".to_owned();
+            r
+        };
+        let (alpha, beta) = (stack("alpha"), stack("beta"));
+        let candidates = [&said, &alpha, &beta];
+
+        let first = converge(&candidates, &[], &[], 2, 1);
+        let pages: Vec<ProfileScopePage> = first
+            .writes
+            .iter()
+            .map(|entry| {
+                let (frontmatter, body) = render_entry(entry);
+                ProfileScopePage {
+                    path: entry.path.clone(),
+                    title: entry.statement.clone(),
+                    body,
+                    frontmatter,
+                }
+            })
+            .collect();
+        let mut paths: Vec<&str> = pages.iter().map(|p| p.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "profile/stack/rust.md",
+                "profile/stack/use-rust-by-default-for-everything-else.md"
+            ]
+        );
+
+        let again = converge(&candidates, &pages, &[], 2, 1);
+        assert!(
+            again.writes.is_empty(),
+            "the second pass wrote {:?}",
+            again.writes.iter().map(|w| &w.path).collect::<Vec<_>>()
+        );
+        assert_eq!(again.unchanged, 2);
     }
 
     #[test]

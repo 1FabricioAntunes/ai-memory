@@ -121,6 +121,69 @@ Once the material is saved as pages in the right scope, any project can search
 it (`memory_query`) and read a specific document in full (`memory_read_page`)
 before implementing against it.
 
+## Coming from agentmemory
+
+The data moves with the companion importer
+([`ai-memory-importer`](../companions/ai-memory-importer), boundary in
+[`companion-crates.md`](companion-crates.md)). Most of the work is re-wiring
+each harness. Do it in this order:
+
+1. **Export from agentmemory while it still runs.** Its export command writes
+   one `ExportData` JSON file; its Obsidian export writes a vault directory.
+   The JSON is the complete route (memory versions, TTLs, sessions,
+   summaries, lessons, insights). The importer reads only that file and never
+   contacts agentmemory.
+2. **Stop agentmemory and unwire it.** Remove its MCP server entry, the
+   plugins and skills it installed for each harness, and the memory guideline
+   block its `connect` command writes into rules files (`AGENTS.md`,
+   `GEMINI.md`, `.cursor/rules/`, `.kiro/steering/` and the like). Left in
+   place, that block keeps agents calling tools that no longer exist, and one
+   of them, `memory_consolidate`, is also an ai-memory tool with different
+   arguments. `ai-memory doctor` lists every leftover it can see, with the file
+   and lines and the fix, and changes nothing:
+
+   ```text
+   ⚠ agentmemory configuration is still present (2 place(s)). ...
+     - MCP server entry in /home/me/.cursor/mcp.json (mcpServers.agentmemory)
+         fix: remove the `mcpServers.agentmemory` entry from /home/me/.cursor/mcp.json; ...
+     - guideline block in /home/me/work/api/AGENTS.md (lines 5-10)
+         fix: delete the agentmemory guideline block (lines 5-10) from ...
+   ```
+
+   Rules kept outside files (Warp's, for example) need a look by hand.
+3. **Wire ai-memory into each harness:** `ai-memory install-hooks --agent <name>
+   --apply`, `ai-memory install-mcp --client <name> --apply` and `ai-memory
+   install-skills --agent <name>`.
+4. **Map projects, dry-run, then import.** agentmemory names a project by its
+   directory basename, so the importer needs a mapping file to the ai-memory
+   `workspace`/`project` (by basename, or by exact session `cwd` when two
+   repositories share a name). The dry run lists every unmapped project and
+   every record type it leaves out, with counts; `--apply` refuses to run
+   while anything is unmapped:
+
+   ```bash
+   cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+     agentmemory-export --file agentmemory-export.json --mapping mapping.json
+   cargo run --manifest-path companions/ai-memory-importer/Cargo.toml -- \
+     agentmemory-export --file agentmemory-export.json --mapping mapping.json \
+     --apply --manifest-out agentmemory-manifest.json
+   ```
+
+   Pages land under `imported/agentmemory/` in the mapped project. A memory's
+   versions become one page with its supersession history, `forgetAfter`
+   becomes `expires_at`, and observations are dropped unless you pass
+   `--replay-observations`. Rerunning is safe: pages already imported are
+   skipped. For a vault, use `agentmemory-vault --dir <vault> --workspace W
+   --project P` instead.
+5. **Check.** Ask your agent something an old memory answered, or call
+   `memory_query` for a known title in each project, and run `ai-memory
+   doctor` again until it reports no leftovers.
+
+What has no ai-memory counterpart (graph nodes and edges, actions, signals,
+routines, sentinels, sketches, checkpoints) is counted in the manifest's
+`dropped` section and not imported. ai-memory derives its own entity graph from
+the imported pages.
+
 ## Recipe: mirror a team wiki into the repository (team wiki sync)
 
 To keep a team's shared memory reviewable next to the code it documents, use
@@ -510,6 +573,10 @@ ai-memory serve                      # run the server
   installed, it asks Codex whether it will run them. Codex skips a hook you
   have not trusted, and skips it again after its command changes, without
   telling you: open Codex, run `/hooks`, and trust them.
+- **Agents keep calling `memory_recall`, `memory_save` or other tools ai-memory
+  does not have**: agentmemory's MCP entry or its rules-file guideline block is
+  still there. `ai-memory doctor` names each one with the fix (see
+  [Coming from agentmemory](#coming-from-agentmemory)).
 - **I just installed hooks in a project I've worked in for a while**: the first
   time you open the project after installing, ai-memory imports your existing
   local session history once (bounded, sanitized on the server, only into an

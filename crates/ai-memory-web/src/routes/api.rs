@@ -44,6 +44,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             axum::routing::get(search_handler).post(search_post_handler),
         )
         .route(
+            "/workspaces/{workspace}/projects/{project}/history/{*path}",
+            axum::routing::get(history_handler),
+        )
+        .route(
             "/workspaces/{workspace}/projects/{project}/recent",
             axum::routing::get(recent_handler),
         )
@@ -281,6 +285,66 @@ async fn page_handler(
     );
     resp.headers_mut().insert(header::ETAG, etag_header);
     Ok(resp)
+}
+
+/// A page's stored versions, newest first, and a unified diff between two of
+/// them (default: the newest against the version it replaced). See
+/// `routes/history.rs`; the HTML view renders the same data.
+async fn history_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    Path((workspace, project, path)): Path<(String, String, String)>,
+    Query(query): Query<super::history::HistoryQuery>,
+) -> Result<Response, Response> {
+    use super::history::HistoryError;
+    let history = super::history::load(
+        &state,
+        viewer_of(viewer),
+        &workspace,
+        &project,
+        &path,
+        &query,
+    )
+    .await
+    .map_err(|err| match err {
+        HistoryError::Scope(ScopeResolutionError::ProjectNotFoundInWorkspace {
+            project, ..
+        }) => not_found(format!("project '{project}' not found")),
+        HistoryError::Scope(other) => scope_error_response(other),
+        HistoryError::BadRequest(message) => json_error(StatusCode::BAD_REQUEST, message),
+        HistoryError::NotFound(message) => not_found(message),
+        HistoryError::Internal(error) => internal_error(error),
+    })?;
+    let side = |side: &super::history::DiffSide| ApiHistorySide {
+        id: side.id.to_string(),
+        title: side.title.clone(),
+        created_at: side.created_at.clone(),
+    };
+    let (status, reason, truncated, hunks) = match history.diff {
+        crate::diff::Diff::Same => ("same", None, false, Vec::new()),
+        crate::diff::Diff::TooLarge(why) => ("too_large", Some(why), false, Vec::new()),
+        crate::diff::Diff::Changed { hunks, truncated } => ("changed", None, truncated, hunks),
+    };
+    Ok(with_no_store(
+        Json(ApiHistory {
+            workspace,
+            project,
+            path,
+            total: history.total,
+            offset: history.offset,
+            limit: history.limit,
+            diff: ApiHistoryDiff {
+                from: history.from.as_ref().map(side),
+                to: side(&history.to),
+                status,
+                reason,
+                truncated,
+                hunks,
+            },
+            versions: history.versions,
+        })
+        .into_response(),
+    ))
 }
 
 async fn search_handler(
@@ -778,7 +842,7 @@ async fn overview_handler(
 /// may leave `user` empty, and reading `user` here would file that operator as
 /// unattributed while the auth layer calls them a user — hiding their own
 /// handoffs, and the bodies of the shared ones, from them in their own UI.
-fn owner_filter_for(
+pub(crate) fn owner_filter_for(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
 ) -> ai_memory_core::OwnerFilter {
     ai_memory_core::OwnerFilter::for_actor_context(
@@ -1066,8 +1130,8 @@ async fn project_overview_handler(
 /// `memory_read_session_observations` tool so a frontend and an agent see
 /// the same page sizes and body caps.
 const SESSION_LIST_MAX_LIMIT: usize = 100;
-const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
-const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
+pub(crate) const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
+pub(crate) const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
 const SESSION_OBSERVATIONS_MIN_BODY_CHARS: usize = 200;
 const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 
@@ -1208,7 +1272,7 @@ async fn session_observations_handler(
 /// `ai_memory_consolidate::projection::cap_text_with_marker`, which the MCP
 /// tool uses; duplicated here because the web crate does not depend on the
 /// consolidation pipeline.
-fn cap_body(body: &str, max_chars: usize) -> String {
+pub(crate) fn cap_body(body: &str, max_chars: usize) -> String {
     let total = body.chars().count();
     if total <= max_chars {
         return body.to_owned();
@@ -1462,6 +1526,40 @@ struct SessionObservationsQuery {
     /// Per-body character cap; clamped to `200..=16384`, default `4000`.
     #[serde(default)]
     body_max_chars: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiHistory {
+    workspace: String,
+    project: String,
+    path: String,
+    total: u64,
+    offset: usize,
+    limit: usize,
+    versions: Vec<ai_memory_store::PageVersion>,
+    diff: ApiHistoryDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiHistoryDiff {
+    /// `None` when `to` replaced nothing at this path.
+    from: Option<ApiHistorySide>,
+    to: ApiHistorySide,
+    /// `same`, `changed` or `too_large`.
+    status: &'static str,
+    /// Why a `too_large` diff was refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// The output line cap cut `hunks` short.
+    truncated: bool,
+    hunks: Vec<crate::diff::Hunk>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiHistorySide {
+    id: String,
+    title: String,
+    created_at: String,
 }
 
 #[derive(Debug, Serialize)]

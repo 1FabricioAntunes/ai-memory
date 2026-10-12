@@ -36,6 +36,34 @@ pub(crate) fn page_href(workspace: &str, project: &str, path: &str) -> String {
     )
 }
 
+/// Build a page-history URL (`w/{ws}/{proj}/h/{path}`), percent-encoded.
+#[must_use]
+pub(crate) fn history_href(workspace: &str, project: &str, path: &str) -> String {
+    format!(
+        "{}/h/{}",
+        project_href(workspace, project),
+        encode_path(path)
+    )
+}
+
+/// Build a session-timeline URL (`w/{ws}/{proj}/s/{id}`), percent-encoded.
+#[must_use]
+pub(crate) fn session_href(workspace: &str, project: &str, session_id: &str) -> String {
+    format!(
+        "{}/s/{}",
+        project_href(workspace, project),
+        encode_segment(session_id)
+    )
+}
+
+/// The last eight characters of a UUID, for display. The ids here are
+/// UUIDv7, whose leading characters are a shared timestamp prefix.
+#[must_use]
+pub(crate) fn short_id(id: &str) -> String {
+    let skip = id.chars().count().saturating_sub(8);
+    id.chars().skip(skip).collect()
+}
+
 fn encode_path(path: &str) -> String {
     path.split('/')
         .map(encode_segment)
@@ -226,6 +254,24 @@ pub(crate) struct ProjectView {
     pub mailbox_total: u64,
     /// `mailbox` lists fewer messages than are pending.
     pub mailbox_capped: bool,
+    /// The project's most recent sessions the viewer may see.
+    pub sessions: Vec<SessionRow>,
+}
+
+/// One recent session on the project page.
+pub(crate) struct SessionRow {
+    /// Link to the session timeline.
+    pub href: String,
+    /// Agent kind as stored (`claude-code`, `codex`, …).
+    pub agent_kind: String,
+    /// Last eight characters of the session id.
+    pub short_id: String,
+    /// Observations this session left in the project.
+    pub observation_count: u64,
+    /// Humanised start timestamp.
+    pub started_relative: String,
+    /// The session has not ended.
+    pub open: bool,
 }
 
 /// View-model for a namespace (directory) listing — `GET
@@ -280,6 +326,8 @@ pub(crate) struct PageView {
     pub supersedes_href: String,
     /// Rendered markdown body (HTML, trusted).
     pub body_html: String,
+    /// Link to this page's version history.
+    pub history_href: String,
     /// Username of the page's last author. Empty string when the page
     /// was authored anonymously / by root / pre-multi-user — the
     /// template uses the empty check to omit the "Last edited by"
@@ -292,6 +340,171 @@ pub(crate) struct PageView {
     /// Optional email rendered as a `mailto:` link after the username.
     /// Empty when not set on the user row.
     pub author_email: String,
+}
+
+// ---------------------------------------------------------------------------
+// history.html
+// ---------------------------------------------------------------------------
+
+/// One stored version in the history list.
+pub(crate) struct HistoryVersionRow {
+    /// Full version id, submitted by the compare form.
+    pub id: String,
+    /// Last eight characters of the id.
+    pub short_id: String,
+    /// Short id of the version this one replaced, or empty.
+    pub supersedes_short: String,
+    /// The live version of the path.
+    pub is_latest: bool,
+    /// Title stored on this version.
+    pub title: String,
+    /// ISO-8601 write instant.
+    pub created_at: String,
+    /// Humanised write instant.
+    pub created_relative: String,
+    /// Username of an attributed write, or empty.
+    pub author: String,
+    /// Body length in characters.
+    pub body_chars: u64,
+    /// Selected as the older side of the diff.
+    pub is_from: bool,
+    /// Selected as the newer side of the diff.
+    pub is_to: bool,
+    /// Link diffing this version against the one it replaced, or empty.
+    pub compare_href: String,
+}
+
+/// One diff line; `text` is untrusted page content and is escaped.
+pub(crate) struct HistoryDiffLine {
+    /// `+`, `-` or a space.
+    pub sign: String,
+    /// The line itself.
+    pub text: String,
+}
+
+/// One diff hunk.
+pub(crate) struct HistoryHunk {
+    /// `@@ -a,b +c,d @@`.
+    pub header: String,
+    /// The hunk's lines.
+    pub lines: Vec<HistoryDiffLine>,
+}
+
+/// View-model for `GET /w/:workspace/:project/h/*path`.
+#[derive(Template)]
+#[template(path = "history.html")]
+pub(crate) struct HistoryView {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link to the project.
+    pub project_href: String,
+    /// Link to the live page.
+    pub page_href: String,
+    /// This route, without a query string (the compare form's action).
+    pub history_href: String,
+    /// Wiki path.
+    pub path: String,
+    /// Every version stored at the path.
+    pub total: u64,
+    /// 1-based position of the first listed version (0 when none).
+    pub shown_start: usize,
+    /// 1-based position of the last listed version.
+    pub shown_end: usize,
+    /// Versions per listing page.
+    pub limit: usize,
+    /// Link to newer versions, or empty.
+    pub newer_href: String,
+    /// Link to older versions, or empty.
+    pub older_href: String,
+    /// The listed versions, newest first.
+    pub versions: Vec<HistoryVersionRow>,
+    /// Short id of the older side, or empty when the diff starts from nothing.
+    pub from_short: String,
+    /// Write instant of the older side, or empty.
+    pub from_created: String,
+    /// Title of the older side, or empty.
+    pub from_title: String,
+    /// Short id of the newer side.
+    pub to_short: String,
+    /// Write instant of the newer side.
+    pub to_created: String,
+    /// Title of the newer side.
+    pub to_title: String,
+    /// The two bodies are identical.
+    pub same: bool,
+    /// Why the diff was refused, or empty.
+    pub too_large: String,
+    /// The output line cap cut the diff short.
+    pub truncated: bool,
+    /// Diff hunks.
+    pub hunks: Vec<HistoryHunk>,
+}
+
+// ---------------------------------------------------------------------------
+// session.html
+// ---------------------------------------------------------------------------
+
+/// One observation on the session timeline; every text field is untrusted
+/// captured text and is escaped by the template.
+pub(crate) struct SessionObservationRow {
+    /// 1-based position in capture order within this project.
+    pub position: usize,
+    /// Observation kind.
+    pub kind: String,
+    /// Observation title.
+    pub title: String,
+    /// Body, capped like the API's default `body_max_chars`.
+    pub body: String,
+    /// ISO-8601 capture instant.
+    pub created_at: String,
+    /// Humanised capture instant.
+    pub created_relative: String,
+}
+
+/// View-model for `GET /w/:workspace/:project/s/:session_id`.
+#[derive(Template)]
+#[template(path = "session.html")]
+pub(crate) struct SessionView {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link to the project.
+    pub project_href: String,
+    /// This route, without a query string (the jump form's action).
+    pub session_href: String,
+    /// Session id.
+    pub session_id: String,
+    /// Agent kind as stored.
+    pub agent_kind: String,
+    /// ISO-8601 start.
+    pub started_at: String,
+    /// ISO-8601 end, or empty while open.
+    pub ended_at: String,
+    /// Observations in this project.
+    pub total: u64,
+    /// Observations per page.
+    pub limit: usize,
+    /// 1-based position of the first shown observation (0 when none).
+    pub shown_start: usize,
+    /// 1-based position of the last shown observation.
+    pub shown_end: usize,
+    /// Rows the session left in other projects (not shown here).
+    pub elided_other_scope: u64,
+    /// Link to the first page, or empty on it.
+    pub first_href: String,
+    /// Link to the previous page, or empty.
+    pub prev_href: String,
+    /// Link to the next page, or empty.
+    pub next_href: String,
+    /// Link to the last page, or empty on it.
+    pub last_href: String,
+    /// Prefilled value of the jump field.
+    pub jump_value: usize,
+    /// This page's observations.
+    pub observations: Vec<SessionObservationRow>,
 }
 
 // ---------------------------------------------------------------------------

@@ -1752,6 +1752,228 @@ handoff injection at session start or the client's closest equivalent, except
 for Zero's no-stdout SessionStart behavior. Grok delivers on the first
 `PostToolUse` instead (Antigravity CLI uses `PreInvocation`).
 
+#### Clients without an `install-mcp` writer
+
+The clients below can reach ai-memory over streamable HTTP, but `install-mcp`
+has no `--client` value for them, so you add the entry by hand. Each recipe
+follows the client's own documentation at the version named. None of them has
+been run end to end against ai-memory yet; the
+[support matrix](support-matrix.md) marks them `MCP-only (documented)`.
+If one does not connect as described, please open an issue with the client
+version.
+
+All of them are MCP-only here: ai-memory installs no lifecycle hooks for them,
+so there is no automatic capture and no handoff injection. Ask the agent to
+call `memory_handoff_begin` before you leave and `memory_handoff_accept` when
+you resume. None of them sends ai-memory a session id, so they are static
+clients: project-scoped calls need `workspace` and `project`, which the
+routing snippet from `ai-memory install-instructions --target AGENTS.md`
+tells the model.
+
+The examples use the local server, `http://127.0.0.1:49374/mcp`. For a remote
+server, change the URL and add the bearer header shown. Where the client
+expands environment variables in its config, the example reads the token
+from `AI_MEMORY_AUTH_TOKEN`; export it in the shell that starts the client.
+Where the client documents no expansion, the example shows `<token>`, and the
+token has to be written into that file, so keep the file private. All of
+these clients speak HTTP MCP natively; `ai-memory mcp-bridge` is a Claude
+Code-only adapter and is not needed.
+
+##### Factory Droid
+
+Droid (`droid`) reads MCP servers from `~/.factory/mcp.json` (user),
+`.factory/mcp.json` in the project root, or a `.factory/mcp.json` in an
+ancestor folder. It reloads when the file changes. Droid expands `${NAME}` in
+`headers` values (not in `url`), and its docs say to keep auth headers in the
+user file rather than the committed project file:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+Leave out `headers` when the server has no bearer token. An unset variable
+makes Droid fail that connection with an error naming it. Without a token,
+`droid mcp add ai-memory http://127.0.0.1:49374/mcp --type http` writes the
+same entry to the user file. Documented for Droid CLI 0.237.0.
+Sources: <https://docs.factory.com/cli/configuration/mcp>,
+<https://docs.factory.com/changelog/cli-updates>.
+
+##### Warp
+
+Warp reads `~/.warp/.mcp.json` and, after you approve it, a project's
+`.warp/.mcp.json`. You can also add the server under **Settings > Agents >
+MCP servers > + Add**. A URL server takes `url` and an optional `headers`
+map, with no `type` key:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Warp does not document environment-variable expansion in `headers`. Leave
+out `headers` when the server has no bearer token. The separate Warp Agent
+CLI keeps its own file with the same `mcpServers` format (`~/.warp_cli/.mcp.json`
+on macOS; the docs give no Linux path). Documented for Warp
+v0.2026.10.07.08.29.
+Sources: <https://docs.warp.dev/agents/capabilities/mcp>,
+<https://docs.warp.dev/agents/cli/configuration/>.
+
+##### Cline
+
+The Cline CLI reads `~/.cline/data/settings/cline_mcp_settings.json`
+(override the path with `CLINE_MCP_SETTINGS_PATH`). In the VS Code extension,
+open the **MCP Servers** icon, then **Configure > Configure MCP Servers**, and
+edit the same `mcpServers` map. Set `type` to `streamableHttp`: without it,
+Cline falls back to the legacy SSE transport.
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "disabled": false
+    }
+  }
+}
+```
+
+Cline does not document environment-variable expansion in `headers`. Leave
+out `headers` when the server has no bearer token; in that case the CLI can
+write the entry with
+`cline mcp add ai-memory http://127.0.0.1:49374/mcp --transport http`.
+Documented for the Cline extension 4.1.23 and CLI 3.0.70.
+Source: <https://docs.cline.bot/mcp/mcp-overview>.
+
+##### Kilo Code
+
+The Kilo Code VS Code extension and the Kilo CLI share one config:
+`~/.config/kilo/kilo.jsonc` (or `kilo.json`) globally, or `kilo.jsonc` /
+`.kilo/kilo.jsonc` in the project. Servers live under the `mcp` key, and a
+remote server has `type: "remote"`; Kilo tries streamable HTTP first and
+falls back to SSE. Kilo expands `{env:NAME}` in config values:
+
+```json
+{
+  "mcp": {
+    "ai-memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:49374/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": { "Authorization": "Bearer {env:AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+ai-memory uses a bearer token, not OAuth, so `"oauth": false` stops Kilo from
+starting an OAuth flow. Leave out `headers` when the server has no bearer
+token. The older `mcp_settings.json` and `.kilocode/mcp.json` files are not
+in the current docs. Documented for Kilo Code 7.8.8.
+Sources: <https://kilo.ai/docs/automate/mcp/using-in-kilo-code>,
+<https://kilo.ai/docs/automate/mcp/using-in-cli>.
+
+##### Goose
+
+Goose keeps extensions in `~/.config/goose/config.yaml`
+(`%APPDATA%\Block\goose\config\config.yaml` on Windows). Run `goose
+configure`, choose **Add Extension > Remote Extension (Streamable HTTP)**,
+enter the URL, and, for a server with a bearer token, add the custom request
+header `Authorization: Bearer <token>`. The resulting entry has this shape;
+note that the URL key is `uri`:
+
+```yaml
+extensions:
+  ai-memory:
+    type: streamable_http
+    name: ai-memory
+    enabled: true
+    uri: "http://127.0.0.1:49374/mcp"
+    headers:
+      Authorization: "Bearer <token>"
+    timeout: 300
+```
+
+Goose does not document environment-variable expansion in `headers`. Leave
+`headers` empty (`{}`) when the server has no bearer token. For one session,
+`goose session --with-streamable-http-extension "http://127.0.0.1:49374/mcp"`
+loads the server without saving it (that flag takes no header). Documented
+for Goose 1.54.0.
+Sources: <https://goose-docs.ai/docs/guides/config-files>,
+<https://goose-docs.ai/docs/getting-started/using-extensions>,
+<https://goose-docs.ai/docs/guides/goose-cli-commands>.
+
+##### Qwen Code
+
+Qwen Code reads `mcpServers` from `~/.qwen/settings.json` (user) or
+`.qwen/settings.json` (project). A streamable-HTTP server uses `httpUrl`; the
+plain `url` key means the legacy SSE transport. Qwen Code expands `$NAME` and
+`${NAME}` in every string of `settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "httpUrl": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+Leave out `headers` when the server has no bearer token; in that case
+`qwen mcp add --scope user --transport http ai-memory http://127.0.0.1:49374/mcp`
+writes the entry. Documented for Qwen Code 0.25.1.
+Sources: <https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/>,
+<https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/>.
+
+##### OpenHuman
+
+OpenHuman (tinyhumansai/openhuman) adds servers through the **mcp.json** tab
+of its MCP Servers screen. That document is a view over OpenHuman's own
+server store, not a file you edit on disk. A server with `url` is dialled
+over streamable HTTP, and `headers` holds its credentials:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+OpenHuman does not document environment-variable expansion in that
+document. It stores header values write-only and never shows them again.
+Leave out `headers` when the server has no bearer token. Documented for
+OpenHuman 0.64.15.
+Sources: <https://tinyhumans.gitbook.io/openhuman/features/integrations/mcp-and-skills>,
+<https://tinyhumans.gitbook.io/openhuman/developing/architecture/mcp-registry>.
+
+##### Aider
+
+Aider has no MCP support in any release (checked against 0.86.2 and its
+release history), so there is no recipe. Its feature request is
+[Aider-AI/aider#3314](https://github.com/Aider-AI/aider/issues/3314).
+
 ---
 
 ## Installing hooks without docker

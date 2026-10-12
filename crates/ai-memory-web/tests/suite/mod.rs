@@ -2,5 +2,6 @@
 //! test harness (see the `integration` module in `src/lib.rs`), so they cost
 //! no extra binary; a new file must be declared below.
 
+mod history_replay;
 mod pending;
 mod routes;

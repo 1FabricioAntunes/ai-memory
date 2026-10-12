@@ -9,12 +9,14 @@ use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
 
 mod api;
+mod history;
 mod index;
 mod login;
 mod page;
 mod pending;
 mod project;
 mod search;
+mod session;
 mod statics;
 
 /// Whether the viewer may read `workspace/project` (#708).
@@ -46,12 +48,39 @@ pub(crate) async fn authorize_read(
     .map(Some)
 }
 
+/// Resolve `workspace/project` for a route that needs its ids, refusing a
+/// viewer without read access (#708).
+///
+/// Unlike [`authorize_read`] it always resolves, viewer or not, because the
+/// history and session views read by id. No-create and fail-closed, like
+/// every read path.
+pub(crate) async fn resolve_read_scope(
+    state: &WebState,
+    viewer: Option<ai_memory_core::UserId>,
+    workspace: &str,
+    project: &str,
+) -> Result<ai_memory_store::ResolvedScope, ai_memory_store::ScopeResolutionError> {
+    ai_memory_store::lookup_existing_scope_guarded(
+        &state.reader,
+        workspace,
+        project,
+        viewer,
+        ai_memory_store::ProjectAccess::Read,
+    )
+    .await
+}
+
 /// Build the read-only wiki page router (no static assets — those are public).
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index::handler))
         .route("/w/{workspace}/{project}", get(project::handler))
         .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
+        .route("/w/{workspace}/{project}/h/{*path}", get(history::handler))
+        .route(
+            "/w/{workspace}/{project}/s/{session_id}",
+            get(session::handler),
+        )
         .route("/search", get(search::handler))
         .route("/pending", get(pending::handler))
         .with_state(state)
