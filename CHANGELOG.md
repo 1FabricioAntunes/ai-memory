@@ -37,8 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job-state marker locations, staged-script paths — grounded only in what
   the observations show. (#1221)
 - Softened the consolidation prompts' wikilink quota that pushed models to
-  invent links. The single and batch prompts told the model "2-5 well-chosen
-  links per page beat exhaustive linking; zero links should be rare", which
+  invent links. The single, batch and bootstrap prompts told the model "2-5
+  well-chosen links per page beat exhaustive linking; zero links should be
+  rare", which
   pressured it to add links just to hit the number. They now state that zero
   links is fine when nothing in the input genuinely relates, require a genuine
   reason visible in the input for every link, and forbid padding a page with

@@ -1839,6 +1839,11 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("the supplied sources"));
         assert!(SYSTEM_PROMPT.contains("not a repo file path"));
         assert!(SYSTEM_PROMPT.contains("never pad with a cross-scope link"));
+        // #1219: no numeric quota pushing the model to invent links.
+        assert!(SYSTEM_PROMPT.contains("zero links is fine"));
+        assert!(SYSTEM_PROMPT.contains("Never pad a page with links to hit a number"));
+        assert!(!SYSTEM_PROMPT.contains("zero links should be rare"));
+        assert!(!SYSTEM_PROMPT.contains("2-5"));
         assert!(!SYSTEM_PROMPT.contains("A link whose target does not exist yet is acceptable"));
     }
 
