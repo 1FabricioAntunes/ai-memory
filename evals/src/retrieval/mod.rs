@@ -684,7 +684,7 @@ async fn run_config(run: &RunContext<'_>, knobs: &Knobs) -> Result<report::Repor
             let evidence: HashSet<uuid::Uuid> = q
                 .answer_session_ids
                 .iter()
-                .map(|s| stored_session_uuid(s))
+                .map(|s| stored_session_uuid(&q, s))
                 .collect();
             let mut score = score::score_question(
                 &q.question_id,
@@ -833,7 +833,7 @@ fn run_grep(
             let evidence: HashSet<uuid::Uuid> = q
                 .answer_session_ids
                 .iter()
-                .map(|s| stored_session_uuid(s))
+                .map(|s| stored_session_uuid(q, s))
                 .collect();
             score::score_question(
                 &q.question_id,

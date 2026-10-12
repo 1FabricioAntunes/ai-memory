@@ -414,7 +414,7 @@ pub async fn measure_question(
             .iter()
             .position(|s| *s == t.session_id)
             .context("evidence session not in haystack")?;
-        let uuid = stored_session_uuid(&t.session_id);
+        let uuid = stored_session_uuid(q, &t.session_id);
         let mut s = Surfaces::default();
         if let Some((title, body)) = read_page(client, base_url, &project, uuid).await? {
             s.page_present = true;

@@ -111,14 +111,22 @@ pub fn project_for(q: &Question) -> String {
     format!("lme-{}", q.question_id)
 }
 
-/// The store hashes non-UUID session ids to UUIDv5(NAMESPACE_OID, raw)
-/// (`resolve_native_session_id`); the scorer recomputes the same mapping
-/// to attribute `sessions/<uuid>.md` page hits back to dataset sessions.
-pub fn stored_session_uuid(raw: &str) -> uuid::Uuid {
-    match uuid::Uuid::parse_str(raw) {
-        Ok(u) => u,
-        Err(_) => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, raw.as_bytes()),
-    }
+/// The stored session id for dataset session `raw` in `q`'s haystack.
+///
+/// LongMemEval reuses session ids across questions: 4,715 of the 23,566
+/// scored haystack sessions (8 of them evidence) also sit in an earlier
+/// question's haystack. Replayed under its raw id, such a session already
+/// exists in the other question's project when the second replay arrives;
+/// the store files its turns under the new project (follow-cwd routing)
+/// but drops its `session-end` as naming a foreign scope, so the second
+/// project never gets the session page. A real harness mints a fresh id
+/// per session, so the replay namespaces the id by project and sends the
+/// resulting UUID, which the store keeps verbatim.
+pub fn stored_session_uuid(q: &Question, raw: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("{}\n{raw}", project_for(q)).as_bytes(),
+    )
 }
 
 /// Truncate on a char boundary so the marker stays valid UTF-8.
@@ -212,7 +220,7 @@ fn build_items(q: &Question, prefix: DatePrefix) -> Vec<BatchItem> {
     };
 
     for (idx, session) in q.haystack_sessions.iter().enumerate() {
-        let sid = &q.haystack_session_ids[idx];
+        let sid = &stored_session_uuid(q, &q.haystack_session_ids[idx]).to_string();
         let date = &q.haystack_dates[idx];
         let mut start = json!({ "hook_event_name": "SessionStart", "source": "startup" });
         if prefix == DatePrefix::SessionStart {
@@ -363,7 +371,7 @@ pub async fn write_session_pages(
         let request = json!({
             "workspace": EVAL_WORKSPACE,
             "project": project,
-            "path": format!("sessions/{}.md", stored_session_uuid(sid)),
+            "path": format!("sessions/{}.md", stored_session_uuid(q, sid)),
             "title": session_page_title(date),
             "body": body,
             // Hook-synthesised session pages are episodic too.
@@ -455,15 +463,23 @@ mod tests {
     }
 
     #[test]
-    fn non_uuid_session_ids_map_to_the_stores_v5_hash() {
-        // Mirrors resolve_native_session_id in the hooks router.
-        let mapped = stored_session_uuid("sharegpt_abc_0");
-        assert_eq!(
-            mapped,
-            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"sharegpt_abc_0")
-        );
-        let real = uuid::Uuid::now_v7();
-        assert_eq!(stored_session_uuid(&real.to_string()), real);
+    fn replayed_session_ids_are_per_question_uuids() {
+        let first = q();
+        let mut second = q();
+        second.question_id = "qY".into();
+        let a = stored_session_uuid(&first, "sharegpt_abc_0");
+        let b = stored_session_uuid(&second, "sharegpt_abc_0");
+        // A session shared by two haystacks must not share a stored id.
+        assert_ne!(a, b);
+        assert_eq!(a, stored_session_uuid(&first, "sharegpt_abc_0"));
+        // The replay sends the UUID itself, which the store keeps verbatim.
+        for item in build_items(&first, DatePrefix::Turn) {
+            assert_eq!(
+                item.body["session_id"].as_str(),
+                Some(a.to_string().as_str())
+            );
+            assert!(item.url.contains(&format!("session_id={a}")));
+        }
     }
 
     #[test]
