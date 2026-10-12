@@ -29,9 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory-web` crate now has a `clippy.toml` that forbids the `Wiki` write
   and destructive methods, so a write path in the web UI or `/api/v1` fails
   `cargo clippy -D warnings`.
-- Added an opt-in observation stream to `memory_query` ranking:
-  `[retrieval] observation_stream = true` (env
-  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`, default off). A zero-LLM
+- Added an observation stream to `memory_query` ranking:
+  `[retrieval] observation_stream` (env
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM`, on by default). A zero-LLM
   session page keeps only a short excerpt of each turn, so the detail a
   question asks about often lives only in the session's observations. With the
   flag on, project and `scopes` searches also run full-text search over
@@ -211,6 +211,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
   the client's own documentation at a named version and has not yet been run
   end to end. Aider is not listed because it has no MCP support.
+- Changed `memory_query` ranking to include the observation stream by
+  default, after it raised hit@5 on the retrieval eval for both zero-LLM and
+  local-embedding search while staying inside its latency and context-token
+  budgets. `explain=true` lists `observation` in
+  `streams_active` whenever it runs. To keep the previous ranking, set
+  `[retrieval] observation_stream = false` (or
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`); ranking is then identical
+  to before.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites

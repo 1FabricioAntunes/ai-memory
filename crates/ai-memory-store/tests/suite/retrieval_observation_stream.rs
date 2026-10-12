@@ -1,6 +1,7 @@
 //! `[retrieval] observation_stream` (R1): matching observation bodies vote,
 //! once per session, for that session's latest `sessions/<id>.md` page as one
-//! more RRF stream. Off by default and byte-identical when off.
+//! more RRF stream. On by default, and byte-identical to the pre-stream
+//! ranking when turned off.
 
 use ai_memory_core::{
     AgentKind, NewObservation, NewPage, NewSession, ObservationId, ObservationKind, PagePath,
@@ -13,6 +14,18 @@ pub(crate) fn stream_on() -> RetrievalTuning {
         observation_stream: true,
         ..RetrievalTuning::default()
     }
+}
+
+pub(crate) fn stream_off() -> RetrievalTuning {
+    RetrievalTuning {
+        observation_stream: false,
+        ..RetrievalTuning::default()
+    }
+}
+
+#[test]
+fn the_stream_is_on_by_default() {
+    assert_eq!(RetrievalTuning::default(), stream_on());
 }
 
 pub(crate) async fn scope(store: &Store, ws: &str, proj: &str) -> (WorkspaceId, ProjectId) {
@@ -161,6 +174,7 @@ async fn an_observation_hit_lifts_its_own_session_page() {
     observe(&store, ws, proj, other, "we talked about gardening instead").await;
 
     // Off: the evidence is unreachable from pages.
+    store.reader.set_retrieval_tuning(stream_off());
     assert!(
         search(&store, ws, proj, "quasar telescope")
             .await
@@ -311,7 +325,8 @@ async fn a_superseded_or_expired_session_page_takes_no_vote() {
 async fn stream_off_ranks_byte_identically_to_a_store_without_observations() {
     async fn seeded(with_observations: bool) -> (tempfile::TempDir, Store, WorkspaceId, ProjectId) {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.reader.set_retrieval_tuning(stream_off());
         let (ws, proj) = scope(&store, "default", "app").await;
         for (i, body) in [
             "kestrel nest under the bridge",

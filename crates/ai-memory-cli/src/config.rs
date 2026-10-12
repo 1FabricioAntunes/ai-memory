@@ -1636,13 +1636,14 @@ impl DreamSettings {
     }
 }
 
-/// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
-/// `memory_query`. Every default leaves ranking byte-identical to a store
+/// `[retrieval]` ranking signals layered on the RRF fusion in
+/// `memory_query`. Only `observation_stream` is on by default; with it
+/// turned off, every other default leaves ranking byte-identical to a store
 /// that never heard of this section.
 ///
 /// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
 /// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`,
-/// `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`.
+/// `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalSettings {
@@ -1667,7 +1668,7 @@ pub struct RetrievalSettings {
     /// Add the observation-evidence stream (R1) to the RRF fusion: matching
     /// observation bodies vote, once per session, for that session's latest
     /// `sessions/<id>.md` page in the same project. Read-only; the wiki is
-    /// not enlarged. OFF by default.
+    /// not enlarged. ON by default; `false` restores the previous ranking.
     pub observation_stream: bool,
 }
 
@@ -3315,15 +3316,19 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_observation_stream_defaults_off_and_loads_from_toml() {
-        assert!(!Config::default().retrieval.tuning().observation_stream);
+    fn retrieval_observation_stream_defaults_on_and_loads_from_toml() {
+        assert!(Config::default().retrieval.tuning().observation_stream);
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "[retrieval]\nobservation_stream = true\n").unwrap();
+        std::fs::write(&config_path, "[retrieval]\nobservation_stream = false\n").unwrap();
         let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
-        assert!(config.retrieval.tuning().observation_stream);
+        assert!(!config.retrieval.tuning().observation_stream);
         // The other [retrieval] signals keep their defaults.
         assert!(!config.retrieval.tuning().abstract_vectors);
+        // A config that never names the key gets the default.
+        std::fs::write(&config_path, "[retrieval]\nabstract_vectors = false\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.retrieval.tuning().observation_stream);
     }
 
     #[test]
@@ -3332,9 +3337,9 @@ mod tests {
         if std::env::var_os(CHILD_MARKER).is_some() {
             let tmp = TempDir::new().unwrap();
             let config_path = tmp.path().join("config.toml");
-            std::fs::write(&config_path, "[retrieval]\nobservation_stream = false\n").unwrap();
+            std::fs::write(&config_path, "[retrieval]\nobservation_stream = true\n").unwrap();
             let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
-            assert!(config.retrieval.tuning().observation_stream);
+            assert!(!config.retrieval.tuning().observation_stream);
             println!("observation-stream-env-applied");
             return;
         }
@@ -3345,7 +3350,7 @@ mod tests {
             .arg("--test-threads=1")
             .arg("--nocapture")
             .env(CHILD_MARKER, "1")
-            .env("AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM", "true")
+            .env("AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM", "false")
             .output()
             .unwrap();
         assert!(

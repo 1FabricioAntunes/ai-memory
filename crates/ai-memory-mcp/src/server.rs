@@ -848,7 +848,9 @@ struct MemoryQueryResponse {
     /// Present only when `explain=true`: which retrieval streams ran for
     /// the primary search. Project/scopes retrieval always runs `fts` and
     /// `entity`, and `graph`; `vector` is present only when an embedder
-    /// produced a query vector. Cross-project `global=true` retrieval is FTS-only.
+    /// produced a query vector, and `observation` while `[retrieval]
+    /// observation_stream` is on (the default). Cross-project `global=true`
+    /// retrieval is FTS-only.
     /// An `as_of` query runs `entity` plus version-filtered `fts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     streams_active: Option<Vec<&'static str>>,
@@ -10424,7 +10426,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
         assert_eq!(
             value["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
         let details = &value["hits"][0]["score_details"];
         assert_eq!(details["fts_rank"], 1);
@@ -10545,7 +10547,7 @@ mod tests {
         );
         assert_eq!(
             entity_hit["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
 
         let graph_hit = query("graphseed").await;
@@ -12848,7 +12850,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             value["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
         assert_eq!(
             value["hits"]
