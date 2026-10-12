@@ -3619,6 +3619,11 @@ fn windows_spellings(candidate: &str, cwd: &str) -> Option<Vec<String>> {
 /// One segment as Windows reads it ([`windows_spelling`]); `None` when nothing
 /// is left of it.
 fn windows_segment(segment: &str) -> Option<&str> {
+    // Glob and brace syntax is expanded later; trimming here would change
+    // what it expands to (`{.,}.` read as `{.,}` never reaches `..`).
+    if segment.contains(['*', '?', '[', ']', '{', '}', '(', ')', '|']) {
+        return Some(segment);
+    }
     let name = segment.split(':').next().unwrap_or(segment);
     let unspaced = name.trim_end_matches(' ');
     if unspaced == "." || unspaced == ".." {
@@ -5718,6 +5723,32 @@ mod tests {
         assert_eq!(
             disposition(&active, &bash("cat docs/adr/1.md /tmp/pi-bash-1.log")),
             CaptureDisposition::Drop
+        );
+    }
+
+    /// A Windows session trims trailing dots from plain segments only: a
+    /// glob or brace segment is expanded later, and `{.,}.` trimmed to
+    /// `{.,}` would never reach `..`, hiding the sibling checkout's marker
+    /// (the Windows-only miss the hosted runner caught). Control: a plain
+    /// trailing-dot segment is still read as Windows reads it.
+    #[test]
+    fn windows_lookup_locations_keep_glob_segments_whole() {
+        let cwd = r"C:\work\b";
+        let locations =
+            |raw: &Value| capture_lookup_locations(AgentKind::ClaudeCode, raw, cwd, None);
+        assert_eq!(
+            locations(&bash("cat {.,}./a/secrets.env")),
+            Some(vec![
+                r"C:\work\b".to_owned(),
+                r"C:\work\b\{.,}.\a\secrets.env".to_owned(),
+            ])
+        );
+        assert_eq!(
+            locations(&bash("cat a.\\secrets.env")),
+            Some(vec![
+                r"C:\work\b".to_owned(),
+                r"C:\work\b\a\secrets.env".to_owned()
+            ])
         );
     }
 
