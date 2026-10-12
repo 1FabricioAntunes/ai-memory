@@ -54,11 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file tool whose target cannot be read. A glob inside the event's own
   checkout is not walked, so ordinary monorepo commands over many packages
   (`cat packages/*/package.json`, `du -sh packages/*`) keep their output with
-  or without a marker. A `..` after a `**`, a dot glob that older bash
-  expands to the parent directory, a brace expansion, a zsh glob
-  group, an ANSI-C escape, an indented `apply_patch` header and Hermes
-  `search_files`' `file_glob` filter can no longer hide which checkout a call
-  reaches. A broken
+  or without a marker, and neither are a large brace expansion that cannot
+  leave it (`touch test/file{1..200}.txt`) or the checkout's own subtree under
+  a `**` that starts above it. Each directory's marker is looked up once, so
+  many paths in a deep tree stay within the hook's time budget, and a
+  dotfiles `.git` in the home directory no longer counts as every project's
+  own checkout. A `..` after a `**`, a dot glob that older bash
+  expands to the parent directory (POSIX classes and extglobs included), a
+  brace expansion, a zsh glob group, an ANSI-C escape (also inside a
+  double-quoted `bash -c` or `eval` script), an indented `apply_patch` header
+  and Hermes `search_files`' `file_glob` filter can no longer hide which
+  checkout a call reaches. A broken
   marker makes a search metadata-only, as it does a file or shell call.
   Reading back a file a harness saved an earlier tool's output to
   (Claude Code's saved large results and background task output, OpenCode's

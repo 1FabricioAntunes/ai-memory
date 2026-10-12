@@ -1306,9 +1306,8 @@ pub(crate) fn tool_location_routing_cwd(
     source_keeps.then(|| dir.to_string_lossy().into_owned())
 }
 
-/// How many distinct directories, and markers other than the event's own, one
-/// tool call may make [`foreign_capture_decision`] look up.
-const MAX_FOREIGN_DIRECTORIES: usize = 256;
+/// How many markers other than the event's own one tool call may make
+/// [`foreign_capture_decision`] apply.
 const MAX_FOREIGN_MARKERS: usize = 16;
 /// How many directories, and directory entries read, following the glob
 /// syntax of one tool call's locations may cost, and how long: a hook has
@@ -1316,6 +1315,12 @@ const MAX_FOREIGN_MARKERS: usize = 16;
 const MAX_GLOB_DIRECTORIES: usize = 256;
 const MAX_GLOB_ENTRIES: usize = 32_768;
 const MAX_GLOB_TIME: Duration = Duration::from_millis(50);
+/// How many filesystem probes looking up the markers of one call's locations
+/// may cost; each directory's marker is found once ([`MarkerMemo`]), so only
+/// a tree built to be deep and wide reaches it.
+///
+/// [`MarkerMemo`]: crate::marker::MarkerMemo
+const MAX_LOOKUP_PROBES: usize = 16_384;
 
 /// The stricter decision of every other marker that governs a location the
 /// tool call names: a file-tool target, or a path a shell argument spells,
@@ -1326,23 +1331,53 @@ const MAX_GLOB_TIME: Duration = Duration::from_millis(50);
 ///
 /// Markers are found by the same lexical walk as the event's (no
 /// canonicalization), from the nearest existing directory of each location,
-/// with each directory looked up once. A location with glob syntax
-/// ([`glob_walk`]) is looked up from its literal root, and, when that root
-/// lies outside the event's own checkout (its `.git` root), every directory
-/// the glob could pass through below the root is checked for a marker of its
+/// with each directory's answer remembered for every lookup that passes it
+/// ([`MarkerMemo`]), so a deep tree costs one probe per directory. A location
+/// with glob syntax ([`glob_walk`]) is looked up from its literal root first,
+/// and, when that root lies outside the event's own checkout, every directory the
+/// glob could pass through below the root is checked for a marker of its
 /// own: each glob segment lists the child directories (never following a
-/// symlink), and a `**` lists the whole subtree. A glob rooted inside the
-/// event's own checkout is not walked, so a monorepo's `packages/*/x` costs
-/// nothing; a checkout nested inside the event's own is not reached through
-/// one. A call naming more locations, directories, entries or markers than
-/// the bounds, a walk past its time budget, glob syntax the walk cannot
-/// follow, or locations that cannot be read is unprovable and gets the
-/// fail-closed decision of an invalid policy.
+/// symlink), and a `**` lists the whole subtree except the own checkout's. A
+/// glob rooted inside the event's own checkout is not walked, so a monorepo's
+/// `packages/*/x` costs nothing; a checkout nested inside the event's own is
+/// not reached through one. The own checkout is the nearest `.git` root of
+/// the cwd unless that is the filesystem root or lies at or above the home
+/// directory ([`own_checkout`]).
+///
+/// The walk and the lookups share one budget of time, directories, entries
+/// and probes. Locations outside the own checkout come first: there a call
+/// naming more locations or markers than the bounds, a walk or lookup past
+/// the budget, glob syntax the walk cannot follow, or locations that cannot
+/// be read is unprovable and gets the fail-closed decision of an invalid
+/// policy. Inside the own checkout the own policy governs, so running out of
+/// budget there ends the lookup without failing closed.
+///
+/// [`MarkerMemo`]: crate::marker::MarkerMemo
 pub(crate) fn foreign_capture_decision(
     agent: AgentKind,
     raw: &serde_json::Value,
     inspection_cwd: &str,
     own_marker: Option<&Path>,
+) -> Option<CaptureDecision> {
+    foreign_decision_within(
+        agent,
+        raw,
+        inspection_cwd,
+        own_marker,
+        home_dir().as_deref(),
+        || GlobBudget::new(MAX_GLOB_TIME),
+    )
+}
+
+/// [`foreign_capture_decision`] with the home directory and the budget given;
+/// the budget is made once the event's own lookups are done.
+fn foreign_decision_within(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    inspection_cwd: &str,
+    own_marker: Option<&Path>,
+    home: Option<&Path>,
+    budget: impl FnOnce() -> GlobBudget,
 ) -> Option<CaptureDecision> {
     let unprovable = || {
         Some(
@@ -1353,65 +1388,93 @@ pub(crate) fn foreign_capture_decision(
             ),
         )
     };
-    let home = home_dir();
-    let Some(locations) = capture_lookup_locations(
-        agent,
-        raw,
-        inspection_cwd,
-        home.as_deref().and_then(Path::to_str),
-    ) else {
+    let Some(locations) =
+        capture_lookup_locations(agent, raw, inspection_cwd, home.and_then(Path::to_str))
+    else {
         return unprovable();
     };
-    let mut directories: std::collections::HashMap<PathBuf, Option<PathBuf>> =
-        std::collections::HashMap::new();
     let mut markers: Vec<PathBuf> = Vec::new();
-    let checkout = crate::marker::checkout_root(Path::new(inspection_cwd));
-    let mut walk = GlobBudget::new(MAX_GLOB_TIME);
-    for location in locations {
-        let location = match glob_walk(&location) {
-            GlobWalk::Literal => location,
+    let mut memo = crate::marker::MarkerMemo::with_home(home);
+    // The event's own lookups already paid for these, outside the budget; a
+    // location below the cwd then stops at it.
+    let cwd = Path::new(inspection_cwd);
+    let checkout = memo
+        .checkout_root(cwd, &mut || Some(()))
+        .flatten()
+        .filter(|root| own_checkout(root, home));
+    memo.remember(cwd, own_marker);
+    if cwd.is_dir() {
+        memo.note_directory(cwd);
+    }
+    let mut walk = budget();
+    // Locations outside the own checkout first: there another checkout's
+    // policy may apply, so running out of budget there is unprovable, and a
+    // long list inside the checkout must not spend it first. Inside it the
+    // own policy governs, as for a glob rooted there; a marker nested in it
+    // is found while the budget lasts, the shallowest locations first.
+    let (outside, mut inside): (Vec<String>, Vec<String>) =
+        locations.into_iter().partition(|location| {
+            checkout
+                .as_deref()
+                .is_none_or(|checkout| !Path::new(location).starts_with(checkout))
+        });
+    inside.sort_by_key(|location| Path::new(location).components().count());
+    let inside_from = outside.len();
+    for (index, location) in outside.into_iter().chain(inside).enumerate() {
+        // Past a bound, a location inside the own checkout ends the lookup;
+        // one outside it is unprovable.
+        let exhausted = || {
+            if index >= inside_from {
+                None
+            } else {
+                Some(unprovable())
+            }
+        };
+        let (lookup, steps) = match glob_walk(&location) {
+            GlobWalk::Literal => (location, None),
             GlobWalk::Unprovable => return unprovable(),
-            GlobWalk::Walk { root, steps } => {
-                let Some(found) = walk.markers_below(Path::new(&root), &steps, checkout.as_deref())
+            GlobWalk::Walk { root, steps } => (root, Some(steps)),
+        };
+        // The literal root's marker first: a few probes, before a directory
+        // listing that may spend the rest of the time budget on its own.
+        let Some(dir) = memo.existing_dir(Path::new(&lookup), &mut || walk.probe()) else {
+            match exhausted() {
+                Some(decision) => return decision,
+                None => break,
+            }
+        };
+        let marker = match dir {
+            Some(dir) => {
+                let Some(marker) = memo.find_marker(&dir, &mut || walk.probe()) else {
+                    match exhausted() {
+                        Some(decision) => return decision,
+                        None => break,
+                    }
+                };
+                marker
+            }
+            None => None,
+        };
+        let below = match steps {
+            Some(steps) => {
+                let Some(found) =
+                    walk.markers_below(Path::new(&lookup), &steps, checkout.as_deref())
                 else {
                     return unprovable();
                 };
-                for marker in found {
-                    if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
-                        continue;
-                    }
-                    if markers.len() == MAX_FOREIGN_MARKERS {
-                        return unprovable();
-                    }
-                    markers.push(marker);
-                }
-                root
+                found
             }
+            None => Vec::new(),
         };
-        let Some(dir) = existing_target_dir(Path::new(&location)) else {
-            continue;
-        };
-        let marker = match directories.get(&dir) {
-            Some(marker) => marker.clone(),
-            None => {
-                if directories.len() == MAX_FOREIGN_DIRECTORIES {
-                    return unprovable();
-                }
-                let marker = crate::marker::find_marker(&dir.to_string_lossy());
-                directories.insert(dir, marker.clone());
-                marker
+        for marker in marker.into_iter().chain(below) {
+            if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
+                continue;
             }
-        };
-        let Some(marker) = marker else {
-            continue;
-        };
-        if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
-            continue;
+            if markers.len() == MAX_FOREIGN_MARKERS {
+                return unprovable();
+            }
+            markers.push(marker);
         }
-        if markers.len() == MAX_FOREIGN_MARKERS {
-            return unprovable();
-        }
-        markers.push(marker);
     }
     markers
         .iter()
@@ -1421,10 +1484,22 @@ pub(crate) fn foreign_capture_decision(
         .reduce(CaptureDecision::stricter)
 }
 
-/// What following one call's glob locations has cost so far.
+/// Whether a checkout root counts as the event's own for the rules that a
+/// glob rooted inside it is not walked and that its locations come last:
+/// not the filesystem root, and not at or above the home directory (a
+/// dotfiles repository in `$HOME` would otherwise make every other checkout
+/// under it "own"). It still counts as a checkout for marker lookups.
+fn own_checkout(root: &Path, home: Option<&Path>) -> bool {
+    let home = home.map(crate::marker::absolute_normalized);
+    root.parent().is_some() && !home.is_some_and(|home| home.starts_with(root))
+}
+
+/// What following one call's glob locations and looking up their markers
+/// has cost so far.
 struct GlobBudget {
     directories: usize,
     entries: usize,
+    probes: usize,
     /// Time spent since the walk started; injectable so a test can stand in
     /// for a slow filesystem.
     elapsed: Box<dyn FnMut() -> Duration>,
@@ -1441,9 +1516,17 @@ impl GlobBudget {
         Self {
             directories: 0,
             entries: 0,
+            probes: 0,
             elapsed,
             limit,
         }
+    }
+
+    /// Counts one more filesystem probe of the marker lookup; `None` past
+    /// [`MAX_LOOKUP_PROBES`] or the time budget the walk shares.
+    fn probe(&mut self) -> Option<()> {
+        self.probes += 1;
+        (self.probes <= MAX_LOOKUP_PROBES && (self.elapsed)() <= self.limit).then_some(())
     }
 
     /// Counts one more directory the glob reaches; `None` past the bound.
@@ -1454,7 +1537,8 @@ impl GlobBudget {
 
     /// The marker files of every directory `steps` can reach below `root`,
     /// `root` itself excluded (its lookup is the caller's). Nothing when
-    /// `root` lies inside the event's own `checkout`. `None` past the bounds.
+    /// `root` lies inside the event's own `checkout`, and a `**` lists
+    /// nothing inside it. `None` past the bounds.
     /// A step that reaches no directory ends the walk: the glob then matches
     /// nothing there.
     fn markers_below(
@@ -1491,11 +1575,22 @@ impl GlobBudget {
                             continue;
                         }
                         // Counted as listed: a deep tree must not cost a
-                        // full listing before the bound applies.
-                        let mut pending = self.child_directories(dir)?;
+                        // full listing before the bound applies. The own
+                        // checkout's subtree is skipped, as a glob rooted
+                        // in it is.
+                        let outside = |path: &PathBuf| {
+                            checkout.is_none_or(|checkout| !path.starts_with(checkout))
+                        };
+                        let mut pending: Vec<PathBuf> = self
+                            .child_directories(dir)?
+                            .into_iter()
+                            .filter(outside)
+                            .collect();
                         while let Some(below) = pending.pop() {
                             self.reach()?;
-                            pending.extend(self.child_directories(&below)?);
+                            pending.extend(
+                                self.child_directories(&below)?.into_iter().filter(outside),
+                            );
                             next.push(below);
                         }
                     }
@@ -3809,6 +3904,223 @@ mod tests {
         );
     }
 
+    /// The payload of a Bash call made from `cwd`.
+    fn bash_call(cwd: &Path, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "lookup",
+            "cwd": cwd,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": "x"}
+        })
+    }
+
+    /// The disposition [`foreign_decision_within`] gives a call, `None` when no
+    /// other marker governs it.
+    fn foreign_disposition(
+        cwd: &Path,
+        command: &str,
+        own_marker: Option<&Path>,
+        home: Option<&Path>,
+        budget: impl FnOnce() -> GlobBudget,
+    ) -> Option<CaptureDisposition> {
+        let raw = bash_call(cwd, command);
+        foreign_decision_within(
+            AgentKind::ClaudeCode,
+            &raw,
+            &lexical_capture_cwd(&cwd.to_string_lossy()),
+            own_marker,
+            home,
+            budget,
+        )
+        .map(|decision| decision.protocol().disposition())
+    }
+
+    /// Regression (the docs promised it; v2.6.3 kept the call): a `**` that
+    /// starts above the event's checkout skips the checkout's own subtree, so
+    /// a checkout with more directories than the walk's bound keeps
+    /// `ls ../**/README.md`. Adversarial: the sibling checkout's policy still
+    /// drops `cat ../**/secrets.env`.
+    #[test]
+    fn a_globstar_above_the_checkout_skips_the_own_subtree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let own = work.join("own");
+        let a = work.join("a");
+        std::fs::create_dir_all(own.join(".git")).unwrap();
+        for index in 0..300 {
+            std::fs::create_dir_all(own.join(format!("d{index}"))).unwrap();
+        }
+        const _: () = assert!(300 > MAX_GLOB_DIRECTORIES);
+        std::fs::create_dir_all(&a).unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        assert_eq!(
+            fast().markers_below(&work, &[GlobStep::AnyDepth], Some(&own)),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            fast().markers_below(&work, &[GlobStep::AnyDepth], None),
+            None,
+            "without the skip the own subtree exceeds the bound"
+        );
+        assert_eq!(
+            foreign_disposition(&own, "ls ../**/README.md", None, None, fast),
+            None
+        );
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_disposition(&own, "cat ../**/secrets.env", None, None, fast),
+            Some(CaptureDisposition::Drop)
+        );
+    }
+
+    /// Regression (v2.6.3 answered in milliseconds): many paths inside a deep
+    /// tree look each directory's marker up once, not once per path and
+    /// level, and the lookup shares the walk's budget. Running out of it
+    /// inside the own checkout keeps the call (the own policy governs there);
+    /// outside it the call is unprovable. Adversarial: a location outside
+    /// the checkout is looked up first, so a long list inside it cannot spend
+    /// the budget before another checkout's policy is found, and inside it a
+    /// shallow nested marker is found before a deep list.
+    #[test]
+    fn marker_lookups_in_a_deep_tree_cost_one_probe_per_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let own = work.join("own");
+        let a = work.join("a");
+        let depth = 300;
+        let deep = (0..depth).fold(own.clone(), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(own.join(".git")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let spread: Vec<String> = (1..=depth)
+            .map(|level| format!("{}f", "d/".repeat(level)))
+            .collect();
+        let inside = format!("cat {}", spread.join(" "));
+        // A clock that counts its readings: one per probe or listing.
+        let counted = |readings: std::rc::Rc<std::cell::Cell<usize>>, expire_after: usize| {
+            move || {
+                GlobBudget::with_clock(
+                    MAX_GLOB_TIME,
+                    Box::new(move || {
+                        readings.set(readings.get() + 1);
+                        if readings.get() > expire_after {
+                            MAX_GLOB_TIME * 2
+                        } else {
+                            Duration::ZERO
+                        }
+                    }),
+                )
+            }
+        };
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(
+                &own,
+                &inside,
+                None,
+                None,
+                counted(readings.clone(), usize::MAX)
+            ),
+            None
+        );
+        assert!(
+            readings.get() < 5 * depth,
+            "{} probes for {depth} levels",
+            readings.get()
+        );
+        // Out of budget inside the own checkout: kept.
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &inside, None, None, counted(readings, 10)),
+            None
+        );
+        // Out of budget outside it: unprovable.
+        let outside = (0..depth).fold(work.join("elsewhere"), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(
+                &own,
+                &format!("cat {}/f", outside.display()),
+                None,
+                None,
+                counted(readings, 10)
+            ),
+            Some(CaptureDisposition::MetadataOnly)
+        );
+        // The other checkout's location comes first, whatever the order.
+        let attack = format!("{inside} ../a/secrets.env");
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &attack, None, None, counted(readings, 10)),
+            Some(CaptureDisposition::Drop)
+        );
+        // Inside the checkout the shallowest locations come first, so a
+        // marker nested near the top is found before a deep list spends the
+        // budget.
+        std::fs::create_dir_all(own.join("vendor")).unwrap();
+        std::fs::write(
+            own.join("vendor").join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let nested = format!("{inside} vendor/secrets.env");
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert_eq!(
+            foreign_disposition(&own, &nested, None, None, counted(readings, 10)),
+            Some(CaptureDisposition::Drop)
+        );
+    }
+
+    /// Adversarial: a `.git` at the home directory (a dotfiles repository)
+    /// does not make every checkout under home the event's own, so a glob
+    /// from `~/Projects` into a sibling checkout is still walked and that
+    /// checkout's policy drops the call. Control: a harmless glob is kept.
+    #[test]
+    fn a_dotfiles_checkout_at_home_is_not_the_own_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let projects = home.join("Projects");
+        let a = projects.join("a");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(projects.join("b")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        for command in [
+            "cat */secrets.env".to_owned(),
+            format!("cat {}/*/secrets.env", projects.display()),
+        ] {
+            assert_eq!(
+                foreign_disposition(&projects, &command, None, Some(&home), fast),
+                Some(CaptureDisposition::Drop),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            foreign_disposition(&projects, "cat */README.md", None, Some(&home), fast),
+            Some(CaptureDisposition::Keep)
+        );
+        assert!(!own_checkout(&home, Some(&home)));
+        assert!(!own_checkout(tmp.path(), Some(&home)));
+        assert!(!own_checkout(Path::new("/"), None));
+        assert!(own_checkout(&a, Some(&home)));
+    }
+
     /// Adversarial: syntax that builds a step out of the event's checkout
     /// reaches checkout A's policy: a `..` after a `**` (which can match no
     /// directory), a brace that builds `..`, a zsh glob group, an ANSI-C
@@ -3914,6 +4226,47 @@ mod tests {
                     serde_json::json!({"pattern": "KEY", "path": "..", "file_glob": "a/*.env"}),
                 ),
             ),
+            (
+                "ansi-c in a double-quoted script",
+                "claude-code",
+                bash("bash -c \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\""),
+            ),
+            (
+                "ansi-c in a double-quoted eval",
+                "claude-code",
+                bash("eval \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\""),
+            ),
+            (
+                "posix class dot glob",
+                "claude-code",
+                bash("cat .[[:punct:]]/a/secrets.env"),
+            ),
+            ("extglob at", "claude-code", bash("cat .@(.)/a/secrets.env")),
+            (
+                "extglob optional",
+                "claude-code",
+                bash("cat .?(.)/a/secrets.env"),
+            ),
+            (
+                "extglob star",
+                "claude-code",
+                bash("cat .*(.)/a/secrets.env"),
+            ),
+            (
+                "extglob plus",
+                "claude-code",
+                bash("cat .+(.)/a/secrets.env"),
+            ),
+            (
+                "brace dot glob",
+                "claude-code",
+                bash("cat .{*,x}/a/secrets.env"),
+            ),
+            (
+                "oversized brace sequence",
+                "claude-code",
+                bash("cat .{-..~}/a/secrets.env"),
+            ),
         ];
         for (name, agent, raw) in attacks {
             let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
@@ -3957,6 +4310,39 @@ mod tests {
                     "search_files",
                     serde_json::json!({"pattern": "KEY", "path": "sub", "file_glob": "x/*.rs"}),
                 ),
+            ),
+            (
+                "double-quoted script",
+                "claude-code",
+                bash("bash -c \"echo \\$HOME && cat ../a/README.md\""),
+            ),
+            ("posix class own", "claude-code", bash("ls .[[:alpha:]]*")),
+            (
+                "posix class own directory",
+                "claude-code",
+                bash("cat .[[:alpha:]]x/README.md"),
+            ),
+            // Regression (v2.6.3 kept these): an expansion too large to list
+            // that cannot leave the checkout.
+            (
+                "oversized brace",
+                "claude-code",
+                bash("touch test/file{1..200}.txt"),
+            ),
+            (
+                "oversized directory brace",
+                "claude-code",
+                bash("mkdir -p build/{1..100}/out"),
+            ),
+            (
+                "oversized dotted brace",
+                "claude-code",
+                bash("rm -f logs/app.{1..99}.log"),
+            ),
+            (
+                "oversized product",
+                "claude-code",
+                bash("cat data/{a..h}{1..9}.csv"),
             ),
         ];
         for (name, agent, raw) in controls {

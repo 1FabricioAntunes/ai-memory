@@ -1664,8 +1664,8 @@ pub enum GlobWalk {
     },
     /// Syntax a walk cannot follow: a brace or group that spans a separator,
     /// or an alternative of `..` or `~…` inside one (also one a brace
-    /// expansion builds), which leaves the root.
-    /// Nothing proves which markers govern it.
+    /// expansion builds, or a directory alternative older bash expands to
+    /// `..`), which leaves the root. Nothing proves which markers govern it.
     Unprovable,
 }
 
@@ -1697,10 +1697,10 @@ pub fn glob_segment_matches(segment: &str, name: &str) -> bool {
 pub fn glob_walk(location: &str) -> GlobWalk {
     // A parameter expansion's braces are not a brace expansion; the shell
     // split also reads the word with each default in its place.
-    if location.contains("${") {
+    let syntax = |segment: &str| segment.contains(['*', '?', '[', '{', '(']);
+    if location.contains("${") || !syntax(location) {
         return GlobWalk::Literal;
     }
-    let syntax = |segment: &str| segment.contains(['*', '?', '[', '{', '(']);
     let flavor = flavor_of(location);
     let Ok(normalized) = normalize_root(location) else {
         return GlobWalk::Literal;
@@ -1724,7 +1724,8 @@ pub fn glob_walk(location: &str) -> GlobWalk {
         return GlobWalk::Literal;
     };
     let mut steps = Vec::new();
-    for segment in &segments[first..] {
+    let last = segments.len() - 1;
+    for (index, segment) in segments.iter().enumerate().skip(first) {
         if !syntax(segment) {
             steps.push(GlobStep::Named((*segment).to_owned()));
             continue;
@@ -1733,18 +1734,24 @@ pub fn glob_walk(location: &str) -> GlobWalk {
             segment.matches(open).count() == segment.matches(close).count()
         };
         // A brace or group alternative of `..` or `~…` leaves the root, and
-        // so does one a brace expansion builds out of other pieces.
+        // so does one a brace expansion builds out of other pieces, or a
+        // directory alternative it builds that an older bash expands to `..`
+        // (`.{*,x}/`). An expansion too large to list leaves only when its
+        // pieces could build such a word.
         let leaves_at = |text: &str| {
             text.split(['{', '}', ',', '(', ')', '|', '@', '!', '+'])
                 .any(|piece| piece == ".." || piece.starts_with('~'))
         };
         let leaves = leaves_at(segment)
             || (segment.contains('{')
-                && brace_alternatives(segment).is_none_or(|alternatives| {
-                    alternatives.iter().any(|alternative| {
-                        alternative.contains(['/', '\\']) || leaves_at(alternative)
-                    })
-                }));
+                && match brace_alternatives(segment) {
+                    Some(alternatives) => alternatives.iter().any(|alternative| {
+                        alternative.contains(['/', '\\'])
+                            || leaves_at(alternative)
+                            || (index < last && could_name_parent(alternative))
+                    }),
+                    None => brace_overflow_could_leave(segment),
+                });
         if leaves || !balanced('{', '}') || !balanced('(', ')') {
             return GlobWalk::Unprovable;
         }
@@ -1843,38 +1850,41 @@ fn expand_braces(text: &[char], words: &mut Vec<String>) -> Option<()> {
     Some(())
 }
 
-/// The words of a brace sequence body (`1..3`, `a..e`, `x..y..n`):
-/// `Some(None)` when the body is not one; `None` past
-/// [`MAX_BRACE_ALTERNATIVES`] words.
-fn brace_sequence(body: &[char]) -> Option<Option<Vec<Vec<char>>>> {
-    let body: String = body.iter().collect();
+/// The bounds of a brace sequence body (`1..3`, `a..e`, `x..y..n`): the
+/// first and last value, whether they are integers (else code points of
+/// single characters), and the step. `None` when the body is not one.
+fn brace_sequence_bounds(body: &str) -> Option<(i64, i64, bool, u64)> {
     let parts: Vec<&str> = body.split("..").collect();
     if !(2..=3).contains(&parts.len()) {
-        return Some(None);
+        return None;
     }
     let step = match parts.get(2) {
-        Some(step) => match step.parse::<i64>() {
-            Ok(step) => step.unsigned_abs().max(1),
-            Err(_) => return Some(None),
-        },
+        Some(step) => step.parse::<i64>().ok()?.unsigned_abs().max(1),
         None => 1,
     };
-    let bounds = match (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-        (Ok(from), Ok(to)) => Some((from, to, true)),
+    match (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+        (Ok(from), Ok(to)) => Some((from, to, true, step)),
         _ => {
             let single = |part: &str| {
                 let mut chars = part.chars();
                 chars.next().filter(|_| chars.next().is_none())
             };
-            match (single(parts[0]), single(parts[1])) {
-                (Some(from), Some(to)) => {
-                    Some((i64::from(u32::from(from)), i64::from(u32::from(to)), false))
-                }
-                _ => None,
-            }
+            let (from, to) = (single(parts[0])?, single(parts[1])?);
+            Some((
+                i64::from(u32::from(from)),
+                i64::from(u32::from(to)),
+                false,
+                step,
+            ))
         }
-    };
-    let Some((from, to, numeric)) = bounds else {
+    }
+}
+
+/// The words of a brace sequence body: `Some(None)` when the body is not
+/// one; `None` past [`MAX_BRACE_ALTERNATIVES`] words.
+fn brace_sequence(body: &[char]) -> Option<Option<Vec<Vec<char>>>> {
+    let body: String = body.iter().collect();
+    let Some((from, to, numeric, step)) = brace_sequence_bounds(&body) else {
         return Some(None);
     };
     let count = from.abs_diff(to) / step + 1;
@@ -1902,6 +1912,90 @@ fn brace_sequence(body: &[char]) -> Option<Option<Vec<Vec<char>>>> {
         };
     }
     Some(Some(words))
+}
+
+/// Whether a segment whose brace expansion has more words than
+/// [`brace_alternatives`] lists could still build one that leaves the root:
+/// one holding a separator, `~` or a group, or one that is `..` or a dot-glob
+/// an older bash expands to it. Integer and letter sequences
+/// (`file{1..200}.txt`, `{a..h}{1..9}`) build none of these, and neither does
+/// a segment with a `.` only where every word also holds another literal
+/// character (`app.{1..99}.log`). A character sequence over a range holding
+/// `.`, a separator, `~` or a group character leaves.
+fn brace_overflow_could_leave(segment: &str) -> bool {
+    const LEAVING: [char; 7] = ['.', '/', '\\', '~', '(', ')', '|'];
+    // Characters a glob can match a `.` with: never a word's anchor.
+    const GLOB: [char; 5] = ['.', '*', '?', '[', ']'];
+    if segment.contains(['/', '\\', '~', '(', ')', '|']) {
+        return true;
+    }
+    let chars: Vec<char> = segment.chars().collect();
+    // Pair each `{` with its `}` and note the ones holding a comma of their
+    // own, in one pass.
+    let mut close = vec![None; chars.len()];
+    let mut comma = vec![false; chars.len()];
+    let mut open = Vec::new();
+    for (index, &c) in chars.iter().enumerate() {
+        match c {
+            '{' => open.push(index),
+            '}' => {
+                if let Some(start) = open.pop() {
+                    close[start] = Some(index);
+                }
+            }
+            ',' => {
+                if let Some(&start) = open.last() {
+                    comma[start] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // `dot`: a word can hold a `.`; `anchor`: every word holds a literal
+    // character no glob reads as `.`, so no word is `..` or matches it.
+    let (mut dot, mut anchor) = (false, false);
+    // The closing indexes of the comma braces the scan is inside.
+    let mut ends: Vec<usize> = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let c = chars[index];
+        if ends.last() == Some(&index) {
+            ends.pop();
+            index += 1;
+            continue;
+        }
+        if c == '{'
+            && let Some(end) = close[index]
+        {
+            if comma[index] {
+                ends.push(end);
+                index += 1;
+                continue;
+            }
+            let body: String = chars[index + 1..end].iter().collect();
+            if let Some((from, to, numeric, _)) = brace_sequence_bounds(&body) {
+                let range = from.min(to)..=from.max(to);
+                let holds = |set: &[char]| {
+                    set.iter()
+                        .any(|&c| range.contains(&i64::from(u32::from(c))))
+                };
+                if !numeric && holds(&LEAVING) {
+                    return true;
+                }
+                anchor |= ends.is_empty() && (numeric || !holds(&GLOB));
+                index = end + 1;
+                continue;
+            }
+        }
+        if c == ',' && !ends.is_empty() {
+            index += 1;
+            continue;
+        }
+        dot |= c == '.';
+        anchor |= ends.is_empty() && !GLOB.contains(&c);
+        index += 1;
+    }
+    dot && !anchor
 }
 
 /// The directory a shell tool's relative arguments resolve from: its own
@@ -2534,7 +2628,10 @@ fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
             (Some('"') | None, '\\') if chars.peek() == Some(&'\n') => {
                 chars.next();
             }
-            (Some('"'), '\\') if matches!(chars.peek(), Some('"' | '\\')) => {
+            // Inside double quotes a backslash escapes `"`, `\`, `$` and a
+            // backquote, so a script a shell re-reads (`bash -c "cat \$'…'"`)
+            // sees the `$` itself.
+            (Some('"'), '\\') if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
                 word.extend(chars.next());
             }
             (Some('$'), '\\') => match chars.next() {
@@ -2874,55 +2971,201 @@ fn keep<'a>(readings: &mut Vec<Vec<&'a str>>, parts: Vec<&'a str>) {
 
 /// Whether a glob segment can match `..` in a shell that, like bash before
 /// 5.2, lets a pattern with a leading `.` match the `.` and `..` entries
-/// (`.*`, `.?`, a class after the dot that admits `.`). zsh and newer bash
-/// never do; reading the segment as `..` as well only adds a reading.
+/// (`.*`, `.?`, a class after the dot that admits `.`, `[[:punct:]]` among
+/// them, or an extglob group with an alternative that matches `.`, as in
+/// `.@(.)` or `.!(x)`). zsh and newer bash never do; reading the segment as
+/// `..` as well only adds a reading.
 fn could_name_parent(segment: &str) -> bool {
     let Some(rest) = segment.strip_prefix('.') else {
         return false;
     };
-    rest.contains(['*', '?', '[']) && class_glob_matches(&rest.chars().collect::<Vec<_>>(), &['.'])
+    rest.contains(['*', '?', '[', '('])
+        && class_glob_matches(&rest.chars().collect::<Vec<_>>(), &['.'])
 }
 
-/// A one-segment glob over `*`, `?` and `[…]` classes (`!` or `^` negates,
-/// `a-z` ranges, a leading `]` is a member) matched against `text`. A `[`
-/// without a closing `]` is literal.
+/// A one-segment glob over `*`, `?`, `[…]` classes (`!` or `^` negates,
+/// `a-z` ranges, a leading `]` is a member, `[:name:]`, `[=c=]` and `[.c.]`
+/// inside) and extglob groups (`@(…)`, `?(…)`, `*(…)`, `+(…)`, `!(…)`, `|`
+/// between alternatives) matched against `text`. A `[` without a closing `]`
+/// is literal, and so is a `(` without its `)`. Meant for short texts: a
+/// group tries every split of the text.
 fn class_glob_matches(pattern: &[char], text: &[char]) -> bool {
+    if let [kind @ ('@' | '?' | '*' | '+' | '!'), '(', ..] = pattern
+        && let Some(close) = group_close(pattern, 1)
+    {
+        let alternatives = group_alternatives(&pattern[2..close]);
+        let rest = &pattern[close + 1..];
+        return (0..=text.len()).any(|split| {
+            extglob_group_matches(*kind, &alternatives, &text[..split])
+                && class_glob_matches(rest, &text[split..])
+        });
+    }
     match pattern.first() {
         None => text.is_empty(),
         Some('*') => (0..=text.len()).any(|skip| class_glob_matches(&pattern[1..], &text[skip..])),
         Some('?') => !text.is_empty() && class_glob_matches(&pattern[1..], &text[1..]),
         Some('[') => {
-            let negated = matches!(pattern.get(1), Some('!' | '^'));
-            let start = if negated { 2 } else { 1 };
-            // A `]` right after the opening (and negation) is a member.
-            let close = pattern
-                .iter()
-                .enumerate()
-                .skip(start + 1)
-                .find(|(_, c)| **c == ']')
-                .map(|(index, _)| index);
-            let Some(close) = close else {
+            let Some((close, members)) = bracket_class(pattern) else {
                 return text.first() == Some(&'[') && class_glob_matches(&pattern[1..], &text[1..]);
             };
             let Some(&c) = text.first() else {
                 return false;
             };
-            let members = &pattern[start..close];
-            let mut index = 0;
-            let mut found = false;
-            while index < members.len() {
-                if index + 2 < members.len() && members[index + 1] == '-' {
-                    found |= (members[index]..=members[index + 2]).contains(&c);
-                    index += 3;
-                } else {
-                    found |= members[index] == c;
-                    index += 1;
-                }
-            }
-            found != negated && class_glob_matches(&pattern[close + 1..], &text[1..])
+            members(c) && class_glob_matches(&pattern[close + 1..], &text[1..])
         }
         Some(&literal) => {
             text.first() == Some(&literal) && class_glob_matches(&pattern[1..], &text[1..])
+        }
+    }
+}
+
+/// The index of the `)` closing the group whose `(` is at `open`.
+fn group_close(pattern: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, &c) in pattern.iter().enumerate().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `|`-separated alternatives of a group body, nested groups kept whole.
+fn group_alternatives(body: &[char]) -> Vec<&[char]> {
+    let mut alternatives = Vec::new();
+    let (mut depth, mut start) = (0_usize, 0);
+    for (index, &c) in body.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
+                alternatives.push(&body[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    alternatives.push(&body[start..]);
+    alternatives
+}
+
+/// Whether the extglob group `kind(alternatives)` matches all of `text`.
+fn extglob_group_matches(kind: char, alternatives: &[&[char]], text: &[char]) -> bool {
+    let once = |text: &[char]| {
+        alternatives
+            .iter()
+            .any(|alternative| class_glob_matches(alternative, text))
+    };
+    // One or more alternatives in a row (`+`), or none as well (`*`).
+    fn repeated(once: &dyn Fn(&[char]) -> bool, text: &[char]) -> bool {
+        (1..=text.len()).any(|split| {
+            once(&text[..split]) && (split == text.len() || repeated(once, &text[split..]))
+        })
+    }
+    match kind {
+        '@' => once(text),
+        '?' => text.is_empty() || once(text),
+        '*' => text.is_empty() || repeated(&once, text),
+        '+' => repeated(&once, text),
+        _ => !once(text),
+    }
+}
+
+/// The `]` closing the bracket class that opens `pattern`, and whether the
+/// class admits a character. `None` when no `]` closes it.
+fn bracket_class(pattern: &[char]) -> Option<(usize, impl Fn(char) -> bool + '_)> {
+    let negated = matches!(pattern.get(1), Some('!' | '^'));
+    let start = if negated { 2 } else { 1 };
+    // A `]` right after the opening (and negation) is a member.
+    let mut index = start + usize::from(pattern.get(start) == Some(&']'));
+    let mut members: Vec<ClassMember> = Vec::new();
+    if index > start {
+        members.push(ClassMember::Char(']'));
+    }
+    loop {
+        match pattern.get(index)? {
+            ']' => break,
+            '[' if matches!(pattern.get(index + 1), Some(':' | '=' | '.')) => {
+                let kind = pattern[index + 1];
+                let end = (index + 2..pattern.len().saturating_sub(1))
+                    .find(|&at| pattern[at] == kind && pattern[at + 1] == ']');
+                if let Some(end) = end {
+                    let name: String = pattern[index + 2..end].iter().collect();
+                    members.push(if kind == ':' {
+                        ClassMember::Named(name)
+                    } else {
+                        ClassMember::Symbol(name)
+                    });
+                    index = end + 2;
+                } else {
+                    members.push(ClassMember::Char('['));
+                    index += 1;
+                }
+            }
+            &low if pattern.get(index + 1) == Some(&'-')
+                && pattern.get(index + 2).is_some_and(|&high| high != ']') =>
+            {
+                members.push(ClassMember::Range(low, pattern[index + 2]));
+                index += 3;
+            }
+            &c => {
+                members.push(ClassMember::Char(c));
+                index += 1;
+            }
+        }
+    }
+    let admits = move |c: char| members.iter().any(|member| member.admits(c)) != negated;
+    Some((index, admits))
+}
+
+/// One member of a bracket class.
+enum ClassMember {
+    Char(char),
+    Range(char, char),
+    /// `[:name:]`.
+    Named(String),
+    /// `[=c=]` or `[.c.]`.
+    Symbol(String),
+}
+
+impl ClassMember {
+    fn admits(&self, c: char) -> bool {
+        match self {
+            Self::Char(member) => *member == c,
+            Self::Range(low, high) => (*low..=*high).contains(&c),
+            Self::Named(name) => match name.as_str() {
+                "alnum" => c.is_alphanumeric(),
+                "alpha" => c.is_alphabetic(),
+                "blank" => c == ' ' || c == '\t',
+                "cntrl" => c.is_control(),
+                "digit" => c.is_ascii_digit(),
+                "lower" => c.is_lowercase(),
+                "space" => c.is_whitespace(),
+                "upper" => c.is_uppercase(),
+                "word" => c.is_alphanumeric() || c == '_',
+                "xdigit" => c.is_ascii_hexdigit(),
+                "punct" => c.is_ascii_punctuation(),
+                "graph" => c.is_ascii_graphic(),
+                "print" => c.is_ascii_graphic() || c == ' ',
+                "ascii" => c.is_ascii(),
+                // A class this reading does not know may admit anything.
+                _ => true,
+            },
+            // A single character, or a named collating element that may be it.
+            Self::Symbol(symbol) => {
+                let mut chars = symbol.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(only), None) => only == c,
+                    _ => true,
+                }
+            }
         }
     }
 }
@@ -4979,6 +5222,69 @@ mod tests {
         assert_eq!(brace_alternatives(&"{a,b}".repeat(7)), None);
     }
 
+    /// Regression (v2.6.3 kept these): a brace expansion with more words than
+    /// [`brace_alternatives`] lists is walked like any glob, so inside the
+    /// own checkout it costs nothing; only one whose pieces could build a
+    /// separator, `~`, a group, `..` or a dot-glob that names the parent
+    /// cannot be. Adversarial: such oversized braces stay unprovable. A
+    /// directory alternative an older bash expands to `..` (`.{*,x}/`) is
+    /// unprovable at any size.
+    #[test]
+    fn an_oversized_brace_expansion_is_walked_unless_its_pieces_could_leave() {
+        for location in [
+            "/work/b/test/file{1..200}.txt",
+            "/work/b/build/{1..100}/out",
+            "/work/b/logs/app.{1..99}.log",
+            "/work/b/data/{a..h}{1..9}.csv",
+            "/work/b/{A..Z}{a..z}/x",
+            "/work/b/x{1..9}{1..9}.{a,b,c}/y",
+            "/work/b/.{1..100}/y",
+            "/work/b/.cache{1..100}/y",
+            "/work/b/v{001..100}/y",
+            "/work/b/{-100..100}/y",
+        ] {
+            assert!(
+                matches!(glob_walk(location), GlobWalk::Walk { .. }),
+                "{location}"
+            );
+        }
+        for location in [
+            "/work/b/.{-..~}/a/secrets.env",
+            "/work/b/.{!..z}/a/x",
+            "/work/b/.{.,a}{,}{,}{,}{,}{,}{,}/a/x",
+            "/work/b/{.,}{.,}{,}{,}{,}{,}{,}/a/x",
+            "/work/b/.{,a,b}{,c}{,d}{,e}{,f}{,g}*/a/x",
+            "/work/b/{1..100}~/x",
+        ] {
+            assert_eq!(glob_walk(location), GlobWalk::Unprovable, "{location}");
+        }
+        for location in [
+            "/work/b/.{*,x}/a/x",
+            "/work/b/.{?,x}/a/x",
+            "/work/b/x/.{[.],y}/z",
+        ] {
+            assert_eq!(glob_walk(location), GlobWalk::Unprovable, "{location}");
+        }
+        // A final segment names files, which never step out.
+        assert!(matches!(glob_walk("/work/b/.{*,x}"), GlobWalk::Walk { .. }));
+        for segment in [
+            "file{1..200}.txt",
+            "app.{1..99}.log",
+            "{a..h}{1..9}.csv",
+            "{x,y}{1..99}",
+        ] {
+            assert!(!brace_overflow_could_leave(segment), "{segment}");
+        }
+        for segment in [
+            ".{-..~}",
+            "{,.}{.,}{,}{,}{,}{,}{,}",
+            ".{,a}{,b}{,c}{,d}{,e}{,f}{,g}*",
+            "{0..z}",
+        ] {
+            assert!(brace_overflow_could_leave(segment), "{segment}");
+        }
+    }
+
     /// Adversarial: a `**` matches no directory as well as many, so a `..`
     /// after it steps back from the directory before it (`sub/**/../x` reads
     /// `x`), which a lexical `..` that only removes the `**` misses. Both the
@@ -5066,11 +5372,53 @@ mod tests {
     /// cannot match `..` read as before.
     #[test]
     fn a_dot_glob_directory_that_can_match_the_parent_is_read_as_it() {
-        for segment in [".*", ".?", ".[.]", ".[!x]", ".[^x]", ".[--0]", ".**"] {
+        for segment in [
+            ".*",
+            ".?",
+            ".[.]",
+            ".[!x]",
+            ".[^x]",
+            ".[--0]",
+            ".**",
+            ".[[:punct:]]",
+            ".[[:print:]]",
+            ".[[:graph:]]",
+            ".[[:ascii:]]",
+            ".[![:alpha:]]",
+            ".[^[:space:]]",
+            ".[[=.=]]",
+            ".[[.period.]]",
+            ".[[:nope:]]",
+            ".@(.)",
+            ".?(.)",
+            ".*(.)",
+            ".+(.)",
+            ".!(x)",
+            ".@(x|.)",
+            ".@(?)",
+            ".+(@(.))",
+        ] {
             assert!(could_name_parent(segment), "{segment}");
         }
         for segment in [
-            ".g*", ".[!.]", ".[x]", "*", "?", "..", ".", ".config", ".?x",
+            ".g*",
+            ".[!.]",
+            ".[x]",
+            "*",
+            "?",
+            "..",
+            ".",
+            ".config",
+            ".?x",
+            ".[[:alpha:]]",
+            ".[[:digit:]]",
+            ".[![:punct:]]",
+            ".[[=x=]]",
+            ".@(x)",
+            ".+(x|y)",
+            ".!(.)",
+            ".@(.)x",
+            "x@(.)",
         ] {
             assert!(!could_name_parent(segment), "{segment}");
         }
@@ -5094,13 +5442,27 @@ mod tests {
             capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
                 .unwrap()
         };
-        for command in ["cat .*/a/secrets.env", "cat ./.?/a/secrets.env"] {
+        for command in [
+            "cat .*/a/secrets.env",
+            "cat ./.?/a/secrets.env",
+            "cat .[[:punct:]]/a/secrets.env",
+            "cat .@(.)/a/secrets.env",
+            "cat .?(.)/a/secrets.env",
+            "cat .*(.)/a/secrets.env",
+            "cat .+(.)/a/secrets.env",
+        ] {
             assert!(
                 locations(command).contains(&"/work/a/secrets.env".to_owned()),
                 "{command}"
             );
         }
-        for command in ["ls .*", "cat .config/x", "cat .github/*.yml"] {
+        for command in [
+            "ls .*",
+            "cat .config/x",
+            "cat .github/*.yml",
+            "cat .[[:alpha:]]*/x",
+            "ls .[[:alnum:]]*",
+        ] {
             assert!(
                 locations(command).iter().all(|l| l.starts_with("/work/b")),
                 "{command}"
@@ -5129,6 +5491,20 @@ mod tests {
             (
                 "bash -c \"cat ../(a)/secrets.env\"",
                 "/work/(a)/secrets.env",
+            ),
+            // A double-quoted script loses the backslash before `$`, so the
+            // shell it runs reads an ANSI-C string.
+            (
+                "bash -c \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\"",
+                "/work/a/secrets.env",
+            ),
+            (
+                "eval \"cat \\$'\\\\x2e\\\\x2e'/a/secrets.env\"",
+                "/work/a/secrets.env",
+            ),
+            (
+                "sh -c \"bash -c \\\"cat \\\\\\$'\\\\x2e\\\\x2e'/a/secrets.env\\\"\"",
+                "/work/a/secrets.env",
             ),
         ] {
             assert!(

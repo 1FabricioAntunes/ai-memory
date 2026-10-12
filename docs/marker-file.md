@@ -634,9 +634,17 @@ event's directory has none) apply that marker's policy as well: `cat
 checkout, or a Hermes terminal call from an unmarked directory, is dropped when
 `other` ignores `secrets.env` (a search reaching a checkout with an active
 policy is dropped, as in its own checkout), and a broken marker there makes the
-call metadata-only. Each directory is looked up once; a call naming more than
-4,096 path locations, 256 directories or 16 other markers is metadata-only, and
-so is a file tool whose target cannot be read or resolved.
+call metadata-only. Each directory is looked up once, and what one lookup
+learns about a directory serves every other location below it, so many paths
+in a deep tree cost one check per directory. A call naming more than 4,096
+path locations or 16 other markers is metadata-only, and so is a file tool
+whose target cannot be read or resolved. The lookups share the glob walk's
+budget below (50 ms, and at most 16,384 file checks); a glob's leading
+directories are looked up before the walk below them. Locations outside the
+event's own checkout are looked up first, and running out of budget there makes
+the call metadata-only; inside the own checkout the event's own policy already
+applies, so running out there ends the lookup and the call keeps its
+disposition.
 
 A location with glob syntax in a directory name (`cat ../*/secrets.env`, `cat
 */secrets.env` from a parent folder, `../{a,b}/x`, `../[ab]/x`)
@@ -645,17 +653,28 @@ event's own checkout (the directory holding `.git`), every directory the glob
 could pass through is checked for a marker of its own: a `*`/`?` segment lists
 the child directories whose names it matches (ignoring ASCII case), a class,
 brace or group segment lists every child, and a `**` lists the whole subtree
-(not below the event's own checkout). A glob whose leading directories lie
+except the event's own checkout, so `ls ../**/README.md` does not list the
+checkout it runs in. A glob whose leading directories lie
 inside the event's own checkout is not walked, so `cat packages/*/package.json`
-in a monorepo costs nothing however many packages it has. Symlinks are never
-followed. The walk reads at most 32,768 directory entries, visits at most 256
-directories and runs at most 50 ms per call; past any bound the call is
-metadata-only, and so is glob syntax that can leave its leading directories: a
-brace or group spanning a separator, a `..` or `~` alternative, or a brace
-expansion that builds one. A `..` after a `**`, and a dot-glob directory
-segment that older bash can expand to `..`, are looked up in both readings,
-and a zsh glob group or an ANSI-C numeric escape is looked up as the shell
-expands it. An older server drops these metadata-only shell and output-reader
+in a monorepo costs nothing however many packages it has. A `.git` at or above
+your home directory (a dotfiles repository) or at the filesystem root does not
+make that directory the own checkout for these rules, so `cat */secrets.env`
+from `~/Projects` is still checked against the checkouts it reaches. Symlinks
+are never followed. The walk reads at most 32,768 directory entries, visits at
+most 256 directories and runs at most 50 ms per call; past any bound the call
+is metadata-only, and so is glob syntax that can leave its leading directories:
+a brace or group spanning a separator, a `..` or `~` alternative, a brace
+expansion that builds one, or a brace-built directory name that older bash
+expands to `..` (`.{*,x}/`). A brace expansion too large to list (more than 64
+words) counts as leaving only when its pieces could build such a word; integer
+and letter sequences cannot, so `touch test/file{1..200}.txt` and `cat
+data/{a..h}{1..9}.csv` are walked like any other glob. A `..` after a `**`,
+and a dot-glob directory segment that older bash can expand to `..` (`.*`,
+`.?`, a class such as `.[[:punct:]]`, or an extglob such as `.@(.)` or
+`.+(.)`), are looked up in both readings, and a zsh glob group or an ANSI-C
+numeric escape is looked up as the shell expands it, also inside a
+double-quoted script (`bash -c "cat \$'…'"`, `eval "…"`), whose backslash
+before `$` the outer shell removes. An older server drops these metadata-only shell and output-reader
 events, so upgrade the server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
@@ -700,6 +719,17 @@ can be mentioned.
   next to glob syntax (`${X}/*/x`) is not walked; a harness output file kept at a
   location other than the defaults listed above (a Claude Code config
   directory whose name lacks `claude`) is read as an ordinary file;
+- a saved-output glob counts only when it spells three characters of the
+  output file's distinctive name in a row, so a glob with no such literal run
+  (`/tmp/p?-b*`) is read as an ordinary glob; requiring the literal text is
+  what keeps `cat /tmp/*.log` and `tail log/*.log` ordinary;
+- the own checkout is decided after the command ran, so a command that creates
+  a `.git` (`touch .git; cat */x`) makes its directory the own checkout and its
+  globs are not walked; a `.git` at or above the home directory never counts,
+  but one in any other directory does;
+- a marker nested inside the own checkout is found only while the lookup
+  budget lasts (the shallowest paths are looked up first); past it the
+  event's own policy governs the remaining paths;
 - a value glued to a short flag is read after the flag's first letter only,
   not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
   are not decoded;
