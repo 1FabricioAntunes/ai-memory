@@ -26,6 +26,7 @@ pub mod lint;
 mod path_sanitize;
 pub mod profile;
 pub mod projection;
+mod prompt_template;
 pub mod sweep;
 pub mod types;
 
