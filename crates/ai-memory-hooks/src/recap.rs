@@ -151,6 +151,9 @@ const REPLY_FLOOR: usize = 1_000;
 const HANDOFF_FLOOR: usize = 500;
 /// Room kept for the "N earlier prompts omitted" line once prompts overflow.
 const OMITTED_LINE_RESERVE: usize = 80;
+/// Smallest room worth a clipped prompt; less than this is left to the reply
+/// and the handoffs.
+const MIN_CLIPPED_PROMPT: usize = 300;
 const TRUNCATED: &str = "\n[truncated]";
 
 /// One captured prompt or reply, with its capture time.
@@ -250,8 +253,9 @@ fn item(row: &ObservationRecord) -> RecapItem {
 }
 
 /// Render the recap within `budget` chars. Prompts land uncut when they fit;
-/// past the room left after the reply and handoff floors, the oldest are
-/// dropped first and only a lone prompt larger than the room is clipped.
+/// past the room left after the reply and handoff floors, the newest are kept
+/// whole, the next one is clipped into what room is left, and older ones are
+/// dropped.
 pub(crate) fn compose_recap(
     session_id: &str,
     window: &RecapWindow,
@@ -362,14 +366,18 @@ fn render_prompts(prompts: &[RecapItem], room: usize) -> String {
         if used + len <= room {
             kept.push(line.clone());
             used += len;
-        } else if kept.is_empty() {
-            let mut clipped = clip(line, room.saturating_sub(1));
-            clipped.push('\n');
-            used += chars(&clipped);
-            kept.push(clipped);
-        } else {
-            break;
+            continue;
         }
+        // The first prompt that does not fit keeps its head in the room left,
+        // when that room is worth a clipped prompt; everything older is
+        // counted as omitted.
+        let left = room.saturating_sub(used);
+        if kept.is_empty() || left >= MIN_CLIPPED_PROMPT {
+            let mut clipped = clip(line, left.saturating_sub(1));
+            clipped.push('\n');
+            kept.push(clipped);
+        }
+        break;
     }
     kept.reverse();
     let omitted = lines.len() - kept.len();
@@ -610,6 +618,35 @@ mod tests {
         assert!(recap.contains("earlier prompts omitted"), "{recap}");
         assert!(recap.contains(&"r".repeat(1_000)), "reply floor not held");
         assert!(recap.chars().count() <= RECAP_BUDGET_DEFAULT);
+    }
+
+    /// Codex's smaller budget: the newest prompt fits, the older `/goal`
+    /// does not. Its head is clipped into the room left rather than dropped
+    /// while that room goes unused.
+    #[test]
+    fn an_older_prompt_is_clipped_into_the_room_left() {
+        let goal = format!("/goal GOAL-HEAD {}", "g".repeat(3_978));
+        let rows = vec![
+            row("pre-compact", "", "2026-10-12T02:55:02Z"),
+            row("stop", &"r".repeat(550), "2026-10-12T02:01:05Z"),
+            row("user-prompt", &"m".repeat(96), "2026-10-12T01:07:07Z"),
+            row("user-prompt", &goal, "2026-10-12T01:00:57Z"),
+        ];
+        let window = select_window(&rows, false).unwrap();
+        let recap = compose_recap("sid", &window, &[handoff(&"h".repeat(700), true)], 6_000);
+        assert!(
+            recap.contains("GOAL-HEAD"),
+            "the /goal prompt was dropped: {recap}"
+        );
+        assert!(recap.contains("[truncated]"), "{recap}");
+        assert!(recap.contains(&"m".repeat(96)));
+        assert!(recap.contains(&"r".repeat(550)));
+        assert!(recap.chars().count() <= 6_000);
+        assert!(
+            recap.chars().count() > 5_000,
+            "room left unused: {}",
+            recap.chars().count()
+        );
     }
 
     #[test]

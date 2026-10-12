@@ -167,8 +167,9 @@ from what ai-memory captured for this session between its latest compaction
 and the one before it (or the session start):
 
 - your prompts in that stretch, verbatim, oldest first; harness markup and
-  task notifications are left out, and when they do not all fit the oldest
-  are dropped first;
+  task notifications are left out. When they do not all fit, the newest stay
+  whole, the next older one is cut to the room left, and older ones are
+  dropped with a note;
 - the agent's last reply before the compaction. Replies are captured only
   with the assistant-capture double opt-in (`install-hooks --capture-assistant`
   plus `capture_assistant` on the server); without it the recap says so;
