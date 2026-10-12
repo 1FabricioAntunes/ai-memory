@@ -466,7 +466,7 @@ and [0.x](docs/changelog/0.x.md).
   captured observations. Claude Code and Codex receive it with that prompt
   through `UserPromptSubmit` `additionalContext`, OpenCode V1/V2 through the
   plugin's system/context hook, and Grok Build on the next `PostToolUse`.
-  Nothing is written, so a reload never consumes a baton (#NNN).
+  Serving the recap writes nothing, so a reload never consumes a baton (#NNN).
 
 ### Changed
 - Documented the 2.x to 3.0 upgrade in `docs/upgrading-to-3.0.md`: what

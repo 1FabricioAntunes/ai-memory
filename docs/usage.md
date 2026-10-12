@@ -176,8 +176,9 @@ and the one before it (or the session start):
 - the project's open handoffs, listed and never claimed, this session's own
   first.
 
-The rest of the prompt runs as usual with the recap in context. Nothing is
-written: no handoff is claimed, no observation or page is added.
+The rest of the prompt runs as usual with the recap in context. Serving the
+recap writes nothing: no handoff is claimed and no page or extra observation
+is added (the prompt itself is captured like any other).
 
 | Harness | When the agent sees the recap |
 |---|---|
