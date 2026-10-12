@@ -477,6 +477,126 @@ async fn concurrent_writes_to_one_path_supersede_rather_than_destroy() {
     );
 }
 
+/// The batched path-existence probe the consolidation link guard validates
+/// proposed cross-scope wikilinks against (#1218): it reports exactly the
+/// paths with a latest row, in any input order, and never invents one.
+#[tokio::test]
+async fn existing_latest_paths_reports_exactly_the_live_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/real.md", "Real", "a real page"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, proj, "decisions/adr.md", "ADR", "a decision"))
+        .await
+        .unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/missing.md".to_string(),
+                "decisions/adr.md".to_string(),
+                "notes/real.md".to_string(),
+                // A duplicate must not double-report.
+                "notes/real.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["decisions/adr.md", "notes/real.md"]);
+
+    // A superseded path still counts: the latest version is the one a link
+    // resolves to.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/real.md", "Real", "rewritten"))
+        .await
+        .unwrap();
+    let found = store
+        .reader
+        .existing_latest_paths(ws, proj, vec!["notes/real.md".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(found, vec!["notes/real.md"]);
+
+    // A foreign scope never sees this project's pages.
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+    let found = store
+        .reader
+        .existing_latest_paths(ws, other_proj, vec!["notes/real.md".to_string()])
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+
+    // Empty input is a no-op, not an error.
+    let found = store
+        .reader
+        .existing_latest_paths(ws, proj, Vec::new())
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+}
+
+/// The link guard's path probe is no existence oracle for a restricted
+/// project (#1218): a restricted target reports nothing whether or not the
+/// path exists, so a link that survives consolidation tells a reader of the
+/// source page nothing about a project they may not read. Reopening the
+/// project is the control: the same probe then sees the page.
+#[tokio::test]
+async fn existing_latest_paths_reports_nothing_for_a_restricted_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, _proj) = scope(&store).await;
+    let secret = store
+        .writer
+        .get_or_create_project(ws, "secret-app".to_string(), None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, secret, "notes/plan.md", "Plan", "private plan"))
+        .await
+        .unwrap();
+    let probe = || {
+        store.reader.existing_latest_paths(
+            ws,
+            secret,
+            vec!["notes/plan.md".to_string(), "notes/absent.md".to_string()],
+        )
+    };
+
+    store
+        .writer
+        .set_access_mode(secret, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    assert!(
+        probe().await.unwrap().is_empty(),
+        "a restricted project must answer the same for a real and an absent path"
+    );
+
+    store
+        .writer
+        .set_access_mode(secret, ai_memory_store::AccessMode::Open)
+        .await
+        .unwrap();
+    assert_eq!(probe().await.unwrap(), vec!["notes/plan.md"]);
+}
+
 /// Re-writing identical content must not churn a new version.
 ///
 /// Two harnesses syncing the same file would otherwise manufacture a version
@@ -588,6 +708,179 @@ async fn a_second_accept_cannot_steal_an_accepted_handoff() {
         Some(&winner.as_bytes()[..]),
         "and the winning session must not have been overwritten by the loser"
     );
+}
+
+/// The receiver named in a claim must be a real session of the claim's own
+/// workspace, project and agent kind. A session from a sibling project, from
+/// another workspace (even one using the same project name), of a different
+/// agent kind, or one that does not exist must be refused with `InvalidState`
+/// and must leave the baton open and untouched; a matching receiver still
+/// claims it, and nobody can claim it a second time.
+#[tokio::test]
+async fn handoff_accept_rejects_foreign_or_missing_receiver_session() {
+    /// The columns a claim writes, read straight from the row.
+    #[derive(Debug, PartialEq)]
+    struct ClaimColumns {
+        state: HandoffState,
+        accepted_by: Option<String>,
+        accepted_at: Option<i64>,
+        accepted_by_session: Option<Vec<u8>>,
+        accepted_by_user: Option<String>,
+    }
+
+    async fn claim_columns(store: &Store, id: ai_memory_core::HandoffId) -> ClaimColumns {
+        let handoff_bytes = id.as_bytes().to_vec();
+        store
+            .reader
+            .with_conn(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state, accepted_by, accepted_at, accepted_by_session, \
+                            accepted_by_user \
+                     FROM handoffs WHERE id = ?1",
+                    rusqlite::params![handoff_bytes],
+                    |r| {
+                        Ok(ClaimColumns {
+                            state: r.get::<_, String>(0)?.parse().unwrap(),
+                            accepted_by: r.get(1)?,
+                            accepted_at: r.get(2)?,
+                            accepted_by_session: r.get(3)?,
+                            accepted_by_user: r.get(4)?,
+                        })
+                    },
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let sibling_proj = store
+        .writer
+        .get_or_create_project(ws, "sibling-app".to_string(), None)
+        .await
+        .unwrap();
+    let rival_ws = store
+        .writer
+        .get_or_create_workspace("rival".to_string())
+        .await
+        .unwrap();
+    // Same project name as the real one, in another workspace: a lookup by
+    // name alone would conflate the two.
+    let rival_proj = store
+        .writer
+        .get_or_create_project(rival_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            from_session_id: None,
+            summary: "pick this up".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    // Every claim names the handoff's own scope and `ClaudeCode`; only the
+    // receiver session varies.
+    let claim = |session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::ClaudeCode,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    let valid = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    let other_project = open_session(&store, ws, sibling_proj, AgentKind::ClaudeCode).await;
+    let other_workspace = open_session(&store, rival_ws, rival_proj, AgentKind::ClaudeCode).await;
+    let wrong_agent = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let missing = SessionId::new();
+
+    let open = ClaimColumns {
+        state: HandoffState::Open,
+        accepted_by: None,
+        accepted_at: None,
+        accepted_by_session: None,
+        accepted_by_user: None,
+    };
+    assert_eq!(claim_columns(&store, id).await, open, "fixture starts open");
+
+    for (label, receiver) in [
+        ("a session of a sibling project", other_project),
+        ("a session of another workspace", other_workspace),
+        ("a session of a different agent kind", wrong_agent),
+        ("a session that does not exist", missing),
+    ] {
+        let err = store
+            .writer
+            .accept_handoff(claim(receiver))
+            .await
+            .expect_err(label);
+        assert!(
+            matches!(&err, StoreError::InvalidState(_)),
+            "{label} must be refused as InvalidState, got {err:?}"
+        );
+        assert_eq!(
+            claim_columns(&store, id).await,
+            open,
+            "{label} must leave the handoff open and unclaimed"
+        );
+    }
+
+    // Control: the matching receiver takes the baton.
+    assert!(
+        store.writer.accept_handoff(claim(valid)).await.unwrap(),
+        "a receiver in the handoff's own workspace, project and agent kind claims it"
+    );
+    let accepted = claim_columns(&store, id).await;
+    assert_eq!(accepted.state, HandoffState::Accepted);
+    assert_eq!(
+        accepted.accepted_by.as_deref(),
+        Some(AgentKind::ClaudeCode.as_str())
+    );
+    assert_eq!(
+        accepted.accepted_by_session.as_deref(),
+        Some(&valid.as_bytes()[..])
+    );
+    assert!(accepted.accepted_at.is_some(), "the claim is timestamped");
+    assert_eq!(
+        accepted.accepted_by_user, None,
+        "the claim named no operator"
+    );
+
+    // Nobody claims it twice: neither the same receiver retrying nor another
+    // matching session (the latter reaches the `state = 'open'` guards rather
+    // than the per-receiver early return).
+    let second_match = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    for (label, receiver) in [
+        ("the same receiver retrying", valid),
+        ("a second matching session", second_match),
+    ] {
+        assert!(
+            !store.writer.accept_handoff(claim(receiver)).await.unwrap(),
+            "{label} must not claim an accepted handoff"
+        );
+        assert_eq!(
+            claim_columns(&store, id).await,
+            accepted,
+            "{label} must leave the first claim intact"
+        );
+    }
 }
 
 /// Ownership still applies to batons even though pages are shared: the two
@@ -731,6 +1024,147 @@ async fn accept_reopens_an_ended_receiver_session_but_keeps_claim_once() {
     assert!(
         !stolen,
         "the resurrection path must not let a second session steal an accepted baton"
+    );
+}
+
+/// Kimi Code reuses its native session id when a session is resumed after
+/// SessionEnd (observed in production 2026-10: one kimi session row carried a
+/// SessionEnd and then fresh session-start/user-prompt observations under the
+/// same id), so it needs the same reopen exemption as Grok — without weakening
+/// any guard around it: other agents stay final-after-end, a receiver in a
+/// different project is still refused, and claim-once still binds the resumed
+/// session.
+#[tokio::test]
+async fn accept_reopens_an_ended_kimi_receiver_but_keeps_every_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let new_handoff = |summary: &str| NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_agent: AgentKind::ClaudeCode,
+        to_agent: None,
+        from_session_id: None,
+        summary: summary.into(),
+        next_steps: Vec::new(),
+        open_questions: Vec::new(),
+        files_touched: Vec::new(),
+        cwd: None,
+        owner_user: None,
+    };
+    let accept = |id, agent: AgentKind, session: SessionId, ws, proj| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: agent,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    // Adversarial control: an ended Claude Code session is still final — the
+    // reuse exemption must not leak to agents that never reuse ids.
+    let claude = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    store.writer.end_session(claude, None).await.unwrap();
+    let claude_baton = store
+        .writer
+        .insert_handoff(new_handoff("claude control"))
+        .await
+        .unwrap();
+    let err = store
+        .writer
+        .accept_handoff(accept(
+            claude_baton,
+            AgentKind::ClaudeCode,
+            claude,
+            ws,
+            proj,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::InvalidState(_)),
+        "an ended claude-code session must still be refused: {err}"
+    );
+
+    // The resumed kimi-code session: ended at SessionEnd, then the same
+    // native id comes back on resume and must be able to take the baton.
+    let kimi = open_session(&store, ws, proj, AgentKind::KimiCode).await;
+    store.writer.end_session(kimi, None).await.unwrap();
+
+    let id = store
+        .writer
+        .insert_handoff(new_handoff("resume after restart"))
+        .await
+        .unwrap();
+    let claimed = store
+        .writer
+        .accept_handoff(accept(id, AgentKind::KimiCode, kimi, ws, proj))
+        .await
+        .unwrap();
+    assert!(
+        claimed,
+        "a resumed kimi-code session must be able to accept the handoff"
+    );
+
+    // The receiver row was reopened (ended_at cleared), not left a corpse.
+    let kimi_bytes = kimi.as_bytes().to_vec();
+    let ended_at: Option<i64> = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                rusqlite::params![kimi_bytes],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(
+        ended_at.is_none(),
+        "accepting a handoff must reopen the ended kimi-code receiver session"
+    );
+
+    // Claim-once still binds kimi: the same resumed session must not take a
+    // second baton.
+    let second = store
+        .writer
+        .insert_handoff(new_handoff("a second baton"))
+        .await
+        .unwrap();
+    let claimed_again = store
+        .writer
+        .accept_handoff(accept(second, AgentKind::KimiCode, kimi, ws, proj))
+        .await
+        .unwrap();
+    assert!(
+        !claimed_again,
+        "a kimi-code session that already claimed a handoff must not claim another"
+    );
+
+    // Adversarial control: a kimi-code session living in a DIFFERENT project
+    // must not claim this project's baton (scope isolation).
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+    let foreign = open_session(&store, ws, other_proj, AgentKind::KimiCode).await;
+    let third = store
+        .writer
+        .insert_handoff(new_handoff("foreign attempt"))
+        .await
+        .unwrap();
+    let err = store
+        .writer
+        .accept_handoff(accept(third, AgentKind::KimiCode, foreign, ws, proj))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::InvalidState(_)),
+        "a kimi-code session from another project must be refused: {err}"
     );
 }
 

@@ -477,14 +477,17 @@ impl AgentKind {
     ///
     /// Grok does: the same session id comes back after an end, so an already-
     /// ended receiver row is a live restart, not a corpse, and
-    /// `accept_handoff` reopens it. For every other agent an ended session is
+    /// `accept_handoff` reopens it. Kimi Code does too: a resumed session
+    /// reuses the native session id after `SessionEnd` (same shape as Grok;
+    /// observed in production 2026-10). For every other agent an ended
+    /// session is
     /// final — a late/out-of-order startup fetch must not rebind it to a new
     /// handoff, so accepting into an ended session stays an error (this is what
     /// keeps a lifecycle-only receiver from reclaiming after it released and
     /// ended).
     #[must_use]
     pub fn reuses_session_id_after_end(self) -> bool {
-        matches!(self, Self::Grok)
+        matches!(self, Self::Grok | Self::KimiCode)
     }
 }
 
@@ -599,6 +602,12 @@ mod tests {
         // source), so the handoff is delivered on UserPromptSubmit instead.
         assert!(!AgentKind::KimiCode.session_start_injects_handoff());
         assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+        // A resumed session reuses the native id after SessionEnd (observed
+        // in production 2026-10), the same shape as Grok's restart.
+        assert!(AgentKind::KimiCode.reuses_session_id_after_end());
+        assert!(AgentKind::Grok.reuses_session_id_after_end());
+        assert!(!AgentKind::ClaudeCode.reuses_session_id_after_end());
+        assert!(!AgentKind::Codex.reuses_session_id_after_end());
     }
 
     #[test]

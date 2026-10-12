@@ -67,6 +67,11 @@ A reviewed decision record kept in the repository (an ADR directory, a Keep the 
 decisions there under the project's convention; ai-memory keeps recall, handoffs and
 session history and does not duplicate that record as a page.
 
+Cross-project messaging exists: `memory_message_send` is the ONLY way to
+reach another project's inbox (send a report, notify, leave a message for
+that project's agent). A wiki page written into the target project is NOT a
+message and is never surfaced as one.
+
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
 and reports that active stream without per-hit RRF details. The installed
@@ -158,6 +163,8 @@ Lifecycle hooks automatically capture sanitized, bounded prompt and tool-lifecyc
 Do not manually record routine session activity. Write durable memory only when the user explicitly asks to remember or permanently annotate something. For time-bounded memory, set `expires_at`; expired pages are hidden from normal reads and removed by the next forget sweep, and TTL takes precedence over `pinned`.
 
 ai-memory is the cross-harness memory of record for durable project knowledge. Do not duplicate the same durable project facts in harness-local memory stores that other agents cannot see.
+
+`memory_message_send` is the only path into another project's inbox (send a report, notify, leave a message for that project's agent); a wiki page written there is not a message and is never surfaced as one.
 
 ### Retrieval and trust
 

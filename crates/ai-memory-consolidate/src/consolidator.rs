@@ -38,6 +38,11 @@ pub enum ConsolidatorError {
     #[error(transparent)]
     Store(#[from] ai_memory_store::StoreError),
 
+    /// Cross-scope link validation could not resolve a named scope (a real
+    /// store failure — a merely absent scope is de-linked, not an error).
+    #[error(transparent)]
+    Scope(#[from] ai_memory_store::ScopeResolutionError),
+
     /// Underlying wiki error.
     #[error(transparent)]
     Wiki(#[from] ai_memory_wiki::WikiError),
@@ -81,6 +86,7 @@ pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
     let (class, status) = match error {
         ConsolidatorError::Memory(_) => ("memory", None),
         ConsolidatorError::Store(_) => ("store", None),
+        ConsolidatorError::Scope(_) => ("scope", None),
         ConsolidatorError::Wiki(_) => ("wiki", None),
         ConsolidatorError::Llm(llm) => (llm.class(), llm.http_status()),
         ConsolidatorError::Serde(_) => ("serde", None),
@@ -319,7 +325,21 @@ impl Consolidator {
             page.title = new_title;
         }
 
-        let frontmatter = build_frontmatter(&page, session_id, agent_kind);
+        // #1218: a cross-scope link the model invented — body wikilink or
+        // `relations:` entry — must not be written. Resolve each against the
+        // store; de-link unresolved body links and drop unresolved relations,
+        // so the write cannot mint a dangling cross-project edge the lint
+        // pass would flag.
+        let mut frontmatter = build_frontmatter(&page, session_id, agent_kind);
+        let unresolved = crate::link_guard::unresolved_cross_scope_links(
+            &self.reader,
+            ws,
+            &[(&path, page.body_markdown.as_str(), &frontmatter)],
+        )
+        .await?;
+        page.body_markdown =
+            crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved).into_owned();
+        crate::link_guard::prune_relations(&mut frontmatter, &unresolved);
         let id = self
             .wiki
             .write_page(WritePageRequest {
@@ -805,6 +825,27 @@ impl Consolidator {
             }
             requests.push(req);
             outcomes_preview.push(outcome);
+        }
+
+        // #1218: same cross-scope link guard as the single-page path, run
+        // once over every proposed body so the store checks batch too.
+        // De-linking rewrites in memory only; `apply_batch` below stays the
+        // single atomic write.
+        let unresolved = {
+            let pages: Vec<(&PagePath, &str, &serde_json::Value)> = requests
+                .iter()
+                .map(|req| (&req.path, req.body.as_str(), &req.frontmatter))
+                .collect();
+            crate::link_guard::unresolved_cross_scope_links(&self.reader, ws, &pages).await?
+        };
+        if !unresolved.is_empty() {
+            for (req, outcome) in requests.iter_mut().zip(outcomes_preview.iter_mut()) {
+                let rewritten =
+                    crate::link_guard::delink_body(&req.body, &req.path, &unresolved).into_owned();
+                req.body = rewritten.clone();
+                outcome.new_body_markdown = rewritten;
+                crate::link_guard::prune_relations(&mut req.frontmatter, &unresolved);
+            }
         }
 
         let ids = self.wiki.apply_batch(requests).await?;
@@ -1376,7 +1417,7 @@ const MIN_OBSERVATION_RESERVE_CHARS: usize = 1_024;
 /// Smallest input budget that still leaves room for observations after
 /// the fixed prompts and structured-output schema. Below this the batch prompt
 /// can leave too little room for observations.
-pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_000;
+pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_500;
 
 /// Smallest useful structured-output allowance. Lower values are unlikely to
 /// fit even one concise batch update and its JSON framing.
@@ -2955,6 +2996,115 @@ mod tests {
                 prompt.contains("JSON keys stay in English"),
                 "{name} prompt"
             );
+            // Lint reports a missing `project:` / `_global:` target as
+            // `broken_link`, so the prompt must not license inventing one.
+            assert!(
+                prompt.contains("Never invent project names or page paths"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("page body"), "{name} prompt");
+            assert!(prompt.contains("not a repo file path"), "{name} prompt");
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt"
+            );
+            assert!(
+                !prompt.contains("A link whose target does not exist yet is acceptable"),
+                "{name} prompt must scope the pending-link allowance to the same project"
+            );
+        }
+    }
+
+    /// #1219: a numeric quota ("2-5 links per page, zero links should be
+    /// rare") pressures the model to invent links to hit the number. The
+    /// prompts must state that zero links is a fine outcome, that links
+    /// need a genuine reason visible in the input, and that padding to
+    /// hit a number is never acceptable — while keeping the #1217
+    /// cross-scope restriction intact.
+    #[test]
+    fn consolidation_system_prompts_do_not_pressure_invented_links() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(
+                prompt.contains("zero links is fine"),
+                "{name} prompt must permit a linkless page"
+            );
+            assert!(
+                prompt.contains("genuine reason"),
+                "{name} prompt must require a genuine reason to link"
+            );
+            assert!(
+                prompt.contains("Never pad a page with links to hit a number"),
+                "{name} prompt must forbid quota padding"
+            );
+            assert!(
+                prompt.contains("never pad with a cross-scope link"),
+                "{name} prompt must keep the #1217 cross-scope restriction"
+            );
+            assert!(
+                !prompt.contains("zero links should be rare"),
+                "{name} prompt must not stigmatise a linkless page"
+            );
+            assert!(
+                !prompt.contains("2-5"),
+                "{name} prompt must not carry a numeric link quota"
+            );
+        }
+    }
+
+    /// #1221: consolidation was losing the tail of a session — an
+    /// unanswered final prompt, a late correction to a "done" milestone,
+    /// the last reported metrics of in-flight work, operator "run X when Y"
+    /// instructions, and how to reach and verify external systems the
+    /// session touched. Each rule must be pinned in both prompts.
+    #[test]
+    fn consolidation_system_prompts_preserve_terminal_state_and_carried_detail() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            // 1. Terminal state: unanswered prompt / abnormal stop is said
+            //    explicitly; in-flight work is pending state, not done.
+            assert!(prompt.contains("Terminal state"), "{name} prompt");
+            assert!(
+                prompt.contains("ends on an unanswered prompt"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("without a normal stop"), "{name} prompt");
+            assert!(prompt.contains("pending state"), "{name} prompt");
+            // 2. Late corrections: final state only, superseded claim is
+            //    history at most.
+            assert!(prompt.contains("Late corrections"), "{name} prompt");
+            assert!(
+                prompt.contains("corrects an earlier \"done\""),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("state only the final state"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("as history at most"), "{name} prompt");
+            // 3. Final metrics of in-flight work, verbatim.
+            assert!(prompt.contains("Final metrics"), "{name} prompt");
+            assert!(
+                prompt.contains("sizes, rates, counts, ETAs"),
+                "{name} prompt"
+            );
+            // 4. Operator "run X when Y" instructions carried verbatim with
+            //    their preconditions into Next steps / Pending.
+            assert!(prompt.contains("Operator instructions"), "{name} prompt");
+            assert!(prompt.contains("run X when Y"), "{name} prompt");
+            assert!(prompt.contains("preconditions"), "{name} prompt");
+            assert!(prompt.contains("Next steps / Pending"), "{name} prompt");
+            // 5. Access and verification for external systems: extraction
+            //    grounded in the observations, never secrets themselves.
+            assert!(prompt.contains("Access and verification"), "{name} prompt");
+            assert!(
+                prompt.contains("NEVER secrets or tokens themselves"),
+                "{name} prompt"
+            );
+            assert!(prompt.contains("job-state marker"), "{name} prompt");
+            assert!(prompt.contains("staged-script paths"), "{name} prompt");
+            assert!(
+                prompt.contains("extraction, not scaffolding"),
+                "{name} prompt"
+            );
         }
     }
 
@@ -3180,9 +3330,14 @@ mod tests {
 
     /// The batch path must include schema and dynamic slot snapshots in its
     /// envelope instead of assuming a fixed number of slots.
+    ///
+    /// The budget sits above the validated floor so the optional-context
+    /// block reaches its clipping regime (a visible `[truncated]` marker)
+    /// rather than being dropped whole: at the floor the growing system
+    /// prompt leaves no optional-context room at all.
     #[test]
     fn batch_budget_accounts_for_many_slot_snapshots() {
-        let budgets = PromptBudgets::from_limits(6_500, 1_000);
+        let budgets = PromptBudgets::from_limits(8_000, 1_000);
         let observations = (0..64).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
         let slots = (0..100)
             .map(|index| SlotSnapshot {
@@ -5546,5 +5701,228 @@ mod tests {
             slot_page.body.contains("New focus."),
             "state slots still refresh"
         );
+    }
+
+    /// Write one page into a second project of the fixture's workspace, so a
+    /// cross-scope wikilink has something real to resolve to.
+    async fn seed_other_project_page(
+        store: &ai_memory_store::Store,
+        wiki: &Wiki,
+        ws: WorkspaceId,
+        project: &str,
+        path: &str,
+    ) {
+        let other = store
+            .writer
+            .get_or_create_project(ws, project.to_string(), None)
+            .await
+            .unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: other,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "Existing target page.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Same, for the reserved `_global` preferences project, which lives in
+    /// the default workspace and goes through its own scope helper.
+    async fn seed_global_page(store: &ai_memory_store::Store, wiki: &Wiki, path: &str) {
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: global.workspace_id,
+            project_id: global.project_id,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "A standing preference.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// #1218: a batch whose model output invents cross-scope wikilinks must
+    /// not write them as links. `[[_global:nope]]` (missing page in the
+    /// reserved project), `[[otherproj:notes/missing.md]]` (missing page in
+    /// a real project) and `[[ghostproj:x.md]]` (a project that does not
+    /// exist at all) are all de-linked to plain text before the write.
+    /// Controls in the same body: a cross-scope link to an existing page
+    /// survives byte-identical, and a same-project pending link stays
+    /// untouched — pending links are by design (#1218 scope).
+    #[tokio::test]
+    async fn batch_delinks_invented_cross_scope_wikilinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+        seed_global_page(&store, &wiki, "prefs.md").await;
+
+        let path = PagePath::new("notes/with-links.md").unwrap();
+        let body = "Invented: [[_global:nope]], [[otherproj:notes/missing.md]], \
+                    [[ghostproj:x.md]]. \
+                    Controls: [[otherproj:notes/exists.md]], [[_global:prefs.md|the prefs]], \
+                    [[notes/pending.md]].";
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(batch_targeting(path.as_str(), body))),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        // Invented links are plain text now: brackets dropped, label kept.
+        assert!(!stored.body.contains("[[_global:nope]]"));
+        assert!(!stored.body.contains("[[otherproj:notes/missing.md]]"));
+        assert!(!stored.body.contains("[[ghostproj:x.md]]"));
+        assert!(stored.body.contains("_global:nope"));
+        assert!(stored.body.contains("otherproj:notes/missing.md"));
+        assert!(stored.body.contains("ghostproj:x.md"));
+        assert!(
+            stored.body.contains("[[otherproj:notes/exists.md]]"),
+            "a cross-scope link to an existing page survives byte-identical: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains("[[_global:prefs.md|the prefs]]"),
+            "a resolved _global link keeps its label form: {}",
+            stored.body
+        );
+        assert!(
+            stored.body.contains("[[notes/pending.md]]"),
+            "a same-project pending link is by design untouched: {}",
+            stored.body
+        );
+        // The outcome reports the body as actually written.
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].new_body_markdown, stored.body);
+
+        // And the lint pass has nothing left to flag: no dangling
+        // cross-project edge was minted.
+        let dangling = store
+            .reader
+            .dangling_cross_project_links(ws, proj)
+            .await
+            .unwrap();
+        assert!(
+            dangling.is_empty(),
+            "de-linking must leave no dangling cross-project edges: {dangling:?}"
+        );
+    }
+
+    /// #1218 on the single-page path: the session page gets the same guard
+    /// before `Wiki::write_page`.
+    #[tokio::test]
+    async fn single_page_delinks_invented_cross_scope_wikilinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+
+        let response = serde_json::json!({
+            "title": "Link cleanup",
+            "body_markdown": "Saw [[otherproj:notes/missing.md]] and \
+                              [[otherproj:notes/exists.md]] and [[notes/pending.md]].",
+            "tags": [],
+        });
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert!(!stored.body.contains("[[otherproj:notes/missing.md]]"));
+        assert!(stored.body.contains("otherproj:notes/missing.md"));
+        assert!(stored.body.contains("[[otherproj:notes/exists.md]]"));
+        assert!(stored.body.contains("[[notes/pending.md]]"));
+    }
+
+    /// #1218 covers typed `relations:` edges too: an unresolved cross-scope
+    /// relation target is dropped before the write (an emptied relation goes
+    /// with it), while a live cross-scope target and a same-project target
+    /// stay, so frontmatter cannot mint the dangling edge the body guard
+    /// prevents.
+    #[tokio::test]
+    async fn single_page_drops_unresolved_cross_scope_relations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+
+        let response = serde_json::json!({
+            "title": "Relation cleanup",
+            "body_markdown": "No links in the body.",
+            "tags": [],
+            "relations": {
+                "causes": ["otherproj:notes/missing.md", "otherproj:notes/exists.md", "notes/local.md"],
+                "fixes": ["ghostproj:x.md"],
+            },
+        });
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(
+            stored.frontmatter["relations"]["causes"],
+            serde_json::json!(["otherproj:notes/exists.md", "notes/local.md"]),
+            "{}",
+            stored.frontmatter
+        );
+        assert!(stored.frontmatter["relations"].get("fixes").is_none());
     }
 }

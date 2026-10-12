@@ -132,10 +132,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enabled. Both routes now answer 415 unless the body is `application/json`;
   the built-in login page and the documented `curl` recovery already send
   that. (GHSA-6mc4-46pr-w82w)
-- Fixed approving or rejecting an unknown pending write
-  (`POST /admin/pending-writes/{id}/approve` or `/reject`) answering 500 instead
-  of 404. An id outside the given workspace and project now answers 404 too.
-  (#1205)
+- Fixed the cross-project profile harvester treating pages the auto-improve
+  scheduler auto-approved as curated human input: model output nobody
+  reviewed fed the profile like a hand-written rule. A page stamped from an
+  auto-improve proposal is now skipped when the proposal's decider is the
+  scheduler's auto-approve actor; a page a human approved still counts, and a
+  page whose proposal id resolves to no row (legacy or imported) stays
+  curated. (#1211)
+- Fixed the zero-LLM session page staying silent about abrupt endings. The
+  rule-based synthesis now adds a deterministic terminal-state line reusing
+  the automatic handoff's heuristics: "Session ended without a normal stop;
+  the final prompt was never answered." when the log ends on an unanswered
+  question, the equivalent line when file activity was never followed by a
+  stop, and a mid-task-exit line when a stop was recorded but no session
+  end arrived. A session with a normal stop and end gets no line. (#1221)
+- Fixed consolidation dropping the tail of a session from the compiled
+  page. The single and batch prompts now carry explicit rules: say so when
+  the observation log ends on an unanswered prompt or without a normal
+  stop, and record in-flight work (background jobs, watchers, timers) as
+  pending state; when a later observation corrects an earlier "done"
+  milestone, state only the final state with the superseded claim as
+  history at most; preserve the last reported metrics of in-flight work
+  (sizes, rates, counts, ETAs) verbatim; carry operator "run X when Y"
+  instructions verbatim, with their preconditions, into a
+  Next steps / Pending section; and, for sessions that operated on
+  external systems, emit an "Access and verification" section — hosts,
+  the per-host auth mechanism (never secrets or tokens themselves),
+  job-state marker locations, staged-script paths — grounded only in what
+  the observations show. (#1221)
+- Softened the consolidation prompts' wikilink quota that pushed models to
+  invent links. The single, batch and bootstrap prompts told the model "2-5
+  well-chosen links per page beat exhaustive linking; zero links should be
+  rare", which
+  pressured it to add links just to hit the number. They now state that zero
+  links is fine when nothing in the input genuinely relates, require a genuine
+  reason visible in the input for every link, and forbid padding a page with
+  links to hit a number; the #1207 restriction on cross-scope links whose
+  target is not visible in the input is unchanged. The validated
+  `consolidation.max_input_tokens` floor moved from 6,000 to 6,500 tokens so
+  the larger prompts still leave room for observation evidence at the minimum.
+  (#1219)
+- Fixed consolidation still writing invented `[[_global:…]]` / `[[project:…]]`
+  wikilinks when a model ignored the #1207 prompt wording. The single-page,
+  batch and bootstrap apply paths now resolve every cross-scope wikilink
+  target against the store with no-create lookups before the write and
+  rewrite an unresolvable one to its plain label text (an unresolvable
+  `relations:` frontmatter entry is dropped), so a missing target
+  can no longer mint the dangling cross-project edge that `ai-memory lint`
+  reports as `broken_link`. Resolved cross-scope links survive
+  byte-identical, and same-project pending links stay untouched by design.
+  A link into a restricted project is always de-linked, so the result never
+  reveals which pages exist there. (#1218)
+- Fixed consolidation inventing `[[_global:…]]` and `[[project:…]]` wikilinks to
+  pages that never existed, which `ai-memory lint` then reported as
+  `broken_link`. The single, batch and bootstrap prompts told the model that a
+  missing link target was acceptable and gave it no list of cross-scope pages,
+  so it invented targets to meet the 2-5 link guidance. They now allow a
+  `project:` or `_global:` link only when the exact wiki page path appears in
+  the input, which reduces but does not eliminate such links; a missing
+  same-project target stays a pending link. (#1207)
+- Fixed the web UI answering HTTP 500 when a signed-in viewer opened a project
+  or page by a name that two projects answer to. The page and project routes
+  now return a 400 that names the clash, matching the API and MCP surfaces.
+  (#1204)
 - Fixed the Jev choice reranker adapter silently fabricating scores from a
   malformed judge response: `docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`
   defaulted missing or misnamed `probabilities` entries to `0.0`, so an HTTP
@@ -161,6 +220,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination's policy. When the payload `cwd`'s own capture policy is
   invalid, an event aimed at another repository is no longer rerouted; it
   stays with that source repository as metadata only. (#1199)
+
+- `scope_refusal` (the hooks-side mirror of the web surfaces
+  `refusal_response` mapped in #1204) now answers `404 Not Found`
+  for typed not-found `ScopeResolutionError` variants and `400
+  Bad Request` for typed bad-request variants. Previously every
+  refusal that was not `Forbidden` fell through to `500 Internal
+  Server Error`, hiding a missing-id mistake from the caller and
+  making it indistinguishable from a real fault. The four-branch
+  shape (forbidden / not_found / bad_request / fallback) matches
+  the web mapping from #1204; the typed `is_*` predicates the
+  store already exposes carry the classification, so the fix is
+  purely a branch reshuffle with no new predicate. Four unit
+  tests in `workstream.rs::tests` cover the unknown-id (404),
+  unknown-workspace (404), ambiguous-name (400), and forbidden
+  (403, regression guard) cases. (#1209)
+- `POST /admin/pending-writes/{id}/approve` and `/reject` answered
+  `500 Internal Server Error` for an id that did not exist or belonged
+  to a different workspace, because the routes skipped the lookup and
+  let the wiki method surface a generic error. They now share the same
+  `pending_detail` helper the `/detail` and `/diff` routes already used,
+  so all four routes agree on `400` for an unparsable id, `404` for an
+  unknown or foreign-scope id, and `500` only for unexpected internal
+  errors. New tests in `admin::tests` cover the unknown, foreign-scope,
+  and unparsable cases for both `approve` and `reject`. (#1205)
+- Fixed Kimi Code sessions resumed after `SessionEnd` never receiving an
+  open handoff. Kimi Code reuses its native session id when a session is
+  resumed, so the receiver row already had `ended_at` set when the resumed
+  session asked for its handoff, and `accept_handoff` refused the claim with
+  "an ended session cannot accept a handoff" — an error the `/handoff` route
+  swallows as an empty 200, leaving the handoff open forever.
+  `AgentKind::reuses_session_id_after_end()` now covers Kimi Code alongside
+  Grok, so accepting reopens the ended receiver row. Every surrounding guard
+  is unchanged: an ended session of any other agent is still final, a
+  receiver in another project is still refused, and the claim-once guard
+  still stops the resumed session from taking a second baton. Covered by an
+  adversarial integration test in `multi_session.rs` and a unit test on the
+  predicate itself.
+- Fixed agents filing cross-project reports as wiki pages. Asked to "send a
+  report to the ai-memory inbox", an agent wrote pages into the target
+  project with `memory_write_page` instead of calling
+  `memory_message_send`, and the report never existed as a message. The
+  always-visible surfaces now carry the channel contrast in both
+  directions: `memory_message_send`'s tool description and its
+  MEMORY_INSTRUCTIONS bullet name the trigger phrasing ("send a report",
+  "notify", "leave a message for") and state it is the only tool that lands
+  in a project's inbox; `memory_write_page`'s description and bullet say a
+  page is not a message and redirect messaging to `memory_message_send`.
+  The routing snippet (full and compact) gained the same contrast, the
+  `memory_message_pop` bullet now forbids guessing the inbox's project
+  name, and `docs/agent-messaging.md` states the distinction.
 
 ## [2.6.3] - 2026-10-09
 

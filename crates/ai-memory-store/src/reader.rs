@@ -8545,6 +8545,66 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the subset of `paths` that name a latest page in this scope, in
+    /// a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
+    /// for callers that need to know *which* paths resolve — the consolidation
+    /// link guard validates proposed cross-scope wikilinks against it (#1218).
+    ///
+    /// A `restricted` project reports nothing, whatever it holds (the global
+    /// preferences project excepted, which every viewer may read). The link
+    /// guard runs with no viewer — background consolidation has none — and a
+    /// link it keeps lands on a page readers of the source project see, so
+    /// answering for a restricted project would let anyone who can plant an
+    /// observation learn which paths exist there.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn existing_latest_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        paths: Vec<String>,
+    ) -> StoreResult<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            let mut distinct: Vec<String> = paths;
+            distinct.sort();
+            distinct.dedup();
+            let placeholders = std::iter::repeat_n("?", distinct.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT pg.path FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1 \
+                   AND (p.access_mode <> 'restricted' \
+                        OR (w.name = '{global_ws}' AND p.name = '{global_proj}')) \
+                   AND pg.path IN ({placeholders})",
+                global_ws = ai_memory_core::DEFAULT_WORKSPACE_NAME,
+                global_proj = ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 2);
+            binds.push(ws_bytes as &dyn rusqlite::ToSql);
+            binds.push(proj_bytes as &dyn rusqlite::ToSql);
+            for p in &distinct {
+                binds.push(p as &dyn rusqlite::ToSql);
+            }
+            let rows = stmt.query_map(binds.as_slice(), |row| row.get::<_, String>(0))?;
+            let mut found = Vec::new();
+            for r in rows {
+                found.push(r?);
+            }
+            Ok(found)
+        })
+        .await
+    }
+
     /// Return whether the latest version of one fully scoped page is expired.
     /// Returns `None` when the path has no latest indexed row.
     ///
@@ -10202,6 +10262,23 @@ impl ReaderPool {
                 )?,
                 crate::profile::project_stack_tags(conn, workspace_id, project_id)?,
             ))
+        })
+        .await
+    }
+
+    /// The decider agent of each given auto-improve proposal in a scope,
+    /// keyed by proposal id; a proposal with no row is absent (#1211).
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn auto_improve_decided_by(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_ids: Vec<AutoImproveProposalId>,
+    ) -> StoreResult<std::collections::HashMap<AutoImproveProposalId, Option<String>>> {
+        self.with_conn(move |conn| {
+            crate::profile::auto_improve_decided_by(conn, workspace_id, project_id, &proposal_ids)
         })
         .await
     }

@@ -39,6 +39,11 @@ A reviewed decision record kept in the repository (an ADR directory, a Keep the 
 decisions there under the project's convention; ai-memory keeps recall, handoffs and
 session history and does not duplicate that record as a page.
 
+Cross-project messaging exists: `memory_message_send` is the ONLY way to
+reach another project's inbox (send a report, notify, leave a message for
+that project's agent). A wiki page written into the target project is NOT a
+message and is never surfaced as one.
+
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
 and reports that active stream without per-hit RRF details. The installed
