@@ -10206,6 +10206,23 @@ impl ReaderPool {
         .await
     }
 
+    /// The decider agent of each given auto-improve proposal in a scope,
+    /// keyed by proposal id; a proposal with no row is absent (#1211).
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn auto_improve_decided_by(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_ids: Vec<AutoImproveProposalId>,
+    ) -> StoreResult<std::collections::HashMap<AutoImproveProposalId, Option<String>>> {
+        self.with_conn(move |conn| {
+            crate::profile::auto_improve_decided_by(conn, workspace_id, project_id, &proposal_ids)
+        })
+        .await
+    }
+
     /// The newest recorded profile candidates of contributing projects.
     ///
     /// # Errors

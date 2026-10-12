@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the cross-project profile harvester treating pages the auto-improve
+  scheduler auto-approved as curated human input: model output nobody
+  reviewed fed the profile like a hand-written rule. A page stamped from an
+  auto-improve proposal is now skipped when the proposal's decider is the
+  scheduler's auto-approve actor; a page a human approved still counts, and a
+  page whose proposal id resolves to no row (legacy or imported) stays
+  curated. (#1211)
 - Fixed the zero-LLM session page staying silent about abrupt endings. The
   rule-based synthesis now adds a deterministic terminal-state line reusing
   the automatic handoff's heuristics: "Session ended without a normal stop;
