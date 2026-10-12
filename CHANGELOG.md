@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added an opt-in observation stream to `memory_query` ranking:
+  `[retrieval] observation_stream = true` (env
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`, default off). A zero-LLM
+  session page keeps only a short excerpt of each turn, so the detail a
+  question asks about often lives only in the session's observations. With the
+  flag on, project and `scopes` searches also run full-text search over
+  observations in the same project, and each matching session votes once,
+  through its best-matching observation, for its own latest
+  `sessions/<id>.md` page as one more RRF stream. The matching excerpt becomes
+  the hit's snippet when it ranks ahead of the page's own match, and
+  `explain=true` reports an `observation` stream with the matched observation
+  ids. Hits are still pages and nothing is written; sessions without a page
+  keep the `raw_hits` fallback, and `global=true` search is unchanged.
+
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,

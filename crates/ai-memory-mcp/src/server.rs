@@ -3101,6 +3101,9 @@ impl AiMemoryServer {
                 }
             }
             streams.push("graph");
+            if self.reader.retrieval_tuning().observation_stream {
+                streams.push("observation");
+            }
             streams
         });
         let hits: Vec<QueryHit> = hits
@@ -16326,6 +16329,218 @@ mod tests {
         // No viewer is stamped and nothing changes.
         assert!(found_by_query(bob, false).await);
         assert!(found_by_recent(bob, false).await);
+    }
+
+    /// R1 observation stream, per-project authorization (row 14) and pages
+    /// shared (row 5a). The stream reads observation bodies, which hold more
+    /// than the session page does, so it must sit behind the same resolver
+    /// gate as page search: a non-grantee reaches neither the session page
+    /// nor its evidence by naming the restricted project, listing it in
+    /// `scopes`, or querying their own project. Controls: the writer and a
+    /// second operator holding only a read grant both get the session page,
+    /// lifted by the first operator's observation.
+    #[tokio::test]
+    async fn observation_stream_evidence_stays_inside_a_restricted_project() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store
+            .reader
+            .set_retrieval_tuning(ai_memory_store::RetrievalTuning {
+                observation_stream: true,
+                ..ai_memory_store::RetrievalTuning::default()
+            });
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let scratch = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let client = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        let carol = human("carol").await;
+        grant_writer(store.db_path(), alice, client);
+        grant_role(store.db_path(), carol, client, "read");
+
+        // Alice's finished session: the page keeps a short excerpt, the
+        // observation keeps the confidential detail.
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: client,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: Some(ai_memory_core::IdentityKey::User("alice".into()).storage_key()),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: client,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "the zircon day rate for this client is confidential".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        let session_path = format!("sessions/{session_id}.md");
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: client,
+                path: PagePath::new(session_path.clone()).unwrap(),
+                title: "Session".into(),
+                body: "User asked about pricing.".into(),
+                tier: Tier::Episodic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: Some(alice),
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, scratch);
+
+        let as_user = |user: ai_memory_core::UserId| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(user));
+            parts
+        };
+        let ask =
+            |user, workspace: Option<&str>, project: Option<&str>, scopes: Vec<MemoryScopeArg>| {
+                let server = &server;
+                let workspace = workspace.map(str::to_string);
+                let project = project.map(str::to_string);
+                async move {
+                    server
+                        .memory_query(
+                            Parameters(QueryArgs {
+                                reasoning: None,
+                                answer: None,
+                                include_superseded: None,
+                                pin_first: None,
+                                query: "zircon".into(),
+                                limit: Some(10),
+                                project,
+                                workspace,
+                                scopes,
+                                global: None,
+                                include_expired: None,
+                                explain: Some(true),
+                                as_of: None,
+                            }),
+                            OptionalParts(as_user(user)),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|result| {
+                            result
+                                .content
+                                .first()
+                                .and_then(|c| c.as_text())
+                                .map(|t| t.text.clone())
+                        })
+                }
+            };
+        let client_scope = || {
+            vec![MemoryScopeArg {
+                workspace: "default".into(),
+                project: "alice-client-work".into(),
+            }]
+        };
+        let leaked = |text: &Option<String>| {
+            text.as_deref()
+                .is_some_and(|t| t.contains("zircon") || t.contains(&session_path))
+        };
+
+        // Bob holds nothing on the repository: naming it, scoping to it, or
+        // searching his own project never surfaces the session or its
+        // evidence.
+        let named = ask(bob, Some("default"), Some("alice-client-work"), Vec::new()).await;
+        assert!(!leaked(&named), "bob reached it by name: {named:?}");
+        let scoped = ask(bob, None, None, client_scope()).await;
+        assert!(
+            !leaked(&scoped),
+            "bob reached it through scopes: {scoped:?}"
+        );
+        let own = ask(bob, Some("default"), Some("scratch"), Vec::new()).await;
+        assert!(own.is_some(), "bob's own project still answers");
+        assert!(
+            !leaked(&own),
+            "bob reached it from his own project: {own:?}"
+        );
+
+        // Alice, and Carol with only a read grant, get the session page,
+        // lifted by Alice's observation.
+        for (who, user) in [("alice", alice), ("carol", carol)] {
+            for text in [
+                ask(user, Some("default"), Some("alice-client-work"), Vec::new()).await,
+                ask(user, None, None, client_scope()).await,
+            ] {
+                let text = text.unwrap_or_else(|| panic!("{who}'s query failed"));
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let hit = json["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|h| h["path"] == session_path.as_str())
+                    .unwrap_or_else(|| panic!("{who} missed the session page: {text}"));
+                assert_eq!(hit["score_details"]["observation_rank"], 1, "{text}");
+            }
+        }
     }
 
     fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {

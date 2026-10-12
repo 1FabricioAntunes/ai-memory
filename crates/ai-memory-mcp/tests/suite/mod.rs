@@ -30,6 +30,7 @@ mod handoff_admission;
 mod handoff_identity;
 mod mcp_stateless_http;
 mod query_answer;
+mod query_observation_stream;
 mod query_pin_first;
 mod query_reasoning;
 mod query_superseded;
