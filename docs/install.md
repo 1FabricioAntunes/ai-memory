@@ -1737,7 +1737,9 @@ so those hooks do not accept the handoff. `install-hooks --agent grok --apply`
 also writes `$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
 `memory_handoff_list`. Grok reaches MCP tools only through its `use_tool`
 meta-tool, so the rule hands the model the qualified catalog key
-`ai-memory__memory_handoff_list` instead of leaving it to `search_tool`. The
+`ai-memory__memory_handoff_list` instead of leaving it to `search_tool`. That
+call comes before any file read, and the rule corrects `workspace`/`project`
+from `./.ai-memory.toml` only when the list comes back empty. The
 first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
 `[briefing]`). The model sees it after that tool result. A session with no

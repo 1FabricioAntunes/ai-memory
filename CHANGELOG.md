@@ -49,8 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SessionStart stdout, so that list is the first tool and PostToolUse still
   claims the baton through GET `/handoff`. The rule names Grok's invocation —
   `use_tool` with the qualified catalog key `ai-memory__memory_handoff_list` —
-  because Grok reaches MCP tools only through that meta-tool, and keeps scope
-  resolution inside the current repository so it cannot consume the turn.
+  because Grok reaches MCP tools only through that meta-tool. The rule puts
+  that call ahead of any file read and corrects `workspace`/`project` from
+  `./.ai-memory.toml` only when the list comes back empty, so scope resolution
+  neither consumes the turn nor leaves the current repository.
   Project-scope Grok skills and `--target-dir` leave the user rule alone.
   Unmanaged same-name files are refused without `--force`; `install-hooks`
   warns and keeps the hook file. `uninstall --only skills` and `--only hooks`

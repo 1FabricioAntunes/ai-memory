@@ -1006,7 +1006,9 @@ so those events do not accept the handoff. `--apply` also writes
 `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
 so the first turn calls `memory_handoff_list` through `use_tool` with the
 qualified catalog key `ai-memory__memory_handoff_list` (Grok exposes MCP tools
-only through that meta-tool); PostToolUse then claims the row.
+only through that meta-tool), before any file read, and corrects the scope from
+`./.ai-memory.toml` only when that list is empty; PostToolUse then claims the
+row.
 
 **Config file:** `install-mcp --client grok --apply` writes the user config at
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`). To use a project or

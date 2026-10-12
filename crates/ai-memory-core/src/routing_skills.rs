@@ -359,6 +359,25 @@ mod tests {
     }
 
     #[test]
+    fn grok_handoff_rule_lists_before_it_reads_the_marker() {
+        let list_at = GROK_HANDOFF_RULE_CONTENT
+            .find("ai-memory__memory_handoff_list")
+            .expect("the rule must hand Grok the qualified catalog key");
+        let marker_at = GROK_HANDOFF_RULE_CONTENT
+            .find("./.ai-memory.toml")
+            .expect("scope correction must name the marker it reads");
+        assert!(
+            list_at < marker_at,
+            "the list call must come before the marker read, or the read becomes the first tool \
+             call and PostToolUse claims the baton before the rule's own step 1 runs"
+        );
+        assert!(
+            GROK_HANDOFF_RULE_CONTENT.contains("before reading any file"),
+            "step 1 must say the list precedes any file read"
+        );
+    }
+
+    #[test]
     fn grok_handoff_rule_does_not_embed_a_handoff_peek() {
         for leak in [
             "📥",
