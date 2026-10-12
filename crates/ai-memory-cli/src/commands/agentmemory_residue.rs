@@ -576,20 +576,19 @@ mod tests {
             .collect();
 
         let findings = scan(home.path(), repo.path(), &project_mcp_configs(repo.path()));
-        let mut paths: Vec<&str> = findings.iter().map(|f| f.path.as_str()).collect();
+        // Compare as paths, not display strings: on Windows the scanner joins
+        // `.cursor/rules` and `memory.mdc` with `\\`, which `Path` treats as
+        // the same separator as `/`.
+        let mut paths: Vec<PathBuf> = findings.iter().map(|f| PathBuf::from(&f.path)).collect();
         paths.sort_unstable();
-        let expect = |base: &Path, rel: &str| base.join(rel).display().to_string();
         let mut expected = [
-            expect(repo.path(), "AGENTS.md"),
-            expect(repo.path(), ".cursor/rules/memory.mdc"),
-            expect(repo.path(), ".mcp.json"),
-            expect(home.path(), ".gemini/GEMINI.md"),
+            repo.path().join("AGENTS.md"),
+            repo.path().join(".cursor/rules/memory.mdc"),
+            repo.path().join(".mcp.json"),
+            home.path().join(".gemini/GEMINI.md"),
         ];
         expected.sort();
-        assert_eq!(
-            paths,
-            expected.iter().map(String::as_str).collect::<Vec<_>>()
-        );
+        assert_eq!(paths, expected);
         for (path, bytes) in before {
             assert_eq!(
                 std::fs::read(&path).unwrap(),
