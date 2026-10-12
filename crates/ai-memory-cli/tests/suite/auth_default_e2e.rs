@@ -15,6 +15,11 @@
 //! file, and it must behave exactly as before until `auth enable` opts it in.
 
 /// Spawns servers: seconds, not milliseconds, so the slow tier.
+// Unix only: Windows resolves the harness app-data folders (Zed, OpenClaw)
+// through known-folder lookups that ignore the sandbox's HOME/USERPROFILE,
+// so these flows cannot run hermetically there. The unit tests cover the
+// Windows rendering paths.
+#[cfg(unix)]
 mod slow {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::path::{Path, PathBuf};

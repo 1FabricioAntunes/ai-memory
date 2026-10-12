@@ -36,8 +36,14 @@ impl Sandbox {
         }
     }
 
+    /// The default data dir `setup` resolves in this home: macOS uses
+    /// `~/Library/Application Support`, other Unix the XDG data dir.
     fn data_dir(&self) -> PathBuf {
-        self.home.join(".local/share/ai-memory")
+        if cfg!(target_os = "macos") {
+            self.home.join("Library/Application Support/ai-memory")
+        } else {
+            self.home.join(".local/share/ai-memory")
+        }
     }
 
     /// Every file under the home with its contents, the database and logs
