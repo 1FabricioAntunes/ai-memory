@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--target-dir` leave the user rule alone. Unmanaged same-name files are
   refused without `--force`; `install-hooks` warns and keeps the hook file.
   `uninstall --only skills` and `--only hooks` remove the markered rule.
+  (#1228)
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,
