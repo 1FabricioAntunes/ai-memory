@@ -574,6 +574,91 @@ async fn concurrent_writes_to_one_path_supersede_rather_than_destroy() {
     );
 }
 
+/// The history readers behind the web page-history view: every version at a
+/// path, the overwritten one included, and nothing from another project or
+/// workspace at the same path. A foreign version id reads as `None`, the
+/// same as an unknown one.
+#[tokio::test]
+async fn page_history_keeps_the_overwritten_version_and_stays_in_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling".to_string(), None)
+        .await
+        .unwrap();
+    let far_ws = store
+        .writer
+        .get_or_create_workspace("far".to_string())
+        .await
+        .unwrap();
+    let far = store
+        .writer
+        .get_or_create_project(far_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+    let path = "notes/shared.md";
+    let first = store
+        .writer
+        .upsert_page(page(ws, proj, path, "Shared", "alice's text"))
+        .await
+        .unwrap();
+    let second = store
+        .writer
+        .upsert_page(page(ws, proj, path, "Shared", "carol's text"))
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .upsert_page(page(ws, sibling, path, "Shared", "sibling text"))
+        .await
+        .unwrap();
+    let far_id = store
+        .writer
+        .upsert_page(page(far_ws, far, path, "Shared", "far text"))
+        .await
+        .unwrap();
+
+    let history = store
+        .reader
+        .page_versions(ws, proj, path.to_string(), 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(history.total, 2);
+    let ids: Vec<_> = history.versions.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        [second, first],
+        "newest first, the overwritten one kept"
+    );
+    assert_eq!(history.versions[0].supersedes, Some(first));
+    assert!(history.versions[0].is_latest && !history.versions[1].is_latest);
+
+    let body = |version| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .page_version_body(ws, proj, path.to_string(), version)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(body(first).await.unwrap().body.contains("alice's text"));
+    assert_eq!(body(second).await.unwrap().supersedes, Some(first));
+    assert!(body(foreign).await.is_none(), "a sibling project's version");
+    assert!(body(far_id).await.is_none(), "another workspace's version");
+    assert!(
+        store
+            .reader
+            .page_version_body(ws, proj, "notes/other.md".to_string(), first)
+            .await
+            .unwrap()
+            .is_none(),
+        "a version under a path it does not belong to"
+    );
+}
+
 /// The batched path-existence probe the consolidation link guard validates
 /// proposed cross-scope wikilinks against (#1218): it reports exactly the
 /// paths with a latest row, in any input order, and never invents one.

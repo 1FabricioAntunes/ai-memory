@@ -11,6 +11,8 @@
 //! - `GET /`                              → project list (cards)
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
+//! - `GET /w/:workspace/:project/h/*path` → version history + unified diff
+//! - `GET /w/:workspace/:project/s/:session` → session timeline, paged
 //! - `GET /search?q=…`                    → FTS5 hit list
 //! - `GET /pending`                       → root-only pending-writes triage;
 //!   its buttons post to `/admin/pending-writes/*`, not to this crate
@@ -19,7 +21,8 @@
 //!
 //! The companion `api_router` exposes the same read-only data as JSON
 //! for custom frontends. It intentionally does not expose write/admin
-//! operations.
+//! operations. `clippy.toml` in this crate forbids the `Wiki` write and
+//! destructive methods, so read-only holds at lint time, not only by review.
 //!
 //! Theme follows `prefers-color-scheme` via the included Tailwind
 //! stylesheet; no JS toggle, no cookie.
@@ -30,6 +33,7 @@ use ai_memory_store::ReaderPool;
 use ai_memory_wiki::Wiki;
 use axum::Router;
 
+mod diff;
 mod html_auth;
 mod markdown;
 pub mod mount;
@@ -76,6 +80,9 @@ pub fn favicon_router() -> Router {
 // public API; `extern crate self` lets them keep addressing it by crate name.
 #[cfg(test)]
 extern crate self as ai_memory_web;
+// The fixtures seed pages through `Wiki::write_page`, which `clippy.toml`
+// forbids in this crate's own code.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 #[path = "../tests/suite/mod.rs"]
 mod integration;

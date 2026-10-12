@@ -513,7 +513,17 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and FTS5 search. In rendered
+breadcrumbs, rendered markdown, metadata, and FTS5 search. Each page links
+to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version, newest
+first, with the author where the write was attributed, and a unified diff
+between any two of them (by default the latest against the version it
+replaced). A version another write replaced stays listed; an expired one does
+not, and a page whose TTL has passed has no history. The project page
+lists recent sessions, and each opens a timeline
+(`/web/w/<ws>/<proj>/s/<session-id>`) that pages through the session's
+captured observations in order, with first/prev/next/last links, a jump field
+and, when JavaScript runs, a slider and `j`/`k` keys to step one observation
+at a time. Observations are shown as plain text. In rendered
 pages, `[[wiki links]]` become clickable links to the target page.
 `[[path]]`, `[[path|label]]`, `[[project:path]]`,
 `[[workspace/project:path]]`, and `[[_global:path]]` are all supported

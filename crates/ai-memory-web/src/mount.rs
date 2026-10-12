@@ -1229,6 +1229,51 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // A page version and a session, so the history and timeline routes
+        // answer 200 rather than an error page.
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: ai_memory_core::PagePath::new("notes/a.md").unwrap(),
+                title: "A".into(),
+                body: "a".into(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let session = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
         let base_href = web_base_href("", "/web");
         let router = mount_web_router(
             axum::Router::new(),
@@ -1246,12 +1291,24 @@ mod tests {
             },
         )
         .unwrap();
-        for uri in ["/web", "/web/pending", "/web/login", "/api/v1/projects"] {
+        let session_uri = format!("/web/w/default/scratch/s/{session}");
+        for uri in [
+            "/web",
+            "/web/pending",
+            "/web/login",
+            "/api/v1/projects",
+            "/web/w/default/scratch/h/notes/a.md",
+            session_uri.as_str(),
+            "/api/v1/workspaces/default/projects/scratch/history/notes/a.md",
+        ] {
             let resp = router
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
+            if uri.contains("/h/") || uri.contains("/s/") || uri.contains("/history/") {
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
             let headers = resp.headers();
             assert_eq!(
                 headers.get("x-frame-options").map(|v| v.to_str().unwrap()),

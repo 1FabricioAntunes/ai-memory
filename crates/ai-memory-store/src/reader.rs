@@ -75,6 +75,25 @@ pub(crate) fn now_us() -> i64 {
     Timestamp::now().as_microsecond()
 }
 
+/// Visibility guard for the page-history readers ([`ReaderPool::page_versions`],
+/// [`ReaderPool::page_version_body`]). A version is hidden when its own TTL
+/// has passed, the same per-row [`not_expired`] rule the superseded-inclusive
+/// retrieval streams apply, and also when the live version at its path has
+/// expired: the forget sweep hard-deletes every row at that path, so the
+/// history of an expired page is as hidden as the page itself. The readers
+/// also report a `supersedes` link to a hidden version as `None`, so an
+/// expired version's id does not surface through its successor.
+fn history_visible(table: &str, now_param: &str) -> String {
+    format!(
+        "{per_row} AND NOT EXISTS (SELECT 1 FROM pages live \
+         WHERE live.workspace_id = {table}.workspace_id \
+           AND live.project_id = {table}.project_id \
+           AND live.path = {table}.path AND live.is_latest = 1 \
+           AND live.expires_at IS NOT NULL AND live.expires_at <= {now_param})",
+        per_row = not_expired(table, now_param),
+    )
+}
+
 /// Restrict `project_column` to the repositories `viewer` may read (#708).
 ///
 /// Returns a fragment to append to a `WHERE` clause and the values it binds,
@@ -979,6 +998,56 @@ pub struct StoredPageBody {
     pub tier: String,
     /// Whether the latest page row is pinned.
     pub pinned: bool,
+}
+
+/// Most versions [`ReaderPool::page_versions`] returns in one call.
+pub const PAGE_VERSIONS_MAX_LIMIT: usize = 200;
+
+/// One stored version of a page path, listed by [`ReaderPool::page_versions`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PageVersion {
+    /// This version's id (`pages.id`).
+    pub id: PageId,
+    /// The version this one replaced, if it replaced one.
+    pub supersedes: Option<PageId>,
+    /// Whether this is the live version of the path.
+    pub is_latest: bool,
+    /// Title stored on this version.
+    pub title: String,
+    /// Memory tier stored on this version.
+    pub tier: String,
+    /// ISO-8601 instant this version was written.
+    pub created_at: String,
+    /// Length of this version's body in characters.
+    pub body_chars: u64,
+    /// The user who wrote this version, when the write was attributed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<PageAuthor>,
+}
+
+/// One page of a path's version history, newest first.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageVersions {
+    /// Every version stored at the path.
+    pub total: u64,
+    /// The requested slice of versions.
+    pub versions: Vec<PageVersion>,
+}
+
+/// The stored content of one page version, read by
+/// [`ReaderPool::page_version_body`].
+#[derive(Debug, Clone)]
+pub struct PageVersionBody {
+    /// The version's id.
+    pub id: PageId,
+    /// The version this one replaced, if it replaced one.
+    pub supersedes: Option<PageId>,
+    /// Title stored on this version.
+    pub title: String,
+    /// Body stored on this version (markdown without frontmatter).
+    pub body: String,
+    /// ISO-8601 instant this version was written.
+    pub created_at: String,
 }
 
 /// Search hit with workspace/project names, used by the web UI to avoid
@@ -8877,6 +8946,165 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(row)
+        })
+        .await
+    }
+
+    /// List the stored versions of one fully scoped page path, newest first.
+    ///
+    /// Every row at the path is listed, superseded ones included, so a
+    /// version a concurrent write replaced stays visible (invariant #16).
+    /// The listing reads by `(workspace_id, project_id, path)` and nothing
+    /// else, so another project's rows at the same path never appear.
+    /// `limit` is clamped to `1..=`[`PAGE_VERSIONS_MAX_LIMIT`]; `total` counts
+    /// every visible version at the path. Bodies are not read, only their
+    /// length. Expired versions are hidden (see `history_visible`).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_versions(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<PageVersions> {
+        self.with_conn(move |conn| {
+            let now = now_us();
+            let total: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pages pg \
+                     WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.path = ?3{visible}",
+                    visible = history_visible("pg", "?4"),
+                ),
+                params![workspace_id.as_bytes(), project_id.as_bytes(), path, now],
+                |row| row.get(0),
+            )?;
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT pg.id, \
+                        (SELECT sp.id FROM pages sp WHERE sp.id = pg.supersedes{prev_visible}), \
+                        pg.is_latest, pg.title, pg.tier, \
+                        pg.created_at, length(pg.body), au.username, au.name, au.email \
+                 FROM pages pg \
+                 LEFT JOIN users au ON au.id = pg.author_id \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.path = ?3{visible} \
+                 ORDER BY pg.created_at DESC, pg.rowid DESC \
+                 LIMIT ?5 OFFSET ?6",
+                visible = history_visible("pg", "?4"),
+                prev_visible = history_visible("sp", "?4"),
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    path,
+                    now,
+                    limit.clamp(1, PAGE_VERSIONS_MAX_LIMIT) as i64,
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )?;
+            let mut versions = Vec::new();
+            for row in rows {
+                let (id, supersedes, is_latest, title, tier, created_us, chars, user, name, email) =
+                    row?;
+                versions.push(PageVersion {
+                    id: PageId::from_slice(&id)?,
+                    supersedes: supersedes.as_deref().map(PageId::from_slice).transpose()?,
+                    is_latest: is_latest != 0,
+                    title,
+                    tier,
+                    created_at: jiff::Timestamp::from_microsecond(created_us)
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_default(),
+                    body_chars: u64::try_from(chars).unwrap_or(0),
+                    author: user.map(|username| PageAuthor {
+                        username,
+                        name,
+                        email,
+                    }),
+                });
+            }
+            Ok(PageVersions {
+                total: u64::try_from(total).unwrap_or(0),
+                versions,
+            })
+        })
+        .await
+    }
+
+    /// Read one stored version of a page by id, only if it belongs to the
+    /// given `(workspace_id, project_id, path)`.
+    ///
+    /// A version id from another project, workspace or path returns `None`,
+    /// exactly like an unknown id, so a raw id cannot read across scopes. An
+    /// expired version (see `history_visible`) returns `None` the same way.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_version_body(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+        version: PageId,
+    ) -> StoreResult<Option<PageVersionBody>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    &format!(
+                        "SELECT pg.title, pg.body, pg.created_at, \
+                                (SELECT sp.id FROM pages sp \
+                                 WHERE sp.id = pg.supersedes{prev_visible}) \
+                         FROM pages pg \
+                         WHERE pg.id = ?1 AND pg.workspace_id = ?2 AND pg.project_id = ?3 \
+                           AND pg.path = ?4{visible}",
+                        visible = history_visible("pg", "?5"),
+                        prev_visible = history_visible("sp", "?5"),
+                    ),
+                    params![
+                        version.as_bytes(),
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        path,
+                        now_us()
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((title, body, created_us, supersedes)) = row else {
+                return Ok(None);
+            };
+            Ok(Some(PageVersionBody {
+                id: version,
+                supersedes: supersedes.as_deref().map(PageId::from_slice).transpose()?,
+                title,
+                body,
+                created_at: jiff::Timestamp::from_microsecond(created_us)
+                    .map(|ts| ts.to_string())
+                    .unwrap_or_default(),
+            }))
         })
         .await
     }

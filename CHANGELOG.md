@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added page history and session replay to the read-only web UI. Each page
+  links to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version,
+  newest first, superseded ones included, so a version a concurrent write
+  replaced stays visible, with timestamps and the author of attributed writes,
+  plus a server-side unified diff between any two versions (by default the
+  latest against the version it replaced). Expired versions are hidden, and a
+  page whose TTL has passed shows no history. The same data is available as JSON
+  at `GET /api/v1/workspaces/{ws}/projects/{proj}/history/{*path}`. The version
+  list is capped at 200 per request, and the diff refuses inputs over 512 KiB,
+  10,000 lines or 1,000 changed lines and stops at 2,000 output lines. The
+  project page lists recent sessions, and each opens a timeline
+  (`/web/w/<ws>/<proj>/s/<session-id>`) that pages through its observations in
+  capture order with first/prev/next/last links and a jump field; with
+  JavaScript, a slider and `j`/`k` keys step one observation at a time. It uses
+  the same readers, owner filter and caps as the `/api/v1` session routes, and
+  observations render as escaped text. Both views follow the per-project read
+  rule: a non-grantee of a restricted project gets a 403, and a version id or
+  session id from another project or workspace reads as not found. The
+  `ai-memory-web` crate now has a `clippy.toml` that forbids the `Wiki` write
+  and destructive methods, so a write path in the web UI or `/api/v1` fails
+  `cargo clippy -D warnings`.
 - Added an opt-in observation stream to `memory_query` ranking:
   `[retrieval] observation_stream = true` (env
   `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true`, default off). A zero-LLM

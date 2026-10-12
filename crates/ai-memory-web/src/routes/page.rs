@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
-    NamespaceView, NotFoundView, PageRow, PageView, humanize, page_href, project_href,
+    NamespaceView, NotFoundView, PageRow, PageView, history_href, humanize, page_href, project_href,
 };
 
 /// Handler for `GET /w/:workspace/:project/p/*path`.
@@ -73,6 +73,7 @@ pub(crate) async fn handler(
         },
     );
 
+    let history_href = history_href(&workspace, &project, &path);
     match (PageView {
         workspace,
         project,
@@ -87,6 +88,7 @@ pub(crate) async fn handler(
         supersedes_path,
         supersedes_href,
         body_html,
+        history_href,
         author_username,
         author_name,
         author_email,
@@ -162,7 +164,7 @@ pub(crate) fn refusal_response(refusal: &ai_memory_store::ScopeResolutionError) 
     }
 }
 
-fn not_found_response() -> Response {
+pub(crate) fn not_found_response() -> Response {
     let html = NotFoundView {}
         .render()
         .unwrap_or_else(|_| "<h1>Not found</h1>".to_owned());

@@ -1276,12 +1276,20 @@ embeddings spec, and is not covered by a live test against Copilot here.
   keeping deletes and semantic rewrites review-gated.
 * **Richer read surfaces for the web UI.** The multi-workspace read-only
   wiki browser shipped in `ai-memory-web` (`/web`: project list, page
-  tree, page view, search, and the root-only `/web/pending` triage page,
+  tree, page view, page history with a server-side unified diff, a paged
+  session timeline, search, and the root-only `/web/pending` triage page,
   whose approve and reject buttons post to the existing
   `/admin/pending-writes/*` routes). It stays read-only by design: the wiki is a
   machine-authored record, and a browser edit surface would break the
-  invariant the whole store rests on (#482). Better *reading* (richer
-  navigation, diff/history views, graph exploration) is open. See
+  invariant the whole store rests on (#482). The crate's `clippy.toml` forbids
+  the `Wiki` write and destructive methods there, so a write path fails
+  `cargo clippy -D warnings`. History reads every version at a path (`ReaderPool::page_versions`,
+  `page_version_body`, both keyed by workspace, project and path), so a version
+  a concurrent write replaced stays visible (invariant #16). TTL expiry still
+  applies: an expired version is neither listed nor readable by id, and a page
+  whose live version expired shows no history, since the forget sweep deletes
+  every row at its path. Better *reading*
+  (graph exploration, recall traces) is open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
 * **Real LongMemEval-S harness.** The recall-eval framework exists
   ([`crates/ai-memory-consolidate/tests/suite/recall_eval.rs`](../crates/ai-memory-consolidate/tests/suite/recall_eval.rs));

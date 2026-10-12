@@ -12,11 +12,15 @@ use ai_memory_store::ResolvedScope;
 
 use crate::state::WebState;
 use crate::templates::{
-    Folder, MailboxRow, PageRow, ProjectView, humanize, page_href, project_href,
+    Folder, MailboxRow, PageRow, ProjectView, SessionRow, humanize, page_href, project_href,
+    session_href,
 };
 
 /// Pending messages listed on the project page before it says there are more.
 const MAILBOX_LIMIT: usize = 5;
+
+/// Recent sessions listed on the project page.
+const SESSION_LIMIT: usize = 10;
 
 /// Leading body characters shown per message.
 const SNIPPET_CHARS: usize = 160;
@@ -25,6 +29,7 @@ const SNIPPET_CHARS: usize = 160;
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
 ) -> Response {
     let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
@@ -32,7 +37,8 @@ pub(crate) async fn handler(
         Ok(authorized) => authorized,
         Err(refusal) => return super::page::refusal_response(&refusal),
     };
-    render(&state, workspace, project, viewer_id, authorized)
+    let owner = super::api::owner_filter_for(actor);
+    render(&state, workspace, project, viewer_id, authorized, owner)
         .await
         .into_response()
 }
@@ -43,8 +49,9 @@ async fn render(
     project: String,
     viewer: Option<ai_memory_core::UserId>,
     authorized: Option<ResolvedScope>,
+    owner: ai_memory_core::OwnerFilter,
 ) -> Result<Html<String>, StatusCode> {
-    let (pages, (mailbox, mailbox_total)) = tokio::try_join!(
+    let (pages, (mailbox, mailbox_total), sessions) = tokio::try_join!(
         async {
             state
                 .reader
@@ -53,6 +60,7 @@ async fn render(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         },
         mailbox(state, &workspace, &project, viewer, authorized),
+        sessions(state, &workspace, &project, authorized, owner),
     )?;
 
     // Build sidebar folder trees (group by first path segment), split
@@ -131,6 +139,7 @@ async fn render(
         mailbox,
         mailbox_total,
         mailbox_capped,
+        sessions,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -191,6 +200,47 @@ async fn mailbox(
         })
         .collect();
     Ok((rows, total))
+}
+
+/// The project's most recent sessions, open ones included, through the same
+/// owner-filtered reader as `/api/v1/.../sessions`: a session another operator
+/// owns is not listed.
+async fn sessions(
+    state: &WebState,
+    workspace: &str,
+    project: &str,
+    authorized: Option<ResolvedScope>,
+    owner: ai_memory_core::OwnerFilter,
+) -> Result<Vec<SessionRow>, StatusCode> {
+    let Some(scope) = mailbox_scope(state, workspace, project, authorized).await? else {
+        return Ok(Vec::new());
+    };
+    let sessions = state
+        .reader
+        .sessions_for_scope(
+            scope.workspace_id,
+            scope.project_id,
+            owner,
+            true,
+            SESSION_LIMIT,
+            0,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(sessions
+        .into_iter()
+        .map(|s| {
+            let id = s.session_id.to_string();
+            SessionRow {
+                href: session_href(workspace, project, &id),
+                agent_kind: s.agent_kind,
+                short_id: crate::templates::short_id(&id),
+                observation_count: s.observation_count,
+                started_relative: humanize(&s.started_at),
+                open: s.ended_at.is_none(),
+            }
+        })
+        .collect())
 }
 
 /// The project whose pages this page lists, or `None` when there is none.
