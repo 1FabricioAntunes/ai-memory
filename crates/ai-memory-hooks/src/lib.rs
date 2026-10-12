@@ -56,7 +56,7 @@ pub use drop_list::IngestDropList;
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
     USER_PROMPT_EXCERPT_MAX_BYTES, agent_from_payload, cap_lifecycle_body_for_client,
-    hook_payload_context,
+    hook_payload_context, user_prompt_text,
 };
 pub use router::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
