@@ -4,6 +4,8 @@ The [README quick-start](../README.md#quick-start) covers the happy
 paths (Docker + Claude Code, Arch AUR, Fedora RPM, macOS menu bar app). This
 page covers everything else:
 
+- [One-step native install](#one-step-native-install-installsh--ai-memory-setup)
+  (`install.sh` + `ai-memory setup`, Linux and macOS, no root)
 - [Server on a different machine](#server-on-a-different-machine)
   (homelab, LAN box, remote server)
 - [Configuring the CLI URL and auth](#configuring-the-cli-url-and-auth)
@@ -50,6 +52,105 @@ Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
 > engine's rootless and SELinux state.
 
 ---
+
+## One-step native install (`install.sh` + `ai-memory setup`)
+
+On Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel), two commands go
+from nothing to a running server with your agents wired. Neither needs root.
+
+```bash
+curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh
+ai-memory setup
+```
+
+`install.sh` is published with every release, next to its own
+`install.sh.sha256`. It picks `ai-memory-<os>-<arch>.tar.gz` for the machine,
+downloads it with its `.sha256` file, and stops before unpacking anything when
+the checksum file is missing, names another asset, or does not match. It also
+refuses an archive holding an absolute or `..` path. The release goes to
+`~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
+binary, so the bundled `hooks/` directory sits beside it and
+`ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
+is not such a link (the Docker wrapper, a hand-built binary) is left alone and
+the script exits. The whole script runs from one function called on its last
+line, so a download cut short runs nothing. To read it before running it:
+
+```bash
+curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh
+curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh.sha256
+sha256sum -c install.sh.sha256   # macOS: shasum -a 256 -c install.sh.sha256
+sh install.sh
+```
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AI_MEMORY_VERSION` | latest | Install this release, e.g. `2.7.0` |
+| `AI_MEMORY_BIN_DIR` | `~/.local/bin` | Where the `ai-memory` link goes |
+| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked |
+| `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
+| `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
+
+Windows is not covered by the script; use the zip in
+[`docs/windows.md`](windows.md).
+
+`ai-memory setup [--yes] [--agent <name>]... [--no-service]` runs, in order,
+the commands a native install otherwise needs one by one:
+
+1. `init`. On a fresh data dir this mints the root bearer token into
+   `<data_dir>/auth-tokens/default` (owner-only) and records
+   `[auth] bearer_token_file`, as described in
+   [`[auth]` root bearer](ARCHITECTURE.md#auth-root-bearer). An existing install
+   keeps its config and its auth posture; `ai-memory auth enable` is still the
+   opt-in for a token there.
+2. A per-user service running `serve --transport http --enable-web` on that
+   data dir and config: `~/.config/systemd/user/ai-memory.service` (or under
+   `$XDG_CONFIG_HOME`) on Linux, rendered from the packaged user unit, or
+   `~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist` on macOS,
+   rendered from the packaged LaunchAgent. The unit runs the binary `setup` ran
+   from. The step is skipped when a server already answers at the configured
+   URL and no unit of ours exists yet (Docker, a packaged system unit, a
+   foreground `serve`), when the configured server is not on this machine,
+   with `--no-service`, and on Windows.
+3. For each agent: `install-mcp --apply`, `install-hooks --apply` and
+   `install-skills --scope global`. With no `--agent`, `setup` wires every
+   harness whose session store or MCP config exists under your home, using the
+   same store locations as `doctor` (including `CLAUDE_CONFIG_DIR`,
+   `CODEX_HOME` and similar relocations). OpenCode 2 and the Kiro CLI v3
+   engine share a store with OpenCode and Kiro CLI, so they are wired only
+   when named, for example `--agent opencode2`.
+4. A self-check that writes nothing: `GET /healthz`, a `memory_status` call
+   over MCP with the install's credential, and `doctor`.
+
+Without `--yes`, `setup` prints this plan and asks on a terminal; with no
+terminal (a script, an agent's tool call) it changes nothing and exits
+non-zero, asking for `--yes`. Each step is idempotent: a second run rewrites no
+file and leaves a running service alone. A step that fails does not stop the
+others; `setup` lists each `problem:` at the end and exits non-zero. The token
+is never printed or passed on a command line, and no harness config holds it:
+hooks read the credential files `init` writes, and MCP clients reach the
+server through `ai-memory mcp-bridge`.
+
+`uninstall --apply` removes the hooks, MCP entries and skills `setup` wired,
+but not the service. Remove that by hand:
+
+```bash
+# Linux
+systemctl --user disable --now ai-memory.service
+rm ~/.config/systemd/user/ai-memory.service
+# macOS
+launchctl bootout "gui/$(id -u)/com.github.akitaonrails.ai-memory"
+rm ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist
+```
+
+An AI agent installing ai-memory for its user can follow
+[`INSTALL_FOR_AGENTS.md`](../INSTALL_FOR_AGENTS.md), which comes down to
+`ai-memory setup --yes --agent <self>`.
+
+`scripts/onboarding-acceptance.sh` measures this path in a clean temporary
+home against a locally built release: two commands, and about one second from
+the first command to a `memory_query` that returns a captured hook event (a
+debug build on a Linux workstation, local embeddings off so no model download
+is counted). The target is 60 seconds.
 
 ## Server on a different machine
 

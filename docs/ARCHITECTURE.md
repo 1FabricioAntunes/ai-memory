@@ -779,10 +779,24 @@ api-key                     export-okf           message
 doctor                      backfill             project
 reclaim-ledger-versions     repair-backfill-timestamps
 server                      backup-agents        restore-agents
-profile
+profile                     setup
 ```
 
 Run `ai-memory --help` for the full tree.
+
+`setup` is the one-step native install. It is a thin composition of existing
+library calls: `init` (which mints the root bearer on a fresh data dir), a
+per-user service rendered from `packaging/systemd/ai-memory-user.service` or
+the launchd LaunchAgent template with the running binary, data dir and config
+path filled in, then `install-mcp`, `install-hooks` and global
+`install-skills` for each agent named with `--agent` or detected from its
+session store or MCP config (the stores `doctor` scans). It finishes with a
+read-only self-check: `/healthz`, a `memory_status` call over MCP, and
+`doctor`. The service manager is reached through an injectable runner, so the
+unit rendering and the `systemctl`/`launchctl` calls are tested without a real
+session. Windows has no service step. A second run changes no file.
+`install.sh`, a release asset with its own `.sha256`, installs the release
+tarball under `~/.local` after checking it against the published checksum.
 
 `auth enable` turns on the root bearer for an install created before
 new installs got one; see [`[auth]` root bearer](#auth-root-bearer).

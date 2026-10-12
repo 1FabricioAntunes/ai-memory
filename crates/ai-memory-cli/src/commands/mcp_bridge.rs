@@ -80,7 +80,7 @@ fn upstream_error(error: ServiceError) -> McpError {
     }
 }
 
-fn upstream_config(
+pub(crate) fn upstream_config(
     server_url: &str,
     session_id: Option<&str>,
     auth_token: Option<&str>,

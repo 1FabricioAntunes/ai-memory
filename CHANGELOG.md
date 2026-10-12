@@ -40,6 +40,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry command. The page is read-only and is gated like `/web/pending`: on a
   multi-user server anonymous requests get a 401 and database users a 403. It
   never shows provider error text, page content or project names.
+- Added a two-command native install for Linux and macOS:
+  `curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh`,
+  then `ai-memory setup`. `install.sh` is a new release asset with its own
+  `install.sh.sha256`. It downloads the release tarball for the machine, checks
+  it against the published `.sha256` file and refuses to install when that file
+  is missing, names another asset or does not match, or when the archive holds
+  an absolute or `..` path. It unpacks under `~/.local/lib/ai-memory`, links
+  `~/.local/bin/ai-memory`, needs no root, leaves an existing non-link
+  `ai-memory` (such as the Docker wrapper) alone, and runs nothing when the
+  download is cut short. The new `ai-memory setup [--yes] [--agent <name>]...
+  [--no-service]` runs `init` (a fresh data dir gets the root bearer token),
+  installs and starts a per-user service rendered from the packaged systemd
+  user unit or launchd LaunchAgent with this install's binary, data dir and
+  config, wires MCP, hooks and global Agent Skills for each named or detected
+  agent, and ends with a read-only check of `/healthz`, `memory_status` and
+  `doctor`. It shows the plan and asks first; without a terminal it changes
+  nothing unless given `--yes`. A second run changes nothing. Windows has no
+  service step. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
+  ai-memory for its user, and `scripts/onboarding-acceptance.sh` measures the
+  path from a clean home to the first returned memory.
 - Added page history and session replay to the read-only web UI. Each page
   links to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version,
   newest first, superseded ones included, so a version a concurrent write

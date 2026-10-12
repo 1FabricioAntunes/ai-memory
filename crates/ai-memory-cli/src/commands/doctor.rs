@@ -282,6 +282,24 @@ pub(crate) fn relocated_session_dir(harness: ManagedHarness) -> Option<PathBuf> 
         .and_then(|plan| plan.session_dir)
 }
 
+/// [`relocated_session_dir`] reading the relocation variables through `env`,
+/// for `setup`, which reads the environment `Config::load` captured.
+pub(crate) fn relocated_session_dir_with(
+    harness: ManagedHarness,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    ai_memory_workstream::build_launch_plan_with_env_lookup(
+        harness,
+        None,
+        Vec::new(),
+        None,
+        |name: &str| env(name),
+        None,
+    )
+    .ok()
+    .and_then(|plan| plan.session_dir)
+}
+
 /// Harnesses whose native "memory" store location is known, so `doctor` can
 /// report on it (harness-issue #1003). Only Claude Code's is established
 /// today — `~/.claude/projects/<project>/memory/`, found via
