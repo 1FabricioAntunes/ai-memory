@@ -484,7 +484,12 @@ The **nearest** `.ai-memory.toml` is authoritative; marker sections do not
 merge. A missing `[capture]` section or `ignore_paths = []` is inactive and
 preserves current behavior. `[capture]` accepts only `ignore_paths`: unknown
 keys, invalid types/globs/roots, unreadable markers, or a marker over 64 KiB
-invalidate the whole capture policy rather than partially applying it.
+invalidate the whole capture policy rather than partially applying it. Any
+TOML spelling of the table works (`[ capture ]`, `["capture"]`, or a top-level
+dotted `capture.ignore_paths = [...]`), and the shapes TOML does not make a
+plain table (an inline `capture = { ignore_paths = [...] }`, `[[capture]]`, a
+`[capture.x]` subtable, a second `[capture]`) are invalid. The native hook and
+the generated TypeScript integrations reach the same decision for each.
 
 Patterns match an entire lexically normalized path, not a substring. Use only
 `*`, `?`, and `**`; relative patterns are rooted at the marker directory,
@@ -494,6 +499,12 @@ POSIX matching is case-sensitive; Windows drive/UNC matching is ASCII
 case-insensitive. Bounds are 128 patterns, 1,024 characters per pattern, 32
 direct candidates and 4,096 characters per candidate, and 1,000,000 bounded
 pattern/candidate comparisons.
+
+A `**/` matches one or more directories, never zero, unlike `.gitignore`:
+`**/.env` matches `sub/.env` but not the `.env` at the marker directory, and
+`docs/**/x.md` does not match `docs/x.md`. List both forms when you mean both
+(`[".env", "**/.env"]`). A trailing `/**` does match the directory itself
+(`secrets/**` covers `secrets`).
 
 For fixture-proven direct file tools, ai-memory reads only explicit path fields
 and documented direct arrays for multi-file calls. If any candidate matches, the
@@ -606,8 +617,14 @@ also after options that take a value, as in `python3 -W ignore -c`) is
 **metadata-only** under an active policy
 unless one of its words names an ignored path outright, which drops it:
 code can build a path at run time (`'docs/' + name`), so no lexical match can
-rule one out. Running a script file or a module (`python3 -m pytest`,
-`node build.js`) is unaffected. Variables, command substitution, `cd` state, and
+rule one out. Hermes Agent's `execute_code` tool, which runs program source
+it is given, is metadata-only under an active policy for the same reason.
+Running a script file or a module (`python3 -m pytest`,
+`node build.js`) is unaffected. A shell command longer than 1 MiB (1,048,576
+characters, summed over the elements of an argument vector) is not read at
+all: it is metadata-only under an active policy, and its marker lookup
+(below) counts as unprovable, which makes it metadata-only even in a
+directory without a marker. Variables, command substitution, `cd` state, and
 commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
 their output is still captured. An invalid policy makes a shell command
 **metadata-only**, like a file tool, because a broken marker cannot prove its
@@ -617,6 +634,19 @@ generated integrations match file-tool and shell paths without regard to case
 (`NOTES/X.md` matches `notes/**`, `ÄRGER/x.md` matches `ärger/**`) and treat a
 decomposed accent like the composed letter, as its filesystem does; other POSIX
 hosts compare case-sensitively, and Windows paths always ignore ASCII case.
+
+In a Windows session (the event's `cwd` is a drive or UNC path), a file-tool
+path, shell argument or `workdir` is read as the file Windows opens, so other
+spellings of an ignored file match its pattern too: Git Bash, MSYS2 and Cygwin
+`/c/Users/me/repo/x` and `/cygdrive/c/...` are `C:\Users\me\repo\x`; a rooted
+path without a drive (`/repo/x`, `\repo\x`) is on the `cwd`'s drive; the
+`\\?\`, `\\.\` and `\??\` prefixes and the local administrative share
+(`\\localhost\C$\...`, `\\127.0.0.1\C$\...`) name the drive itself; an
+alternate data stream suffix (`private.md::$DATA`, `private.md:stream`) and the
+trailing dots and spaces of each segment (`private.md.`, `secrets. \x`) are
+dropped. Any other device path (`\\.\pipe\x`) makes a file tool
+metadata-only. None of this applies to a POSIX session, where `/c/x`, a
+trailing dot or a colon is part of the name.
 
 A checkout's exclusions protect its files wherever a call is made from. For
 every file-tool target (for `apply_patch`, the files its `*** Add File:`,
@@ -733,6 +763,13 @@ can be mentioned.
 - a value glued to a short flag is read after the flag's first letter only,
   not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
   are not decoded;
+- in a Windows session `/c/x` is read only as Git Bash reads it
+  (`C:\x`), so a native tool's reading of it (`C:\c\x`, under a one-letter
+  top-level directory) is not matched;
+- the generated TypeScript integrations check the `[capture]` table as
+  strictly as the native hook but do not validate the rest of the marker's
+  TOML, so a syntax error elsewhere in the file invalidates the policy only in
+  the native hook;
 - tools the matcher does not list keep their current behavior.
 
 For a project whose content must never be captured, use allowlist capture mode

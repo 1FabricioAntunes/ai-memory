@@ -646,22 +646,28 @@ impl CapturePolicy {
                         } else {
                             self.match_paths(paths, cwd)
                         };
+                        // A harness's saved copy of an earlier tool's output
+                        // is read back like `BashOutput`; past the budget
+                        // that check proves nothing either.
+                        let spooled = || -> Result<bool, ()> {
+                            let mut work = 0_usize;
+                            for path in paths {
+                                let readings = if extracted.globs {
+                                    normalize_readings(path, cwd).ok().flatten()
+                                } else {
+                                    normalize_candidate(path, cwd).map(|c| vec![c])
+                                };
+                                for candidate in readings.into_iter().flatten() {
+                                    if output_spool(&candidate.path, &mut work)? {
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                            Ok(false)
+                        };
                         match matched {
                             Ok(true) => (CaptureDisposition::Drop, ExtractionState::Extracted),
-                            // A harness's saved copy of an earlier tool's
-                            // output is read back like `BashOutput`.
-                            Ok(false)
-                                if paths.iter().any(|path| {
-                                    let readings = if extracted.globs {
-                                        normalize_readings(path, cwd).ok().flatten()
-                                    } else {
-                                        normalize_candidate(path, cwd).map(|c| vec![c])
-                                    };
-                                    readings.is_some_and(|readings| {
-                                        readings.iter().any(|c| output_spool(&c.path))
-                                    })
-                                }) =>
-                            {
+                            Ok(false) if spooled().unwrap_or(true) => {
                                 (CaptureDisposition::MetadataOnly, ExtractionState::Extracted)
                             }
                             Ok(false) => (CaptureDisposition::Keep, ExtractionState::Extracted),
@@ -672,6 +678,18 @@ impl CapturePolicy {
                         }
                     }
                 },
+                // Program source builds its paths at run time, like
+                // `python3 -c`, and a command longer than the matcher splits
+                // is not read at all; neither proves a miss.
+                ToolFamily::NonFile
+                    if extracted.inline_code
+                        || extracted
+                            .command
+                            .as_ref()
+                            .is_some_and(ShellCommand::oversized) =>
+                {
+                    (CaptureDisposition::MetadataOnly, extracted.state)
+                }
                 // A shell command has no path field, but its arguments can
                 // still name an ignored file whose content lands in the
                 // output (`cat docs/adr/*.md`). An exhausted match budget
@@ -767,7 +785,7 @@ impl CapturePolicy {
                         continue;
                     };
                     for candidate in readings {
-                        spool |= output_spool(&candidate.path);
+                        spool |= output_spool(&candidate.path, &mut work)?;
                         if self.match_pattern_candidate(&candidate, false, &mut work)? {
                             return Ok((true, spool));
                         }
@@ -980,6 +998,8 @@ struct Extracted<'a> {
     output_reader: bool,
     /// Claude Code's `PowerShell` tool.
     powershell: bool,
+    /// A non-file tool whose input is program source ([`INLINE_CODE_TOOL_NAMES`]).
+    inline_code: bool,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -1105,6 +1125,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         globs: name.eq_ignore_ascii_case("read_many_files"),
         output_reader: reads_earlier_output(name),
         powershell: name.eq_ignore_ascii_case("powershell"),
+        inline_code: family == ToolFamily::NonFile
+            && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
         call_id,
         state,
     }
@@ -1126,23 +1148,11 @@ fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
     family(name)
 }
 
-/// Tools that return output of a command started by an earlier call: Claude
-/// Code `BashOutput`/`TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw
-/// `process`, Copilot CLI `read_bash`/`write_bash` and their PowerShell twins.
-/// That command's own event may have been dropped, so its output must not
-/// come back through these.
+/// Whether a tool returns output of a command started by an earlier call
+/// ([`OUTPUT_READER_TOOL_NAMES`]). That command's own event may have been
+/// dropped, so its output must not come back through these.
 fn reads_earlier_output(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "bashoutput"
-            | "taskoutput"
-            | "write_stdin"
-            | "process"
-            | "read_bash"
-            | "write_bash"
-            | "read_powershell"
-            | "write_powershell"
-    )
+    OUTPUT_READER_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str())
 }
 
 /// Whether a normalized path is a file a harness saved a tool's output to and
@@ -1162,52 +1172,84 @@ fn reads_earlier_output(name: &str) -> bool {
 /// `tool-results`, `tasks`, `.output`, `opencode`, `tool-output`, `pi-bash-`)
 /// in literal text, so a bare `*` or `*/*`, or a `*.log` whose wildcard stands
 /// where `pi-bash-` would be, is never taken for a saved output file.
-fn output_spool(path: &str) -> bool {
+///
+/// Each segment is fitted against each shape at most once, so the work is
+/// linear in the path; it is charged to the caller's match budget (`work`,
+/// up to [`MAX_MATCH_WORK`]), and past it nothing is proven (`Err`).
+fn output_spool(path: &str, work: &mut usize) -> Result<bool, ()> {
     let segments: Vec<Vec<char>> = path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(|segment| segment.to_ascii_lowercase().chars().collect())
         .collect();
     let Some((file, directories)) = segments.split_last() else {
-        return false;
+        return Ok(false);
     };
-    let fits = |segment: &[char], shape: &str| {
-        globs_intersect(segment, &shape.chars().collect::<Vec<_>>())
+    let mut charge = |segment: &[char], shape: &str| -> Result<(), ()> {
+        *work = work
+            .checked_add((segment.len() + 1).saturating_mul(shape.chars().count() + 1))
+            .ok_or(())?;
+        if *work > MAX_MATCH_WORK {
+            Err(())
+        } else {
+            Ok(())
+        }
     };
-    let named = |segments: &[(&Vec<char>, &str)]| {
-        segments.iter().any(|(segment, word)| spells(segment, word))
+    let mut fits = |segment: &[char], shape: &str| -> Result<bool, ()> {
+        charge(segment, shape)?;
+        Ok(globs_intersect(segment, &shape.chars().collect::<Vec<_>>()))
     };
     let count = directories.len();
-    let claude_results = (1..count).any(|index| {
+    // `<..claude..>/projects/../tool-results/..`: whether some directory past
+    // `index` fits `tool-results`, and whether one that fits also spells it,
+    // each computed once for every `index` (`after[index]`).
+    let mut after: Option<Vec<(bool, bool)>> = None;
+    let mut claude_results = false;
+    for index in 1..count {
         let (claude, projects) = (&directories[index - 1], &directories[index]);
-        fits(claude, "*claude*")
-            && fits(projects, "projects")
-            && directories[index + 1..].iter().any(|results| {
-                fits(results, "tool-results")
-                    && named(&[
-                        (claude, "claude"),
-                        (projects, "projects"),
-                        (results, "tool-results"),
-                    ])
-            })
-    });
+        if !fits(claude, "*claude*")? || !fits(projects, "projects")? {
+            continue;
+        }
+        if after.is_none() {
+            let mut suffix = vec![(false, false); count];
+            let mut seen = (false, false);
+            for at in (0..count).rev() {
+                suffix[at] = seen;
+                let results = &directories[at];
+                if fits(results, "tool-results")? {
+                    seen = (true, seen.1 || spells(results, "tool-results"));
+                }
+            }
+            after = Some(suffix);
+        }
+        let (fitting, spelled) = after.as_ref().map_or((false, false), |after| after[index]);
+        if spelled || (fitting && (spells(claude, "claude") || spells(projects, "projects"))) {
+            claude_results = true;
+            break;
+        }
+    }
     let claude_task = count > 0 && {
         let parent = &directories[count - 1];
-        fits(parent, "tasks")
-            && fits(file, "*.output")
-            && directories.iter().any(|claude| {
-                fits(claude, "claude*")
-                    && named(&[(parent, "tasks"), (file, ".output"), (claude, "claude")])
-            })
+        fits(parent, "tasks")? && fits(file, "*.output")? && {
+            let named = spells(parent, "tasks") || spells(file, ".output");
+            let mut found = false;
+            for claude in directories {
+                if fits(claude, "claude*")? && (named || spells(claude, "claude")) {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
     };
     let opencode = count >= 2 && {
         let (data, output) = (&directories[count - 2], &directories[count - 1]);
-        fits(data, "opencode")
-            && fits(output, "tool-output")
-            && named(&[(data, "opencode"), (output, "tool-output")])
+        fits(data, "opencode")?
+            && fits(output, "tool-output")?
+            && (spells(data, "opencode") || spells(output, "tool-output"))
     };
-    let pi = fits(file, "pi-bash-*.log") && named(&[(file, "pi-bash-")]);
-    claude_results || claude_task || opencode || pi
+    let pi = fits(file, "pi-bash-*.log")? && spells(file, "pi-bash-");
+    Ok(claude_results || claude_task || opencode || pi)
 }
 
 /// Whether a one-segment glob spells part of `word` in literal text: some
@@ -1248,53 +1290,120 @@ fn globs_intersect(left: &[char], right: &[char]) -> bool {
     common[0][0]
 }
 
+/// Tool names (compared ASCII-lowercased) whose calls name the files they
+/// read or write. The generated TypeScript integrations embed this list, so
+/// the two front doors cannot drift apart. Gemini CLI's `read_many_files`
+/// reads every file its `include` globs expand to.
+pub const FILE_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "notebookedit",
+    "notebook_edit",
+    "create_file",
+    "delete_file",
+    "remove",
+    "rename_file",
+    "move_file",
+    "multi_edit",
+    "multiedit",
+    "replace",
+    "replace_all",
+    "view_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "write_to_file",
+    "fs_read",
+    "fs_write",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "patch",
+    "read_many_files",
+];
+
+/// Search and list tools, whose output under an active policy is dropped.
+/// Includes Gemini CLI's directory listing and the pre-rename name of its
+/// `grep_search` that it still accepts as an alias.
+pub const SEARCH_LIST_TOOL_NAMES: &[&str] = &[
+    "search",
+    "grep",
+    "glob",
+    "find",
+    "list",
+    "ls",
+    "list_files",
+    "read_dir",
+    "list_dir",
+    "grep_search",
+    "search_files",
+    "find_by_name",
+    "list_directory",
+    "search_file_content",
+];
+
+/// Tools that name no workspace file path of their own: shells (Claude Code's
+/// `PowerShell` beside `Bash` with the same `tool_input.command` field, #1186;
+/// Gemini CLI's `run_shell_command`, `{command, dir_path?}`) and the Hermes
+/// Agent tools that execute code, drive a browser, or fetch the web
+/// (agent/shell_hooks.py envelope; names from the model_tools registry,
+/// live-captured 2026-10-07). They are non-file rather than unknown because
+/// family `unknown` drops the tool output from observation bodies.
+pub const NON_FILE_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "shell",
+    "shell_command",
+    "exec",
+    "execute",
+    "run_command",
+    "web_search",
+    "search_web",
+    "manage_task",
+    "manage_subagents",
+    "terminal",
+    "execute_bash",
+    "execute_cmd",
+    "powershell",
+    "run_shell_command",
+    "execute_code",
+    "browser_exec",
+    "browser_navigate",
+    "web_extract",
+    "web_fetch",
+    "delegate_task",
+];
+
+/// Non-file tools whose input is program source (Hermes `execute_code`,
+/// `{"code": "..."}`): like `python3 -c`, it builds paths at run time, so
+/// nothing lexical proves it read no ignored file.
+pub const INLINE_CODE_TOOL_NAMES: &[&str] = &["execute_code"];
+
+/// Tools that return output of a command started by an earlier call: Claude
+/// Code `BashOutput`/`TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw
+/// `process`, Copilot CLI `read_bash`/`write_bash` and their PowerShell twins.
+pub const OUTPUT_READER_TOOL_NAMES: &[&str] = &[
+    "bashoutput",
+    "taskoutput",
+    "write_stdin",
+    "process",
+    "read_bash",
+    "write_bash",
+    "read_powershell",
+    "write_powershell",
+];
+
 fn family(name: &str) -> ToolFamily {
-    match name.to_ascii_lowercase().as_str() {
-        "read"
-        | "write"
-        | "edit"
-        | "apply_patch"
-        | "notebookedit"
-        | "notebook_edit"
-        | "create_file"
-        | "delete_file"
-        | "remove"
-        | "rename_file"
-        | "move_file"
-        | "multi_edit"
-        | "multiedit"
-        | "replace"
-        | "replace_all"
-        | "view_file"
-        | "replace_file_content"
-        | "multi_replace_file_content"
-        | "write_to_file"
-        | "fs_read"
-        | "fs_write" => ToolFamily::File,
-        "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
-        // Gemini CLI reads every file its `include` globs expand to.
-        "read_many_files" => ToolFamily::File,
-        "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
-        | "list_dir" | "grep_search" | "search_files" | "find_by_name" => ToolFamily::SearchList,
-        // Gemini CLI's directory listing, and the pre-rename name of its
-        // `grep_search` that it still accepts as an alias.
-        "list_directory" | "search_file_content" => ToolFamily::SearchList,
-        "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
-        | "search_web" | "manage_task" | "manage_subagents" | "terminal" | "execute_bash"
-        | "execute_cmd" => ToolFamily::NonFile,
-        // Claude Code on Windows exposes `PowerShell` beside `Bash`, with the
-        // same `tool_input.command` field (#1186).
-        "powershell" => ToolFamily::NonFile,
-        // Gemini CLI's shell tool, `{command, dir_path?}`.
-        "run_shell_command" => ToolFamily::NonFile,
-        // Hermes Agent tool surface (agent/shell_hooks.py envelope; tool
-        // names from model_tools registry, live-captured 2026-10-07). These
-        // execute code, drive a browser, or fetch the web — none touch
-        // workspace file paths, so they are non-file rather than unknown:
-        // family `unknown` drops the tool output from observation bodies.
-        "execute_code" | "browser_exec" | "browser_navigate" | "web_extract" | "web_fetch"
-        | "delegate_task" => ToolFamily::NonFile,
-        _ => ToolFamily::Unknown,
+    let name = name.to_ascii_lowercase();
+    let name = name.as_str();
+    if FILE_TOOL_NAMES.contains(&name) {
+        ToolFamily::File
+    } else if SEARCH_LIST_TOOL_NAMES.contains(&name) {
+        ToolFamily::SearchList
+    } else if NON_FILE_TOOL_NAMES.contains(&name) {
+        ToolFamily::NonFile
+    } else {
+        ToolFamily::Unknown
     }
 }
 fn canonical(family: ToolFamily) -> CanonicalTool {
@@ -1512,6 +1621,9 @@ pub fn capture_lookup_locations(
             }
         }
         (ToolFamily::NonFile, Some(command)) => {
+            if command.oversized() {
+                return None;
+            }
             let base = command_base(extracted.workdir.as_deref(), cwd);
             push(normalize_candidate(&base, &base))?;
             let home = home.and_then(|dir| normalize_root(dir).ok());
@@ -2001,6 +2113,16 @@ fn brace_overflow_could_leave(segment: &str) -> bool {
 /// The directory a shell tool's relative arguments resolve from: its own
 /// `workdir` (absolute, or relative to the `cwd`), else the `cwd`.
 fn command_base(workdir: Option<&str>, cwd: &str) -> String {
+    // A Windows shell's own spellings of its directory (`/c/x`, `\\?\C:\x`)
+    // must not turn the base, and every argument resolved from it, POSIX.
+    if let Some(dir) = workdir
+        && let Ok(root) = normalize_root(cwd)
+        && flavor_of(&root) == Flavor::Windows
+        && !is_drive_relative(dir)
+        && let Some(base) = windows_spelling(dir, &root)
+    {
+        return base;
+    }
     match workdir {
         Some(dir) if is_absolute(dir) => dir.to_owned(),
         // `join` would turn an unusable cwd into `/dir`.
@@ -2067,7 +2189,34 @@ struct ShellWords {
     expanded: Vec<(String, bool)>,
 }
 
+/// Longest shell command, in characters summed over its argv elements, the
+/// matcher splits. Splitting, matching and the marker-lookup scan are linear
+/// in the command (tens of milliseconds per MiB in a release build), but the
+/// hook reads an unbounded payload and only the glob walk is timed, so a
+/// longer command is unprovable: metadata-only under an active policy, and
+/// no marker lookup (the invalid-policy decision, metadata-only for a shell).
+pub const MAX_SHELL_COMMAND_CHARS: usize = 1024 * 1024;
+
 impl ShellCommand<'_> {
+    /// Longer than [`MAX_SHELL_COMMAND_CHARS`].
+    fn oversized(&self) -> bool {
+        let over = |text: &str| {
+            // Bytes bound characters from above, so most commands are cleared
+            // without counting.
+            text.len() > MAX_SHELL_COMMAND_CHARS && text.chars().count() > MAX_SHELL_COMMAND_CHARS
+        };
+        match self {
+            Self::Line(command) => over(command),
+            Self::Argv(items) => {
+                let mut total = 0_usize;
+                items.iter().any(|item| {
+                    total = total.saturating_add(item.chars().count());
+                    total > MAX_SHELL_COMMAND_CHARS
+                })
+            }
+        }
+    }
+
     #[cfg(test)]
     fn words(&self) -> Vec<String> {
         self.split(false)
@@ -3180,6 +3329,9 @@ fn candidate_raw(candidate: &str, cwd: &str) -> Option<(String, Flavor)> {
         return None;
     }
     let cwd = normalize_root(cwd).ok()?;
+    if flavor_of(&cwd) == Flavor::Windows {
+        return Some((windows_spelling(candidate, &cwd)?, Flavor::Windows));
+    }
     // Flavor must come from the host (the cwd), never from the candidate
     // string alone: on a POSIX host a leading `//` is an ordinary doubled
     // separator, not a UNC root, but `flavor_of` cannot tell the two apart
@@ -3201,6 +3353,88 @@ fn candidate_raw(candidate: &str, cwd: &str) -> Option<(String, Flavor)> {
     let flavor = flavor_of(&raw);
     Some((raw, flavor))
 }
+/// The absolute path Windows opens for `candidate` from the normalized
+/// Windows `cwd`, spelled with `/`, its `.` and `..` segments still in place.
+/// Every spelling of one file comes out the same, because an ignore pattern
+/// names only one of them:
+///
+/// - the Win32 device and NT prefixes `\\?\`, `\\.\` and `\??\` before a
+///   drive or `UNC\server\share`, and the administrative share of the local
+///   machine (`\\localhost\C$`, `\\127.0.0.1\C$`), name the drive or share
+///   itself; any other device (a volume GUID, a pipe) is no usable path;
+/// - Git Bash, MSYS2 and Cygwin spell `C:\x` as `/c/x` and `/cygdrive/c/x`;
+/// - any other rooted path (`/x`, `\x`) is on the cwd's drive or share;
+/// - Windows drops an alternate data stream suffix (`name:stream`,
+///   `name::$DATA`, the file's own content) and the trailing dots and spaces
+///   of every segment (`private.md.`, `secrets. `).
+///
+/// A native tool reads `/c/x` as `C:\c\x`; only the MSYS reading is kept, so
+/// a pattern under a one-letter top-level directory misses that spelling.
+fn windows_spelling(candidate: &str, cwd: &str) -> Option<String> {
+    let one_letter =
+        |segment: &str| segment.len() == 1 && segment.as_bytes()[0].is_ascii_alphabetic();
+    let mut path = candidate.replace('\\', "/");
+    if let Some(rest) = ["//?/", "//./", "/??/"]
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+    {
+        path = if let Some(unc) = rest
+            .get(..4)
+            .filter(|unc| unc.eq_ignore_ascii_case("unc/"))
+            .and_then(|_| rest.get(4..))
+        {
+            format!("//{unc}")
+        } else if valid_drive_prefix(rest) {
+            rest.to_owned()
+        } else {
+            return None;
+        };
+    }
+    if valid_drive_prefix(&path) && path.len() == 2 {
+        path.push('/');
+    }
+    if let Some(rest) = path.strip_prefix("//") {
+        let mut parts = rest.splitn(3, '/');
+        let (server, share) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        if (server.eq_ignore_ascii_case("localhost") || server == "127.0.0.1")
+            && share.len() == 2
+            && share.as_bytes()[0].is_ascii_alphabetic()
+            && share.as_bytes()[1] == b'$'
+        {
+            path = format!("{}:/{}", &share[..1], parts.next().unwrap_or(""));
+        }
+    } else if let Some(rest) = path.strip_prefix('/') {
+        let forward = candidate.starts_with('/');
+        let (first, after) = rest.split_once('/').unwrap_or((rest, ""));
+        let cygdrive = after.split_once('/').unwrap_or((after, ""));
+        path = if forward && one_letter(first) {
+            format!("{}:/{after}", first.to_ascii_uppercase())
+        } else if forward && first.eq_ignore_ascii_case("cygdrive") && one_letter(cygdrive.0) {
+            format!("{}:/{}", cygdrive.0.to_ascii_uppercase(), cygdrive.1)
+        } else {
+            let (root, _) = split_root(cwd)?;
+            format!("{}{path}", root.trim_end_matches('/'))
+        };
+    } else if !is_absolute(&path) {
+        path = join(cwd, &path);
+    }
+    let (root, tail) = split_root(&path)?;
+    let parts: Vec<&str> = tail.into_iter().filter_map(windows_segment).collect();
+    Some(join_segments(root, &parts))
+}
+
+/// One segment as Windows reads it ([`windows_spelling`]); `None` when nothing
+/// is left of it.
+fn windows_segment(segment: &str) -> Option<&str> {
+    let name = segment.split(':').next().unwrap_or(segment);
+    let unspaced = name.trim_end_matches(' ');
+    if unspaced == "." || unspaced == ".." {
+        return Some(unspaced);
+    }
+    let name = name.trim_end_matches(['.', ' ']);
+    (!name.is_empty()).then_some(name)
+}
+
 fn compile(
     config: &CaptureConfig,
     marker_dir: &str,
@@ -4508,6 +4742,201 @@ mod tests {
 
     /// The drop/keep tables live in the shared fixture so the generated
     /// TypeScript matcher runs the very same vectors (#961).
+    /// The shared Windows-spelling vectors. Adversarial: every Git Bash,
+    /// MSYS2, Cygwin, rooted, device, administrative-share, trailing
+    /// dot/space and alternate-data-stream spelling of an ignored file in a
+    /// Windows session drops, file tool or shell. Controls: the same names on
+    /// another drive or share, a longer name, and a POSIX session (where a
+    /// trailing dot, a colon or `/c/...` is part of the name) keep.
+    #[test]
+    fn windows_spelling_fixture_vectors() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
+        for name in ["windows", "windows_posix_controls"] {
+            let section = &fixture[name];
+            let cwd = section["cwd"].as_str().unwrap();
+            let config = CaptureConfig {
+                ignore_paths: section["ignore_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|pattern| pattern.as_str().unwrap().to_owned())
+                    .collect(),
+            };
+            let policy =
+                CapturePolicy::resolve_for_host(CaptureSource::Parsed(&config), cwd, None, false);
+            let shell = section["shell"].as_array().cloned().unwrap_or_default();
+            let files = section["files"].as_array().unwrap().iter().map(|vector| {
+                (
+                    json!({"tool": "edit", "args": {"path": vector["path"]}}),
+                    vector,
+                )
+            });
+            let commands = shell.iter().map(|vector| {
+                let payload = vector.get("payload").cloned().unwrap_or_else(
+                    || json!({"tool": "bash", "args": {"command": vector["command"]}}),
+                );
+                (payload, vector)
+            });
+            for (payload, vector) in files.chain(commands) {
+                let decision = policy.inspect(AgentKind::OpenCode, &payload, cwd);
+                assert_eq!(
+                    serde_json::to_value(decision.protocol().disposition()).unwrap(),
+                    vector["disposition"],
+                    "{name}: {vector}"
+                );
+            }
+        }
+    }
+
+    /// Native and generated TypeScript classify every tool name alike; the
+    /// TypeScript lists are generated from these constants.
+    #[test]
+    fn tool_family_fixture_vectors() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
+        for vector in fixture["tool_families"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            assert_eq!(
+                serde_json::to_value(family(name)).unwrap(),
+                vector["family"],
+                "{name}"
+            );
+        }
+    }
+
+    /// Adversarial: a path of thousands of `*` segments used to cost a
+    /// quadratic number of allocating glob intersections outside any budget
+    /// (~400 ms for one, 14 s for 32). The check is linear, charged to the
+    /// match budget, and a call past the budget fails closed. Controls: a
+    /// real spool path is still found, and one long path or 32 short ones
+    /// keep.
+    #[test]
+    fn output_spool_work_is_linear_and_budgeted() {
+        let path = format!("/tmp/{}x", "*/".repeat(2040));
+        let mut work = 0;
+        assert_eq!(output_spool(&path, &mut work), Ok(false));
+        assert!(
+            work <= 64 * path.len(),
+            "spool work {work} for {} chars",
+            path.len()
+        );
+        assert_eq!(
+            output_spool("/home/u/.claude/projects/p/s/tool-results/a.txt", &mut 0),
+            Ok(true)
+        );
+        assert_eq!(output_spool(&path, &mut MAX_MATCH_WORK.clone()), Err(()));
+        // A two-character pattern keeps the path match itself under budget
+        // (natively and in the generated TypeScript), so only the spool check
+        // can run out.
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["/s".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let read = |paths: &[String]| {
+            policy
+                .inspect(
+                    AgentKind::ClaudeCode,
+                    &json!({"tool_name": "Read", "tool_input": {"paths": paths}}),
+                    "/repo",
+                )
+                .protocol()
+                .disposition()
+        };
+        let long: Vec<String> = (0..32)
+            .map(|i| format!("/tmp/{i}/{}x", "*/".repeat(2000)))
+            .collect();
+        assert_eq!(read(&long), CaptureDisposition::MetadataOnly);
+        assert_eq!(read(&long[..1]), CaptureDisposition::Keep);
+        let short: Vec<String> = (0..32).map(|i| format!("/tmp/{i}/x")).collect();
+        assert_eq!(read(&short), CaptureDisposition::Keep);
+    }
+
+    /// A command longer than [`MAX_SHELL_COMMAND_CHARS`] is not split: it is
+    /// metadata-only under a policy and its marker lookup is unprovable.
+    /// Controls: one character shorter keeps and is looked up, and without a
+    /// policy nothing changes.
+    #[test]
+    fn an_oversized_shell_command_is_unprovable() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let at_limit = format!("cat public.md{}", " ".repeat(MAX_SHELL_COMMAND_CHARS - 13));
+        let over = format!("{at_limit} ");
+        let bash = |command: &str| json!({"tool_name": "Bash", "tool_input": {"command": command}});
+        let decide = |policy: &CapturePolicy, raw: &Value| {
+            policy
+                .inspect(AgentKind::ClaudeCode, raw, "/repo")
+                .protocol()
+                .disposition()
+        };
+        assert_eq!(decide(&policy, &bash(&at_limit)), CaptureDisposition::Keep);
+        assert_eq!(
+            decide(&policy, &bash(&over)),
+            CaptureDisposition::MetadataOnly
+        );
+        let argv =
+            json!({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", at_limit]}});
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &argv, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+        assert_eq!(
+            decide(&CapturePolicy::inactive(), &bash(&over)),
+            CaptureDisposition::Keep
+        );
+        assert!(
+            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&over), "/repo", None).is_none()
+        );
+        assert!(
+            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&at_limit), "/repo", None)
+                .is_some()
+        );
+    }
+
+    /// Hermes `execute_code` runs program source, which names its paths at
+    /// run time: metadata-only under an active or broken policy, untouched
+    /// without one. Control: a browser tool keeps.
+    #[test]
+    fn inline_code_tools_are_unprovable_under_a_policy() {
+        let raw = json!({"tool_name": "execute_code", "tool_input": {"code": "print(open('secret/a.txt').read())"}});
+        let active = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let invalid = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        for (policy, expected) in [
+            (&active, CaptureDisposition::MetadataOnly),
+            (&invalid, CaptureDisposition::MetadataOnly),
+            (&CapturePolicy::inactive(), CaptureDisposition::Keep),
+        ] {
+            let decision = policy.inspect(AgentKind::Hermes, &raw, "/repo");
+            assert_eq!(decision.protocol().disposition(), expected);
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::NonFile);
+        }
+        let browse = json!({"tool_name": "browser_navigate", "tool_input": {"url": "https://example.com/secret/a"}});
+        assert_eq!(
+            active
+                .inspect(AgentKind::Hermes, &browse, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
     #[test]
     fn shell_fixture_vectors() {
         let fixture: Value =
@@ -5547,7 +5976,7 @@ mod tests {
             "/data/*/t*/tool_01",
             "/home/me/.c*/p*/x/s/t*/a.txt",
         ] {
-            assert!(!output_spool(path), "{path}");
+            assert_eq!(output_spool(path, &mut 0), Ok(false), "{path}");
         }
         for path in [
             "/tmp/pi-*",
@@ -5557,7 +5986,7 @@ mod tests {
             "/data/*/tool-*/tool_01",
             "/tmp/c*/x/s/tasks/*",
         ] {
-            assert!(output_spool(path), "{path}");
+            assert_eq!(output_spool(path, &mut 0), Ok(true), "{path}");
         }
     }
 

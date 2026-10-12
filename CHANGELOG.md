@@ -76,6 +76,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads is metadata-only, and a backslash escape inside a default is read. A
   quoted `~` (`git commit -m "fix ~approx"`) is no longer treated as a home
   or user directory, so such commands are kept again.
+  In a Windows session, Git Bash, MSYS2 and Cygwin spellings (`/c/...`,
+  `/cygdrive/c/...`), a rooted path without a drive, the `\\?\`, `\\.\` and
+  `\\localhost\C$` prefixes, an alternate data stream suffix and trailing dots
+  or spaces are read as the file they open, so they no longer slip past a
+  pattern. Hermes `execute_code` is metadata-only under an active policy, like
+  `python3 -c`, and a shell command longer than 1 MiB is metadata-only instead
+  of being split. The generated TypeScript integrations now read a dotted
+  `capture.ignore_paths` key and quoted `[capture]` headers, reject the shapes
+  the native hook rejects (an inline `capture = { ... }` table among them),
+  recognize the same file tools (`read_file`, `patch`, `fs_read`, ...), and stop
+  reading a directory at the walk's entry bound. Checking a path of thousands
+  of wildcard segments for a saved output file no longer takes seconds.
   This applies to the native hook, the server, and the
   generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
 - Fixed `ai-memory backfill`, including the automatic first-boot import, and

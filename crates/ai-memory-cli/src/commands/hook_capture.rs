@@ -1290,6 +1290,47 @@ mod tests {
         assert!(read_capture_config(&marker).is_err());
     }
 
+    /// Every TOML spelling of `[capture]` the native parser honours, and the
+    /// ones it rejects, from the shared fixture the generated TypeScript
+    /// reader's Node runtime evidence runs too: a dotted top-level key or a
+    /// quoted table name must not escape either reader, and a shape toml_edit
+    /// rejects (an inline table, `[[capture]]`) fails closed in both.
+    #[test]
+    fn capture_section_spellings_match_toml_semantics() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../ai-memory-hooks/tests/fixtures/capture-policy.json"
+        ))
+        .unwrap();
+        let spellings = &fixture["marker_spellings"];
+        let texts = |kind: &str| {
+            spellings[kind]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|text| text.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let read = |text: &str| {
+            std::fs::write(&marker, text).unwrap();
+            read_capture_config(&marker).map(|config| config.ignore_paths)
+        };
+        for honoured in texts("honoured") {
+            assert_eq!(
+                read(&honoured),
+                Ok(vec!["secret/**".to_owned()]),
+                "{honoured}"
+            );
+        }
+        for rejected in texts("rejected") {
+            assert!(read(&rejected).is_err(), "{rejected}");
+        }
+        for unrelated in texts("unrelated") {
+            assert_eq!(read(&unrelated), Ok(Vec::new()), "{unrelated}");
+        }
+    }
+
     #[test]
     fn canonical_context_matches_supported_routing_shapes() {
         let agy =
