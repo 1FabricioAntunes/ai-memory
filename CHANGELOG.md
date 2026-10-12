@@ -159,6 +159,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses `--apply`. (#1193)
 
 ### Changed
+- Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
+  Code, Goose, Qwen Code and OpenHuman in `docs/install.md`, and listed them
+  in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
+  the client's own documentation at a named version and has not yet been run
+  end to end. Aider is not listed because it has no MCP support.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites

@@ -3,6 +3,10 @@
 For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
 It shows direct MCP writes, queries and handoffs without a native hook adapter.
 
+Factory Droid, Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
+`install-mcp` client; their hand-written recipes are in
+[`install.md`](install.md#clients-without-an-install-mcp-writer).
+
 > All snippets below default to `http://127.0.0.1:49374` (local server). For a
 > remote server (homelab, LAN box) substitute the appropriate URL AND add an
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
