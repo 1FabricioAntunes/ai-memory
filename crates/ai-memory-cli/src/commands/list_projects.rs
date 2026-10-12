@@ -6,13 +6,25 @@
 //! use of that endpoint is folded into an interactive picker and silently
 //! falls back to client-local scan results when the server call fails, so it
 //! was never a plain, scriptable listing on its own.
+//!
+//! `/api/v1/projects` is mounted only by `serve --enable-web`, so a 404 there
+//! falls back to the always-mounted `GET /admin/projects`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::Deserialize;
 
 use crate::cli::ListProjectsArgs;
 use crate::commands::show::ProjectRow;
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json};
+use crate::http_client::{ServerEndpoint, ServerResponseError, get_json};
+
+const WEB_PROJECTS_PATH: &str = "/api/v1/projects";
+const ADMIN_PROJECTS_PATH: &str = "/admin/projects";
+
+#[derive(Debug, Deserialize)]
+struct AdminProjectList {
+    projects: Vec<ProjectRow>,
+}
 
 pub async fn run(config: &Config, args: ListProjectsArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -31,16 +43,55 @@ async fn fetch_sorted(
     endpoint: &ServerEndpoint,
     workspace: Option<&str>,
 ) -> Result<Vec<ProjectRow>> {
-    let query = workspace
-        .filter(|value| !value.is_empty())
-        .map_or_else(Vec::new, |workspace| vec![("workspace", workspace)]);
-    let mut rows: Vec<ProjectRow> = get_json(endpoint, "/api/v1/projects", &query).await?;
+    let workspace = workspace.map(str::trim).filter(|value| !value.is_empty());
+    let query = workspace.map_or_else(Vec::new, |workspace| vec![("workspace", workspace)]);
+    let mut rows = match get_json::<Vec<ProjectRow>>(endpoint, WEB_PROJECTS_PATH, &query).await {
+        Ok(rows) => rows,
+        Err(error) if is_not_found(&error) => fetch_from_admin(endpoint, workspace).await?,
+        Err(error) => return Err(error),
+    };
+    sort_rows(&mut rows);
+    Ok(rows)
+}
+
+async fn fetch_from_admin(
+    endpoint: &ServerEndpoint,
+    workspace: Option<&str>,
+) -> Result<Vec<ProjectRow>> {
+    let listing: AdminProjectList = get_json(endpoint, ADMIN_PROJECTS_PATH, &[])
+        .await
+        .with_context(|| {
+            format!(
+                "{WEB_PROJECTS_PATH} returned 404 (the server runs without `serve --enable-web`), \
+                 and the fallback {ADMIN_PROJECTS_PATH} also failed; restart the server with \
+                 `--enable-web`, or use a token the server accepts on admin routes"
+            )
+        })?;
+    Ok(keep_workspace(listing.projects, workspace))
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|response| response.status() == reqwest::StatusCode::NOT_FOUND)
+}
+
+fn keep_workspace(rows: Vec<ProjectRow>, workspace: Option<&str>) -> Vec<ProjectRow> {
+    match workspace {
+        Some(workspace) => rows
+            .into_iter()
+            .filter(|row| row.workspace_name == workspace)
+            .collect(),
+        None => rows,
+    }
+}
+
+fn sort_rows(rows: &mut [ProjectRow]) {
     rows.sort_by(|a, b| {
         a.workspace_name
             .cmp(&b.workspace_name)
             .then_with(|| a.project_name.cmp(&b.project_name))
     });
-    Ok(rows)
 }
 
 fn render_human(rows: &[ProjectRow]) -> String {
@@ -144,11 +195,7 @@ mod tests {
             row("alpha", "zeta", 1, None),
             row("default", "alpha", 1, None),
         ];
-        rows.sort_by(|a, b| {
-            a.workspace_name
-                .cmp(&b.workspace_name)
-                .then_with(|| a.project_name.cmp(&b.project_name))
-        });
+        sort_rows(&mut rows);
         let ordered: Vec<(&str, &str)> = rows
             .iter()
             .map(|r| (r.workspace_name.as_str(), r.project_name.as_str()))
@@ -157,5 +204,45 @@ mod tests {
             ordered,
             vec![("alpha", "zeta"), ("default", "alpha"), ("default", "zeta")]
         );
+    }
+
+    #[test]
+    fn a_404_from_the_web_route_triggers_the_admin_fallback() {
+        let error = crate::http_client::server_response_error_for_test(
+            reqwest::Method::GET,
+            WEB_PROJECTS_PATH,
+            reqwest::StatusCode::NOT_FOUND,
+            String::new(),
+        );
+        assert!(is_not_found(&error));
+    }
+
+    #[test]
+    fn other_failures_do_not_trigger_the_admin_fallback() {
+        let error = crate::http_client::server_response_error_for_test(
+            reqwest::Method::GET,
+            WEB_PROJECTS_PATH,
+            reqwest::StatusCode::UNAUTHORIZED,
+            String::new(),
+        );
+        assert!(!is_not_found(&error));
+        assert!(!is_not_found(&anyhow::anyhow!("connection refused")));
+    }
+
+    #[test]
+    fn admin_listing_parses_the_wrapped_project_rows() {
+        let body = r#"{"projects":[{"workspace_name":"default","project_name":"acme-api","page_count":3,"last_updated":null}]}"#;
+        let listing: AdminProjectList = serde_json::from_str(body).expect("admin listing");
+        assert_eq!(listing.projects.len(), 1);
+        assert_eq!(listing.projects[0].project_name, "acme-api");
+    }
+
+    #[test]
+    fn keep_workspace_filters_only_when_a_workspace_is_given() {
+        let rows = vec![row("default", "a", 1, None), row("team", "b", 1, None)];
+        assert_eq!(keep_workspace(rows.clone(), None).len(), 2);
+        let kept = keep_workspace(rows, Some("team"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].project_name, "b");
     }
 }
