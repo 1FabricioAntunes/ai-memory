@@ -72,6 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still stops the resumed session from taking a second baton. Covered by an
   adversarial integration test in `multi_session.rs` and a unit test on the
   predicate itself.
+- Fixed agents filing cross-project reports as wiki pages. Asked to "send a
+  report to the ai-memory inbox", an agent wrote pages into the target
+  project with `memory_write_page` instead of calling
+  `memory_message_send`, and the report never existed as a message. The
+  always-visible surfaces now carry the channel contrast in both
+  directions: `memory_message_send`'s tool description and its
+  MEMORY_INSTRUCTIONS bullet name the trigger phrasing ("send a report",
+  "notify", "leave a message for") and state it is the only tool that lands
+  in a project's inbox; `memory_write_page`'s description and bullet say a
+  page is not a message and redirect messaging to `memory_message_send`.
+  The routing snippet (full and compact) gained the same contrast, the
+  `memory_message_pop` bullet now forbids guessing the inbox's project
+  name, and `docs/agent-messaging.md` states the distinction.
 
 ## [2.6.3] - 2026-10-09
 

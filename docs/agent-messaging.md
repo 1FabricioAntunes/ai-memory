@@ -28,6 +28,13 @@ ever sees mail addressed **to** it (its inbox) or sent **from** it (its outbox).
 - **Bounded.** Each recipient inbox holds at most 256 pending messages; a full
   inbox rejects new sends.
 
+A wiki page is not a message. `memory_message_send` is the only thing that
+lands in a project's inbox; writing a page into the target project with
+`memory_write_page` stores knowledge there but is never surfaced as mail, so
+a "report" delivered as a page sits unread. When the ask is to send, notify,
+or leave a message for the agent in another project, use
+`memory_message_send` — never a wiki page.
+
 ## Using it from an agent (MCP — the primary path)
 
 Four MCP tools (documented in the installed `ai-memory-messaging` skill):
