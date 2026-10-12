@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the cross-project profile harvester treating pages the auto-improve
+  scheduler auto-approved as curated human input: model output nobody
+  reviewed fed the profile like a hand-written rule. A page stamped from an
+  auto-improve proposal is now skipped when the proposal's decider is the
+  scheduler's auto-approve actor; a page a human approved still counts, and a
+  page whose proposal id resolves to no row (legacy or imported) stays
+  curated. (#1211)
 - Fixed consolidation inventing `[[_global:…]]` and `[[project:…]]` wikilinks to
   pages that never existed, which `ai-memory lint` then reported as
   `broken_link`. The single, batch and bootstrap prompts told the model that a

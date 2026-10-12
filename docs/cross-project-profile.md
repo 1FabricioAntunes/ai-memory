@@ -181,7 +181,9 @@ is new since the last one.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
   `procedures/`. A page contributes its `summary`, or else its first line of
   prose; metadata fields such as `**Status:** Accepted` or `**Date:**` at the
-  top of an ADR are skipped.
+  top of an ADR are skipped. A page the auto-improve scheduler auto-approved
+  is skipped too: model output nobody reviewed is not curated, but a page a
+  human approved still counts.
 - **Stack signals**: the languages the project's activity shows (from file
   names such as `Cargo.toml` and source extensions).
 
