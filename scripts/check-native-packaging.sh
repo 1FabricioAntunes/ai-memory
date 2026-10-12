@@ -149,6 +149,9 @@ main() {
   token_home="${TMP_ROOT}/token-home"
   bind_dir="${TMP_ROOT}/bind-data"
   mkdir -p "${token_home}" "${bind_dir}"
+  # An explicit env token wins over the volume copy, so a contributor shell
+  # that exports one would hide the hand-off this section checks.
+  unset AI_MEMORY_AUTH_TOKEN
   cat >"${token_docker}" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
