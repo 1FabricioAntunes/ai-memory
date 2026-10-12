@@ -299,3 +299,27 @@ async fn a_live_session_without_a_page_still_reaches_the_raw_fallback() {
     assert_eq!(raw.len(), 1, "{payload}");
     assert_eq!(raw[0]["id"], seeded.observation_id.as_str());
 }
+
+/// `explain=true` times the observation stream exactly when it runs, and a
+/// query without explain carries no timings at all.
+#[tokio::test]
+async fn explain_timings_follow_the_observation_stream() {
+    let on = seeded(true).await;
+    let payload = query(&on.router, args()).await;
+    assert!(
+        payload["timings"]["observation_ms"]
+            .as_f64()
+            .is_some_and(|ms| ms >= 0.0),
+        "{payload}"
+    );
+    let mut quiet = args();
+    quiet["explain"] = json!(false);
+    let payload = query(&on.router, quiet).await;
+    assert!(payload.get("timings").is_none(), "{payload}");
+
+    let off = seeded(false).await;
+    let payload = query(&off.router, args()).await;
+    let timings = payload["timings"].as_object().expect("timings");
+    assert!(timings.contains_key("fts_ms"), "{payload}");
+    assert!(!timings.contains_key("observation_ms"), "{payload}");
+}

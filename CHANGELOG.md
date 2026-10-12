@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `explain=true` reports an `observation` stream with the matched observation
   ids. Hits are still pages and nothing is written; sessions without a page
   keep the `raw_hits` fallback, and `global=true` search is unchanged.
+- Added a `timings` object to `memory_query` responses with `explain=true`:
+  each retrieval stream's wall time in milliseconds (`fts_ms`, `entity_ms`,
+  `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`), summed over `scopes`.
+  Streams that did not run are left out, and a query without `explain` reads
+  no clock for them.
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,
