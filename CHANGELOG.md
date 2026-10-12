@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Replaced the unmaintained YAML library (`serde_yaml` and its
-  `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr` for wiki
-  page frontmatter, in the server and in `ai-memory-importer`. Existing
-  frontmatter parses to the same values as before. One formatting change:
-  when a page is next saved, a frontmatter value that needs quoting (a title
-  containing `: `, for example) is written in double quotes instead of
-  single quotes.
+  `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
+  reads existing page frontmatter to exactly the same values as before. One
+  formatting change: when a page is next saved, a frontmatter value that needs
+  quoting (a title containing `: `, for example) is written in double quotes
+  instead of single quotes. `ai-memory-importer` reads three rare
+  hand-written forms differently: a numeric-looking `title` or tag such as
+  `007` is no longer used, a `!!timestamp`-tagged title fails that page's
+  import, and a custom-tagged title (`!foo x`) imports as its plain text.
 
 ## [2.6.5] - 2026-10-12
 
