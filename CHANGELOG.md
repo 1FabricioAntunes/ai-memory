@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed keyboard and screen reader support in the web UI. Every page now has
   a "Skip to content" link, the search fields have labels, and breadcrumbs
   are a labelled landmark that marks the current page. Footer text, page
-  paths and relative dates now meet AA contrast in both themes. (#NNNN)
+  paths and relative dates now meet AA contrast in both themes. (#1237)
 
 ## [2.6.5] - 2026-10-12
 
