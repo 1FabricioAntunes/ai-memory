@@ -341,6 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn grok_handoff_rule_names_the_use_tool_invocation_before_search_tool() {
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("use_tool"));
+        let qualified_at = GROK_HANDOFF_RULE_CONTENT
+            .find("ai-memory__memory_handoff_list")
+            .expect("the rule must hand Grok the qualified catalog key, not the bare tool name");
+        if let Some(search_at) = GROK_HANDOFF_RULE_CONTENT.find("search_tool") {
+            assert!(
+                qualified_at < search_at,
+                "the key must precede search_tool so the rule never reads as a discovery roundtrip"
+            );
+        }
+        assert!(
+            GROK_HANDOFF_RULE_CONTENT.contains("do not search the filesystem"),
+            "scope resolution must stay inside the current repository"
+        );
+    }
+
+    #[test]
     fn grok_handoff_rule_does_not_embed_a_handoff_peek() {
         for leak in [
             "📥",

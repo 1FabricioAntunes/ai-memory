@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
   so the model calls `memory_handoff_list` on the first turn. Grok discards
   SessionStart stdout, so that list is the first tool and PostToolUse still
-  claims the baton through GET `/handoff`. Project-scope Grok skills and
+  claims the baton through GET `/handoff`. The rule names Grok's invocation —
+  `use_tool` with the qualified catalog key `ai-memory__memory_handoff_list` —
+  because Grok reaches MCP tools only through that meta-tool, and keeps scope
+  resolution inside the current repository so it cannot consume the turn. Project-scope Grok skills and
   `--target-dir` leave the user rule alone. Unmanaged same-name files are
   refused without `--force`; `install-hooks` warns and keeps the hook file.
   `uninstall --only skills` and `--only hooks` remove the markered rule.

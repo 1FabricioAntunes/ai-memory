@@ -44,8 +44,10 @@ SessionStart stdout, so ai-memory does not auto-inject handoffs for them.
 SessionStart handoff injection works only for clients that consume startup-hook
 stdout (or their equivalent context-injection result). Grok's first-turn rule
 (`$GROK_HOME/rules/ai-memory-handoff.md`, installed with the Grok hooks and
-with global Grok skills) has the model call `memory_handoff_list` so the first
-`PostToolUse` can claim the baton; Zero must call `memory_handoff_list` then
+with global Grok skills) has the model call `memory_handoff_list` through
+`use_tool` with the qualified catalog key `ai-memory__memory_handoff_list`, so
+the first `PostToolUse` can claim the baton; Zero must call
+`memory_handoff_list` then
 `memory_handoff_accept` when resuming.
 
 Capture exclusions are separate from MCP registration. Native hook commands and
@@ -998,7 +1000,9 @@ first `PostToolUse` (`additionalContext` after the tool result). Grok
 ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
 so those events do not accept the handoff. `--apply` also writes
 `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
-so the first turn calls `memory_handoff_list`; PostToolUse then claims the row.
+so the first turn calls `memory_handoff_list` through `use_tool` with the
+qualified catalog key `ai-memory__memory_handoff_list` (Grok exposes MCP tools
+only through that meta-tool); PostToolUse then claims the row.
 
 **Config file:** `install-mcp --client grok --apply` writes the user config at
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`). To use a project or

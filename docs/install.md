@@ -1735,7 +1735,10 @@ captures lifecycle events.
 Grok ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
 so those hooks do not accept the handoff. `install-hooks --agent grok --apply`
 also writes `$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
-`memory_handoff_list`. The first `PostToolUse` prints
+`memory_handoff_list`. Grok reaches MCP tools only through its `use_tool`
+meta-tool, so the rule hands the model the qualified catalog key
+`ai-memory__memory_handoff_list` instead of leaving it to `search_tool`. The
+first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
 `[briefing]`). The model sees it after that tool result. A session with no
 tool call and without that rule leaves the handoff for
