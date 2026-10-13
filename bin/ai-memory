@@ -18,6 +18,12 @@
 #   ai-memory mcp-bridge ...  Run the session-aware MCP bridge through that
 #                           client: its --server-url loopback only resolves on
 #                           the host, never inside the helper container.
+#   ai-memory hook ...      Run lifecycle hooks (and the hidden hook-drain)
+#                           through that client: they target the host's
+#                           loopback server, read host markers and spool, and
+#                           must stay inside the hook time bound. If the
+#                           client is unavailable the event is dropped and
+#                           the hook still exits 0.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         container image (default: docker.io/akitaonrails/ai-memory:latest)
@@ -597,6 +603,21 @@ case "${1:-}" in
     # the same checksum-verified native client install-hooks uses.
     NATIVE_HOST_BIN=$(native_host_binary)
     exec "${NATIVE_HOST_BIN}" "$@"
+    ;;
+  hook | hook-drain)
+    # Lifecycle hooks are client-side for the same reason as mcp-bridge: the
+    # default hook URL is the host's loopback server, and the cwd, marker
+    # files, capture exclusions and hook spool all live on the host. A helper
+    # container would also cost ~280 ms per event, past the hook time bound.
+    # Resolve the same native client mcp-bridge uses and never fall back to the
+    # container. If that client is unavailable, native_host_binary has already
+    # said why on stderr; drop this one event and exit 0 so the agent is never
+    # blocked or shown a failing hook.
+    if NATIVE_HOST_BIN=$(native_host_binary) && [ -x "${NATIVE_HOST_BIN}" ]; then
+      exec "${NATIVE_HOST_BIN}" "$@"
+    fi
+    echo "ai-memory: native host client unavailable; lifecycle hook event not captured" >&2
+    exit 0
     ;;
 esac
 

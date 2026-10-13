@@ -27,6 +27,14 @@ and [0.x](docs/changelog/0.x.md).
   that is being deleted, so the queue-file guard failed with `inspect
   relay.sqlite-journal: Access is denied`. The guard now retries that answer
   for up to about 100 ms; a file that stays unreadable is still refused.
+- Fixed `ai-memory hook` running inside a helper container on Docker-wrapper
+  installs (Linux/macOS). A hook config or plugin that called the wrapper paid
+  about 280 ms per event, over the 200 ms hook budget, and its default
+  `127.0.0.1` server URL pointed at the container instead of the host server.
+  The wrapper now runs `hook` and `hook-drain` through the same
+  checksum-verified native host client as `mcp-bridge` and `install-hooks`.
+  When that client is unavailable, the wrapper reports why on stderr, skips
+  the event and exits 0, so the agent is never blocked.
 
 ## [2.6.6] - 2026-10-13
 
