@@ -787,6 +787,12 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
              break cross-agent continuity."
         );
     }
+    // Codex's default hooks file depends on CODEX_HOME. Resolve it from the
+    // captured environment once, into `args` like the project strategy below,
+    // so every reader of the existing install and the writer agree on it.
+    if args.apply && args.agent == AgentChoice::Codex && args.config_file.is_none() {
+        args.config_file = Some(codex_hooks_path(&config.runtime_env)?);
+    }
     // Preserve an existing `--capture-assistant` opt-in on a bare re-apply. There
     // is no negative flag, so a re-run without `--capture-assistant` (notably the
     // `ai-memory run` auto-wire, which always passes it off) must NOT silently
@@ -794,12 +800,6 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     // `--capture-assistant` still forces it on; this only fills in the unset case
     // from what is already installed. Gated to the agents where assistant capture
     // is allowed (Claude Code, Codex), whose configs share the nested-hooks shape.
-    // Codex's default hooks file depends on CODEX_HOME. Resolve it from the
-    // captured environment once, into `args` like the project strategy below,
-    // so every reader of the existing install and the writer agree on it.
-    if args.apply && args.agent == AgentChoice::Codex && args.config_file.is_none() {
-        args.config_file = Some(codex_hooks_path(&config.runtime_env)?);
-    }
     if args.apply
         && !args.capture_assistant
         && capture_assistant_allowed(args.agent)
@@ -9874,13 +9874,6 @@ model = "gpt-5"
         );
     }
 
-    /// #552, the regression guard: `--apply` must persist the bearer under the
-    /// data dir and leave it out of the agent config entirely.
-    ///
-    /// Before this, the token was written into the rendered command — as
-    /// `--auth-token <token>` for native hooks — so it sat in the agent's
-    /// config file *and* in `/proc/<pid>/cmdline` for the lifetime of every
-    /// hook, on every tool call.
     /// `install-hooks --agent codex --apply` writes to the CODEX_HOME that
     /// `Config::load` captured, not one re-read from the live process
     /// (invariant #1): an injected value decides the file.
@@ -9906,10 +9899,22 @@ model = "gpt-5"
 
         run(&config, args).expect("apply should succeed");
 
+        // Assert on the hook command, not the binary path: the test binary's
+        // path depends on where the workspace is built.
         let written = std::fs::read_to_string(codex_home.path().join("hooks.json")).unwrap();
-        assert!(written.contains("ai-memory"), "{written}");
+        assert!(
+            written.contains("hook --event session-start --agent codex"),
+            "{written}"
+        );
     }
 
+    /// #552, the regression guard: `--apply` must persist the bearer under the
+    /// data dir and leave it out of the agent config entirely.
+    ///
+    /// Before this, the token was written into the rendered command — as
+    /// `--auth-token <token>` for native hooks — so it sat in the agent's
+    /// config file *and* in `/proc/<pid>/cmdline` for the lifetime of every
+    /// hook, on every tool call.
     #[test]
     fn apply_persists_the_bearer_and_keeps_it_out_of_the_agent_config() {
         let home = TempDir::new().unwrap();

@@ -665,6 +665,17 @@ impl std::fmt::Debug for CapturedProcessEnv {
     }
 }
 
+/// Whether a captured environment key names `name`: exactly, or ignoring
+/// ASCII case where the platform's environment is case-insensitive (Windows).
+fn env_name_matches(key: &std::ffi::OsStr, name: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        key.to_str()
+            .is_some_and(|key| key.eq_ignore_ascii_case(name))
+    } else {
+        key == name
+    }
+}
+
 /// Environment-only values captured once by [`Config::load`].
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeEnv {
@@ -813,13 +824,14 @@ impl RuntimeEnv {
     /// One variable of the captured process environment. Third-party harness
     /// homes (`CODEX_HOME`, `COPILOT_HOME`, ...) are read through here so a
     /// command never re-reads the live environment (invariant #1) and tests
-    /// can inject them.
+    /// can inject them. Names match case-insensitively on Windows, as
+    /// `std::env::var_os` does there.
     #[must_use]
     pub(crate) fn var_os(&self, name: &str) -> Option<OsString> {
         self.process_env
             .0
             .iter()
-            .find(|(key, _)| key.as_os_str() == name)
+            .find(|(key, _)| env_name_matches(key, name, cfg!(windows)))
             .map(|(_, value)| value.clone())
     }
 
@@ -3289,6 +3301,39 @@ fn normalize_home_dir(home: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Windows environment names are case-insensitive (`std::env::var_os`
+    /// finds `Codex_Home` for `CODEX_HOME`), so the captured lookup must be
+    /// too there, and stay exact elsewhere.
+    #[test]
+    fn captured_env_names_match_case_insensitively_only_on_windows_rules() {
+        use std::ffi::OsStr;
+        assert!(super::env_name_matches(
+            OsStr::new("Codex_Home"),
+            "CODEX_HOME",
+            true
+        ));
+        assert!(super::env_name_matches(
+            OsStr::new("CODEX_HOME"),
+            "CODEX_HOME",
+            true
+        ));
+        assert!(!super::env_name_matches(
+            OsStr::new("CODEX_HOMES"),
+            "CODEX_HOME",
+            true
+        ));
+        assert!(!super::env_name_matches(
+            OsStr::new("Codex_Home"),
+            "CODEX_HOME",
+            false
+        ));
+        assert!(super::env_name_matches(
+            OsStr::new("CODEX_HOME"),
+            "CODEX_HOME",
+            false
+        ));
+    }
 
     /// #552: the bearer used to travel on every hook's command line, readable
     /// through `/proc/<pid>/cmdline` by any local user. It now lives in the
