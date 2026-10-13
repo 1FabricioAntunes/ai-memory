@@ -2127,6 +2127,58 @@ mod tests {
             .unwrap();
     }
 
+    /// V78 rebuilds `sessions`, which `observations` and `ingest_keys`
+    /// reference with ON DELETE CASCADE, and its own PRAGMA cannot switch
+    /// enforcement off inside refinery's transaction. `Store::open` is the
+    /// only production caller of the runner and must keep foreign keys off
+    /// around it, or upgrading a V77 store deletes every observation.
+    #[tokio::test]
+    async fn opening_a_v77_store_keeps_observations_and_ingest_keys_through_v78() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut conn = Connection::open(db_dir.join(DB_FILENAME)).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 77).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let ws = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let proj = crate::ops::get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+        let sid = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, started_at) \
+             VALUES (?1, ?2, ?3, 'codex', 1)",
+            params![sid.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'user_prompt', 'keep', 'this observation must survive', 1)",
+            params![
+                ObservationId::new().as_bytes(),
+                sid.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
+             VALUES (?1, 'k1', 1, ?2, 'codex')",
+            params![proj.as_bytes(), sid.as_bytes()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(tmp.path()).unwrap();
+        let count = store.reader.status_counts().await.unwrap().observations;
+        assert_eq!(count, 1, "V78 must not cascade-delete observations");
+        let conn = Connection::open(store.db_path()).unwrap();
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ingest_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(keys, 1, "V78 must not cascade-delete ingest keys");
+    }
+
     #[tokio::test]
     async fn serialises_parallel_writes() {
         let tmp = TempDir::new().unwrap();

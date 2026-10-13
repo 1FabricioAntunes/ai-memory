@@ -2,8 +2,11 @@
 --
 -- Keep the complete V73 schema, indexes, and scope-pairing triggers while
 -- adding the `droid` wire value.
-
-PRAGMA foreign_keys = OFF;
+--
+-- `Store::open` turns foreign keys off around the migration runner (a PRAGMA
+-- inside refinery's transaction is ignored). With them on, `DROP TABLE
+-- sessions` would delete every observation, ingest key, and other row that
+-- references a session through ON DELETE CASCADE.
 
 DROP TRIGGER IF EXISTS auto_improve_scheduler_claims_session_pairing_ai;
 DROP TRIGGER IF EXISTS session_consolidation_jobs_session_pairing_ai;
@@ -69,5 +72,3 @@ WHEN NEW.workspace_id IS NOT (SELECT workspace_id FROM sessions WHERE id = NEW.s
 BEGIN
     SELECT RAISE(ABORT, 'session_consolidation_jobs scope does not match the session scope');
 END;
-
-PRAGMA foreign_keys = ON;

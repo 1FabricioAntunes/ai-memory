@@ -545,3 +545,91 @@ async fn a_curated_page_keeps_its_page_fts_contribution() {
     assert!((decision.rrf.fts - 1.0 / (K + 1.0)).abs() < 1e-12);
     assert!(decision.rrf.observation.abs() < 1e-12);
 }
+
+/// The stream's rowid-span probe runs on every query, so it must stay a
+/// min/max seek on the rowid-ordered `idx_observations_project`: filtering on
+/// `(workspace_id, project_id)` let the planner choose the created_at-ordered
+/// index and walk all of the project's entries. It must also return exactly
+/// what the original two-column aggregate did, for every project in a store
+/// whose projects interleave their writes.
+#[tokio::test]
+async fn the_rowid_span_probe_seeks_the_rowid_ordered_index_and_matches_the_aggregate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let scopes = [
+        scope(&store, "default", "alpha").await,
+        scope(&store, "default", "beta").await,
+        scope(&store, "other", "alpha").await,
+    ];
+    let mut sessions = Vec::new();
+    for &(ws, proj) in &scopes {
+        sessions.push(session(&store, ws, proj).await);
+    }
+    for round in 0..4 {
+        for (i, &(ws, proj)) in scopes.iter().enumerate() {
+            // The third project writes only in the middle rounds, so its span
+            // sits strictly inside the others'.
+            if i == 2 && !(1..=2).contains(&round) {
+                continue;
+            }
+            observe(&store, ws, proj, sessions[i], &format!("note {round} {i}")).await;
+        }
+    }
+    let (empty_ws, empty_proj) = scope(&store, "default", "empty").await;
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let plan: Vec<String> = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::reader::OBSERVATION_ROWID_SPAN_SQL
+        ))
+        .unwrap()
+        .query_map([scopes[0].1.as_bytes()], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let plan = plan.join("\n");
+    assert!(
+        plan.contains("COVERING INDEX idx_observations_project (project_id=?)"),
+        "span probe must seek the rowid-ordered index:\n{plan}"
+    );
+    assert!(
+        !plan.contains("idx_observations_project_created") && !plan.contains("SCAN observations"),
+        "span probe must not walk the created_at index or the table:\n{plan}"
+    );
+
+    let mut spans = Vec::new();
+    for &(ws, proj) in scopes.iter().chain([(empty_ws, empty_proj)].iter()) {
+        let legacy: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT MIN(rowid), MAX(rowid) FROM observations \
+                 WHERE workspace_id = ?1 AND project_id = ?2",
+                rusqlite::params![ws.as_bytes(), proj.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let probe: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                crate::reader::OBSERVATION_ROWID_SPAN_SQL,
+                [proj.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(probe, legacy);
+        spans.push(probe);
+    }
+    assert!(
+        spans[..3]
+            .iter()
+            .all(|(lo, hi)| lo.is_some() && hi.is_some())
+    );
+    assert_ne!(
+        spans[0], spans[1],
+        "fixture projects must have distinct spans"
+    );
+    assert_eq!(
+        spans[3],
+        (None, None),
+        "a project with no observations has no span"
+    );
+}

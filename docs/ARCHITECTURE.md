@@ -164,9 +164,14 @@ from hook paths.
    `sessions/<id>.md` page in that scope. The vote never crosses projects (both
    the observation and the page are scope-filtered), a session without a page
    contributes nothing, and nothing is written. Setting it to `false` restores
-   the earlier ranking byte for byte. If
+   the earlier ranking byte for byte. Every operator's observations vote, since
+   session pages are shared, but a vote's excerpt and observation ids are
+   attached only when the caller may read that session under the session
+   timeline's owner rule (their own sessions and unattributed ones); otherwise
+   the hit shows the page's own snippet. If
    compiled wiki pages miss entirely in default, explicit project, or explicit
-   `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`;
+   `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`, from
+   sessions the caller may read under that same rule;
    `global=true` searches compiled wiki pages across projects only. Page hits
    bump `access_count` + `last_accessed_at`, the M8 reinforcement term, which
    `memory_feedback` complements with explicit per-page salience. Identified
@@ -695,7 +700,7 @@ browser compatibility path:
 | Web session | `ai_memory_session` cookie + CSRF | `/auth/me`, `/admin/*`, `/api/v1/*` by `AuthLevel`; never `/mcp` or hooks |
 | Recovery | `POST /auth/recovery` body | Root password reset; no session |
 | API key | `Authorization: Bearer` (`aim_`, the root bearer from `AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token` or `[auth].bearer_token_file`, or external `amk_`) | Machine APIs; never a web session |
-| Browser token sign-in (no human accounts yet) | HTTP Basic with the root bearer as the password, then HttpOnly `ai_memory_auth` cookie | GET-only browser routes until any human password or completed bootstrap exists; never machine routes. A fresh install has no human accounts, so this is how a browser reaches `/web` there: the 401 carries a Basic challenge, which the HTML login redirect lets through |
+| Browser token sign-in (no human accounts yet) | HTTP Basic with the root bearer as the password, resent by the browser on each request (no cookie is set; an `ai_memory_auth` cookie an older build set is still accepted) | GET-only browser routes until any human password or completed bootstrap exists; never machine routes. A fresh install has no human accounts, so this is how a browser reaches `/web` there: the 401 carries a Basic challenge, which the HTML login redirect lets through |
 
 The deprecated Basic/cookie path stops immediately when human auth becomes
 active; restart is not required. `/web` SPA HTML is public static; the builtin

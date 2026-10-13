@@ -159,10 +159,15 @@ Safety rules:
   during this run", and left with its old state for the next run; the other
   pages still sync, and the run exits non-zero. A server without these
   preconditions (before ai-memory 3.0) is detected before anything is
-  written and refused.
+  written and refused. The repository side is guarded the same way: an
+  export, a file delete, or an import's rewrite (below) touches a file only
+  while it still holds the bytes the plan read, so a file edited during the
+  run is kept, reported as "changed in the repository during this run", and
+  picked up by the next run.
 - **The server's version wins after an import.** If the server stores
   something other than the file (the sanitizer redacting a secret), the file
-  is rewritten with the server's rendering.
+  is rewritten with the server's rendering, unless it was edited after the
+  plan read it.
 - **Deletes are opt-in.** Without `--propagate-deletes` a delete is only
   reported, and the page keeps its state entry so the next run reports it
   again. With it, a side is deleted only if it is unchanged since the last

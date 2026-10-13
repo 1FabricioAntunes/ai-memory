@@ -471,7 +471,11 @@ fn resolve_provider(side: &str, args: &AbArgs) -> Result<ResolvedConfig> {
             base_url.clone(),
         ),
         AuthRequirement::AnthropicOAuthToken => ProviderAuth::anthropic_oauth_token(api_key),
-        AuthRequirement::CursorCli => ProviderAuth::cursor("agent"),
+        AuthRequirement::CursorCli => ProviderAuth::cursor(ai_memory_llm::CursorAuth::new(
+            "agent",
+            std::env::temp_dir(),
+            &std::env::vars_os().collect::<Vec<_>>(),
+        )),
     };
 
     Ok(ResolvedConfig {

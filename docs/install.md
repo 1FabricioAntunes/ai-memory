@@ -3167,8 +3167,9 @@ sandbox, map the data dir read-write, e.g. `ai-jail --rw-map
 Human console login is username/password, not a Bearer pasted into the
 browser. Machine APIs keep using `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN`
 or a native `aim_` key). Before human auth activates, deprecated GET-only
-browser compatibility may exchange the root bearer through HTTP Basic for an
-HttpOnly `ai_memory_auth` cookie; activation disables that path immediately.
+browser compatibility may accept the root bearer through HTTP Basic (no cookie
+is set; an `ai_memory_auth` cookie an older build set is still accepted);
+activation disables that path immediately.
 The active classes stay isolated: a password only issues a session; a session
 never authenticates `/mcp`/hooks/workstreams; recovery never issues a session;
 an API key never logs into `/auth/login`.

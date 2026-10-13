@@ -349,21 +349,23 @@ async fn history_handler(
 async fn search_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, Response> {
     let query = SearchQuery::from_raw(raw_query.as_deref()).map_err(ApiFailure::into_response)?;
     let request = query
         .try_into_request()
         .map_err(ApiFailure::into_response)?;
-    search_with_request(&state, request, viewer_of(viewer)).await
+    search_with_request(&state, request, viewer_of(viewer), &owner_filter_for(actor)).await
 }
 
 async fn search_post_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Response, Response> {
-    search_with_request(&state, request, viewer_of(viewer)).await
+    search_with_request(&state, request, viewer_of(viewer), &owner_filter_for(actor)).await
 }
 
 // A global search is FTS5 over every readable repository, as
@@ -374,6 +376,7 @@ async fn search_with_request(
     state: &WebState,
     request: SearchRequest,
     viewer: Option<ai_memory_core::UserId>,
+    owner: &ai_memory_core::OwnerFilter,
 ) -> Result<Response, Response> {
     let term = request.q.trim().to_owned();
     if term.is_empty() {
@@ -403,7 +406,7 @@ async fn search_with_request(
                 .iter()
                 .map(|scope| (scope.workspace_id, scope.project_id))
                 .collect();
-            crate::recall::search_scopes(state, &scopes, &term, limit, false)
+            crate::recall::search_scopes(state, &scopes, &term, limit, false, owner)
                 .await
                 .map(|result| result.hits.into_iter().map(|(hit, _)| hit).collect())
         }

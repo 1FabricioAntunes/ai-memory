@@ -88,7 +88,8 @@ form post or a `text/plain` request from another site cannot reach them.
 Do not put `AI_MEMORY_AUTH_TOKEN`, `aim_` keys, session values, or CSRF values
 in `localStorage`. Before any human password or completed bootstrap exists,
 deprecated GET-only browser compatibility may accept the root bearer through
-HTTP Basic and an HttpOnly `ai_memory_auth` cookie. Human activation disables
+HTTP Basic, or an HttpOnly `ai_memory_auth` cookie an older build set; a Basic
+sign-in no longer sets that cookie. Human activation disables
 that path immediately. See [`docs/users.md`](users.md) for bootstrap, password
 rotation, recovery, roles, session expiry, and API-key lifecycle.
 

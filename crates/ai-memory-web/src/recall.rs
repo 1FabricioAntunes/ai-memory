@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::{ProjectId, WorkspaceId};
+use ai_memory_core::{OwnerFilter, ProjectId, WorkspaceId};
 use ai_memory_llm::{Embedder, QueryVector, RerankCandidate, RerankStage};
 use ai_memory_store::{
     HybridSearch, PageHit, SearchExplain, StoreResult, StreamTimings, VectorQuery,
@@ -46,13 +46,16 @@ pub(crate) struct RecallResult {
 }
 
 /// Rank `query` over `scopes` exactly as a `memory_query` project/scopes
-/// search does (latest versions only, expired pages hidden).
+/// search does (latest versions only, expired pages hidden). `owner` is the
+/// viewer's session-timeline filter: an observation excerpt is shown only
+/// from a session it admits, as in `memory_query`.
 pub(crate) async fn search_scopes(
     state: &WebState,
     scopes: &[(WorkspaceId, ProjectId)],
     query: &str,
     limit: usize,
     explain: bool,
+    owner: &OwnerFilter,
 ) -> StoreResult<RecallResult> {
     let query_vector: Option<QueryVector> = match &state.recall.embedder {
         Some(embedder) => ai_memory_llm::embed_search_query(embedder.as_ref(), query).await,
@@ -79,6 +82,7 @@ pub(crate) async fn search_scopes(
                 expiry_cutoff_us: None,
                 include_superseded: false,
                 explain,
+                owner,
             },
         )
         .await?;

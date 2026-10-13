@@ -5,11 +5,12 @@
 
 #![cfg(unix)]
 
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
-    CURSOR_DEFAULT_MODEL, ChatRequest, CursorAgentProvider, LlmProvider, ProviderAuth,
+    CURSOR_DEFAULT_MODEL, ChatRequest, CursorAgentProvider, CursorAuth, LlmProvider, ProviderAuth,
 };
 
 fn sh_single(value: &str) -> String {
@@ -48,9 +49,21 @@ impl Drop for TempDir {
     }
 }
 
+/// The fake agents are shell scripts that need `PATH`; the workspace root is
+/// the fake agent's own temp dir.
 fn provider(executable: PathBuf, model: &str) -> CursorAgentProvider {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    provider_with_env(executable, model, &[(OsString::from("PATH"), path)])
+}
+
+fn provider_with_env(
+    executable: PathBuf,
+    model: &str,
+    process_env: &[(OsString, OsString)],
+) -> CursorAgentProvider {
+    let root = executable.parent().unwrap().to_path_buf();
     CursorAgentProvider::new(
-        ProviderAuth::cursor(executable)
+        ProviderAuth::cursor(CursorAuth::new(executable, root, process_env))
             .require_cursor_auth()
             .expect("cursor executable resolves"),
         model,
@@ -172,4 +185,70 @@ async fn the_prompt_workspace_is_private() {
         .unwrap();
     let listing = std::fs::read_to_string(&sink).unwrap();
     assert!(listing.starts_with("drwx------"), "{listing}");
+}
+
+/// The child reads untrusted captured session text, so it runs with the
+/// allowlisted environment only: the server's bearer and another provider's
+/// key never reach it, and nothing leaks from the parent process itself
+/// (cargo sets `CARGO_*` in every test process). Control: the allowlisted
+/// `PATH`, `HOME` and `CURSOR_API_KEY` arrive, and the workspace sits under
+/// the injected root rather than the process temp dir.
+#[tokio::test]
+async fn the_child_gets_only_the_allowlisted_environment() {
+    let dir = TempDir::new();
+    let sink = dir.0.join("env");
+    let agent = script_agent(
+        &dir.0,
+        &format!(
+            "env > {sink}\npwd >> {sink}\nprintf 'OK\\n'",
+            sink = sh_single(&sink.display().to_string())
+        ),
+    );
+    let process_env: Vec<(OsString, OsString)> = [
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("HOME", "/home/operator".to_string()),
+        ("CURSOR_API_KEY", "cursor-key-ok".to_string()),
+        ("AI_MEMORY_AUTH_TOKEN", "root-bearer-canary".to_string()),
+        ("OPENAI_API_KEY", "sk-openai-canary".to_string()),
+    ]
+    .into_iter()
+    .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+    .collect();
+
+    let response = provider_with_env(agent, "default", &process_env)
+        .complete(ChatRequest::user_prompt("hi"))
+        .await
+        .unwrap();
+    assert_eq!(response.text, "OK");
+
+    let seen = std::fs::read_to_string(&sink).unwrap();
+    assert!(!seen.contains("root-bearer-canary"), "{seen}");
+    assert!(!seen.contains("sk-openai-canary"), "{seen}");
+    assert!(
+        !seen.lines().any(|line| line.starts_with("CARGO_")),
+        "the parent's own environment must not be inherited: {seen}"
+    );
+    assert!(seen.contains("HOME=/home/operator\n"), "{seen}");
+    assert!(seen.contains("CURSOR_API_KEY=cursor-key-ok\n"), "{seen}");
+    let workspace = seen.lines().last().unwrap();
+    let root = std::fs::canonicalize(&dir.0).unwrap();
+    assert!(
+        Path::new(workspace).starts_with(&dir.0) || Path::new(workspace).starts_with(&root),
+        "workspace {workspace} must sit under the injected root"
+    );
+}
+
+/// A relative workspace root would put the prompt under the server's cwd;
+/// the provider refuses instead.
+#[tokio::test]
+async fn a_relative_workspace_root_is_refused() {
+    let auth = CursorAuth::new("agent", "relative-root", &[]);
+    let err = CursorAgentProvider::new(
+        ProviderAuth::cursor(auth).require_cursor_auth().unwrap(),
+        "default",
+    )
+    .complete(ChatRequest::user_prompt("hi"))
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("absolute"), "{err}");
 }

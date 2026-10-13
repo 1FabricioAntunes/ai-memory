@@ -90,9 +90,16 @@ ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "
 into a temporary workspace and calls `agent --print --mode ask --trust`. It
 does not pass `--yolo` or `--force`: consolidation text is untrusted captured
 content, and those flags would allow tool execution. The Cursor CLI has no
-JSON-schema mode, so the schema travels in the prompt and the answer is parsed
-and validated against it. The `agent` process inherits the server's
-environment, so run the server with only the credentials it needs.
+JSON-schema mode, so the schema travels in the prompt. The answer is parsed
+leniently (code fences and surrounding prose are stripped) and then
+deserialised into the expected type; nothing checks it against the schema
+itself, so a value that deserialises is accepted even if it breaks a constraint
+serde does not enforce. The `agent` process does not inherit the server's
+environment. It gets `PATH`, `HOME`, user and locale variables (`LANG`,
+`LC_*`), temp and XDG directories, `DBUS_SESSION_BUS_ADDRESS`, proxy and CA
+settings, the Windows process basics, and every `CURSOR_*` variable, so
+`AI_MEMORY_AUTH_TOKEN` and other providers' keys never reach it. The per-call
+workspace is created under the system temp directory captured at startup.
 
 ```bash
 export AI_MEMORY_LLM_PROVIDER=cursor
