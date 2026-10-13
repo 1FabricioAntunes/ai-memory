@@ -25,6 +25,8 @@ use crate::cli::RenderPluginsArgs;
 
 /// The repository the catalogs point at.
 const REPOSITORY_URL: &str = "https://github.com/akitaonrails/ai-memory";
+/// The project's landing page, used for every manifest's `homepage`.
+const HOMEPAGE_URL: &str = "https://aimemory.sh";
 /// The marketplace name and the plugin name; installs as `ai-memory@ai-memory`.
 pub(crate) const MARKETPLACE_NAME: &str = "ai-memory";
 /// The plugin's name inside its marketplace.
@@ -168,7 +170,7 @@ fn claude_code_plugin(version: &str) -> Vec<PluginFile> {
         "version": version,
         "description": CLAUDE_DESCRIPTION,
         "author": author(),
-        "homepage": REPOSITORY_URL,
+        "homepage": HOMEPAGE_URL,
         "repository": REPOSITORY_URL,
         "license": "MIT",
         "keywords": ["memory", "mcp", "hooks", "handoff", "context"],
@@ -242,7 +244,7 @@ fn codex_plugin(version: &str) -> Vec<PluginFile> {
         "version": version,
         "description": CODEX_DESCRIPTION,
         "author": author(),
-        "homepage": REPOSITORY_URL,
+        "homepage": HOMEPAGE_URL,
         "repository": REPOSITORY_URL,
         "license": "MIT",
         "mcpServers": "./mcp.json",
@@ -382,8 +384,10 @@ mod tests {
         for file in render("1.0.0") {
             let lower = file.contents.to_ascii_lowercase();
             if file.path.ends_with(".json") {
+                // The homepage URL ends in `.sh"`; a script path must not.
+                let without_homepage = lower.replace(HOMEPAGE_URL, "");
                 assert!(!lower.contains("hooks/claude-code/"), "{}", file.path);
-                assert!(!lower.contains(".sh\""), "{}", file.path);
+                assert!(!without_homepage.contains(".sh\""), "{}", file.path);
                 assert!(!lower.contains("authorization"), "{}", file.path);
                 assert!(!lower.contains("auth_token"), "{}", file.path);
                 assert!(!lower.contains("auth-token"), "{}", file.path);

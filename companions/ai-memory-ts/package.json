@@ -4,6 +4,7 @@
   "private": true,
   "description": "Typed TypeScript client for an ai-memory server: pages, search, handoffs, messages and the read-only /api/v1 routes.",
   "license": "MIT",
+  "homepage": "https://aimemory.sh",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/akitaonrails/ai-memory.git",
