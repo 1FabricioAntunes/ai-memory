@@ -307,6 +307,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ai-memory status` and `ai-memory doctor` now show the server's auth
   posture, and for an unauthenticated loopback server print
   `auth: none (loopback)` with the fix, `ai-memory auth enable`.
+- Added `--project-id` to `purge-project`, `rename-project` and
+  `move-project` (and `project_id` to their admin endpoints), as an
+  alternative to the project name. A legacy twin row whose name collides with
+  another project's `legacy_name` (the empty leftover an older migration
+  leaves behind) was refused as ambiguous by name, so it could not be purged
+  or renamed. The id is looked up inside the named workspace: sending both or
+  neither is a 400, a malformed UUID is a 400, and an id that names no project
+  in that workspace is a 404. `list-projects` now prints each project's id so
+  an operator can copy it. (#1208, #1226)
 
 ### Changed
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
