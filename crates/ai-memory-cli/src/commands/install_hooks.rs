@@ -8273,13 +8273,18 @@ mod tests {
     /// `XDG_CONFIG_HOME` when it is absolute.
     #[test]
     fn muse_settings_path_reads_xdg_config_home_from_the_runtime_env() {
-        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
-            "XDG_CONFIG_HOME",
-            "/xdg-from-env",
-        )]);
+        // Absolute on the host platform: a Unix-style root is relative on
+        // Windows, where it would rightly be ignored.
+        let xdg = if cfg!(windows) {
+            r"C:\xdg-from-env"
+        } else {
+            "/xdg-from-env"
+        };
+        let env =
+            crate::config::RuntimeEnv::with_process_env_for_tests(&[("XDG_CONFIG_HOME", xdg)]);
         assert_eq!(
             muse_settings_path(&env).unwrap(),
-            Path::new("/xdg-from-env/muse/settings.json")
+            Path::new(xdg).join("muse").join("settings.json")
         );
     }
 

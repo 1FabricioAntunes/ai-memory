@@ -2805,9 +2805,12 @@ mod tests {
             muse_settings_path_in(None, home.clone()).unwrap(),
             Path::new("/home/u/.config/muse/settings.json")
         );
+        // Absolute on the host platform: a Unix-style root is relative on
+        // Windows, where it would rightly be ignored.
+        let xdg = if cfg!(windows) { r"C:\xdg" } else { "/xdg" };
         assert_eq!(
-            muse_settings_path_in(Some("/xdg".into()), home.clone()).unwrap(),
-            Path::new("/xdg/muse/settings.json")
+            muse_settings_path_in(Some(xdg.into()), home.clone()).unwrap(),
+            Path::new(xdg).join("muse").join("settings.json")
         );
         for ignored in ["", "  ", "relative/dir"] {
             assert_eq!(
