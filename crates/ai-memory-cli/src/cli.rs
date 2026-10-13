@@ -935,11 +935,17 @@ pub struct ProjectArgs {
 /// `project` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
+    /// Interactively create this checkout's `.ai-memory.toml` marker.
+    Init(ProjectInitArgs),
     /// Set a project `open` or `restricted`.
     Access(ProjectAccessArgs),
     /// List who holds a grant on one project.
     Grants(ProjectGrantsArgs),
 }
+
+/// Arguments for `project init`.
+#[derive(Debug, Args)]
+pub struct ProjectInitArgs {}
 
 /// Arguments for `profile`.
 #[derive(Debug, Args)]
@@ -3539,6 +3545,16 @@ mod tests {
             Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
         assert!(Cli::try_parse_from(["ai-memory", "grant", "list"]).is_err());
+    }
+
+    #[test]
+    fn project_init_parses_without_server_scope_flags() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "project", "init"]).expect("project init parses");
+        let Command::Project(args) = parsed.command else {
+            panic!("expected project command");
+        };
+        assert!(matches!(args.command, ProjectCommand::Init(_)));
     }
 
     #[test]
