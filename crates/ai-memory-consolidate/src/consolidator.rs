@@ -2822,6 +2822,67 @@ mod tests {
         }
     }
 
+    /// #1234: the advertised floor must actually leave room for observations
+    /// **at the shipped safety margin**, not just at a nominal one.
+    ///
+    /// `MIN_CONSOLIDATION_MAX_INPUT_TOKENS` is described as the smallest budget
+    /// that still leaves room for observations, and `config` refuses anything
+    /// below it. That promise only holds if the char budget the builders really
+    /// run with -- `max_input_tokens * input_token_safety_margin` -- clears the
+    /// fixed prompts. The old check compared the raw token count and ignored
+    /// the margin, and the old floor test built its budgets with
+    /// `PromptBudgets::from_limits` (margin 1.0), so both stayed green while a
+    /// default-margin install at the floor rendered zero observations and sent
+    /// the model a prompt with no evidence at all.
+    ///
+    /// This drives the real builders at the real default margin and demands at
+    /// least one rendered observation in each, so the next time the prompts
+    /// grow this fails here instead of silently emptying the prompt in
+    /// production.
+    #[test]
+    fn floor_budget_leaves_room_for_observations_at_the_default_margin() {
+        let budgets = PromptBudgets::from_limits_with_margin(
+            MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
+            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        );
+        // Five ordinary-sized observations; the point is that *any* fit.
+        let observations = (0..5).map(|_| obs_of_size(210)).collect::<Vec<_>>();
+
+        let single = build_request(SessionId::new(), &observations, "", None, budgets, &[]);
+        let batch = build_batch_request_with_slots(
+            SessionId::new(),
+            &observations,
+            &[],
+            None,
+            budgets,
+            &[],
+        );
+
+        // Each builder's own response schema, so the fixed part is measured
+        // exactly as the production builder measures it.
+        assert!(
+            !single.messages[0].content.contains("observations omitted"),
+            "single: at the floor with the default {} margin every observation was              omitted, so the prompt carries no evidence;              MIN_CONSOLIDATION_MAX_INPUT_TOKENS must be raised to clear the fixed              part. Rendered: {}",
+            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+            single.messages[0].content
+        );
+        assert!(
+            estimated_input_chars::<ConsolidatedPage>(&single) <= budgets.max_input_chars,
+            "single: the fixed prompt alone must still fit the effective budget"
+        );
+        assert!(
+            !batch.messages[0].content.contains("observations omitted"),
+            "batch: at the floor with the default {} margin every observation was              omitted, so the prompt carries no evidence;              MIN_CONSOLIDATION_MAX_INPUT_TOKENS must be raised to clear the fixed              part. Rendered: {}",
+            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+            batch.messages[0].content
+        );
+        assert!(
+            estimated_input_chars::<ConsolidatedBatch>(&batch) <= budgets.max_input_chars,
+            "batch: the fixed prompt alone must still fit the effective budget"
+        );
+    }
+
     #[test]
     fn build_request_omits_titles_block_when_the_project_is_empty() {
         let single = build_request(
