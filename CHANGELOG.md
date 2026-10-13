@@ -11,6 +11,15 @@ and [0.x](docs/changelog/0.x.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the companion relay refusing to open its queue on Windows when another
+  relay process was committing to the same queue. SQLite deletes its rollback
+  journal at each commit, and Windows answers "access denied" for a file
+  that is being deleted, so the queue-file guard failed with `inspect
+  relay.sqlite-journal: Access is denied`. The guard now retries that answer
+  for up to about 100 ms; a file that stays unreadable is still refused.
+
 ## [2.6.6] - 2026-10-13
 
 ### Fixed
