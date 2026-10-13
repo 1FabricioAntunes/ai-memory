@@ -906,7 +906,7 @@ async fn run_session_consolidation_worker(
         {
             Ok(job) => job,
             Err(error) => {
-                tracing::warn!(%error, "SessionEnd consolidation queue claim failed");
+                tracing::warn!(%error, "session consolidation queue claim failed");
                 tokio::select! {
                     () = cancel.cancelled() => return,
                     () = notify.notified() => {},
@@ -939,13 +939,13 @@ async fn run_session_consolidation_worker(
                     Ok(()) => info!(
                         session = %session_id,
                         generation,
-                        "SessionEnd: session page was written by the agent; consolidation skipped",
+                        "session page was written by the agent; queued consolidation skipped",
                     ),
                     Err(error) => tracing::warn!(
                         %error,
                         session = %session_id,
                         generation,
-                        "SessionEnd consolidation skip could not complete the queue job",
+                        "session consolidation skip could not complete the queue job",
                     ),
                 }
                 #[cfg(test)]
@@ -957,7 +957,7 @@ async fn run_session_consolidation_worker(
                 %error,
                 session = %session_id,
                 generation,
-                "could not read the session page before SessionEnd consolidation; consolidating",
+                "could not read the session page before queued consolidation; consolidating",
             ),
         }
         let actor = session_consolidation_actor(&reader, session_id).await;
@@ -966,7 +966,7 @@ async fn run_session_consolidation_worker(
         let result = tokio::select! {
             () = cancel.cancelled() => {
                 if let Err(error) = writer.release_session_consolidation(job).await {
-                    tracing::warn!(%error, %session_id, generation, "failed to release SessionEnd consolidation during shutdown");
+                    tracing::warn!(%error, %session_id, generation, "failed to release session consolidation during shutdown");
                 }
                 return;
             }
@@ -990,7 +990,7 @@ async fn run_session_consolidation_worker(
                     %error,
                     session = %session_id,
                     generation,
-                    "SessionEnd consolidation succeeded but queue completion failed",
+                    "session consolidation succeeded but queue completion failed",
                 ),
             },
             Err(error) => {
@@ -1018,7 +1018,7 @@ async fn run_session_consolidation_worker(
                         error = %store_error,
                         session = %session_id,
                         generation,
-                        "failed to persist SessionEnd consolidation failure",
+                        "failed to persist session consolidation failure",
                     );
                 } else if terminal {
                     tracing::error!(
@@ -1026,7 +1026,7 @@ async fn run_session_consolidation_worker(
                         session = %session_id,
                         generation,
                         attempts,
-                        "SessionEnd LLM consolidation exhausted retries; heuristic page remains",
+                        "queued LLM consolidation exhausted retries; heuristic page remains",
                     );
                 } else {
                     tracing::warn!(
@@ -1034,7 +1034,7 @@ async fn run_session_consolidation_worker(
                         session = %session_id,
                         generation,
                         attempts,
-                        "SessionEnd LLM consolidation failed; queued for retry",
+                        "queued LLM consolidation failed; queued for retry",
                     );
                 }
             }
@@ -1903,11 +1903,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+                        tracing::warn!(%error, "session consolidation worker join failed");
                     }
                     Err(_) => tracing::warn!(
                         grace_secs = SHUTDOWN_GRACE.as_secs(),
-                        "SessionEnd consolidation worker did not stop within the shutdown \
+                        "session consolidation worker did not stop within the shutdown \
                          grace period; exiting anyway"
                     ),
                 }

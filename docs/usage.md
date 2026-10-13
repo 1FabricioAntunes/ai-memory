@@ -127,7 +127,11 @@ through `consolidate` admission, so a policy that refuses consolidation
 leaves no page and queues nothing. A rewrite still queued when the
 session ends runs once over the whole session even with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` off, replacing the rule-based
-summary; with the opt-in on, the SessionEnd job supersedes it. After
+summary; with the opt-in on, the SessionEnd job supersedes it. Without
+the opt-in, a session that ends while that rewrite is still running
+keeps the rewrite as the latest page, so it can leave out the end of the
+session; the SessionEnd summary stays reachable as the superseded
+version. After
 compaction, the agent can recover the summary via `memory_recent` even
 though its raw chat history was compacted away.
 

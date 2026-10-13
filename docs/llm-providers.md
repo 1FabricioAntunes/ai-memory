@@ -19,7 +19,11 @@ queued after those deterministic writes and handled by one bounded server
 worker, so hook drain latency does not cancel it. The worker starts whenever a
 consolidator is configured; SessionEnd enqueue stays behind the opt-in flag.
 A checkpoint rewrite still queued when the session ends runs once anyway, even
-with the flag off. Failed jobs retry with backoff and survive a server restart. A resumed native session is ended again only after its
+with the flag off. One already running when the session ends finishes after the
+SessionEnd summary and replaces it, so with the flag off the latest page can
+leave out the end of the session; the summary stays reachable as the superseded
+version. Every queued job runs as the session owner recorded at session start,
+not anonymously. Failed jobs retry with backoff and survive a server restart. A resumed native session is ended again only after its
 observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and
