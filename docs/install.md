@@ -3251,7 +3251,11 @@ token into the volume), `docker restart ai-memory`, then re-run
 `install-hooks` copies the token from the volume to an owner-only file under
 `~/.local/share/ai-memory/native-runner/`, and the commands the wrapper runs
 natively (`install-hooks`, `mcp-bridge`, `run`) read it from there, never from
-a command line.
+a command line. When `install-hooks` finds no token in the volume any more (auth
+turned off, or the token file gone), it deletes that copy; a container engine
+that cannot be reached leaves it alone. A full `ai-memory uninstall --apply`
+through the wrapper deletes it once the uninstall succeeds; a dry run or an
+`--only` subset keeps it.
 
 Then wire up the agent CLI. Both commands default to
 `http://127.0.0.1:49374` - no extra flags needed for the local case:

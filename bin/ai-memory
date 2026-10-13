@@ -613,15 +613,23 @@ use_volume_token() {
 # Refresh the host copy from the volume, then use it. Only `install-hooks`,
 # the setup step, does this: the managed host commands (`run`, `show`, ...)
 # and `mcp-bridge`, which starts with every agent session, never enter the
-# container engine, so they read the copy it leaves behind.
+# container engine, so they read the copy it leaves behind. A volume that
+# answers with no token (auth turned off, the token file renamed or gone)
+# removes the copy, so a rotated-away bearer does not linger on the host; an
+# engine that cannot answer at all leaves the copy as it was.
 refresh_volume_token() {
   volume_token_applies || return 0
   local token
-  token="$("${DOCKER}" run --rm -v "${DATA_VOLUME}:/data:ro" --entrypoint /bin/sh "${IMAGE}" -c \
-    'grep -qs "^[[:space:]]*bearer_token_file[[:space:]]*=[[:space:]]*\"auth-tokens/default\"" /data/config.toml && cat /data/auth-tokens/default' \
-    2>/dev/null)" || token=""
+  if ! token="$("${DOCKER}" run --rm -v "${DATA_VOLUME}:/data:ro" --entrypoint /bin/sh "${IMAGE}" -c \
+    'if grep -qs "^[[:space:]]*bearer_token_file[[:space:]]*=[[:space:]]*\"auth-tokens/default\"" /data/config.toml; then cat /data/auth-tokens/default 2>/dev/null; fi; exit 0' \
+    2>/dev/null)"; then
+    use_volume_token
+    return 0
+  fi
   token="$(printf '%s' "${token}" | tr -d '\r\n')"
-  if [ -n "${token}" ]; then
+  if [ -z "${token}" ]; then
+    rm -f "${VOLUME_TOKEN_FILE}"
+  else
     (
       umask 077
       mkdir -p "${NATIVE_RUNNER_DIR}" \
@@ -822,6 +830,23 @@ case "${WRAPPER_SUBCOMMAND}" in
       WRITES_HOST_FILES=1
       ;;
 esac
+# A full `uninstall --apply` unwires every hook and MCP entry that reads the
+# host copy of the volume's root bearer, so the copy goes too once the
+# container reports success. A dry run or an `--only` subset keeps it.
+DROPS_VOLUME_TOKEN=0
+if [ "${WRAPPER_SUBCOMMAND}" = "uninstall" ]; then
+  uninstall_apply=0
+  uninstall_only=0
+  for arg in ${WRAPPER_ARGS[@]+"${WRAPPER_ARGS[@]:$((idx + 1))}"}; do
+    case "${arg}" in
+      --apply) uninstall_apply=1 ;;
+      --only | --only=*) uninstall_only=1 ;;
+    esac
+  done
+  if [ "${uninstall_apply}" -eq 1 ] && [ "${uninstall_only}" -eq 0 ]; then
+    DROPS_VOLUME_TOKEN=1
+  fi
+fi
 # bootstrap only *reads* host files — the repo bind-mounted at /work and the
 # `.ai-memory.toml` markers under $HOME — but an unmapped UID and a confined
 # SELinux label block reads exactly as hard as writes. The failure is
@@ -1046,6 +1071,15 @@ if [ "${WRAPPER_SUBCOMMAND}" = "completions" ]; then
   trap - EXIT
   [ "${OUTPUT_STATUS}" -eq 141 ] && exit 0
   exit "${OUTPUT_STATUS}"
+fi
+
+if [ "${DROPS_VOLUME_TOKEN}" -eq 1 ]; then
+  if "${DOCKER}" "${HELPER_ARGS[@]}"; then
+    rm -f "${VOLUME_TOKEN_FILE}"
+    exit 0
+  else
+    exit $?
+  fi
 fi
 
 exec "${DOCKER}" "${HELPER_ARGS[@]}"

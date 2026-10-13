@@ -201,7 +201,13 @@ main() {
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
 case "$*" in
-  *"--entrypoint /bin/sh"*) printf 'VOLUME-ROOT-TOKEN\n' ;;
+  *"--entrypoint /bin/sh"*)
+    [ -z "${AI_MEMORY_TEST_ENGINE_DOWN:-}" ] || exit 125
+    printf '%s\n' "${AI_MEMORY_TEST_VOLUME_TOKEN-VOLUME-ROOT-TOKEN}"
+    ;;
+  *" uninstall "* | *" uninstall")
+    [ -z "${AI_MEMORY_TEST_UNINSTALL_FAIL:-}" ] || exit 3
+    ;;
 esac
 FAKE
   cat >"${token_native}" <<'FAKE'
@@ -272,6 +278,43 @@ FAKE
   if grep -Fq 'file=/' "${token_log}" || [ -s "${token_docker_log}" ]; then
     fail "an explicit AI_MEMORY_AUTH_TOKEN must win over the volume token copy"
   fi
+
+  log "Checking the host token copy goes with the volume's token and with uninstall"
+  local token_copy="${token_home}/.local/share/ai-memory/native-runner/server-token"
+  token_wrapper() {
+    HOME="${token_home}" XDG_DATA_HOME="${token_home}/.local/share" \
+      AI_MEMORY_NO_VERSION_CHECK=1 AI_MEMORY_NO_TTY=1 \
+      AI_MEMORY_DOCKER="${token_docker}" AI_MEMORY_NATIVE_BIN="${token_native}" \
+      AI_MEMORY_DOCKER_TEST_LOG="${token_docker_log}" AI_MEMORY_WRAPPER_TEST_LOG="${token_log}" \
+      bin/ai-memory "$@" </dev/null >/dev/null
+  }
+  token_wrapper install-hooks --agent claude-code --apply
+  test -s "${token_copy}" || fail "install-hooks must leave the host token copy"
+  # An engine that cannot answer keeps the copy and still hands it over.
+  : >"${token_log}"
+  AI_MEMORY_TEST_ENGINE_DOWN=1 token_wrapper install-hooks --agent claude-code --apply
+  test -s "${token_copy}" || fail "an unreachable engine must not remove the host token copy"
+  assert_contains "${token_log}" "file=${token_copy}"
+  # A volume with no token any more (auth off or rotated away) removes it.
+  : >"${token_log}"
+  AI_MEMORY_TEST_VOLUME_TOKEN="" token_wrapper install-hooks --agent claude-code --apply
+  test ! -e "${token_copy}" || fail "a volume without a token must remove the host token copy"
+  if grep -Fq 'file=/' "${token_log}"; then
+    fail "a removed host token copy must not be handed to the native client"
+  fi
+  # uninstall: a dry run, an --only subset and a failed run keep the copy; a
+  # successful full --apply removes it.
+  token_wrapper install-hooks --agent claude-code --apply
+  token_wrapper uninstall
+  test -s "${token_copy}" || fail "an uninstall dry run must keep the host token copy"
+  token_wrapper uninstall --apply --only hooks
+  test -s "${token_copy}" || fail "uninstall --only must keep the host token copy"
+  if AI_MEMORY_TEST_UNINSTALL_FAIL=1 token_wrapper uninstall --apply; then
+    fail "a failing uninstall must keep its exit status"
+  fi
+  test -s "${token_copy}" || fail "a failed uninstall must keep the host token copy"
+  token_wrapper uninstall --apply --yes
+  test ! -e "${token_copy}" || fail "uninstall --apply must remove the host token copy"
 
   log "Creating temporary alternate root"
   mkdir -p \
