@@ -711,18 +711,9 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
-        .route(
-            "/admin/users",
-            get(handle_list_users).post(handle_create_user),
-        )
+        .route("/admin/users", get(handle_list_users))
         .route("/admin/human-users", post(handle_create_human_user))
         .route("/admin/users/{username}", patch(handle_patch_user))
-        .route("/admin/users/{username}/expire", post(handle_expire_user))
-        .route("/admin/users/{username}/revive", post(handle_revive_user))
-        .route(
-            "/admin/users/{username}/rotate-token",
-            post(handle_rotate_user_token),
-        )
         .route(
             "/admin/users/{username}/reset-password",
             post(handle_reset_password),
@@ -8455,12 +8446,6 @@ struct CreateApiCredentialRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct UserWithTokenResponse {
-    user: ai_memory_core::User,
-    token: String,
-}
-
-#[derive(Debug, Serialize)]
 struct UserWithPasswordResponse {
     user: ai_memory_core::User,
     temporary_password: String,
@@ -8597,44 +8582,6 @@ async fn create_human_user_response(
     ))
 }
 
-async fn handle_create_user(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
-    Json(req): Json<CreateUserRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    if req.role.is_some() {
-        return create_human_user_response(&state, auth, req).await;
-    }
-    let pepper = require_pepper(&state)?;
-    let mut new_user = ai_memory_core::NewUser {
-        username: req.username,
-        name: req.name,
-        email: req.email,
-    };
-    new_user
-        .validate()
-        .map_err(|e| validation_error(e.to_string()))?;
-    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
-    let token_hash = ai_memory_store::hash_token(&token, pepper);
-    let user_id = state
-        .writer
-        .create_user(new_user, token_hash)
-        .await
-        .map_err(map_user_store_err)?;
-    let user = state
-        .reader
-        .find_user_by_id(user_id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("created user vanished from store".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
-    ))
-}
-
 async fn handle_create_human_user(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -8658,87 +8605,6 @@ async fn handle_list_users(
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserListResponse { users }).unwrap_or_default()),
-    ))
-}
-
-async fn handle_expire_user(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    let user = lookup_user_by_username(&state, &username).await?;
-    state
-        .writer
-        .expire_user_token(user.id)
-        .await
-        .map_err(map_user_store_err)?;
-    let user = state
-        .reader
-        .find_user_by_id(user.id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after token expiry".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
-    ))
-}
-
-async fn handle_revive_user(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    let user = lookup_user_by_username(&state, &username).await?;
-    state
-        .writer
-        .revive_user_token(user.id)
-        .await
-        .map_err(map_user_store_err)?;
-    let user = state
-        .reader
-        .find_user_by_id(user.id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after token revival".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
-    ))
-}
-
-async fn handle_rotate_user_token(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    let pepper = require_pepper(&state)?;
-    let user = lookup_user_by_username(&state, &username).await?;
-    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
-    let token_hash = ai_memory_store::hash_token(&token, pepper);
-    let updated = state
-        .writer
-        .rotate_user_token(user.id, token_hash)
-        .await
-        .map_err(map_user_store_err)?;
-    if !updated {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "user vanished mid-rotation" })),
-        ));
-    }
-    let user = state
-        .reader
-        .find_user_by_id(user.id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after token rotation".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
     ))
 }
 
@@ -13705,6 +13571,15 @@ mod tests {
     /// compare. Configured `root_token` is AuthLevel::Root; a DB native key
     /// authenticates as AuthLevel::User even when `users.role` is root.
     fn user_admin_dual_auth_router(root_token: &'static str) -> (TempDir, Router) {
+        let (tmp, _store, router) = user_admin_dual_auth_router_with_store(root_token);
+        (tmp, router)
+    }
+
+    /// [`user_admin_dual_auth_router`] plus the store behind it, for tests
+    /// that seed rows the HTTP surface can no longer create.
+    fn user_admin_dual_auth_router_with_store(
+        root_token: &'static str,
+    ) -> (TempDir, Store, Router) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
@@ -13744,7 +13619,7 @@ mod tests {
             auth_state,
             crate::human_auth::require_dual_auth,
         ));
-        (tmp, router)
+        (tmp, store, router)
     }
 
     async fn post_disable_user(
@@ -13778,26 +13653,6 @@ mod tests {
                 Request::builder()
                     .method("PATCH")
                     .uri(format!("/admin/users/{username}"))
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {root_token}"))
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn post_create_user(
-        router: &Router,
-        root_token: &str,
-        body: serde_json::Value,
-    ) -> axum::http::Response<Body> {
-        router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users")
                     .header("content-type", "application/json")
                     .header("authorization", format!("Bearer {root_token}"))
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -14024,20 +13879,8 @@ mod tests {
             ("GET", "/admin/users", serde_json::Value::Null),
             (
                 "POST",
-                "/admin/users",
-                serde_json::json!({"username": "alice"}),
-            ),
-            (
-                "POST",
                 "/admin/human-users",
                 serde_json::json!({"username": "human"}),
-            ),
-            ("POST", "/admin/users/alice/expire", serde_json::Value::Null),
-            ("POST", "/admin/users/alice/revive", serde_json::Value::Null),
-            (
-                "POST",
-                "/admin/users/alice/rotate-token",
-                serde_json::Value::Null,
             ),
             (
                 "POST",
@@ -14052,7 +13895,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_db_user_tier() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14086,7 +13929,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14128,7 +13971,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_purge_project_dry_run_rejects_db_user_and_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14213,7 +14056,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_purge_session_dry_run_rejects_db_user_and_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14296,7 +14139,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_delete_workspace_dry_run_rejects_db_user_and_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14508,7 +14351,7 @@ mod tests {
             .unwrap();
         assert_eq!(anonymous_before.status(), StatusCode::OK);
 
-        let create = post_create_user(
+        let create = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14655,33 +14498,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_user_happy_path_returns_token_once() {
-        let (_tmp, router) = user_admin_test_router("root-token");
-        let resp = post_create_user(
-            &router,
-            "root-token",
-            serde_json::json!({
-                "username": "alice",
-                "name": "Alice Smith",
-                "email": "Alice@Example.com"
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["user"]["username"], "alice");
-        // Email was normalised to lowercase by NewUser::validate.
-        assert_eq!(json["user"]["email"], "alice@example.com");
-        assert_eq!(json["user"]["name"], "Alice Smith");
-        // Plaintext token is surfaced exactly once.
-        let token = json["token"].as_str().unwrap();
-        assert_eq!(token.len(), 43);
-        assert!(json["user"]["token_expired_at"].is_null());
-        assert!(json.get("temporary_password").is_none());
-    }
-
-    #[tokio::test]
     async fn create_human_user_is_additive_and_returns_temporary_password_once() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let resp = post_create_human_user(
@@ -14702,98 +14518,247 @@ mod tests {
         assert!(json.get("token").is_none());
     }
 
-    #[tokio::test]
-    async fn deprecated_user_token_routes_drive_the_legacy_api_credential() {
-        let (_tmp, router) = user_admin_dual_auth_router("root-token");
-        let create = post_create_user(
-            &router,
+    const LEGACY_TEST_PEPPER: &str = "test-pepper-admin";
+
+    /// What a 2.x `user add` left behind once V55 copied it: a user without a
+    /// password and a `legacy-user-token` credential whose id is the user id
+    /// and whose secret has no `aim_` prefix.
+    async fn seed_legacy_token_user(
+        store: &Store,
+        username: &str,
+        secret: &str,
+    ) -> ai_memory_core::UserId {
+        let user_id = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: username.to_string(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let pepper = ai_memory_store::TokenPepper::new(LEGACY_TEST_PEPPER);
+        store
+            .writer
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::from_slice(user_id.as_bytes()).unwrap(),
+                user_id,
+                "legacy-user-token".to_string(),
+                ai_memory_store::hash_token(secret, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+        user_id
+    }
+
+    async fn issue_api_key(router: &Router, username: &str) -> String {
+        let created = post_create_human_user(
+            router,
             "root-token",
-            serde_json::json!({"username": "alice"}),
+            serde_json::json!({ "username": username }),
         )
         .await;
-        assert_eq!(create.status(), StatusCode::OK);
-        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let original = json["token"].as_str().unwrap().to_string();
+        assert_eq!(created.status(), StatusCode::OK);
+        let (status, json) = admin_call(
+            router,
+            "POST",
+            "/admin/api-credentials",
+            "root-token",
+            Some(serde_json::json!({ "username": username, "label": "cli" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        json["token"].as_str().unwrap().to_string()
+    }
+
+    /// 3.0 removed the 1.x token-management endpoints. None of them may come
+    /// back for any tier: root gets a routing miss, the other tiers never get
+    /// past it either, and nothing about the users or their credentials
+    /// changes.
+    #[tokio::test]
+    async fn removed_legacy_token_routes_are_gone_for_every_tier() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let legacy = "q0N2v1d8kQd3m6Q7e9x4Zb1a2c3d4e5f6g7h8i9j0kL";
+        seed_legacy_token_user(&store, "alice", legacy).await;
+        let db_user = issue_api_key(&router, "bob").await;
+
+        let removed = [
+            (
+                "/admin/users",
+                Some(serde_json::json!({ "username": "mallory" })),
+            ),
+            ("/admin/users/alice/expire", None),
+            ("/admin/users/alice/revive", None),
+            ("/admin/users/alice/rotate-token", None),
+        ];
+        for (uri, body) in removed {
+            for bearer in [
+                Some("root-token"),
+                Some(db_user.as_str()),
+                Some(legacy),
+                None,
+            ] {
+                let mut builder = Request::builder().method("POST").uri(uri);
+                if let Some(token) = bearer {
+                    builder = builder.header("authorization", format!("Bearer {token}"));
+                }
+                let request_body = match &body {
+                    Some(json) => {
+                        builder = builder.header("content-type", "application/json");
+                        Body::from(serde_json::to_vec(json).unwrap())
+                    }
+                    None => Body::empty(),
+                };
+                let status = router
+                    .clone()
+                    .oneshot(builder.body(request_body).unwrap())
+                    .await
+                    .unwrap()
+                    .status();
+                let tier = match bearer {
+                    Some("root-token") => "root",
+                    Some(token) if token == legacy => "legacy token",
+                    Some(_) => "DB user",
+                    None => "anonymous",
+                };
+                // Root passes every gate and meets the routing miss itself:
+                // 405 where GET /admin/users still owns the path, 404 for the
+                // rest. Anonymous stops at authentication. On the shared
+                // /admin/users path the root gate answers other tiers first.
+                let expected = match (tier, uri) {
+                    ("anonymous", _) => StatusCode::UNAUTHORIZED,
+                    ("root", "/admin/users") => StatusCode::METHOD_NOT_ALLOWED,
+                    (_, "/admin/users") => StatusCode::FORBIDDEN,
+                    _ => StatusCode::NOT_FOUND,
+                };
+                assert_eq!(
+                    status, expected,
+                    "POST {uri} as {tier} must not reach a handler"
+                );
+            }
+        }
+
+        let (status, json) = admin_call(&router, "GET", "/admin/users", "root-token", None).await;
+        assert_eq!(status, StatusCode::OK, "GET /admin/users stays mounted");
+        let names: Vec<&str> = json["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["username"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["alice", "bob"], "no user may be created");
+        let (_, json) =
+            admin_call(&router, "GET", "/admin/api-credentials", "root-token", None).await;
+        for credential in json["credentials"].as_array().unwrap() {
+            assert!(
+                credential.get("revoked_at").is_none(),
+                "no credential may be expired: {credential}"
+            );
+        }
         assert_eq!(
-            user_token_admin_status(&router, &original).await,
+            user_token_admin_status(&router, legacy).await,
             StatusCode::FORBIDDEN,
-            "active legacy token must authenticate as a non-root DB user"
-        );
-
-        let expire = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users/alice/expire")
-                    .header("authorization", "Bearer root-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(expire.status(), StatusCode::OK);
-        assert_eq!(
-            user_token_admin_status(&router, &original).await,
-            StatusCode::UNAUTHORIZED
-        );
-
-        let revive = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users/alice/revive")
-                    .header("authorization", "Bearer root-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(revive.status(), StatusCode::OK);
-        assert_eq!(
-            user_token_admin_status(&router, &original).await,
-            StatusCode::FORBIDDEN
-        );
-
-        let rotate = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users/alice/rotate-token")
-                    .header("authorization", "Bearer root-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(rotate.status(), StatusCode::OK);
-        let body = to_bytes(rotate.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let rotated = json["token"].as_str().unwrap();
-        assert_ne!(rotated, original);
-        assert_eq!(
-            user_token_admin_status(&router, &original).await,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            user_token_admin_status(&router, rotated).await,
-            StatusCode::FORBIDDEN
+            "the legacy token must still authenticate"
         );
     }
 
+    /// A token issued by the removed 1.x `user add` is an ordinary API key in
+    /// 3.0: it authenticates as its non-root user, an expired one stays
+    /// refused, and `api-key list|rotate|revoke` manage it.
+    #[tokio::test]
+    async fn legacy_user_token_is_managed_as_an_api_key() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let active = "Lw7u0Qe1r2t3y4u5i6o7p8a9s0d1f2g3h4j5k6l7z8x";
+        let expired = "Mx8v1Rf2t3g4y5h6u7j8i9k0o1l2p3a4s5d6f7g8h9j";
+        let alice = seed_legacy_token_user(&store, "alice", active).await;
+        let carol = seed_legacy_token_user(&store, "carol", expired).await;
+        // 2.x `user expire` reached `api_credentials.revoked_at` through the
+        // V55 mirror; that is the state an expired token arrives in.
+        store
+            .writer
+            .revoke_api_credential(
+                ai_memory_core::ApiCredentialId::from_slice(carol.as_bytes()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            user_token_admin_status(&router, active).await,
+            StatusCode::FORBIDDEN,
+            "an active legacy token authenticates as a non-root DB user"
+        );
+        assert_eq!(
+            user_token_admin_status(&router, expired).await,
+            StatusCode::UNAUTHORIZED,
+            "an expired legacy token stays refused"
+        );
+
+        let (status, json) =
+            admin_call(&router, "GET", "/admin/api-credentials", "root-token", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = json["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == alice.to_string())
+            .cloned()
+            .expect("api-key list shows the legacy credential");
+        assert_eq!(listed["label"], "legacy-user-token");
+        assert_eq!(listed["user_id"], alice.to_string());
+        assert!(listed.get("revoked_at").is_none());
+
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            &format!("/admin/api-credentials/{alice}/rotate"),
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rotated = json["token"].as_str().unwrap().to_string();
+        assert!(rotated.starts_with("aim_"));
+        assert_eq!(
+            user_token_admin_status(&router, active).await,
+            StatusCode::UNAUTHORIZED,
+            "rotation retires the legacy secret"
+        );
+        assert_eq!(
+            user_token_admin_status(&router, &rotated).await,
+            StatusCode::FORBIDDEN
+        );
+
+        let (status, _) = admin_call(
+            &router,
+            "POST",
+            &format!("/admin/api-credentials/{alice}/revoke"),
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            user_token_admin_status(&router, &rotated).await,
+            StatusCode::UNAUTHORIZED,
+            "a revoked credential is refused"
+        );
+    }
     #[tokio::test]
     async fn create_user_rejects_duplicate_username_with_409() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
         )
         .await;
-        let resp = post_create_user(
+        let resp = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14805,7 +14770,7 @@ mod tests {
     #[tokio::test]
     async fn create_user_rejects_invalid_email_with_400() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let resp = post_create_user(
+        let resp = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice", "email": "not-an-email"}),
@@ -14822,7 +14787,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users")
+                    .uri("/admin/human-users")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({"username": "alice"})).unwrap(),
@@ -14837,7 +14802,7 @@ mod tests {
     #[tokio::test]
     async fn create_user_as_user_tier_returns_403() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let resp = post_create_user(
+        let resp = post_create_human_user(
             &router,
             "not-the-root-token",
             serde_json::json!({"username": "alice"}),
@@ -14851,7 +14816,8 @@ mod tests {
         let (_tmp, router) = user_admin_test_router("root-token");
         for n in ["alice", "bob", "carol"] {
             let _ =
-                post_create_user(&router, "root-token", serde_json::json!({"username": n})).await;
+                post_create_human_user(&router, "root-token", serde_json::json!({"username": n}))
+                    .await;
         }
         let resp = router
             .oneshot(
@@ -14883,7 +14849,7 @@ mod tests {
     #[tokio::test]
     async fn disable_then_enable_round_trips() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14958,7 +14924,7 @@ mod tests {
     #[tokio::test]
     async fn grants_can_be_issued_changed_listed_and_revoked_by_root() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15188,7 +15154,7 @@ mod tests {
     #[tokio::test]
     async fn purging_a_project_takes_its_grants() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15221,7 +15187,7 @@ mod tests {
     #[tokio::test]
     async fn a_merging_move_does_not_carry_grants_to_the_destination() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15251,7 +15217,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_a_workspace_takes_its_grants() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15360,7 +15326,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_api_credential_issues_a_distinct_secret() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15492,7 +15458,7 @@ mod tests {
     #[tokio::test]
     async fn patch_demotion_of_last_recoverable_root_returns_409() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let created = post_create_user(
+        let created = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "keeper", "role": "root"}),
@@ -15526,7 +15492,7 @@ mod tests {
     #[tokio::test]
     async fn disable_of_last_recoverable_root_returns_409() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let created = post_create_user(
+        let created = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "keeper", "role": "root"}),
@@ -15551,7 +15517,7 @@ mod tests {
     async fn concurrent_root_removals_leave_one_recoverable_root() {
         let (_tmp, router) = user_admin_test_router("root-token");
         for name in ["alice", "bob"] {
-            let created = post_create_user(
+            let created = post_create_human_user(
                 &router,
                 "root-token",
                 serde_json::json!({"username": name, "role": "root"}),
@@ -15614,7 +15580,7 @@ mod tests {
     #[tokio::test]
     async fn native_api_token_for_root_role_user_cannot_manage_users() {
         let (_tmp, router) = user_admin_dual_auth_router("root-token");
-        let created = post_create_user(
+        let created = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "boss", "role": "root"}),

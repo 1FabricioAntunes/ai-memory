@@ -1453,13 +1453,15 @@ mod tests {
         state.wiki.commit_all("fixture baseline").unwrap();
         let reader = store
             .writer
-            .create_user(
+            .create_human_user(
                 ai_memory_core::NewUser {
                     username: "promotion-reader".into(),
                     name: None,
                     email: None,
                 },
-                [7; ai_memory_store::TOKEN_HASH_LEN],
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -4916,18 +4918,20 @@ mod tests {
             .set_access_mode(holder, ai_memory_store::AccessMode::Restricted)
             .await
             .unwrap();
-        let user = |name: &str, seed: u8| {
-            store.writer.create_user(
+        let user = |name: &str| {
+            store.writer.create_human_user(
                 ai_memory_core::NewUser {
                     username: name.into(),
                     name: None,
                     email: None,
                 },
-                [seed; ai_memory_store::TOKEN_HASH_LEN],
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
         };
-        let outsider = user("outsider", 3).await.unwrap();
-        let member = user("member", 4).await.unwrap();
+        let outsider = user("outsider").await.unwrap();
+        let member = user("member").await.unwrap();
         store
             .writer
             .grant_memory(member, holder, ai_memory_store::GrantLevel::Write, None)
@@ -4991,18 +4995,20 @@ mod tests {
             .set_access_mode(legacy, ai_memory_store::AccessMode::Restricted)
             .await
             .unwrap();
-        let user = |name: &str, seed: u8| {
-            store.writer.create_user(
+        let user = |name: &str| {
+            store.writer.create_human_user(
                 ai_memory_core::NewUser {
                     username: name.into(),
                     name: None,
                     email: None,
                 },
-                [seed; ai_memory_store::TOKEN_HASH_LEN],
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
         };
-        let outsider = user("outsider", 3).await.unwrap();
-        let member = user("member", 4).await.unwrap();
+        let outsider = user("outsider").await.unwrap();
+        let member = user("member").await.unwrap();
         store
             .writer
             .grant_memory(member, legacy, ai_memory_store::GrantLevel::Write, None)

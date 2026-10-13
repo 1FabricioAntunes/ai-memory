@@ -347,8 +347,8 @@ pub enum Command {
     Upgrade(UpgradeArgs),
     /// Manage optional upstream LLM provider authentication.
     Auth(AuthArgs),
-    /// Manage human users and deprecated 1.x compatibility tokens. All
-    /// subcommands require the root bearer token.
+    /// Manage human users and their project grants. All subcommands
+    /// require the root bearer token. API keys live under `api-key`.
     User(UserArgs),
     /// Manage native `aim_` API credentials. All subcommands require
     /// the root bearer token and `[auth].token_pepper`.
@@ -1066,8 +1066,6 @@ pub struct CompletionsArgs {
 /// Subcommands for `user`.
 #[derive(Debug, Subcommand)]
 pub enum UserCommand {
-    /// Create a token-only compatibility user and print their token once.
-    Add(UserAddArgs),
     /// Create a human user and print a temporary password once. The user must
     /// change it on next login. Does not issue an API key.
     #[command(name = "add-human")]
@@ -1075,13 +1073,6 @@ pub enum UserCommand {
     /// List every registered identity. Passwords and hashes are never
     /// surfaced.
     List(UserListArgs),
-    /// Deprecated: expire the user's compatibility token.
-    Expire(UserExpireArgs),
-    /// Deprecated: reactivate the user's compatibility token.
-    Revive(UserReviveArgs),
-    /// Deprecated: replace and reactivate the user's compatibility token.
-    #[command(name = "rotate-token")]
-    RotateToken(UserRotateTokenArgs),
     /// Replace the user's password with a new temporary one, revoke
     /// their web sessions, and force a change on next login. Does not
     /// revoke API credentials.
@@ -1102,23 +1093,6 @@ pub enum UserCommand {
     Revoke(UserRevokeArgs),
     /// List grants: one user's with `--user`, else every grant on the server.
     Grants(UserGrantsArgs),
-}
-
-/// Arguments for `user add`.
-#[derive(Debug, Args)]
-pub struct UserAddArgs {
-    /// Stable username.
-    #[arg(long)]
-    pub username: String,
-    /// Optional display name.
-    #[arg(long)]
-    pub name: Option<String>,
-    /// Optional email.
-    #[arg(long)]
-    pub email: Option<String>,
-    /// Emit JSON. The compatibility token is included exactly once.
-    #[arg(long)]
-    pub json: bool,
 }
 
 /// Arguments for `user add-human`.
@@ -1145,36 +1119,6 @@ pub struct UserAddHumanArgs {
 #[derive(Debug, Args)]
 pub struct UserListArgs {
     /// Emit the response as JSON instead of a human-readable table.
-    #[arg(long)]
-    pub json: bool,
-}
-
-/// Arguments for deprecated `user expire`.
-#[derive(Debug, Args)]
-pub struct UserExpireArgs {
-    /// Username whose compatibility token to expire.
-    pub username: String,
-    /// Skip the interactive confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
-}
-
-/// Arguments for deprecated `user revive`.
-#[derive(Debug, Args)]
-pub struct UserReviveArgs {
-    /// Username whose compatibility token to revive.
-    pub username: String,
-}
-
-/// Arguments for deprecated `user rotate-token`.
-#[derive(Debug, Args)]
-pub struct UserRotateTokenArgs {
-    /// Username whose compatibility token to rotate.
-    pub username: String,
-    /// Skip the interactive confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
-    /// Emit JSON. The new token is included exactly once.
     #[arg(long)]
     pub json: bool,
 }
@@ -4819,45 +4763,55 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_user_token_commands_and_additive_human_create_parse() {
+    fn removed_user_token_commands_no_longer_parse() {
         for argv in [
+            vec!["ai-memory", "user", "add", "--username", "alice"],
             vec!["ai-memory", "user", "expire", "alice", "--yes"],
             vec!["ai-memory", "user", "revive", "alice"],
-            vec![
-                "ai-memory",
-                "user",
-                "rotate-token",
-                "alice",
-                "--yes",
-                "--json",
-            ],
-            vec![
-                "ai-memory",
-                "user",
-                "add-human",
-                "--username",
-                "alice",
-                "--role",
-                "root",
-            ],
+            vec!["ai-memory", "user", "rotate-token", "alice", "--yes"],
         ] {
-            Cli::try_parse_from(&argv)
-                .unwrap_or_else(|error| panic!("{argv:?} must remain parseable: {error}"));
+            let error =
+                Cli::try_parse_from(&argv).expect_err("the 1.x token commands were removed in 3.0");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "{argv:?}"
+            );
         }
-    }
-
-    #[test]
-    fn user_add_keeps_the_legacy_token_contract() {
-        let parsed =
-            Cli::try_parse_from(["ai-memory", "user", "add", "--username", "alice", "--json"])
-                .expect("legacy user add parses");
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "user",
+            "add-human",
+            "--username",
+            "alice",
+            "--role",
+            "root",
+        ])
+        .expect("user add-human still parses");
         let Command::User(args) = parsed.command else {
             panic!("expected user command");
         };
-        assert!(
-            matches!(args.command, UserCommand::Add(_)),
-            "user add must remain the legacy token-issuing command"
-        );
+        assert!(matches!(args.command, UserCommand::AddHuman(_)));
+        for argv in [
+            vec!["ai-memory", "api-key", "list"],
+            vec![
+                "ai-memory",
+                "api-key",
+                "rotate",
+                "0190f0b8-0000-7000-8000-000000000000",
+                "--yes",
+            ],
+            vec![
+                "ai-memory",
+                "api-key",
+                "revoke",
+                "0190f0b8-0000-7000-8000-000000000000",
+                "--yes",
+            ],
+        ] {
+            Cli::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("{argv:?} is the replacement path: {error}"));
+        }
     }
 
     #[test]

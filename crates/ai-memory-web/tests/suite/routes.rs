@@ -3242,7 +3242,7 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
     // Regression guard: the ETag must invalidate when author changes
     // even if the body stays the same. Otherwise a client cached the
     // "anonymous" view of a page wouldn't see the attribution flip
-    // after the operator runs `rotate-token` + re-writes the page.
+    // after the operator runs `api-key rotate` + re-writes the page.
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer

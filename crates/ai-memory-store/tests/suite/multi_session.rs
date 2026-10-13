@@ -300,25 +300,29 @@ async fn two_operators_promote_two_clone_keys_to_one_uuid_without_moving_active_
         .0;
     let alice = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "alice-promotion".into(),
                 name: None,
                 email: None,
             },
-            [41; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();
     let bob = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "bob-promotion".into(),
                 name: None,
                 email: None,
             },
-            [42; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();

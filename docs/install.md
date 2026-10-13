@@ -2813,8 +2813,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
 | `user add-human` / `list` / `reset-password` / `disable` / `enable` / `patch` | `docker exec` or native binary | Human identities and temporary passwords; never issues an API key |
-| `user add` / `expire` / `revive` / `rotate-token` | `docker exec` or native binary | Deprecated 1.x compatibility-token lifecycle backed by `legacy-user-token` |
-| `api-key add` / `list` / `rotate` / `revoke` | `docker exec` or native binary | Native `aim_` machine credentials |
+| `api-key add` / `list` / `rotate` / `revoke` | `docker exec` or native binary | Native `aim_` machine credentials, plus the `legacy-user-token` keys left by the 1.x `user add` (removed in 3.0) |
 | `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
 | `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |

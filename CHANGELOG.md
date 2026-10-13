@@ -446,6 +446,22 @@ and [0.x](docs/changelog/0.x.md).
   so metadata survives a round trip. The first run after upgrading rewrites
   unedited files of an earlier export in place. (#1164)
 
+### Removed
+- Removed the 1.x compatibility-token commands `ai-memory user add`,
+  `user expire`, `user revive` and `user rotate-token`, and their admin
+  endpoints `POST /admin/users` and `POST
+  /admin/users/{name}/expire`, `/revive` and `/rotate-token`. They were
+  deprecated in 2.0. Tokens they issued keep authenticating after the upgrade
+  as ordinary API keys with the label `legacy-user-token`: list them with
+  `ai-memory api-key list`, replace one with `api-key rotate <id>` and retire
+  one with `api-key revoke <id>`. A token expired before the upgrade stays
+  refused. Add people with `user add-human` and machine credentials with
+  `api-key add`. Migration V79 drops the unused `users.token_hash` and
+  `users.token_expired_at` columns and the triggers that mirrored them into
+  `api_credentials`, so user records from `/admin/users` and `ai-memory user
+  list --json` no longer carry `token_expired_at`, and `user list` no longer
+  shows an `expired` status.
+
 ### Fixed
 - Fixed the companion relay refusing to open its queue on Windows when another
   relay process was committing to the same queue. SQLite deletes its rollback

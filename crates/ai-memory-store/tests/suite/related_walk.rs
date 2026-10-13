@@ -393,13 +393,15 @@ async fn the_walk_hides_and_does_not_cross_projects_the_viewer_cannot_read() {
     }
     let viewer = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "vera".into(),
                 name: None,
                 email: None,
             },
-            [7; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();

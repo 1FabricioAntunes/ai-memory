@@ -337,15 +337,26 @@ async fn metrics_are_root_only_on_a_multi_user_server() {
     let h = harness().await;
     let create = Request::builder()
         .method("POST")
-        .uri("/admin/users")
+        .uri("/admin/human-users")
         .header("authorization", format!("Bearer {ROOT}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "username": "alice" }).to_string()))
         .unwrap();
     let (status, created) = send(&h.router, create).await;
     assert_eq!(status, StatusCode::OK, "{created}");
-    let alice: Value = serde_json::from_str(&created).unwrap();
-    let alice_token = alice["token"].as_str().expect("DB-user token").to_string();
+    let issue = Request::builder()
+        .method("POST")
+        .uri("/admin/api-credentials")
+        .header("authorization", format!("Bearer {ROOT}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "username": "alice", "label": "metrics" }).to_string(),
+        ))
+        .unwrap();
+    let (status, issued) = send(&h.router, issue).await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    let issued: Value = serde_json::from_str(&issued).unwrap();
+    let alice_token = issued["token"].as_str().expect("DB-user token").to_string();
 
     let (status, body) = scrape(&h.router, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous: {body}");

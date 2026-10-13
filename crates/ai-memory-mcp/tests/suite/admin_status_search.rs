@@ -265,13 +265,15 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
     };
     let operator = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "operator-sentinel".into(),
                 name: Some("private-user-sentinel".into()),
                 email: Some("private-email-sentinel@example.test".into()),
             },
-            [6; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -453,13 +455,15 @@ async fn project_coordinate_is_root_only_after_multiuser_enablement() {
     let (state, store) = make_admin_state(&tmp).await;
     store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "alice".into(),
                 name: None,
                 email: None,
             },
-            [7; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();

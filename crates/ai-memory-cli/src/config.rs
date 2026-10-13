@@ -3284,7 +3284,7 @@ mod tests {
         }
     }
 
-    /// Re-running `install-hooks --apply` after `user rotate-token` must leave
+    /// Re-running `install-hooks --apply` after `api-key rotate` must leave
     /// the new bearer, not both.
     #[test]
     fn storing_a_second_token_replaces_the_first() {
