@@ -12,6 +12,7 @@
 //!   viewer may read, as `memory_query(global=true)` does. Its trace is the
 //!   FTS time alone; there are no per-hit streams to show.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ai_memory_store::{SearchExplain, StreamTimings};
@@ -209,21 +210,30 @@ pub(crate) async fn handler(
         Ok(summaries) => summaries,
         Err(error) => return internal(error),
     };
-    let mut scope_groups: Vec<ScopeGroup> = Vec::new();
+    // The reader returns projects newest first, which interleaves
+    // workspaces; group and order by name instead.
+    let mut by_workspace: BTreeMap<String, Vec<ScopeOption>> = BTreeMap::new();
     for s in summaries {
         let option = ScopeOption {
             value: format!("{}/{}", s.workspace_name, s.project_name),
             selected: s.workspace_name == workspace && s.project_name == project,
             label: s.project_name,
         };
-        match scope_groups.last_mut() {
-            Some(group) if group.workspace == s.workspace_name => group.projects.push(option),
-            _ => scope_groups.push(ScopeGroup {
-                workspace: s.workspace_name,
-                projects: vec![option],
-            }),
-        }
+        by_workspace
+            .entry(s.workspace_name)
+            .or_default()
+            .push(option);
     }
+    let scope_groups: Vec<ScopeGroup> = by_workspace
+        .into_iter()
+        .map(|(workspace, mut projects)| {
+            projects.sort_by(|a, b| a.label.cmp(&b.label));
+            ScopeGroup {
+                workspace,
+                projects,
+            }
+        })
+        .collect();
     let hit_count = hits.len();
     let global_href = format!("search?q={}", encode_segment(&query));
     let view = SearchView {

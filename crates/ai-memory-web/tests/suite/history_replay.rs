@@ -882,3 +882,26 @@ async fn session_timeline_renders_captured_markup_inert() {
     assert!(!html.contains("\"><img"), "{html}");
     assert!(html.contains("&lt;script&gt;alert("), "{html}");
 }
+
+/// The session timeline's header search stays inside the session's project.
+#[tokio::test]
+async fn session_timeline_header_search_carries_the_project() {
+    let f = Fixture::new().await;
+    let scope = f.scope("default", "app").await;
+    let session = f.session(scope, None, &[("step", "body")]).await;
+    let (status, html) = get(&f.web(), &format!("/w/default/app/s/{session}")).await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    let header = html.split("<main").next().unwrap();
+    assert!(
+        header.contains(r#"<input type="hidden" name="workspace" value="default">"#),
+        "{header}"
+    );
+    assert!(
+        header.contains(r#"<input type="hidden" name="project" value="app">"#),
+        "{header}"
+    );
+    assert!(
+        header.contains(r#"placeholder="Search default/app…""#),
+        "{header}"
+    );
+}

@@ -4821,6 +4821,49 @@ async fn header_search_carries_the_current_project() {
     }
 }
 
+/// Projects come back newest first; the selector still shows one group per
+/// workspace, in name order, even when recency interleaves the workspaces.
+#[tokio::test]
+async fn search_page_scope_selector_groups_each_workspace_once() {
+    let (_tmp, store, wiki) = setup().await;
+    for (workspace, project) in [("aaa", "one"), ("zzz", "two"), ("aaa", "three")] {
+        let ws = store
+            .writer
+            .get_or_create_workspace(workspace)
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, project, None)
+            .await
+            .unwrap();
+        wiki.write_page(wiki_req(ws, proj, "notes/a.md", "# A\n\nbody"))
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+
+    let (status, text) = get_text(&app, "/search?q=body", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        text.matches(r#"<optgroup label="aaa">"#).count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches(r#"<optgroup label="zzz">"#).count(),
+        1,
+        "{text}"
+    );
+    let pos = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {text}"))
+    };
+    assert!(pos(r#"label="aaa""#) < pos(r#"label="zzz""#));
+    assert!(pos(r#"value="aaa/one""#) < pos(r#"value="aaa/three""#));
+    assert!(pos(r#"value="aaa/three""#) < pos(r#"label="zzz""#));
+}
+
 #[tokio::test]
 async fn search_page_scope_selector_round_trips_and_rejects_malformed_values() {
     let (_tmp, store, wiki) = setup().await;
