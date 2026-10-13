@@ -362,6 +362,20 @@ const OBSERVATION_STREAM_IDS_PER_PAGE: usize = 3;
 /// window; an observation body usually does, and a full window made each
 /// excerpt-backed hit cost more context than the page hit it stands in for.
 const OBSERVATION_SNIPPET_TOKENS: usize = 16;
+/// A project's first and last observation rowid, bound to `?1` = project id.
+///
+/// `idx_observations_project` is `(project_id)` with the implicit rowid
+/// suffix, so each scalar subquery is a single min/max seek. Filtering on
+/// `(workspace_id, project_id)` instead lets the planner pick the
+/// created_at-ordered `idx_observations_project_created` and walk every one
+/// of the project's entries. Project ids are unique across workspaces (V18's
+/// pairing triggers keep `observations.workspace_id` equal to the project's),
+/// so the workspace predicate adds nothing here.
+pub(crate) const OBSERVATION_ROWID_SPAN_SQL: &str = "SELECT \
+     (SELECT MIN(rowid) FROM observations INDEXED BY idx_observations_project \
+      WHERE project_id = ?1), \
+     (SELECT MAX(rowid) FROM observations INDEXED BY idx_observations_project \
+      WHERE project_id = ?1)";
 
 #[derive(Debug, Clone, Copy)]
 struct PageAuthority {
@@ -721,8 +735,8 @@ pub struct RrfContributions {
     /// `[retrieval] abstract_vectors`; 0.0 when off or missed).
     #[serde(rename = "abstract", skip_serializing_if = "is_zero")]
     pub abstract_vector: f64,
-    /// Observation-evidence stream contribution (opt-in
-    /// `[retrieval] observation_stream`; 0.0 when off or missed).
+    /// Observation-evidence stream contribution (`[retrieval]
+    /// observation_stream`, on by default; 0.0 when disabled or missed).
     #[serde(skip_serializing_if = "is_zero")]
     pub observation: f64,
 }
@@ -857,8 +871,8 @@ pub struct SearchExplain {
     /// Entity names on this page that matched the query.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub matched_entities: Vec<String>,
-    /// 1-based rank in the observation-evidence stream (opt-in
-    /// `[retrieval] observation_stream`): where this session page's
+    /// 1-based rank in the observation-evidence stream (`[retrieval]
+    /// observation_stream`, on by default): where this session page's
     /// best-matching observation placed among the matching sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation_rank: Option<usize>,
@@ -3039,14 +3053,13 @@ impl ReaderPool {
             let tx = conn.unchecked_transaction()?;
             // `observations_fts` spans every project, and bm25 runs for every
             // match before the scope filter can drop it. The project's rowid
-            // span (one covering-index probe) bounds the index scan to the
-            // stretch of the log where this project wrote; the scope
-            // predicates below still decide membership inside it.
+            // span bounds the index scan to the stretch of the log where
+            // this project wrote; the scope predicates below still decide
+            // membership inside it.
             let span: Option<(i64, i64)> = tx
                 .query_row(
-                    "SELECT MIN(rowid), MAX(rowid) FROM observations \
-                     WHERE workspace_id = ?1 AND project_id = ?2",
-                    params![workspace_id.as_bytes(), project_id.as_bytes()],
+                    OBSERVATION_ROWID_SPAN_SQL,
+                    params![project_id.as_bytes()],
                     |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
                 )
                 .map(|(lo, hi)| lo.zip(hi))?;
