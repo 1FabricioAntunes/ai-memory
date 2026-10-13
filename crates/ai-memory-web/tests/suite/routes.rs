@@ -3595,6 +3595,8 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
             "/workspaces/default/projects/alice-client-work/pages/secrets/rates.md",
         ),
         (&web, "/w/default/alice-client-work/p/secrets/rates.md"),
+        // A namespace listing, past its first page, is the same read.
+        (&web, "/w/default/alice-client-work/p/secrets/?page=2"),
         (&web, "/w/default/alice-client-work"),
     ] {
         let (status, body) = get(app.clone(), uri, Some(bob)).await;
@@ -4763,4 +4765,197 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
             assert!(text.contains(r#"aria-current="page""#), "{uri}");
         }
     }
+}
+
+// ── Folder counts, recency and namespace pagination ──
+
+async fn get_body(app: &axum::Router, uri: &str) -> (StatusCode, String) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Seed `count` pages `notes/n00.md`.. titled `Note NN`, oldest first.
+async fn seed_notes(count: usize) -> (TempDir, axum::Router) {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for i in 0..count {
+        store
+            .writer
+            .upsert_page(new_page(
+                ws,
+                proj,
+                &format!("notes/n{i:02}.md"),
+                &format!("Note {i:02}"),
+                "body",
+            ))
+            .await
+            .unwrap();
+    }
+    (tmp, router(store.reader.clone(), wiki.clone()))
+}
+
+#[tokio::test]
+async fn namespace_pages_split_at_25_and_clamp_bad_page_values() {
+    let (_tmp, app) = seed_notes(26).await;
+    let base = "/w/default/scratch/p/notes/";
+
+    // Newest first: page 1 holds n25..n01, page 2 only the oldest.
+    let (_, first) = get_body(&app, base).await;
+    assert!(first.contains("n25.md") && first.contains("n01.md"));
+    assert!(!first.contains("n00.md"), "n00 belongs on page 2");
+    assert!(first.contains("26 pages in this namespace"));
+    assert!(first.contains("Showing 1&ndash;25"));
+    assert!(
+        first.contains("href=\"w/default/scratch/p/notes/?sort=updated&amp;page=2\""),
+        "next link keeps the namespace path under <base href>"
+    );
+
+    let (_, second) = get_body(&app, &format!("{base}?page=2")).await;
+    assert!(second.contains("n00.md") && !second.contains("n01.md"));
+    assert!(second.contains("Showing 26&ndash;26"));
+    assert!(second.contains("rel=\"prev\"") && !second.contains("rel=\"next\""));
+
+    // Out of range shows the last page; junk and zero show the first.
+    let (status, far) = get_body(&app, &format!("{base}?page=99")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(far.contains("Showing 26&ndash;26"));
+    for junk in ["abc", "0", "-3", ""] {
+        let (status, body) = get_body(&app, &format!("{base}?page={junk}&sort=bogus")).await;
+        assert_eq!(status, StatusCode::OK, "page={junk}");
+        assert!(body.contains("Showing 1&ndash;25"), "page={junk}");
+    }
+    // A repeated key does not parse into the options at all; it falls back
+    // too instead of becoming axum's 400.
+    let (status, body) = get_body(&app, &format!("{base}?sort=a&sort=b&page=2")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Showing 1&ndash;25"), "{body}");
+
+    // Exactly one page of results: no pager, no range.
+    let (_tmp, app) = seed_notes(25).await;
+    let (_, exact) = get_body(&app, base).await;
+    assert!(exact.contains("25 pages in this namespace"));
+    assert!(!exact.contains("Showing") && !exact.contains("aria-label=\"Pagination\""));
+}
+
+/// Every page URL takes the namespace options, so an unparseable query
+/// string must not turn an ordinary page into a 400.
+#[tokio::test]
+async fn page_url_ignores_an_unparseable_query_string() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/bar.md", "# Bar\n\nbody"))
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+    let (status, body) = get_body(&app, "/w/default/scratch/p/notes/bar.md?sort=a&sort=b").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Bar"), "{body}");
+}
+
+#[tokio::test]
+async fn namespace_title_sort_breaks_ties_by_recency() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (path, title) in [
+        ("notes/a-old.md", "Same"),
+        ("notes/z-new.md", "Same"),
+        ("notes/m-first.md", "Alpha"),
+    ] {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, path, title, "body"))
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+
+    let (_, body) = get_body(&app, "/w/default/scratch/p/notes/?sort=title").await;
+    let at = |p: &str| body.find(p).unwrap_or_else(|| panic!("{p} missing"));
+    assert!(at("m-first.md") < at("z-new.md"), "Alpha before Same");
+    assert!(at("z-new.md") < at("a-old.md"), "newer duplicate first");
+    assert!(body.contains("aria-current=\"true\""));
+}
+
+#[tokio::test]
+async fn sidebar_folders_show_five_newest_with_a_link_to_the_rest() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let mut seed = vec![];
+    for i in 0..6 {
+        seed.push((format!("big/b{i}.md"), format!("Big {i}")));
+    }
+    for i in 0..5 {
+        seed.push((format!("five/f{i}.md"), format!("Five {i}")));
+    }
+    for i in 0..7 {
+        seed.push((format!("sessions/s{i}.md"), format!("Sess {i}")));
+    }
+    seed.push(("root-page.md".to_owned(), "Root page".to_owned()));
+    for (path, title) in &seed {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, path, title, "body"))
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+    let (_, body) = get_body(&app, "/w/default/scratch").await;
+
+    // Six pages: the five newest, the oldest hidden behind "View all 6".
+    assert!(body.contains("href=\"w/default/scratch/p/big/\""));
+    assert!(body.contains("(6)"));
+    assert!(body.contains("View all 6"));
+    let side = &body[..body.find("</aside>").expect("sidebar")];
+    assert!(side.contains("Big 5") && !side.contains("Big 0"));
+    // Five pages: all shown, no link; the root bucket is unlinked.
+    assert!(body.contains("Five 0") && !body.contains("View all 5"));
+    assert!(body.contains("(root)/") && !body.contains("p/(root)"));
+    // System pages stay collapsed and capped, and out of the recent list.
+    let details = body.find("<details").expect("system block");
+    assert!(body[details..].contains("View all 7"));
+    assert!(!body[..details].contains("Sess 6"));
 }

@@ -396,6 +396,11 @@ and [0.x](docs/changelog/0.x.md).
   changes, what replaces the removed token commands, the backup, upgrade and
   check steps, and how to roll back by restoring the backup with the 2.x
   binary. README, `docs/install.md` and `docs/MIGRATION-2.0.md` link to it.
+- Changed the web UI's project sidebar to link each folder to its namespace
+  listing with a page count, and to show only its five most recently updated
+  pages with a "View all N" link. The namespace listing now sorts by recent
+  update or by title and shows 25 pages at a time with previous and next links
+  (`?sort=title&page=2`). (#1247)
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
   `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
   FTS5 alone, so it returns the same order as `memory_query`, and `rank` is
