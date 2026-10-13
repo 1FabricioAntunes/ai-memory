@@ -491,6 +491,69 @@ mod launcher {
         );
     }
 
+    /// Front door 4 for Droid (adversarial): Droid runs the Claude Code
+    /// plugin with `DROID_PLUGIN_ROOT`, and the launcher re-attributes it.
+    /// With the `install-hooks --agent droid` hook for the same event in
+    /// `~/.factory/hooks.json` the plugin copy is dropped. Controls: no Droid
+    /// hooks keeps it, and so does a Claude settings hook, which Droid never
+    /// runs. A folderless Droid session is not captured either.
+    #[test]
+    fn a_droid_hook_for_the_same_event_drops_the_droid_plugin_copy() {
+        let sb = Sandbox::new();
+        let root = sb.home.to_string_lossy().into_owned();
+        let droid = [
+            ("CLAUDE_PLUGIN_ROOT", ""),
+            ("DROID_PLUGIN_ROOT", root.as_str()),
+        ];
+
+        sb.settings_hook(
+            &sb.claude.join("settings.json"),
+            "UserPromptSubmit",
+            "user-prompt-submit",
+        );
+        sb.launch("user-prompt-submit", &sb.prompt(), &droid);
+        assert_eq!(sb.spooled().len(), 1, "control: no Droid hook");
+        assert!(
+            sb.spooled()[0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("agent=droid")
+        );
+
+        let factory = sb.home.join(".factory");
+        std::fs::create_dir_all(&factory).unwrap();
+        let command = format!(
+            "{BIN} hook --event user-prompt-submit --agent droid --server-url {}",
+            sb.server
+        );
+        std::fs::write(
+            factory.join("hooks.json"),
+            json!({"UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": command}]}]})
+                .to_string(),
+        )
+        .unwrap();
+        sb.launch("user-prompt-submit", &sb.prompt(), &droid);
+        assert_eq!(
+            sb.spooled().len(),
+            1,
+            "Droid hooks.json: plugin copy dropped"
+        );
+
+        sb.launch("post-tool-use", &sb.read_tool("README.md"), &droid);
+        assert_eq!(
+            sb.spooled().len(),
+            2,
+            "an unwired event stays with the plugin"
+        );
+
+        sb.launch(
+            "user-prompt-submit",
+            &json!({"session_id": "s", "prompt": "no cwd"}),
+            &droid,
+        );
+        assert_eq!(sb.spooled().len(), 2, "folderless Droid session");
+    }
+
     /// A session with no project folder is not captured through the plugin.
     #[test]
     fn folderless_sessions_are_not_captured_through_the_plugin() {

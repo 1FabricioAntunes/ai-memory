@@ -225,6 +225,11 @@ configure ai-memory@ai-memory`:
   `install-mcp`, `install-skills`) to add them anyway.
 - Folderless sessions (a desktop scratch workspace with no project folder)
   are not captured through the plugin.
+- Factory Droid can install this plugin through its Claude marketplace
+  fallback. Its events are recorded as `droid`, and when `install-hooks
+  --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
+  the `hooks` key of `~/.factory/settings.json` while `hooks.json` does not
+  exist) the plugin skips it, as it does for Claude's settings hooks.
 - On Windows, Claude Code runs plugin hooks through Git Bash, which it
   already requires, so the launcher needs nothing else.
 - With the Docker wrapper, plugin hooks need a `bin/ai-memory` wrapper that runs

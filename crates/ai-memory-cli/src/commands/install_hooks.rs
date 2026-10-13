@@ -181,16 +181,30 @@ pub(crate) fn settings_file_carries_ai_memory_hooks(path: &Path) -> bool {
         .is_some_and(|content| settings_carry_ai_memory_hooks(&content))
 }
 
-/// Read bound for [`settings_file_carries_ai_memory_hook_for_event`]: it runs on the hook hot path, so a runaway
-/// settings file costs at most this much.
+/// Read bound for [`hooks_file_delivers_ai_memory_event`]: it runs on the hook
+/// hot path, so a runaway settings file costs at most this much.
 const MAX_PLUGIN_DEDUP_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Whether the Claude-shaped settings file at `path` registers an ai-memory
-/// hook for `event` (`SessionStart`, ...). The Claude Code plugin's copy of
-/// an event is dropped only when a settings hook delivers that same event, so
-/// an older install that wires fewer events still gets the rest from the
-/// plugin. A missing, unreadable or malformed file registers nothing.
-pub(crate) fn settings_file_carries_ai_memory_hook_for_event(path: &Path, event: &str) -> bool {
+/// Where the event map sits in a hooks file a plugin event is checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HooksFileShape {
+    /// Claude-shaped: `{"hooks": {"SessionStart": [...]}}` (Claude Code
+    /// `settings.json`, Droid `settings.json`).
+    HooksKey,
+    /// The event map itself with no wrapper (Droid `hooks.json`).
+    EventMap,
+}
+
+/// Whether the hooks file at `path` registers an ai-memory hook for `event`
+/// (`SessionStart`, ...). A plugin's copy of an event is dropped only when
+/// such a hook delivers that same event, so an older install that wires fewer
+/// events still gets the rest from the plugin. A missing, unreadable or
+/// malformed file registers nothing.
+pub(crate) fn hooks_file_delivers_ai_memory_event(
+    path: &Path,
+    shape: HooksFileShape,
+    event: &str,
+) -> bool {
     use std::io::Read as _;
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -203,11 +217,15 @@ pub(crate) fn settings_file_carries_ai_memory_hook_for_event(path: &Path, event:
     {
         return false;
     }
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .as_ref()
-        .and_then(ai_memory_claude_hooks)
-        .and_then(|hooks| hooks.get(event))
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let event_map = match shape {
+        HooksFileShape::HooksKey => document.get("hooks"),
+        HooksFileShape::EventMap => Some(&document),
+    };
+    event_map
+        .and_then(|map| map.get(event))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry))
 }

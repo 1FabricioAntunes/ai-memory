@@ -20,8 +20,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::install_hooks;
-use super::render_shared::CLAUDE_CODE_EVENTS;
+use super::install_hooks::{self, HooksFileShape};
+use super::render_shared::{CLAUDE_CODE_EVENTS, DROID_EVENTS};
 
 /// The environment variable the plugin launcher sets.
 pub(crate) const HOOK_ORIGIN_ENV: &str = "AI_MEMORY_HOOK_ORIGIN";
@@ -33,6 +33,9 @@ pub(crate) enum PluginOrigin {
     ClaudeCode,
     /// The Codex plugin (`plugins/codex`).
     Codex,
+    /// The Claude Code plugin loaded by Factory Droid through its Claude
+    /// plugin compatibility (the launcher re-attributes it to `droid`).
+    Droid,
 }
 
 impl PluginOrigin {
@@ -42,10 +45,15 @@ impl PluginOrigin {
         match lookup(HOOK_ORIGIN_ENV)?.trim() {
             "claude-code-plugin" => Some(Self::ClaudeCode),
             "codex-plugin" => Some(Self::Codex),
+            "droid-plugin" => Some(Self::Droid),
             _ => None,
         }
     }
 }
+
+/// A file whose ai-memory hooks outrank the plugin, and where its event map
+/// sits.
+pub(crate) type SettingsHooks = (PathBuf, HooksFileShape);
 
 /// Whether a plugin-launched event must be dropped before capture. `cwd` is
 /// the payload's working directory; `settings_files` are the files whose
@@ -54,7 +62,7 @@ pub(crate) fn drops_plugin_event(
     origin: PluginOrigin,
     event: &str,
     cwd: Option<&str>,
-    settings_files: &[PathBuf],
+    settings_files: &[SettingsHooks],
 ) -> bool {
     if is_folderless(cwd) {
         return true;
@@ -64,7 +72,7 @@ pub(crate) fn drops_plugin_event(
     };
     settings_files
         .iter()
-        .any(|path| install_hooks::settings_file_carries_ai_memory_hook_for_event(path, name))
+        .any(|(path, shape)| install_hooks::hooks_file_delivers_ai_memory_event(path, *shape, name))
 }
 
 /// The settings files that outrank the plugin for `origin`.
@@ -78,28 +86,57 @@ pub(crate) fn drops_plugin_event(
 /// trusted, and nothing at hook time can tell a trusted one from a skipped
 /// one, so dropping the plugin copy could lose the event entirely. `setup`
 /// and `doctor` handle a double Codex install instead.
+///
+/// Droid: the one file Droid reads hooks from, as `install-hooks --agent
+/// droid` decides it. `~/.factory/hooks.json` (the bare event map) when it
+/// exists; otherwise the `hooks` key of `~/.factory/settings.json`, which
+/// Droid reads only while `hooks.json` is absent. Checking a file Droid
+/// ignores could drop the plugin copy of an event nothing else delivers.
 pub(crate) fn settings_files_for(
     origin: PluginOrigin,
     cwd: Option<&str>,
     mut lookup: impl FnMut(&str) -> Option<String>,
-) -> Vec<PathBuf> {
+) -> Vec<SettingsHooks> {
     match origin {
         PluginOrigin::Codex => Vec::new(),
         PluginOrigin::ClaudeCode => {
             let mut files = Vec::with_capacity(2);
             let config_dir = lookup("CLAUDE_CONFIG_DIR").map(std::ffi::OsString::from);
             if let Ok(user) = install_hooks::claude_settings_path_in(config_dir) {
-                files.push(user);
+                files.push((user, HooksFileShape::HooksKey));
             }
             let project = lookup("CLAUDE_PROJECT_DIR")
                 .filter(|dir| !dir.trim().is_empty())
                 .or_else(|| cwd.map(str::to_owned));
             if let Some(project) = project {
-                files.push(install_hooks::project_claude_settings_local(Path::new(
-                    &project,
-                )));
+                files.push((
+                    install_hooks::project_claude_settings_local(Path::new(&project)),
+                    HooksFileShape::HooksKey,
+                ));
             }
             files
+        }
+        PluginOrigin::Droid => {
+            // `AI_MEMORY_HOME` relocates every agent home ai-memory resolves
+            // (see `path_util::home_dir`); read it through the lookup so the
+            // check follows the same root `install-hooks` wrote under.
+            let hooks_json = match lookup("AI_MEMORY_HOME").filter(|home| !home.trim().is_empty()) {
+                Some(home) => {
+                    Some(super::install_mcp::factory_home(Path::new(&home)).join("hooks.json"))
+                }
+                None => install_hooks::droid_hooks_path().ok(),
+            };
+            let Some(hooks_json) = hooks_json else {
+                return Vec::new();
+            };
+            if hooks_json.exists() {
+                vec![(hooks_json, HooksFileShape::EventMap)]
+            } else {
+                vec![(
+                    hooks_json.with_file_name("settings.json"),
+                    HooksFileShape::HooksKey,
+                )]
+            }
         }
     }
 }
@@ -109,6 +146,10 @@ pub(crate) fn settings_files_for(
 fn settings_event_name(origin: PluginOrigin, event: &str) -> Option<&'static str> {
     match origin {
         PluginOrigin::ClaudeCode => CLAUDE_CODE_EVENTS
+            .iter()
+            .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
+            .map(|(name, _)| *name),
+        PluginOrigin::Droid => DROID_EVENTS
             .iter()
             .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
             .map(|(name, _)| *name),
@@ -167,6 +208,10 @@ mod tests {
             PluginOrigin::from_env(lookup(&[(HOOK_ORIGIN_ENV, " codex-plugin\n")])),
             Some(PluginOrigin::Codex)
         );
+        assert_eq!(
+            PluginOrigin::from_env(lookup(&[(HOOK_ORIGIN_ENV, "droid-plugin")])),
+            Some(PluginOrigin::Droid)
+        );
         for other in ["", "claude-code", "cursor-plugin", "settings"] {
             assert_eq!(
                 PluginOrigin::from_env(lookup(&[(HOOK_ORIGIN_ENV, other)])),
@@ -186,7 +231,7 @@ mod tests {
         let settings = temp.path().join("settings.json");
         std::fs::write(&settings, SETTINGS_HOOK).unwrap();
         let cwd = Some("/work/repo");
-        let files = vec![settings.clone()];
+        let files = vec![(settings.clone(), HooksFileShape::HooksKey)];
 
         assert!(drops_plugin_event(
             PluginOrigin::ClaudeCode,
@@ -202,7 +247,7 @@ mod tests {
             PluginOrigin::ClaudeCode,
             "session-start",
             cwd,
-            &[temp.path().join("missing.json")]
+            &[(temp.path().join("missing.json"), HooksFileShape::HooksKey)]
         ));
 
         std::fs::write(
@@ -237,9 +282,91 @@ mod tests {
             PluginOrigin::Codex,
             "session-start",
             Some("/work/repo"),
-            &[settings]
+            &[(settings, HooksFileShape::HooksKey)]
         ));
         assert!(settings_files_for(PluginOrigin::Codex, Some("/w"), lookup(&[])).is_empty());
+    }
+
+    const DROID_EVENT_MAP: &str = r#"{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/ai-memory hook --event session-start --agent droid --server-url http://127.0.0.1:49374"}]}]}"#;
+
+    fn droid_files(home: &Path) -> Vec<SettingsHooks> {
+        let home = home.to_string_lossy().into_owned();
+        settings_files_for(
+            PluginOrigin::Droid,
+            Some("/work/repo"),
+            lookup(&[("AI_MEMORY_HOME", home.as_str())]),
+        )
+    }
+
+    fn droid_drops(home: &Path, event: &str) -> bool {
+        drops_plugin_event(
+            PluginOrigin::Droid,
+            event,
+            Some("/work/repo"),
+            &droid_files(home),
+        )
+    }
+
+    /// Adversarial: Droid running the Claude Code plugin next to an
+    /// `install-hooks --agent droid` install delivers each event twice unless
+    /// the plugin copy is dropped. Controls: no Droid hooks at all, and an
+    /// event the Droid hooks do not wire, keep the plugin copy.
+    #[test]
+    fn droid_plugin_copy_is_dropped_when_droid_hooks_deliver_the_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = temp.path().join(".factory");
+        std::fs::create_dir_all(&factory).unwrap();
+        assert!(
+            !droid_drops(temp.path(), "session-start"),
+            "nothing installed"
+        );
+
+        std::fs::write(factory.join("hooks.json"), DROID_EVENT_MAP).unwrap();
+        assert!(droid_drops(temp.path(), "session-start"));
+        assert!(
+            !droid_drops(temp.path(), "stop"),
+            "an event hooks.json does not wire stays with the plugin"
+        );
+        assert!(
+            !droid_drops(temp.path(), "subagent-start"),
+            "Droid has no subagent hook, so the plugin keeps it"
+        );
+    }
+
+    /// Droid reads `settings.json` hooks only while `hooks.json` is absent, so
+    /// that is the only time they may suppress the plugin. Adversarial: an
+    /// ai-memory hook left in `settings.json` beside a `hooks.json` without
+    /// one is dead config and must not drop the plugin copy.
+    #[test]
+    fn droid_settings_hooks_count_only_while_hooks_json_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = temp.path().join(".factory");
+        std::fs::create_dir_all(&factory).unwrap();
+        std::fs::write(
+            factory.join("settings.json"),
+            format!(r#"{{"model":"x","hooks":{DROID_EVENT_MAP}}}"#),
+        )
+        .unwrap();
+        assert!(droid_drops(temp.path(), "session-start"));
+
+        std::fs::write(factory.join("hooks.json"), "{}").unwrap();
+        assert!(!droid_drops(temp.path(), "session-start"));
+    }
+
+    #[test]
+    fn droid_plugin_skips_folderless_sessions() {
+        assert!(drops_plugin_event(
+            PluginOrigin::Droid,
+            "user-prompt-submit",
+            None,
+            &[]
+        ));
+        assert!(!drops_plugin_event(
+            PluginOrigin::Droid,
+            "user-prompt-submit",
+            Some("/work/repo"),
+            &[]
+        ));
     }
 
     #[test]
@@ -254,14 +381,19 @@ mod tests {
         );
         assert_eq!(
             files[0],
-            Path::new("/relocated/claude").join("settings.json")
+            (
+                Path::new("/relocated/claude").join("settings.json"),
+                HooksFileShape::HooksKey
+            )
         );
         assert!(
-            files[1].ends_with(Path::new(".claude").join("settings.local.json")),
+            files[1]
+                .0
+                .ends_with(Path::new(".claude").join("settings.local.json")),
             "{files:?}"
         );
         assert!(
-            files[1].starts_with("/the/project"),
+            files[1].0.starts_with("/the/project"),
             "CLAUDE_PROJECT_DIR outranks the payload cwd: {files:?}"
         );
 
@@ -270,7 +402,7 @@ mod tests {
             Some("/payload/cwd"),
             lookup(&[("CLAUDE_PROJECT_DIR", " ")]),
         );
-        assert!(files[1].starts_with("/payload/cwd"), "{files:?}");
+        assert!(files[1].0.starts_with("/payload/cwd"), "{files:?}");
     }
 
     #[test]
