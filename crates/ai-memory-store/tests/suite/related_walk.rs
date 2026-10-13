@@ -794,13 +794,15 @@ async fn page_links_preview_caps_in_sql_and_counts_only_readable_neighbours() {
         .unwrap();
     let viewer = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "vera".into(),
                 name: None,
                 email: None,
             },
-            [7; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();
