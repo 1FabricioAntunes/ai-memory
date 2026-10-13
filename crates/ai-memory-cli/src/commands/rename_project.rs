@@ -1,6 +1,6 @@
 //! `ai-memory rename-project` — thin HTTP client for project rename.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::cli::RenameProjectArgs;
 use crate::config::Config;
@@ -35,15 +35,10 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
             (ws, Some(from), None)
         }
     };
-    // What the report and the client-local rekey name as the source. With
-    // `--project-id` this is the id itself: the old name is only known to the
-    // server, and a wrong name in the local rekey would miss the link it was
-    // supposed to move.
-    let target_label = match (&from, &project_id) {
-        (Some(from), _) => from.clone(),
-        (None, Some(id)) => id.clone(),
-        (None, None) => unreachable!("clap requires one of --from/--project-id"),
-    };
+    let requested = from
+        .clone()
+        .or_else(|| project_id.clone())
+        .context("one of --from or --project-id is required")?;
     let body = serde_json::json!({
         "workspace": workspace,
         "from": from,
@@ -52,16 +47,12 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     });
     let summary: serde_json::Value = post_json(&endpoint, "/admin/rename-project", &body).await?;
     let pages = summary["pages"].as_u64().unwrap_or(0);
+    let old_name = renamed_from(&summary, requested);
     if let Some(warning) = summary["manifest_warning"].as_str() {
         eprintln!("ai-memory: warning: {warning}");
     }
     if let Err(error) = super::project_registry::rekey_scope(
-        config,
-        &endpoint,
-        &workspace,
-        &target_label,
-        &workspace,
-        &args.to,
+        config, &endpoint, &workspace, &old_name, &workspace, &args.to,
     ) {
         eprintln!(
             "ai-memory: project renamed, but the client-local checkout link could not be updated ({error:#})"
@@ -69,7 +60,27 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     }
     println!(
         "Renamed {}/{} → {}/{} ({} pages now under the new name).",
-        workspace, target_label, workspace, args.to, pages
+        workspace, old_name, workspace, args.to, pages
     );
     Ok(())
+}
+
+/// The renamed project's old name as the server resolved it, the only way to
+/// learn the name behind `--project-id`; the client-local checkout link is
+/// keyed by that name.
+fn renamed_from(summary: &serde_json::Value, requested: String) -> String {
+    summary["from"].as_str().map_or(requested, str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renamed_from;
+
+    #[test]
+    fn a_rename_by_id_rekeys_the_link_under_the_resolved_name() {
+        let id = "0193e7a1-0000-7000-8000-000000000001".to_owned();
+        let summary = serde_json::json!({ "from": "api", "to": "api-v2" });
+        assert_eq!(renamed_from(&summary, id.clone()), "api");
+        assert_eq!(renamed_from(&serde_json::json!({}), id.clone()), id);
+    }
 }

@@ -595,6 +595,68 @@ async fn rename_project_unknown_project_id_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// An id that really exists, but in ANOTHER workspace, is a 404 and leaves
+/// that project's name alone. Control: the same id renames when the request
+/// names its own workspace. (#1208)
+#[tokio::test]
+async fn rename_project_refuses_a_real_id_from_another_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "secret", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state.clone(),
+        "/admin/rename-project",
+        json!({
+            "workspace": "default",
+            "project_id": foreign.to_string(),
+            "to": "hijacked",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a real id from another workspace must not resolve here"
+    );
+    assert_eq!(
+        store
+            .reader
+            .project_name_by_id(other_ws, foreign)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("secret"),
+        "the foreign project keeps its name"
+    );
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({
+            "workspace": "elsewhere",
+            "project_id": foreign.to_string(),
+            "to": "renamed",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "control: its own workspace");
+}
+
 /// `from` and `project_id` together are ambiguous and refused with 400.
 #[tokio::test]
 async fn rename_project_refuses_both_from_and_project_id() {

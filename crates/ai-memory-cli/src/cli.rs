@@ -1546,8 +1546,8 @@ pub struct PurgeProjectArgs {
     /// Project id (UUID) to purge, as an alternative to `--project`.
     ///
     /// Use this when the NAME lookup is ambiguous: a legacy row whose name
-    /// collides with another project's `legacy_name` resolves to the wrong
-    /// row, so only the id reaches the intended one. Find it in the
+    /// collides with another project's `legacy_name` is refused by name, so
+    /// only the id reaches it. Find it in the
     /// `list-projects` output. Mutually exclusive with `--project`.
     #[arg(long)]
     pub project_id: Option<String>,
@@ -1644,8 +1644,8 @@ pub struct RenameProjectArgs {
     /// Project id (UUID) to rename, as an alternative to `--from`.
     ///
     /// Use this when the NAME lookup is ambiguous: a legacy row whose name
-    /// collides with another project's `legacy_name` resolves to the wrong
-    /// row, so only the id reaches the intended one. Find it in the
+    /// collides with another project's `legacy_name` is refused by name, so
+    /// only the id reaches it. Find it in the
     /// `list-projects` output. Mutually exclusive with `--from`.
     #[arg(long)]
     pub project_id: Option<String>,
@@ -1669,8 +1669,8 @@ pub struct MoveProjectArgs {
     /// Project id (UUID) to move, as an alternative to `--project`.
     ///
     /// Use this when the NAME lookup is ambiguous: a legacy row whose name
-    /// collides with another project's `legacy_name` resolves to the wrong
-    /// row, so only the id reaches the intended one. Find it in the
+    /// collides with another project's `legacy_name` is refused by name, so
+    /// only the id reaches it. Find it in the
     /// `list-projects` output. Mutually exclusive with `--project`.
     #[arg(long)]
     pub project_id: Option<String>,

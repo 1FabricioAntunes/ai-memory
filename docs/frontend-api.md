@@ -160,13 +160,20 @@ GET /api/v1/projects?workspace=NAME   # projects in one workspace
 ```json
 [
   {
+    "workspace_id": "0193e7a1-0000-7000-8000-00000000000a",
     "workspace_name": "default",
+    "project_id": "0193e7a1-0000-7000-8000-00000000000b",
     "project_name": "ai-memory",
     "page_count": 138,
     "last_updated": "2026-05-28T14:02:11.123Z"
   }
 ]
 ```
+
+`project_id` is the stable address of a project: names can collide (a legacy
+twin row can carry another project's old name), and the admin project
+operations accept the id where the name is ambiguous. A restricted project's
+row, id included, is hidden from a caller without a grant.
 
 ### 4.3 Pages (list)
 

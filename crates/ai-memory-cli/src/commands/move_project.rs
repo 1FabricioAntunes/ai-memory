@@ -53,15 +53,10 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             (ws, Some(project), None)
         }
     };
-    let target_flag = match (&project, &project_id) {
-        (Some(project), _) => format!("--project {project}"),
-        (None, Some(id)) => format!("--project-id {id}"),
-        (None, None) => unreachable!("clap requires one of --project/--project-id"),
-    };
-    let target_label = match (&project, &project_id) {
-        (Some(project), _) => project.clone(),
-        (None, Some(id)) => id.clone(),
-        (None, None) => unreachable!("clap requires one of --project/--project-id"),
+    let (target_flag, requested) = match (&project, &project_id) {
+        (Some(project), _) => (format!("--project {project}"), project.clone()),
+        (None, Some(id)) => (format!("--project-id {id}"), id.clone()),
+        (None, None) => bail!("one of --project or --project-id is required"),
     };
 
     if !args.confirm {
@@ -100,6 +95,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
     .await?;
 
     let pages = report["pages_copied"].as_u64().unwrap_or(0);
+    let target_label = moved_project_name(&report, requested);
     let purged = report["source_purged"].as_bool().unwrap_or(false);
     let moved_via = report["moved_via"].as_str().unwrap_or("");
     let skipped_count = report["pages_skipped"].as_array().map_or(0, |s| s.len());
@@ -165,4 +161,28 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The moved project's name as the server resolved it. The report's `from` is
+/// `<workspace>/<project>`, and it is the only way to learn the name behind
+/// `--project-id`; the client-local checkout link is keyed by that name.
+fn moved_project_name(report: &serde_json::Value, requested: String) -> String {
+    report["from"]
+        .as_str()
+        .and_then(|label| label.rsplit_once('/'))
+        .map_or(requested, |(_, name)| name.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::moved_project_name;
+
+    #[test]
+    fn a_move_by_id_rekeys_the_link_under_the_resolved_name() {
+        let report = serde_json::json!({ "from": "default/api", "to": "team/api" });
+        let id = "0193e7a1-0000-7000-8000-000000000001".to_owned();
+        assert_eq!(moved_project_name(&report, id.clone()), "api");
+        // A report without the label keeps what the operator asked for.
+        assert_eq!(moved_project_name(&serde_json::json!({}), id.clone()), id);
+    }
 }

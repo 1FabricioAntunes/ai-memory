@@ -3187,6 +3187,69 @@ async fn move_project_unknown_project_id_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// An id that really exists, but in ANOTHER workspace, is a 404 and moves
+/// nothing. Control: the same id moves when the request names its own
+/// workspace as the source. (#1208)
+#[tokio::test]
+async fn move_project_refuses_a_real_id_from_another_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "secret", None)
+        .await
+        .unwrap();
+
+    let resp = post(
+        state.clone(),
+        "/admin/move-project",
+        json!({
+            "from_workspace": "default",
+            "project_id": foreign.to_string(),
+            "to_workspace": "target",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a real id from another workspace must not resolve here"
+    );
+    assert!(
+        store
+            .reader
+            .project_name_by_id(other_ws, foreign)
+            .await
+            .unwrap()
+            .is_some(),
+        "the foreign project stays where it was"
+    );
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "elsewhere",
+            "project_id": foreign.to_string(),
+            "to_workspace": "target",
+            "confirm": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "control: its own workspace");
+}
+
 /// `project` and `project_id` together are ambiguous and refused with 400.
 #[tokio::test]
 async fn move_project_refuses_both_project_and_project_id() {
