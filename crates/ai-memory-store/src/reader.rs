@@ -10460,16 +10460,20 @@ fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage>
 /// SQL for [`PageMeta::created_at`]: when the page itself first appeared.
 ///
 /// `pages.created_at` is per version, so the latest row alone would report the
-/// last rewrite. Every version shares `(workspace_id, project_id, path)`;
-/// the earliest retained one is the page's creation instant, which also
-/// follows a tombstone-resurrected page onto its old chain (#929). Versions
-/// removed by retention or ledger reclaim no longer count. Served by
-/// `idx_pages_path_created`.
+/// last rewrite. The page's versions form its `supersedes` chain (a
+/// tombstone-resurrected page is re-linked onto its old chain, #929), so the
+/// oldest retained version is the minimum along that chain. Each step is a
+/// primary-key lookup, so no index on `(path, created_at)` is needed and the
+/// walk cannot reach a same-path page in another project. Versions removed by
+/// retention or ledger reclaim end the chain early and no longer count.
 const PAGE_FIRST_CREATED_EXPR: &str = "COALESCE(\
-    (SELECT MIN(v.created_at) FROM pages v \
-      WHERE v.workspace_id = pg.workspace_id \
-        AND v.project_id = pg.project_id \
-        AND v.path = pg.path), \
+    (WITH RECURSIVE chain(supersedes, created_at, depth) AS (\
+        SELECT pg.supersedes, pg.created_at, 0 \
+        UNION ALL \
+        SELECT v.supersedes, v.created_at, chain.depth + 1 \
+          FROM pages v JOIN chain ON v.id = chain.supersedes \
+         WHERE chain.depth < 100000) \
+     SELECT MIN(created_at) FROM chain), \
     pg.created_at)";
 
 fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<PageMeta>> {
