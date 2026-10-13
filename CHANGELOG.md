@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed consolidation sending the model a prompt with no evidence when
+  `consolidation.max_input_tokens` sat at the validated floor. The floor is
+  meant to guarantee room for observations after the fixed system prompt, page
+  conventions and structured-output schema, but it was checked against the raw
+  token count while the builders run on a shrunken character budget
+  (`max_input_tokens` times a chars-per-token estimate times
+  `input_token_safety_margin`, default 0.8). At the old 6,500 floor the batch
+  prompt had a 15,600-character budget against a 18,997-character fixed part,
+  so every observation became an omission marker and the config was accepted
+  anyway. The floor is now 8,350 tokens, derived from the real builders at the
+  default margin, and the startup check compares the configured budget at its
+  own margin with that requirement at the default, so lowering the margin
+  demands a proportionally larger `max_input_tokens` instead of silently
+  starving the prompt. An install configured between 6,500 and 8,350 tokens now
+  fails at startup with a message naming both numbers, where it previously
+  started and produced evidence-free consolidations. (#1234)
 - Replaced the unmaintained YAML library (`serde_yaml` and its
   `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
   reads existing page frontmatter to exactly the same values as before. One

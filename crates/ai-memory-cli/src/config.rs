@@ -3973,6 +3973,33 @@ max_input_tokens = {tokens}
         );
     }
 
+    /// The small-context examples in `docs/install.md` and
+    /// `docs/llm-providers.md` must be configs that actually load, so a doc
+    /// example cannot go stale the way `max_input_tokens = 6500` did once the
+    /// floor moved (#1234). These are the literal values those docs quote.
+    #[test]
+    fn documented_small_context_examples_load() {
+        for (doc, tokens, output) in [
+            ("docs/install.md", 10_000, 1_000),
+            ("docs/llm-providers.md", 10_000, 1_000),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[consolidation]
+max_input_tokens = {tokens}
+max_output_tokens = {output}
+"
+                ),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .unwrap_or_else(|error| panic!("{doc}'s example no longer loads: {error:#}"));
+        }
+    }
+
     /// A small-context provider needs both sides of the context allocation to
     /// survive the config round-trip. The budget is derived from the floor
     /// rather than written out, so the test keeps meaning "the smallest

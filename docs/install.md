@@ -2309,7 +2309,7 @@ the real context window, with additional headroom for tokenizer variance:
 
 ```bash
 # e.g. a model loaded with an 8k context window
--e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=6500
+-e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=10000
 -e AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS=1000
 ```
 
@@ -2320,9 +2320,12 @@ schema, and provider-envelope reserve. Tokenizers differ, so this is a
 conservative estimate rather than an exact provider token count. An automatic
 checkpoint provider failure degrades to a rule-based page rather than losing
 the checkpoint, but right-sized limits are what allow LLM consolidation to
-succeed. Startup rejects input targets below 6,000 and output limits below
-1,000 because the batch schema and a useful response cannot fit reliably below
-those floors.
+succeed. Startup rejects a budget that leaves too little room for observations
+after the fixed prompts and the structured-output schema -- 8,350 input tokens
+at the default `input_token_safety_margin` of 0.8 -- and rejects output limits
+below 1,000, because the batch schema and a useful response cannot fit reliably
+below those floors. Lowering the safety margin shrinks the character budget, so
+a smaller margin needs a proportionally larger `max_input_tokens`.
 
 ---
 
