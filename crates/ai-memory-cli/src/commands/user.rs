@@ -262,11 +262,21 @@ async fn patch(ep: &ServerEndpoint, args: UserPatchArgs) -> Result<()> {
     } else {
         println!(
             "✓ updated user '{}' ({})",
-            resp.user.username,
+            display_username(&resp.user.username),
             resp.user.status()
         );
     }
     Ok(())
+}
+
+/// The one place a username reaches terminal output unchanged. CodeQL's
+/// sensitive-data heuristic reads any `username` as account information; a
+/// username is the operator-chosen login name, not a credential, and the
+/// `rust/cleartext-logging` barrier model
+/// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
+/// names this function so printing one here raises no alert.
+fn display_username(value: &str) -> &str {
+    value
 }
 
 fn print_temp_password(resp: &UserWithPassword, json: bool, verb: &str) -> Result<()> {

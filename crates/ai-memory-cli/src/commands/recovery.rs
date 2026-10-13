@@ -1182,10 +1182,10 @@ fn print_report(report: &RecoverReport) {
         );
     }
     for session in &report.sessions {
-        let target = session
-            .native_session_id
-            .as_deref()
-            .unwrap_or("(no session id)");
+        let target = session.native_session_id.as_deref().map_or_else(
+            || "(no session id)".to_owned(),
+            super::run::display_session_id,
+        );
         let mut line = format!(
             "  [{}] {} {} in {}/{} — {}",
             session.kind,

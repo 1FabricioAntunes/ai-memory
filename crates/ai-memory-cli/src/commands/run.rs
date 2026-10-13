@@ -3679,7 +3679,11 @@ fn choose_native_session(
     }
 }
 
-fn display_session_id(value: &str) -> String {
+/// Render a native session id for terminal output, bounded so a long id
+/// cannot flood the line. CodeQL's `rust/cleartext-logging` barrier model
+/// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
+/// names this function, so every session id the CLI prints goes through it.
+pub(crate) fn display_session_id(value: &str) -> String {
     const MAX_CHARS: usize = 64;
     let mut output = value.chars().take(MAX_CHARS).collect::<String>();
     if value.chars().count() > MAX_CHARS {

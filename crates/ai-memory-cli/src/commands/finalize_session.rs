@@ -150,7 +150,8 @@ async fn replay_prompts(
     }
     let Some(home) = super::run::native_home(config) else {
         eprintln!(
-            "ai-memory: no home directory; session {session_id} is finalized without its prompts"
+            "ai-memory: no home directory; session {} is finalized without its prompts",
+            super::run::display_session_id(session_id)
         );
         return;
     };
@@ -166,7 +167,8 @@ async fn replay_prompts(
     .await
     {
         eprintln!(
-            "ai-memory: could not replay the prompts of session {session_id} ({error:#}); finalizing without them"
+            "ai-memory: could not replay the prompts of session {} ({error:#}); finalizing without them",
+            super::run::display_session_id(session_id)
         );
     }
 }

@@ -129,7 +129,7 @@ pub(crate) fn validate_planned_path(path: &str, prefix: &str) -> Result<()> {
 }
 
 /// Validate an agentmemory record id before it names a path or a key.
-pub(crate) fn validate_id<'a>(id: &'a str, what: &str) -> Result<&'a str> {
+pub(crate) fn validate_id(id: &str, what: &str) -> Result<()> {
     if id.trim().is_empty() || id.len() > MAX_ID_BYTES || id.chars().any(char::is_control) {
         bail!(
             "{what} id must be non-empty, at most {MAX_ID_BYTES} bytes and free of control characters"
@@ -137,7 +137,22 @@ pub(crate) fn validate_id<'a>(id: &'a str, what: &str) -> Result<&'a str> {
     }
     ai_memory_client::reject_sensitive(&serde_json::json!(id))
         .with_context(|| format!("{what} id looks like a credential; refusing it"))?;
-    Ok(id)
+    Ok(())
+}
+
+/// Render an agentmemory session id for terminal output, bounded so a long
+/// id cannot flood the report. CodeQL's sensitive-data heuristic reads any
+/// `session_id` name as account information; this is the one function its
+/// `rust/cleartext-logging` barrier model names
+/// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`),
+/// so print every session id through it.
+pub(crate) fn display_session_id(value: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut output = value.chars().take(MAX_CHARS).collect::<String>();
+    if value.chars().count() > MAX_CHARS {
+        output.push_str("...");
+    }
+    output
 }
 
 /// ai-memory `kind` and `tier` for an agentmemory memory `type`.
@@ -657,6 +672,15 @@ mod tests {
         assert!(validate_id("a\nb", "memory").is_err());
         assert!(validate_id(&"x".repeat(MAX_ID_BYTES + 1), "memory").is_err());
         assert!(validate_id("sk-1234567890abcdefghijklmnop", "memory").is_err());
+    }
+
+    #[test]
+    fn session_ids_display_whole_up_to_the_bound_and_truncated_past_it() {
+        assert_eq!(display_session_id("ses_1"), "ses_1");
+        let exact = "s".repeat(64);
+        assert_eq!(display_session_id(&exact), exact);
+        let long = format!("{exact}tail");
+        assert_eq!(display_session_id(&long), format!("{exact}..."));
     }
 
     #[test]

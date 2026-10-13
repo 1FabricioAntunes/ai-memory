@@ -32,9 +32,9 @@ use serde_json::{Value, json};
 
 use super::{
     DEFAULT_DEST_PREFIX, Destination, HookSessionEntry, MAX_EXPLICIT_TITLE_CHARS, MAX_TITLE_CHARS,
-    Manifest, PlannedPage, PlannedVersion, RunStatus, apply_pages, ingest_key, link_target,
-    memory_kind_tier, one_line, preflight, print_done, print_plan, provenance_line, tags_from,
-    validate_dest_prefix, validate_id, validate_planned_path,
+    Manifest, PlannedPage, PlannedVersion, RunStatus, apply_pages, display_session_id, ingest_key,
+    link_target, memory_kind_tier, one_line, preflight, print_done, print_plan, provenance_line,
+    tags_from, validate_dest_prefix, validate_id, validate_planned_path,
 };
 use crate::{
     DEFAULT_SERVER_URL, ImportClient, MAX_EXTENSION_MESSAGE_BYTES, PlannedHookEvent,
@@ -444,7 +444,7 @@ pub(crate) async fn run(args: ExportArgs) -> Result<()> {
         for session in &plan.hook_sessions {
             println!(
                 "  replay session {} -> {}/{} ({} hook events)",
-                session.source_session_id,
+                display_session_id(&session.source_session_id),
                 session.destination.workspace,
                 session.destination.project,
                 session.events.len()
