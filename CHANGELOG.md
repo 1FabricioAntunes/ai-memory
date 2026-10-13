@@ -327,10 +327,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a server-side drop list for tool events: `[ingest]
   drop_tool_use_id_prefixes` and `drop_tool_names` (both empty by default, at
   most 64 entries of 128 characters). A PreToolUse or PostToolUse event whose
-  tool-use id starts with a listed prefix, or whose tool name matches exactly,
-  is answered with 202 and counted as a policy drop in `/hook` and
-  `/hook/batch`, before it is sanitized, rate-limited or stored. The lists
-  apply to every project on the server. (#1241)
+  tool-call id starts with a listed prefix, or whose tool name matches
+  exactly, is answered with 202 and counted as a policy drop in `/hook` and
+  `/hook/batch`, before it is sanitized, rate-limited or stored. The id and
+  name are read from each harness's own fields (Claude Code's `tool_use_id`,
+  OpenCode's `callID`, Hermes's `extra.tool_call_id`, and so on). The lists
+  apply to every project on the server. (#1241, #1244)
 - Added `--project-id` to `purge-project`, `rename-project` and
   `move-project` (and `project_id` to their admin endpoints), as an
   alternative to the project name. A legacy twin row whose name collides with

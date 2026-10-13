@@ -46,8 +46,17 @@ impl IngestDropList {
         if !matches!(env.event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
             return false;
         }
-        let tool_use_id = crate::payload::event_tool_use_id(&env.raw);
-        if let Some(id) = tool_use_id.as_deref()
+        // The per-agent mapping the observation metadata uses knows where
+        // each harness puts the call id (`callID`, `extra.tool_call_id`, ...);
+        // an agent without one falls back to the generic Claude-style fields.
+        let (name, id) = match crate::capture_policy::tool_payload_fields(env.agent, &env.raw) {
+            Some((name, id)) => (Some(name.to_owned()), id.map(str::to_owned)),
+            None => (
+                crate::payload::event_tool_name(&env.raw),
+                crate::payload::event_tool_use_id(&env.raw),
+            ),
+        };
+        if let Some(id) = id.as_deref()
             && self
                 .tool_use_id_prefixes
                 .iter()
@@ -55,8 +64,7 @@ impl IngestDropList {
         {
             return true;
         }
-        crate::payload::event_tool_name(&env.raw)
-            .is_some_and(|name| self.tool_names.contains(&name))
+        name.is_some_and(|name| self.tool_names.contains(&name))
     }
 }
 
@@ -91,10 +99,14 @@ mod tests {
     use crate::payload::HookQuery;
 
     fn event(name: &str, body: serde_json::Value) -> HookEnvelope {
+        agent_event("claude-code", name, body)
+    }
+
+    fn agent_event(agent: &str, name: &str, body: serde_json::Value) -> HookEnvelope {
         HookEnvelope::from_query_and_body(
             HookQuery {
                 event: name.into(),
-                agent: Some("claude-code".into()),
+                agent: Some(agent.into()),
                 ..Default::default()
             },
             body,
@@ -142,6 +154,52 @@ mod tests {
         );
         assert!(!list().matches(&prompt));
         assert!(!IngestDropList::default().matches(&ordinary));
+    }
+
+    #[test]
+    fn each_agent_is_matched_on_its_own_tool_fields() {
+        let list = IngestDropList::new(vec!["plugin-".into()], vec!["noisy_poll".into()]).unwrap();
+        // OpenCode, Pi and OMP carry the call id as `callID` and the name as `tool`.
+        let opencode = agent_event(
+            "opencode",
+            "post-tool-use",
+            serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "plugin-7" }),
+        );
+        assert!(list.matches(&opencode));
+        // Hermes nests the call id under `extra`.
+        let hermes = agent_event(
+            "hermes",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "read", "extra": { "tool_call_id": "plugin-9" } }),
+        );
+        assert!(list.matches(&hermes));
+        // Antigravity nests the tool name under `toolCall`.
+        let antigravity = agent_event(
+            "antigravity-cli",
+            "pre-tool-use",
+            serde_json::json!({ "session_id": "s", "toolCall": { "name": "noisy_poll", "args": {} } }),
+        );
+        assert!(list.matches(&antigravity));
+        // Controls: the same agents with ordinary ids and names stay.
+        let kept = agent_event(
+            "opencode",
+            "post-tool-use",
+            serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "call-7" }),
+        );
+        assert!(!list.matches(&kept));
+        let kept = agent_event(
+            "antigravity-cli",
+            "pre-tool-use",
+            serde_json::json!({ "session_id": "s", "toolCall": { "name": "read", "args": {} } }),
+        );
+        assert!(!list.matches(&kept));
+        // An agent with no closed mapping still matches on the generic fields.
+        let generic = agent_event(
+            "some-new-agent",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "noisy_poll" }),
+        );
+        assert!(list.matches(&generic));
     }
 
     #[test]

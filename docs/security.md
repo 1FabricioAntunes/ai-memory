@@ -126,9 +126,10 @@ rate leaves the limiter disabled.
 To stop the server from storing particular tool calls whatever the client
 sends, list them in `[ingest]`: `drop_tool_use_id_prefixes` (for example
 `["toolu_plugin_"]`, the id prefix Claude Code gives plugin tool calls) and
-`drop_tool_names` (exact names). A matching PreToolUse or PostToolUse event is
-acknowledged and discarded before it is sanitized, rate-limited or stored. The
-lists apply to every project on the server.
+`drop_tool_names` (exact names). The id and name are read from each
+harness's own fields, such as OpenCode's `callID`. A matching PreToolUse or
+PostToolUse event is acknowledged and discarded before it is sanitized,
+rate-limited or stored. The lists apply to every project on the server.
 
 For shared servers where each developer should authenticate their own hook
 writes, native Claude Code hooks can use a stored OIDC device token instead of
