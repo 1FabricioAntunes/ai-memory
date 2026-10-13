@@ -461,6 +461,9 @@ and [0.x](docs/changelog/0.x.md).
   `api_credentials`, so user records from `/admin/users` and `ai-memory user
   list --json` no longer carry `token_expired_at`, and `user list` no longer
   shows an `expired` status.
+- Removed the `OPENCODE_ZEN_BASE_URL` constant from the `ai-memory-llm`
+  crate, deprecated since 2.1.0; use `OPENCODE_GO_BASE_URL`, which holds the
+  same URL. The `opencode-zen` provider alias is unchanged.
 
 ### Fixed
 - Fixed the companion relay refusing to open its queue on Windows when another

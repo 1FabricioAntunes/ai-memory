@@ -141,8 +141,6 @@ pub use openai_oauth::{
     OPENAI_OAUTH_TOKEN_URL, OpenAiExtras, OpenAiOAuthProvider, OpenAiOAuthToken,
     OpenAiOAuthTokenResponse,
 };
-#[allow(deprecated)]
-pub use opencode::OPENCODE_ZEN_BASE_URL;
 pub use opencode::{
     OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OPENCODE_SESSION_HEADER, OpenCodeProvider,
 };
