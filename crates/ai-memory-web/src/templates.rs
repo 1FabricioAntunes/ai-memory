@@ -572,6 +572,24 @@ pub(crate) struct TimingRow {
     pub ms: String,
 }
 
+/// One project in the search page's "Search in" selector.
+pub(crate) struct ScopeOption {
+    /// `workspace/project`, the value the selector submits.
+    pub value: String,
+    /// Project name shown under its workspace's group.
+    pub label: String,
+    /// The current search is scoped to this project.
+    pub selected: bool,
+}
+
+/// The projects of one workspace in the "Search in" selector.
+pub(crate) struct ScopeGroup {
+    /// Workspace name, the group label.
+    pub workspace: String,
+    /// Readable projects of the workspace.
+    pub projects: Vec<ScopeOption>,
+}
+
 /// View-model for `GET /search?q=…`.
 #[derive(Template)]
 #[template(path = "search.html")]
@@ -602,6 +620,10 @@ pub(crate) struct SearchView {
     pub max_results: usize,
     /// The same query across every project.
     pub global_href: String,
+    /// Projects the viewer may read, grouped by workspace.
+    pub scope_groups: Vec<ScopeGroup>,
+    /// Link to the scoped project, for the breadcrumb.
+    pub project_href: String,
 }
 
 impl SearchView {

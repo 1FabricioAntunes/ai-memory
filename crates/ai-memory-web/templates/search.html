@@ -3,6 +3,16 @@
 {% block title %}Search: {{ query }} — ai-memory{% endblock %}
 
 {% block content %}
+<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+  <span aria-hidden="true">/</span>
+  {% if self.scoped() %}
+  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
+  <span aria-hidden="true">/</span>
+  {% endif %}
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">search</span>
+</nav>
+
 <div class="mb-6">
   <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">
     {% if query != "" %}
@@ -12,15 +22,31 @@
     {% endif %}
   </h1>
   {% if self.scoped() %}
-  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">In {{ workspace }}/{{ project }} · <a href="{{ global_href }}" class="hover:text-blue-600 dark:hover:text-blue-400 underline">search every project</a></p>
+  <p class="mt-2 text-sm">
+    <span class="inline-flex items-center gap-1 rounded-full bg-slate-100 dark:bg-slate-800 pl-3 pr-1 py-0.5 text-slate-700 dark:text-slate-300">
+      in {{ workspace }}/{{ project }}
+      <a href="{{ global_href }}" aria-label="Search every project" class="rounded-full px-1.5 hover:bg-slate-200 dark:hover:bg-slate-700">×</a>
+    </span>
+  </p>
   {% endif %}
 </div>
 
 <form action="search" method="get" class="mb-8 flex flex-wrap items-center gap-2">
-  {% if self.scoped() %}
-  <input type="hidden" name="workspace" value="{{ workspace }}">
-  <input type="hidden" name="project" value="{{ project }}">
-  {% endif %}
+  <label for="search-scope" class="sr-only">Search in</label>
+  <select
+    id="search-scope"
+    name="scope"
+    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+  >
+    <option value=""{% if !self.scoped() %} selected{% endif %}>All projects</option>
+    {% for group in scope_groups %}
+    <optgroup label="{{ group.workspace }}">
+      {% for option in group.projects %}
+      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+      {% endfor %}
+    </optgroup>
+    {% endfor %}
+  </select>
   <label for="search-q" class="sr-only">Search pages</label>
   <input
     id="search-q"
@@ -64,7 +90,11 @@
 {% if query == "" %}
 <p class="text-sm text-slate-500 dark:text-slate-400">Enter a search term above.</p>
 {% else if hits.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">No results for <strong>{{ query }}</strong>.</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">No results for <strong>{{ query }}</strong>.
+  {% if self.scoped() %}
+  <a href="{{ global_href }}" class="ml-2 inline-block rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900">Search all projects</a>
+  {% endif %}
+</p>
 {% else %}
 {% if truncated %}
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">Showing the first {{ max_results }} results. Refine your search to narrow them.</p>

@@ -4764,3 +4764,142 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
         }
     }
 }
+
+// ── Header search keeps the project it is opened from ──
+
+#[tokio::test]
+async fn header_search_carries_the_current_project() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/bar.md", "# Bar\n\nbody"))
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+
+    for uri in [
+        "/w/default/scratch",
+        "/w/default/scratch/p/notes/bar.md",
+        "/w/default/scratch/p/notes/",
+        "/w/default/scratch/h/notes/bar.md",
+    ] {
+        let (status, text) = get_text(&app, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let header = text.split("<main").next().unwrap();
+        assert!(
+            header.contains(r#"<input type="hidden" name="workspace" value="default">"#),
+            "{uri}: {header}"
+        );
+        assert!(
+            header.contains(r#"<input type="hidden" name="project" value="scratch">"#),
+            "{uri}: {header}"
+        );
+        assert!(
+            header.contains(r#"placeholder="Search default/scratch…""#),
+            "{uri}"
+        );
+    }
+
+    // Controls: pages without a project keep the bare, cross-project form.
+    for uri in ["/", "/search?q=bar"] {
+        let (status, text) = get_text(&app, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let header = text.split("<main").next().unwrap();
+        assert!(
+            !header.contains(r#"type="hidden" name="workspace""#),
+            "{uri}: {header}"
+        );
+        assert!(header.contains(r#"placeholder="Search…""#), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn search_page_scope_selector_round_trips_and_rejects_malformed_values() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let scratch = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        scratch,
+        "a.md",
+        "# In scratch\n\nselectortoken",
+    ))
+    .await
+    .unwrap();
+    wiki.write_page(wiki_req(ws, other, "b.md", "# In other\n\nselectortoken"))
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+
+    let (status, unscoped) = get_text(&app, "/search?q=selectortoken", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        unscoped.contains(r#"<optgroup label="default">"#),
+        "{unscoped}"
+    );
+    assert!(
+        unscoped.contains(r#"<option value="default/scratch">"#),
+        "{unscoped}"
+    );
+    assert!(
+        unscoped.contains(r#"<option value="" selected>All projects"#),
+        "{unscoped}"
+    );
+    // No scope: both projects, no chip.
+    assert!(
+        unscoped.contains("a.md") && unscoped.contains("b.md"),
+        "{unscoped}"
+    );
+    assert!(!unscoped.contains("Search every project"), "{unscoped}");
+
+    // The selector value gives the same hits as the explicit parameters.
+    let (status, by_selector) =
+        get_text(&app, "/search?q=selectortoken&scope=default/scratch", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, by_params) = get_text(
+        &app,
+        "/search?q=selectortoken&workspace=default&project=scratch",
+        None,
+    )
+    .await;
+    for text in [&by_selector, &by_params] {
+        assert!(text.contains("a.md") && !text.contains("b.md"), "{text}");
+        assert!(text.contains("1 result"), "{text}");
+    }
+    assert!(by_selector.contains(r#"<option value="default/scratch" selected>"#));
+    assert!(by_selector.contains("Search every project"));
+
+    // An empty scoped result offers the way out.
+    let (_, empty) = get_text(&app, "/search?q=nomatchatall&scope=default/scratch", None).await;
+    assert!(empty.contains("Search all projects"), "{empty}");
+
+    // An empty selector value means every project.
+    let (_, all) = get_text(&app, "/search?q=selectortoken&scope=", None).await;
+    assert!(all.contains("a.md") && all.contains("b.md"), "{all}");
+
+    for bad in ["scratch", "%2Fscratch", "default%2F", "%2F"] {
+        let (status, _) = get_text(&app, &format!("/search?q=x&scope={bad}"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "scope={bad}");
+    }
+}
