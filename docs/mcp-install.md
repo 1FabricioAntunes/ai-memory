@@ -225,6 +225,18 @@ or switch identities behind Claude Code.
 `--session-aware` is Claude-Code-only. Other clients keep their documented
 native HTTP or generated bridge paths.
 
+**Marketplace plugin.** The ai-memory Claude Code plugin
+(`claude plugin install ai-memory@ai-memory`, see
+[install.md](install.md#marketplace-plugins)) registers this same
+session-aware bridge for you, as server `plugin:ai-memory:ai-memory`, so its
+tools appear as `mcp__plugin_ai-memory_ai-memory__<tool>`. The plugin passes
+its `server_url` option to `mcp-bridge --server-url`; left empty (the
+default), the bridge uses the server in your ai-memory config. While the
+plugin is enabled, `ai-memory setup` does not also write an `ai-memory`
+entry to `~/.claude.json`, and `ai-memory doctor` flags one that is already
+there. The Codex plugin likewise registers `ai-memory mcp-bridge
+--no-session-id`.
+
 ---
 
 ## Cursor

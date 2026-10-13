@@ -6,6 +6,8 @@ RPM, macOS menu bar app). This page covers everything else:
 
 - [One-step native install](#one-step-native-install-installsh--ai-memory-setup)
   (`install.sh` + `ai-memory setup`, Linux and macOS, no root)
+- [Marketplace plugins](#marketplace-plugins)
+  (Claude Code and Codex: hooks, MCP and skills as one plugin)
 - [Server on a different machine](#server-on-a-different-machine)
   (homelab, LAN box, remote server)
 - [Configuring the CLI URL and auth](#configuring-the-cli-url-and-auth)
@@ -165,6 +167,104 @@ home against a locally built release: two commands, and about one second from
 the first command to a `memory_query` that returns a captured hook event (a
 debug build on a Linux workstation, local embeddings off so no model download
 is counted). The target is 60 seconds.
+
+## Marketplace plugins
+
+From 3.0 this repository is also a plugin marketplace. A plugin wires one
+agent in a single step: lifecycle hooks, the ai-memory MCP tools, the routing
+skills, and a `status` skill that runs `ai-memory doctor` and summarizes it.
+It is the alternative to `install-hooks` + `install-mcp` + `install-skills`
+for that agent; `ai-memory setup` does the rest (data dir, service, other
+agents) either way.
+
+The plugin does not contain ai-memory. Install the binary first (above, or
+Homebrew, AUR, RPM, the Docker wrapper, the macOS app), then add the plugin.
+Every hook runs `scripts/ai-memory-hook`, a short POSIX script that finds
+the binary and hands it the event with `ai-memory hook`, the same native
+command `install-hooks` wires. Capture policy (`ignore_paths`, allowlist
+mode), marker scope and server profiles therefore apply exactly as they do
+for settings-file hooks. Without the binary the plugin captures nothing,
+prints one line at session start, and never blocks the agent. The plugins
+have no telemetry and hold no credentials: hooks and the MCP bridge use the
+credentials the CLI already stores (`ai-memory setup`, `auth login`).
+
+The catalogs pin each plugin to the release tag, so a marketplace add only
+installs released plugin content. Generated files live under `plugins/`
+(see [`plugins/README.md`](../plugins/README.md)).
+
+### Claude Code
+
+```sh
+claude plugin marketplace add akitaonrails/ai-memory
+claude plugin install ai-memory@ai-memory
+```
+
+(or `/plugin marketplace add akitaonrails/ai-memory` and `/plugin install
+ai-memory@ai-memory` inside Claude Code). The plugin works in the CLI and in
+the desktop app's Code tab. Options, all optional, are set with `/plugin
+configure ai-memory@ai-memory`:
+
+| Option | Default | Use |
+| --- | --- | --- |
+| `server_url` | empty | Empty uses the `server_url` from your ai-memory config, so the plugin and the CLI never disagree. Set it only to point this plugin elsewhere. |
+| `ai_memory_bin` | `ai-memory` | Path to the binary when it is not on the `PATH` the app sees. The launcher also tries `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`. |
+| `data_dir` | empty | Only for an install with a non-default data directory. |
+
+- Claude Code does not auto-update a third-party marketplace
+  unless you turn that on. `ai-memory upgrade` runs `claude plugin
+  marketplace update ai-memory` and `claude plugin update ai-memory@ai-memory`
+  after replacing the binary; with a package-managed binary (Homebrew, AUR,
+  RPM) run those two commands yourself after the package upgrade.
+- If `install-hooks` already put ai-memory hooks in
+  `~/.claude/settings.json` or a checkout's `.claude/settings.local.json`,
+  those win: the plugin skips every event they deliver, so nothing is
+  captured twice. `ai-memory doctor` reports the double install and which
+  copy to remove. While the plugin is enabled, `ai-memory setup` and
+  `ai-memory run` stop writing Claude's settings hooks, MCP entry and
+  skills; run `ai-memory install-hooks --agent claude-code --apply` (or
+  `install-mcp`, `install-skills`) to add them anyway.
+- Folderless sessions (a desktop scratch workspace with no project folder)
+  are not captured through the plugin.
+- On Windows, Claude Code runs plugin hooks through Git Bash, which it
+  already requires, so the launcher needs nothing else.
+- With the Docker wrapper, plugin hooks need a `bin/ai-memory` wrapper that runs
+  `ai-memory hook` through its native host client, not in a container
+  (otherwise each event pays a `docker run` and `127.0.0.1` points inside
+  the container). Run `ai-memory upgrade` to get the wrapper with that
+  routing.
+- Each release attaches
+  `ai-memory-claude-plugin.zip` for **Customize > Plugins > Upload plugin**.
+  In Cowork, capture runs on your computer and needs ai-memory installed
+  there; the memory tools still work.
+- Remove it with `claude plugin uninstall ai-memory@ai-memory`;
+  `ai-memory uninstall` does it too.
+
+### Codex
+
+```sh
+codex plugin marketplace add akitaonrails/ai-memory
+codex plugin add ai-memory@ai-memory
+```
+
+Then open Codex, run `/hooks`, and trust the ai-memory hooks. Codex runs a
+plugin's hooks only after you trust them, and skips an untrusted one without
+a message. Trust is keyed on the hook command before `${PLUGIN_ROOT}` is
+expanded, and the commands stay identical across releases, so a plugin
+upgrade keeps it; a release that has to change a command says so in the
+changelog. `ai-memory doctor` and the `status` skill report hooks Codex
+skips. The Codex plugin has no options: the server URL and credentials come
+from your ai-memory config, and the MCP entry runs `ai-memory mcp-bridge
+--no-session-id` from `PATH`. On Windows the hooks call `ai-memory hook`
+directly (`commandWindows`), so `ai-memory` must be on `PATH`.
+
+Codex runs plugin hooks and `~/.codex/hooks.json` hooks side by side, and an
+untrusted settings hook is skipped silently, so the plugin cannot safely drop
+its copy the way the Claude Code plugin does. Keep one: `ai-memory setup`
+does not add Codex settings hooks while the plugin is enabled, and `doctor`
+flags a double install. To update, run `codex plugin marketplace upgrade
+ai-memory` and `codex plugin add ai-memory@ai-memory` (`ai-memory upgrade`
+prints them). Remove with `codex plugin remove ai-memory@ai-memory` or
+`ai-memory uninstall`.
 
 ## Server on a different machine
 

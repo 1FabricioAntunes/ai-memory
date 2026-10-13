@@ -31,20 +31,22 @@ claude plugin marketplace add akitaonrails/ai-memory
 claude plugin install ai-memory@ai-memory
 ```
 
-`ai-memory upgrade` also updates the plugin, because Claude Code does not
-auto-update third-party marketplaces unless you turn that on.
+Claude Code does not auto-update third-party marketplaces unless you turn
+that on. `ai-memory upgrade` updates the plugin along with a release-tarball
+binary; after a Homebrew, AUR or RPM upgrade, run `claude plugin marketplace
+update ai-memory` and `claude plugin update ai-memory@ai-memory`.
 
 ## What it runs and what it sends
 
-- **Hooks.** Every lifecycle event (session start and end, prompts, tool
+- Hooks: every lifecycle event (session start and end, prompts, tool
   calls, compaction, stop, subagents) runs `scripts/ai-memory-hook`, a short
   POSIX shell script you can read in full. It finds the installed `ai-memory`
   binary and hands it the event with `ai-memory hook`. The binary applies
   your capture exclusions (`ignore_paths`, allowlist mode, server profiles)
   before anything is written or sent, spools the event locally, and delivers
   it only to your ai-memory server, which sanitizes it before storage.
-- **MCP.** The ai-memory memory tools, through `ai-memory mcp-bridge`.
-- **Skills.** The ai-memory routing skills, plus `/ai-memory:status`, which
+- MCP: the ai-memory memory tools, through `ai-memory mcp-bridge`.
+- Skills: the ai-memory routing skills, plus `/ai-memory:status`, which
   runs `ai-memory doctor` and summarizes it.
 
 No telemetry. Nothing goes anywhere except the ai-memory server you
@@ -77,11 +79,11 @@ setup` leaves Claude's settings alone while the plugin is enabled.
 
 ## Platform notes
 
-- **Windows.** Claude Code runs plugin hooks through Git Bash, which it
+- On Windows, Claude Code runs plugin hooks through Git Bash, which it
   already requires; the launcher needs nothing else.
-- **Docker wrapper.** Plugin hooks need a wrapper that routes `ai-memory
+- With the Docker wrapper, plugin hooks need a wrapper that routes `ai-memory
   hook` to its native client; run `ai-memory upgrade` to get it.
-- **Cowork.** Capture runs on your computer and needs ai-memory installed
+- In Cowork, capture runs on your computer and needs ai-memory installed
   there; the memory tools still work.
 
 ## Uninstall

@@ -217,6 +217,10 @@ companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace mem
 companions/ai-memory-ts/        optional TypeScript client SDK (npm, Node 22+); NOT a workspace
                            member and never shipped with the server.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
+plugins/                   generated Claude Code + Codex marketplace plugins (catalogs in
+                           `.claude-plugin/`, `.agents/plugins/`); edit the templates in
+                           `crates/ai-memory-cli/templates/plugin/` and re-run
+                           `ai-memory render-plugins --out .` — a test fails on drift.
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
 install.sh                 two-command native install, step one (release asset).
 INSTALL_FOR_AGENTS.md      how an AI agent installs ai-memory for its user.

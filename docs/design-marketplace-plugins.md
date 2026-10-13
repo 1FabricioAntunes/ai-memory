@@ -1,6 +1,13 @@
 # Design proposal: ai-memory as marketplace plugins (#1166)
 
-**Status: proposal for 3.0, research done 2026-10-13. Not implemented.**
+**Status: implemented for 3.0 (Claude Code and Codex plugins), 2026-10-13.
+Cursor, Cowork capture, Antigravity and Gemini remain later work.** The
+sections below keep the research and the reasoning; where the shipped code
+differs from the original proposal, the text says so and
+[Implementation notes](#implementation-notes-30) lists every change. The
+generated files under `plugins/` and the renderer
+(`crates/ai-memory-cli/src/commands/render_plugins.rs`) are authoritative over
+the manifest listings here.
 Builds on RFC #1166, the feedback comments on it, and the
 [`docs/desktop/`](desktop/) notes (especially
 [`verification-2026-10.md`](desktop/verification-2026-10.md) and
@@ -89,7 +96,47 @@ What the local runs showed:
     `plugin.json`, `mcp.json`, `hooks/hooks.json`) from a local
     `.agents/plugins/marketplace.json`: `codex plugin marketplace add` and
     `codex plugin add ai-memory@ai-memory` both succeeded in a scratch
-    `CODEX_HOME`.
+    `CODEX_HOME`. **Corrected in Phase 0:** install succeeding was not the
+    same as loading. With an Agent Plugins root `plugin.json` (`$schema`
+    set), `plugin/read` over `codex app-server` reported the skills and the
+    MCP server but **no hooks**, whether hooks were discovered by default or
+    named with `hooks` or `extensions."com.openai".hooks`. With Codex's own
+    `.codex-plugin/plugin.json` all seven hooks, the seven skills and (once
+    the manifest says `"mcpServers": "./mcp.json"`) the MCP server load. The
+    shipped Codex plugin uses that layout.
+
+Phase 0 runs (2026-10-13, Claude Code 2.1.296 and Codex 0.162.1, scratch
+`HOME`/`CLAUDE_CONFIG_DIR`/`CODEX_HOME`, the operator's configuration
+untouched):
+
+11. **Claude option storage.** `claude plugin install` records the plugin in
+    `<config dir>/plugins/installed_plugins.json` (`version: 2`,
+    `plugins."ai-memory@ai-memory"[]` with `scope`, `installPath`,
+    `version`) and enables it in the user `settings.json` `enabledPlugins`.
+    `claude plugin configure --values-stdin` stores option values under
+    `pluginConfigs."ai-memory@ai-memory".options` in the same file, and an
+    empty string clears an option.
+12. **An option whose default is `""` is substituted as an empty argument**
+    in the MCP `args` (`mcp-bridge --server-url ""`), while the hook
+    environment still has no `CLAUDE_PLUGIN_OPTION_SERVER_URL`. Hooks get
+    `CLAUDE_PROJECT_DIR`.
+13. **Codex trust survives an upgrade.** Codex keys plugin hook trust as
+    `ai-memory@ai-memory:hooks/hooks.json:<event>:<group>:<handler>` and
+    hashes the command *before* `${PLUGIN_ROOT}` expansion: the same plugin
+    installed into two `CODEX_HOME`s at different paths reported identical
+    `currentHash` values, and a trusted hook stayed `trusted` after a
+    version bump and reinstall, both from a local marketplace and through a
+    `git-subdir` source with a moved `ref`. The Codex smoke test also
+    reinstalls into a new `cache/ai-memory/ai-memory/<version>` directory,
+    and every hook stays trusted. Editing `scripts/ai-memory-hook` itself
+    does not change the hash.
+14. **Codex plugin hooks fire without credentials.** Once trusted, a
+    `thread/start` plus `turn/start` over `codex app-server` ran the plugin's
+    `SessionStart` and `UserPromptSubmit` hooks through the launcher into the
+    real binary, which spooled both as agent `codex` in the fixture marker's
+    scope. With the model provider pointed at a closed loopback port, no
+    request left the machine. `commandWindows` in the hooks file is accepted
+    (no `hooks/list` error); it was not run.
 
 ## Per-app capability table
 
@@ -158,13 +205,17 @@ One POSIX `sh` script, `scripts/ai-memory-hook`, shared by every plugin and
 called as `ai-memory-hook <agent> <event>`. It:
 
 1. picks the server URL: the plugin option (`CLAUDE_PLUGIN_OPTION_SERVER_URL`
-   on Claude), else `AI_MEMORY_HOOK_URL`, else `http://127.0.0.1:49374`. It
-   cannot rely on `userConfig` defaults, which hooks do not receive (local
-   finding 5);
+   on Claude) when set, else an empty value, which the binary reads as "use
+   the `server_url` of my config" (section 3). It cannot rely on
+   `userConfig` defaults, which hooks do not receive (local finding 5).
+   *Shipped differently from the proposal,* which fell back to
+   `AI_MEMORY_HOOK_URL` and then to loopback: that would have sent a user
+   whose config names a remote server to `127.0.0.1` unless they also set
+   the plugin option;
 2. finds the binary: the `ai_memory_bin` option if set, else `command -v
    ai-memory`, else the install locations a GUI-launched app may not have on
-   `PATH` (`$HOME/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`,
-   `/usr/bin`);
+   `PATH` (`$HOME/.local/bin`, `$HOME/.cargo/bin`, `/opt/homebrew/bin`,
+   `/usr/local/bin`, `/usr/bin`);
 3. if nothing is found: reads and discards stdin, prints
    `{"systemMessage": "ai-memory: the ai-memory binary was not found, so this
    session is not captured. Install it and run ai-memory setup: <url>"}` on
@@ -209,6 +260,18 @@ See open question 4.
   flags the plugin does not (`--capture-assistant`, a baked
   `--project-strategy`). An env variable rather than a flag keeps an older
   binary working with a newer plugin; it just skips the de-duplication.
+  *Shipped* as `AI_MEMORY_HOOK_ORIGIN=<agent>-plugin` (`claude-code-plugin`,
+  `codex-plugin`), checked per event: the plugin copy is dropped only when a
+  settings file carries an ai-memory hook for *that* event, so an older
+  install wiring fewer events still gets the rest from the plugin. The
+  checkout is `CLAUDE_PROJECT_DIR` when Claude sets it, else the payload
+  `cwd`. Codex plugin events are never de-duplicated: Codex skips an
+  untrusted settings hook without a trace, and nothing at hook time can tell
+  a trusted one from a skipped one, so dropping the plugin copy could lose
+  the event. `setup` and `doctor` handle a double Codex install instead.
+  The same origin check skips a **folderless session** (decision 8): no
+  `cwd`, or a cwd inside a Claude desktop `…/Claude/scratch-workspaces/…`
+  directory, matched lexically.
 - **`hook` and `mcp-bridge`: an empty `--server-url` means unset.** This lets
   `.mcp.json` pass `${user_config.server_url}` while a user who has a
   configured `server_url` keeps it.
@@ -219,19 +282,36 @@ See open question 4.
 - **`setup`, `install-hooks`, `install-skills`:** detect an enabled
   ai-memory Claude plugin (`installed_plugins.json` plus `enabledPlugins` in
   the user settings) and stop writing the parallel Claude settings hooks,
-  skills and MCP entry, printing what was skipped. `--force` keeps today's
-  behaviour. `setup --server-url` writes the plugin's options through
-  `claude plugin configure ai-memory@ai-memory --values-stdin` instead of
-  editing Claude's files.
+  skills and MCP entry, printing what was skipped. *Shipped:* `setup` and the
+  `ai-memory run` auto-wire skip an agent (Claude Code or Codex) whose plugin
+  is enabled. The explicit `install-hooks`, `install-mcp` and
+  `install-skills` still write when asked; they are the override, so no
+  `--force` flag was added (`install-skills --force` already means something
+  else). `setup` has no `--server-url`, and none is needed: the plugin's
+  `server_url` option defaults to empty, so hooks and MCP both follow the
+  server in the ai-memory config, and nothing has to be copied into Claude's
+  plugin options.
 - **`doctor`:** report the plugin (version, enabled, options), version skew
   against the binary, duplicate wiring (plugin plus settings hooks, plugin
   skills plus installed skills), and a Docker wrapper on `PATH` without the
   routing fix. For Codex, extend `codex_hook_trust.rs` to plugin hooks.
+  *Shipped:* plugin, version, enabled state, skew, settings hooks, installed
+  skills, a second MCP entry, `disableAllHooks`/`allowManagedHooksOnly`, and
+  Codex plugin hooks Codex skips (matched by `pluginId`). Plugin options are
+  not reported, and neither is the Docker wrapper: the wrapper fix that
+  routes `hook` to the native client lands separately on `main`, and a
+  wrapper-run `doctor` executes inside the container, where it cannot see
+  the host `PATH`.
 - **`upgrade`:** when the plugin is installed, run `claude plugin
   marketplace update ai-memory` and `claude plugin update
   ai-memory@ai-memory` after replacing the binary, because background
   auto-update is off for third-party marketplaces. This keeps binary and
-  plugin in step without asking users to opt into auto-update.
+  plugin in step without asking users to opt into auto-update. *Shipped,*
+  also when the binary is already current. For Codex, `upgrade` prints
+  `codex plugin marketplace upgrade ai-memory` and `codex plugin add
+  ai-memory@ai-memory` instead of running them. A package-managed binary
+  (Homebrew, AUR, RPM) never reaches this path, so those users run the
+  plugin update themselves (documented in `docs/install.md`).
 - **`uninstall`:** offer `claude plugin uninstall ai-memory@ai-memory`.
 
 None of this touches the MCP tool surface, so the tool count stays at 23.
@@ -243,7 +323,7 @@ install.
 
 | Knob | Claude plugin | Default | Notes |
 | --- | --- | --- | --- |
-| Server URL | `userConfig.server_url` (string) | `http://127.0.0.1:49374` | Read by the launcher from `CLAUDE_PLUGIN_OPTION_SERVER_URL`; MCP gets `${user_config.server_url}` |
+| Server URL | `userConfig.server_url` (string) | empty (shipped; proposed `http://127.0.0.1:49374`) | Read by the launcher from `CLAUDE_PLUGIN_OPTION_SERVER_URL`; MCP gets `${user_config.server_url}`. Empty means the `server_url` of the ai-memory config, for hooks and MCP alike |
 | Binary path | `userConfig.ai_memory_bin` (string) | `ai-memory` | For installs off `PATH` |
 | Data dir | `userConfig.data_dir` (string) | empty | Only for a non-default data dir |
 | Token | **none in the plugin** | — | Hooks read `<data_dir>/auth-token`, the OIDC `auth.json` or a server profile; `mcp-bridge` reads the bearer `Config::load` resolves. Same files `setup`, `install-hooks --auth-token` and `auth login` already write |
@@ -312,7 +392,12 @@ our repository would install the Claude plugin and send events tagged
 - the launcher recognizes the other harnesses' markers (`DROID_PLUGIN_ROOT`,
   Codex's `PLUGIN_ROOT`, Cursor's `CURSOR_VERSION`). It hands the event to
   the matching ai-memory agent when one exists, and otherwise prints `{}` and
-  exits;
+  exits. *Shipped:* `DROID_PLUGIN_ROOT` → `droid`; `PLUGIN_ROOT` without
+  `CLAUDE_PLUGIN_ROOT` → `codex`; neither `CLAUDE_PLUGIN_ROOT` nor
+  `PLUGIN_ROOT` → `{}`. Cursor is not remapped: when Cursor runs Claude
+  hooks the event already reaches the existing #721 path as `claude-code`
+  with `cursor_version`, and whether Cursor runs *plugin* hooks at all is
+  one of the Cursor unknowns;
 - we ship a native catalog for each harness we support, so the fallback is
   never used.
 
@@ -343,6 +428,11 @@ plugins/
   cursor/
     .cursor-plugin/plugin.json  mcp.json  hooks/hooks.json  scripts/  skills/
 ```
+
+*Shipped layout:* as above without `cursor/`, and Codex's manifest is
+`plugins/codex/.codex-plugin/plugin.json` (Phase 0 finding 10). The plugin
+templates (launcher, READMEs, `status` skill) live in
+`crates/ai-memory-cli/templates/plugin/`.
 
 Each harness gets its own directory: event names, the `--agent` value and
 the MCP flags (`--no-session-id` for everyone except Claude) all differ, and
@@ -543,14 +633,19 @@ Portable layout, which Codex 0.162.1 accepted locally (finding 10).
 }
 ```
 
-`plugins/codex/plugin.json`:
+`plugins/codex/.codex-plugin/plugin.json` (shipped; the proposal's Agent
+Plugins root `plugin.json` installs but loads no hooks, finding 10):
 
 ```json
 {
-  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "ai-memory",
   "version": "3.0.0",
-  "description": "Long-term memory across sessions and harnesses, backed by the installed ai-memory binary and your ai-memory server. No telemetry."
+  "description": "Long-term memory across sessions and harnesses, backed by the installed ai-memory binary and your ai-memory server. No telemetry. Codex runs the hooks only after you trust them in /hooks.",
+  "author": { "name": "AkitaOnRails", "url": "https://github.com/akitaonrails" },
+  "homepage": "https://github.com/akitaonrails/ai-memory",
+  "repository": "https://github.com/akitaonrails/ai-memory",
+  "license": "MIT",
+  "mcpServers": "./mcp.json"
 }
 ```
 
@@ -572,7 +667,7 @@ Portable layout, which Codex 0.162.1 accepted locally (finding 10).
   "hooks": {
     "SessionStart": [{ "hooks": [{ "type": "command",
       "command": "sh \"${PLUGIN_ROOT}/scripts/ai-memory-hook\" codex session-start",
-      "commandWindows": "ai-memory hook --event session-start --agent codex --server-url http://127.0.0.1:49374" }] }]
+      "commandWindows": "ai-memory hook --event session-start --agent codex" }] }]
   }
 }
 ```
@@ -582,7 +677,12 @@ The remaining events follow the same shape. `SessionEnd` stays within Codex's
 policy value suits a plugin with no auth of its own, whether omitting
 `matcher` is valid for every event, and whether a hook trusted once stays
 trusted after a plugin upgrade (open question 2). The catalog
-`ref` is stamped by `bin/release` exactly like Claude's.
+`ref` is stamped by `bin/release` exactly like Claude's. *Resolved in Phase
+0:* omitting `matcher` loads all seven events, `ON_INSTALL` installs without
+prompting for anything, and trust survives an upgrade (finding 13). The
+`commandWindows` value omits `--server-url`, which the binary now treats as
+"use the config"; it passes no empty argument because Windows PowerShell 5.1
+drops empty arguments to native commands.
 
 ### Phase 3: Cursor
 
@@ -633,6 +733,15 @@ The #721 de-duplication has to learn about the Cursor plugin. Today
 ## Automation
 
 ### On pull requests (`.github/workflows/plugins.yml`, path-filtered)
+
+*Shipped:* jobs `validate` (items 2), `launcher` (item 3) and `e2e` (items
+4 and 6, plus a cheap `render-plugins` drift check for pushes to `main`).
+Item 1 runs in `ci.yml`'s existing `cargo nextest` job, item 5 in the CLI
+suite. Claude Code 2.1.296 and Codex 0.162.1 are pinned as npm installs in
+the workflow `env`. The Codex smoke points the model provider at a closed
+loopback port, so it needs no secret and no outbound request. Item 7
+(Windows) stays open: the launcher tests are POSIX-only, and nothing has
+run on Windows yet (see the unverified list).
 
 Paths: `plugins/**`, the three catalog files, `render_shared.rs`,
 `ai-memory-core/src/routing_skills/**`, `bin/ai-memory`, the workflow itself.
@@ -711,15 +820,18 @@ Paths: `plugins/**`, the three catalog files, `render_shared.rs`,
 
 Mapped to the boundary inventory, all at integration level:
 
-| Test | Proves | Where |
+| Test | Proves | Where (shipped) |
 | --- | --- | --- |
-| Committed `plugins/` equals renderer output; versions and refs match the workspace | No drift between CLI and plugin installs | CLI `tests/suite/plugins.rs` |
-| Launcher, missing binary | Fail-open, guidance once, nothing sent | `tests/hooks/test_plugin_launcher.sh` |
-| `ignore_paths` and allowlist through the launcher | Capture policy parity (front door 1, 2) | CLI suite, real binary, recorded payloads |
-| Marker and server-profile routing through the launcher | Scope parity (front door 3) | CLI suite, beside `marker_scope.rs` and `server_profiles.rs` |
-| Plugin copy plus settings copy gives one observation; control: plugin alone delivers | De-duplication (front door 4), adversarial with a control | `hook.rs` unit test plus CLI suite |
-| Docker wrapper routes `hook` to the native client | Wrapper fix | `scripts/check-native-packaging.sh` |
-| Sandboxed Claude install fires hooks into a scratch server | Real wiring, no API key | `plugins.yml` |
+| Committed `plugins/` equals renderer output; versions and refs match the workspace; no credential in any plugin file | No drift between CLI and plugin installs | CLI `tests/suite/plugins.rs` `committed_plugins_match_the_renderer`, `plugin_versions_and_catalog_refs_match_the_workspace`, `plugin_tree_carries_no_credentials`; `render_plugins.rs` unit tests |
+| Launcher, missing binary | Fail-open, guidance once, nothing sent | `tests/hooks/test_plugin_launcher.sh`; `plugins.rs` `without_a_binary_nothing_is_sent_and_the_agent_is_not_blocked` |
+| `ignore_paths` and allowlist through the launcher | Capture policy parity (front door 1, 2) | `plugins.rs` `ignore_paths_hold_through_the_plugin`, `allowlist_mode_holds_through_the_plugin` (real binary, recorded payloads) |
+| Marker and server-profile routing through the launcher | Scope parity (front door 3) | `plugins.rs` `marker_scope_routes_plugin_events`, `server_profiles_route_plugin_events` |
+| Plugin copy plus settings copy gives one observation; control: plugin alone delivers | De-duplication (front door 4), adversarial with a control | `plugins.rs` `a_settings_hook_for_the_same_event_drops_the_plugin_copy`; `hook.rs` `plugin_copy_is_dropped_only_with_the_plugin_origin`; `plugin_origin.rs` unit tests; `claude_plugin_smoke.py` scenario 2 (real `claude -p`) |
+| Folderless sessions and foreign hosts | Decision 8; section 6 guard | `plugins.rs` `folderless_sessions_are_not_captured_through_the_plugin`, `foreign_hosts_are_attributed_or_ignored`; `test_plugin_launcher.sh` |
+| Docker wrapper routes `hook` to the native client | Wrapper fix | Lands on `main` separately (not in this change) |
+| Sandboxed Claude install fires hooks into a scratch server | Real wiring, no API key | `tests/e2e/claude_plugin_smoke.py` in `plugins.yml` |
+| Codex install, untrusted by default, trusted hooks fire, trust survives a bump | Real wiring, no API key | `tests/e2e/codex_plugin_smoke.py` in `plugins.yml` |
+| `setup`/`run` skip, `doctor`, `upgrade`, `uninstall` | Integration | `setup.rs` `an_enabled_plugin_takes_over_the_agents_wiring`, `run_autowire.rs` `an_enabled_plugin_leaves_the_harness_unwired`, `doctor.rs` `plugin_report_names_double_wiring_and_skew`, `upgrade.rs` `upgrade_updates_an_installed_claude_code_plugin_only`, `uninstall.rs` `uninstall_removes_each_plugin_through_its_harness`, `codex_hook_trust.rs` `summarizes_the_ai_memory_plugin_hooks_by_plugin_id` |
 
 ## Phased plan for 3.0
 
@@ -737,45 +849,114 @@ Estimates are engineer-days for one person familiar with the codebase.
 Phases 1 to 3 come to roughly 9 to 10.5 days. This is additive work, so it targets
 `release/3.0`, not `main`.
 
+*Delivered for 3.0:* phase 0 (the locally runnable spikes, findings 10-14),
+phase 1 except the Docker wrapper routing (landing separately on `main`),
+phase 2, and phase 3. Phase 4 (Cursor) waits for 3.1: its four unknowns
+need a Cursor install with plugin support, and the #721 detection would have
+to learn the plugin format first.
+
 ## Open questions for the maintainer
 
-1. **Directory listing.** The self-hosted marketplace covers Claude Code and
-   (by zip upload) Cowork. Do we also want the claude.ai directory portal,
-   which needs a paid plan, a README describing every network call, and
-   possibly review of the whole repository? An allowlist-capture variant
-   (events only from repositories with an `.ai-memory.toml` marker) would
-   arguably satisfy the "project-relevance gate" rule. That would be a
-   second plugin with a different default, so it is not proposed for 3.0.
-2. **Codex trust across upgrades.** If Codex hashes hook commands after
-   expanding `${PLUGIN_ROOT}`, every plugin update needs a fresh `/hooks`
-   approval, and an untrusted hook is skipped silently. Is that acceptable
-   with `doctor` and `/ai-memory:status` flagging it, or should Codex stay on
-   `install-hooks` (one trust per command change) until Codex changes?
-3. **Cowork.** If phase 0 shows Cowork hooks run inside the VM, where the
-   binary is absent and the host loopback may be unreachable, should the
-   plugin say "Cowork is not captured" at session start, or stay silent
-   there? The `systemMessage` would otherwise appear on every Cowork session.
-   The #878 report that "each message ends and reopens the session" also
-   means one session-start (and handoff check) per message.
-4. **Windows.** Accept "Git Bash required" for Claude plugin hooks on Windows
-   (Claude Code already prefers Git Bash for hooks), or add a PowerShell twin
-   of the launcher? A hook entry cannot switch by OS in Claude, though Codex's
-   `commandWindows` can.
-5. **Which wiring wins.** Proposed: settings hooks win at runtime, and
-   `setup` stops writing them once the plugin is enabled. The alternative is
-   to make the plugin the default Claude Code install path in `setup` and
-   migrate existing settings hooks. That is cleaner long-term but changes
-   behaviour for every current user.
-6. **Token option.** Add a `sensitive` `auth_token` option, kept in the OS
-   credential store, for remote-server users who never run the CLI's auth
-   commands? It would need the hook to accept a token from the environment,
-   a new input on the trust boundary. Proposed: no for 3.0.
-7. **Marketplace and plugin names.** `ai-memory@ai-memory` reads a little
-   odd, but both names are free of the reserved prefixes, and changing a
-   plugin name later needs a `renames` entry. Keep it?
-8. **Folderless sessions** (Code tab scratch workspaces, Cursor's empty
-   window) still land in `default/scratch`. The plugin does not change that.
-   It stays a separate decision (`desktop/plan.md` phase 2).
+All eight were decided on 2026-10-13. The original question follows each
+decision in brief.
+
+1. **Directory listing. Decided: no submission** to the claude.ai or
+   Anthropic directory for the capture plugin; capture hooks are ungated by
+   design and do not qualify. The plugin ships through our own marketplace
+   in this repository. An MCP-only listing may come later, not now.
+   (Asked: also list in the directory portal, possibly as an
+   allowlist-capture variant?)
+2. **Codex trust across upgrades. Decided: accept and document it** as
+   Codex's security model. Phase 0 found that trust survives an upgrade
+   anyway, because Codex hashes the unexpanded command (finding 13); a
+   release that changes a hook command needs one re-trust, which the
+   changelog will say. `doctor` and the `status` skill flag skipped hooks.
+3. **Cowork. Decided:** the plugin says in one line that capture runs on the
+   user's computer and needs ai-memory installed there, and that the memory
+   tools still work (manifest description and README). No extra
+   session-start message is added.
+4. **Windows. Decided: Git Bash** is fine for Claude plugin hooks, since
+   Claude Code requires it already. A PowerShell launcher only if Codex
+   needs one; it does not, because Codex's `commandWindows` calls
+   `ai-memory hook` directly.
+5. **Which wiring wins. Decided:** settings hooks win at runtime; the
+   plugin's launcher path skips the events the settings hooks already
+   deliver, and `doctor` reports the double install and suggests keeping
+   one. `setup` stops writing settings wiring while the plugin is enabled.
+6. **Token option. Decided: no** stored-token option in the plugin; it reuses
+   the credential files the binary already reads.
+7. **Names. Decided: keep `ai-memory@ai-memory`.**
+8. **Folderless sessions. Decided: skip capture** for a session with no
+   project folder (through the plugin; settings-file hooks keep today's
+   `default/scratch` routing).
+
+Target release: 3.0.0 (the branch formerly called `release/2.7`).
+
+## Implementation notes (3.0)
+
+Where the shipped code differs from the proposal above:
+
+- **Server URL.** The `server_url` option defaults to empty and the launcher
+  passes it through unchanged; `hook` and `mcp-bridge` read an empty
+  `--server-url` as "use the config". `hook --server-url` may now be
+  omitted (the Codex `commandWindows` commands rely on it). No
+  `AI_MEMORY_HOOK_URL` fallback and no `setup --server-url` → `claude plugin
+  configure` step: one source of truth, `config.toml`.
+- **Codex manifest.** `.codex-plugin/plugin.json` with `"mcpServers":
+  "./mcp.json"`, not the Agent Plugins root manifest (finding 10).
+- **No runtime de-duplication for Codex** (section 3).
+- **No `--force`.** `setup` and `run` skip plugin-covered agents; the
+  explicit `install-*` commands are the override.
+- **`upgrade` for Codex prints** the update commands rather than running
+  them.
+- **`doctor`** does not report plugin options or the Docker wrapper (section
+  3).
+- **Catalog entry `version`.** The Claude catalog entry also carries the
+  plugin version; `claude plugin validate --strict` accepts it.
+- **Version.** The renderer stamps the binary's own version, so until
+  `bin/release 3.0.0` runs, the committed manifests say the current
+  workspace version (2.6.6) and the catalogs point at `v2.6.6`, a tag
+  without `plugins/`. A marketplace add of this branch therefore cannot
+  install the plugin yet; `--plugin-dir` and local marketplaces can.
+
+## Still unverified, and how to check
+
+Each needs hardware or software this work did not have. Run every check with
+a scratch config dir, never the operator's own.
+
+- **Claude Code on Windows (Git Bash present / absent).** In a Windows VM
+  with Claude Code: `claude plugin marketplace add <checkout>` and `claude
+  --plugin-dir <checkout>\plugins\claude-code -p hi` with
+  `CLAUDE_CONFIG_DIR` set to a temp dir and options pointing at a scratch
+  server (as in `tests/e2e/claude_plugin_smoke.py`); confirm the
+  observations land. Repeat with Git Bash removed from `PATH` and record what
+  Claude does with the shell-form hook.
+- **Claude desktop Code tab (macOS) hook `PATH`.** Install the plugin, start
+  a Code-tab session in a repository, and check that events arrive with
+  only `/opt/homebrew/bin/ai-memory` or `~/.local/bin/ai-memory` installed
+  (the launcher's fallbacks). `ai-memory doctor` coverage, or a temporary
+  `env > /tmp/x` line in a copy of the launcher, shows the `PATH`.
+- **Cowork.** Upload `ai-memory-claude-plugin.zip`, start a Cowork session,
+  and check whether the hooks run on the host or in the VM (new files under
+  the host's `<data_dir>/hook-spool/`, or the missing-binary
+  `systemMessage`), and whether the host loopback answers.
+- **Codex on Windows.** In Codex for Windows, trust the plugin hooks and
+  check that `commandWindows` (`ai-memory hook --event … --agent codex`)
+  spools events; `codex app-server` `hooks/list` shows the command Codex
+  will run.
+- **Codex from the GitHub marketplace.** After the 3.0.0 tag exists: `codex
+  plugin marketplace add akitaonrails/ai-memory`, `codex plugin add
+  ai-memory@ai-memory`, trust, then after 3.0.1 `codex plugin marketplace
+  upgrade ai-memory` + `codex plugin add ai-memory@ai-memory` and confirm
+  `hooks/list` still reports `trusted` (finding 13 was proven with local
+  and `file://` `git-subdir` sources).
+- **Claude install from GitHub at the tag.** After the tag: `claude plugin
+  marketplace add akitaonrails/ai-memory`, `claude plugin install
+  ai-memory@ai-memory`, then `claude plugin details ai-memory@ai-memory`.
+- **Tool events from a live model turn** (PreToolUse, PostToolUse, Stop,
+  subagents) need a logged-in model; the CLI suite covers them one level
+  down with recorded payloads.
+- **Cursor:** the four unknowns in the Cursor section.
 
 ## What we borrowed and what we avoided
 

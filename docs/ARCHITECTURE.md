@@ -802,6 +802,22 @@ file; `uninstall` stops and removes only a unit whose digest still matches.
 `install.sh`, a release asset with its own `.sha256`, installs the release
 tarball under `~/.local` after checking it against the published checksum.
 
+The hidden `render-plugins --out <dir>` generates the Claude Code and Codex
+marketplace plugins under `plugins/` and their catalogs
+(`.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json`) from
+the same event lists and managed skills `install-hooks` and `install-skills`
+use, pinned to the binary's version and the `v<version>` tag (#1166). A CLI
+suite test fails when the committed tree differs from its output, and
+`bin/release` re-runs it after the version bump. Each plugin's hooks call one
+POSIX launcher that finds the installed binary and `exec`s the native `hook`
+with `AI_MEMORY_HOOK_ORIGIN=<agent>-plugin`; the launcher has no capture
+logic, so the plugin is a fourth front door that adds nothing to the trust
+surface. The origin lets `hook` drop a plugin copy that a Claude settings-file
+hook already delivers and skip folderless sessions
+(`commands/plugin_origin.rs`). `setup` and the `run` auto-wire leave an agent
+with an enabled plugin unwired; `doctor`, `upgrade` and `uninstall` read the
+user-level plugin install (`commands/agent_plugins.rs`).
+
 `auth enable` turns on the root bearer for an install created before
 new installs got one; see [`[auth]` root bearer](#auth-root-bearer).
 

@@ -43,7 +43,8 @@ const LAUNCHER_PATH: &str = "scripts/ai-memory-hook";
 const CLAUDE_DESCRIPTION: &str = "Long-term memory across sessions and harnesses. Hands each \
     lifecycle event to the installed ai-memory binary, which applies your capture exclusions and \
     sends a sanitized record only to your ai-memory server (default http://127.0.0.1:49374). Adds \
-    the ai-memory MCP tools. No telemetry. Requires the ai-memory binary.";
+    the ai-memory MCP tools. No telemetry. Requires the ai-memory binary. In Cowork, capture runs \
+    on your computer and needs ai-memory installed there; the memory tools still work.";
 const CODEX_DESCRIPTION: &str = "Long-term memory across sessions and harnesses, backed by the \
     installed ai-memory binary and your ai-memory server. No telemetry. Codex runs the hooks only \
     after you trust them in /hooks.";
