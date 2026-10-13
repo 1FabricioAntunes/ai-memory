@@ -191,6 +191,9 @@ fn claude_code_plugin(version: &str) -> Vec<PluginFile> {
             ),
         },
     });
+    // Run through `sh`, as the Codex plugin does, rather than executing the
+    // launcher: a plugin uploaded as a desktop zip can lose the exec bit, and
+    // Windows Git Bash does not honour it at all.
     let mut hooks = serde_json::Map::new();
     for (name, script) in CLAUDE_CODE_EVENTS {
         let event = script.trim_end_matches(".sh");
@@ -198,7 +201,7 @@ fn claude_code_plugin(version: &str) -> Vec<PluginFile> {
             name.to_owned(),
             json!([{ "matcher": "", "hooks": [{
                 "type": "command",
-                "command": format!("\"${{CLAUDE_PLUGIN_ROOT}}\"/{LAUNCHER_PATH} claude-code {event}"),
+                "command": format!("sh \"${{CLAUDE_PLUGIN_ROOT}}/{LAUNCHER_PATH}\" claude-code {event}"),
             }]}]),
         );
     }
@@ -353,7 +356,7 @@ mod tests {
             assert_eq!(
                 command,
                 format!(
-                    "\"${{CLAUDE_PLUGIN_ROOT}}\"/scripts/ai-memory-hook claude-code {}",
+                    "sh \"${{CLAUDE_PLUGIN_ROOT}}/scripts/ai-memory-hook\" claude-code {}",
                     script.trim_end_matches(".sh")
                 )
             );
