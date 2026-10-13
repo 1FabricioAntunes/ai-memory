@@ -243,6 +243,9 @@ struct Export {
     bytes: String,
     etag: Option<String>,
     page_id: Option<String>,
+    /// Hash of the file the plan classified (`None`: no file). The write
+    /// happens only while the file still matches it.
+    expected_disk: Option<String>,
 }
 
 /// A server page to delete because its file was deleted.
@@ -497,6 +500,7 @@ async fn build_plan(
                     bail!("server returned 304 for {path} with no local file to compare");
                 };
                 plan.exports.push(Export {
+                    expected_disk: disk.as_deref().map(state::sha256_hex),
                     path,
                     create,
                     bytes,
@@ -722,8 +726,15 @@ async fn apply_plan(
     };
     for import in &plan.imports {
         match import_one(api, mcp, &scope, dest_root, import).await {
-            Ok((entry, normalised)) => {
-                applied.wrote_files |= normalised;
+            Ok((entry, Rewrite::Skipped)) => {
+                // The server holds the import and `entry` records it, so the
+                // next run sees only the newer local edit and imports it.
+                new_state.pages.insert(import.path.clone(), entry);
+                report_local_change(&import.path);
+                applied.raced.push(import.path.clone());
+            }
+            Ok((entry, rewrite)) => {
+                applied.wrote_files |= rewrite == Rewrite::Wrote;
                 new_state.pages.insert(import.path.clone(), entry);
             }
             Err(error) if error.is::<PreconditionFailed>() => {
@@ -740,7 +751,26 @@ async fn apply_plan(
         }
     }
     for export in &plan.exports {
-        sync::atomic_write(dest_root, &export.path, export.bytes.as_bytes())?;
+        let wrote = match write_if_unchanged(
+            dest_root,
+            &export.path,
+            export.expected_disk.as_deref(),
+            export.bytes.as_bytes(),
+        ) {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                state::save(dest_root, &new_state)?;
+                return Err(error.context(format!(
+                    "export of {} failed; the pages synced before it are recorded",
+                    export.path
+                )));
+            }
+        };
+        if !wrote {
+            report_local_change(&export.path);
+            applied.raced.push(export.path.clone());
+            continue;
+        }
         applied.wrote_files = true;
         new_state.pages.insert(
             export.path.clone(),
@@ -780,10 +810,7 @@ async fn apply_plan(
                 applied.deleted_files.push(delete.path.clone());
             }
             Ok(false) => {
-                println!(
-                    "  {:<9} {} — changed in the repository during this run; left for the next sync",
-                    "CHANGED", delete.path
-                );
+                report_local_change(&delete.path);
                 applied.raced.push(delete.path.clone());
             }
             Err(error) => {
@@ -797,6 +824,31 @@ async fn apply_plan(
     }
     state::save(dest_root, &new_state)?;
     Ok(applied)
+}
+
+fn report_local_change(path: &str) {
+    println!(
+        "  {:<9} {path} — changed in the repository during this run; left for the next sync",
+        "CHANGED"
+    );
+}
+
+/// Write `bytes` over a repository file only while it is still the file the
+/// plan classified: `expected` is that file's hash, or `None` when there was
+/// no file. Returns `false`, writing nothing, when an edit landed after the
+/// plan (the check and the rename are as close together as `delete_file`'s).
+fn write_if_unchanged(
+    dest_root: &Path,
+    rel: &str,
+    expected: Option<&str>,
+    bytes: &[u8],
+) -> Result<bool> {
+    let current = sync::read_disk(dest_root, rel)?;
+    if current.as_deref().map(state::sha256_hex).as_deref() != expected {
+        return Ok(false);
+    }
+    sync::atomic_write(dest_root, rel, bytes)?;
+    Ok(true)
 }
 
 fn report_race(path: &str, error: &anyhow::Error) {
@@ -827,16 +879,28 @@ fn delete_file(dest_root: &Path, delete: &FileDelete) -> Result<bool> {
     Ok(true)
 }
 
+/// What an import did to its repository file after the server write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rewrite {
+    /// The server stored the file's bytes; the file is untouched.
+    None,
+    /// The server stored something else (the sanitizer redacting a secret,
+    /// for example), and the file now holds what the server stored.
+    Wrote,
+    /// The server stored something else, but the file was edited after the
+    /// plan read it, so the edit was kept and not overwritten.
+    Skipped,
+}
+
 /// Write, then read back. Returns the new state entry and whether the file
-/// was rewritten because the server stored something other than the file's
-/// bytes (the sanitizer redacting a secret, for example).
+/// was rewritten to what the server stored.
 async fn import_one(
     api: &ApiClient,
     mcp: &McpClient,
     scope: &Scope<'_>,
     dest_root: &Path,
     import: &Import,
-) -> Result<(PageState, bool)> {
+) -> Result<(PageState, Rewrite)> {
     let precondition = match (&import.expected_page_id, import.create) {
         (_, true) => Precondition::Absent,
         (Some(expected), false) => Precondition::Latest(expected),
@@ -870,21 +934,29 @@ async fn import_one(
                 etag: None,
                 page_id: written,
             },
-            false,
+            Rewrite::None,
         ));
     }
     let rendered = sync::render_page(&page)?;
-    let normalised = rendered.as_bytes() != import.disk.as_slice();
-    if normalised {
-        sync::atomic_write(dest_root, &import.path, rendered.as_bytes())?;
-    }
+    let rewrite = if rendered.as_bytes() == import.disk.as_slice() {
+        Rewrite::None
+    } else if write_if_unchanged(
+        dest_root,
+        &import.path,
+        Some(&state::sha256_hex(&import.disk)),
+        rendered.as_bytes(),
+    )? {
+        Rewrite::Wrote
+    } else {
+        Rewrite::Skipped
+    };
     Ok((
         PageState {
             hash: state::sha256_hex(rendered.as_bytes()),
             etag: read.etag,
             page_id: page.id.or(written),
         },
-        normalised,
+        rewrite,
     ))
 }
 
@@ -991,6 +1063,35 @@ mod tests {
     }
 
     const PREFERENCES: [Option<Prefer>; 3] = [None, Some(Prefer::Repo), Some(Prefer::Server)];
+
+    /// An export or an import's normalising rewrite replaces a repository
+    /// file only while it is still the file the plan classified. A local edit
+    /// made after planning survives, and no write happens; controls: the
+    /// planned bytes are replaced, and a planned-absent file is created.
+    #[test]
+    fn a_write_never_replaces_a_file_edited_after_the_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        sync::atomic_write(&root, "_rules/a.md", b"planned").unwrap();
+        let planned = state::sha256_hex(b"planned");
+
+        // The operator saves an edit between planning and applying.
+        sync::atomic_write(&root, "_rules/a.md", b"local edit").unwrap();
+        assert!(!write_if_unchanged(&root, "_rules/a.md", Some(&planned), b"server").unwrap());
+        assert_eq!(fs::read(root.join("_rules/a.md")).unwrap(), b"local edit");
+
+        // A file that appeared where the plan saw none is not overwritten.
+        sync::atomic_write(&root, "_rules/new.md", b"appeared").unwrap();
+        assert!(!write_if_unchanged(&root, "_rules/new.md", None, b"server").unwrap());
+        assert_eq!(fs::read(root.join("_rules/new.md")).unwrap(), b"appeared");
+
+        // Controls.
+        let edit = state::sha256_hex(b"local edit");
+        assert!(write_if_unchanged(&root, "_rules/a.md", Some(&edit), b"server").unwrap());
+        assert_eq!(fs::read(root.join("_rules/a.md")).unwrap(), b"server");
+        assert!(write_if_unchanged(&root, "_rules/b.md", None, b"server").unwrap());
+        assert_eq!(fs::read(root.join("_rules/b.md")).unwrap(), b"server");
+    }
 
     #[test]
     fn decide_three_way_matrix() {
