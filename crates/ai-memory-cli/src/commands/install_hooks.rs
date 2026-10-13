@@ -272,8 +272,10 @@ pub(crate) fn restage_claude_code_scripts(
 /// honors the variable when it resolves that Codex's transcripts
 /// (`ManagedHarness::Codex` in `ai-memory-workstream`), so ignoring it here left
 /// one half of the same install pointing somewhere the other half did not.
-pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    codex_hooks_path_in(std::env::var_os("CODEX_HOME"))
+pub(crate) fn codex_hooks_path(
+    env: &crate::config::RuntimeEnv,
+) -> anyhow::Result<std::path::PathBuf> {
+    codex_hooks_path_in(env.var_os("CODEX_HOME"))
 }
 
 /// The env value comes in as a parameter so tests can exercise both branches
@@ -308,7 +310,7 @@ pub(crate) fn copilot_cli_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 /// [`copilot_cli_hooks_path`] with the `COPILOT_HOME` value passed in. Resolves
 /// through the same config dir as `install-mcp --client copilot-cli`
 /// ([`install_mcp::copilot_home_in`]), so the two halves of one install agree.
-fn copilot_cli_hooks_path_in(
+pub(crate) fn copilot_cli_hooks_path_in(
     env_override: Option<std::ffi::OsString>,
 ) -> anyhow::Result<std::path::PathBuf> {
     Ok(install_mcp::copilot_home_in(env_override)?
@@ -792,6 +794,12 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     // `--capture-assistant` still forces it on; this only fills in the unset case
     // from what is already installed. Gated to the agents where assistant capture
     // is allowed (Claude Code, Codex), whose configs share the nested-hooks shape.
+    // Codex's default hooks file depends on CODEX_HOME. Resolve it from the
+    // captured environment once, into `args` like the project strategy below,
+    // so every reader of the existing install and the writer agree on it.
+    if args.apply && args.agent == AgentChoice::Codex && args.config_file.is_none() {
+        args.config_file = Some(codex_hooks_path(&config.runtime_env)?);
+    }
     if args.apply
         && !args.capture_assistant
         && capture_assistant_allowed(args.agent)
@@ -1272,7 +1280,8 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
     } else {
         match args.agent {
             AgentChoice::ClaudeCode => claude_settings_target(args).ok()?,
-            AgentChoice::Codex => codex_hooks_path().ok()?,
+            // `run` resolves it into `args.config_file` before any caller.
+            AgentChoice::Codex => return None,
             AgentChoice::CommandCode => command_code_settings_path().ok()?,
             AgentChoice::Cursor => cursor_hooks_path().ok()?,
             AgentChoice::GeminiCli => gemini_settings_path().ok()?,
@@ -2658,10 +2667,10 @@ fn apply_to_codex_settings_with_payload(
     payload: serde_json::Value,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let path = match &args.config_file {
-        Some(p) => p.clone(),
-        None => codex_hooks_path()?,
-    };
+    let path = args
+        .config_file
+        .clone()
+        .context("internal: the Codex hooks path is resolved before apply")?;
     let outcome = merge_codex_payload(payload, &path)?;
     println!(
         "✓ {} {} ({})",
@@ -9872,6 +9881,35 @@ model = "gpt-5"
     /// `--auth-token <token>` for native hooks — so it sat in the agent's
     /// config file *and* in `/proc/<pid>/cmdline` for the lifetime of every
     /// hook, on every tool call.
+    /// `install-hooks --agent codex --apply` writes to the CODEX_HOME that
+    /// `Config::load` captured, not one re-read from the live process
+    /// (invariant #1): an injected value decides the file.
+    #[test]
+    fn codex_apply_writes_under_the_captured_codex_home() {
+        let home = TempDir::new().unwrap();
+        let codex_home = TempDir::new().unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.runtime_env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "CODEX_HOME",
+            codex_home.path().to_str().unwrap(),
+        )]);
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Codex,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        run(&config, args).expect("apply should succeed");
+
+        let written = std::fs::read_to_string(codex_home.path().join("hooks.json")).unwrap();
+        assert!(written.contains("ai-memory"), "{written}");
+    }
+
     #[test]
     fn apply_persists_the_bearer_and_keeps_it_out_of_the_agent_config() {
         let home = TempDir::new().unwrap();

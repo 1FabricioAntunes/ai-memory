@@ -179,13 +179,21 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
 /// Build the full removal plan by reading each existing config file and
 /// running the matching pure stripper. Missing files / no-matches
 /// produce no entry. `name`/`url` identify the MCP server.
-fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<PlannedChange>> {
+///
+/// Harness homes (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`,
+/// `GROK_HOME`, `APPDATA`) come
+/// from `env`, the environment `Config::load` captured (invariant #1).
+fn build_plan(
+    args: &UninstallArgs,
+    data_dir: &Path,
+    env: &crate::config::RuntimeEnv,
+) -> anyhow::Result<Vec<PlannedChange>> {
     let mut plan = Vec::new();
     let want = |k: crate::cli::UninstallOnly| args.only.is_none() || args.only == Some(k);
     let name = args.mcp_name.as_deref();
     let url = args.mcp_url.as_str();
     let home = home_dir();
-    let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
     let omp_dirs = if want(crate::cli::UninstallOnly::Hooks) || want(crate::cli::UninstallOnly::Mcp)
     {
         omp_agent_dirs(home.as_deref(), args.profile.as_deref())
@@ -216,11 +224,11 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             // Copilot CLI's standalone file keeps flat entries under the usual
             // `hooks` key next to its `version: 1`, like Cursor's.
             (
-                install_hooks::copilot_cli_hooks_path()?,
+                install_hooks::copilot_cli_hooks_path_in(env.var_os("COPILOT_HOME"))?,
                 HookConfigShape::NestedHooksKey,
             ),
             (
-                install_hooks::codex_hooks_path()?,
+                install_hooks::codex_hooks_path(env)?,
                 HookConfigShape::NestedHooksKey,
             ),
             (
@@ -438,7 +446,7 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
                 // even with CODEX_HOME set, so sweep that file too.
                 claude_config_paths(
                     home.as_deref(),
-                    agent_config_home(std::env::var_os("CODEX_HOME")).as_deref(),
+                    agent_config_home(env.var_os("CODEX_HOME")).as_deref(),
                     Path::new(".codex/config.toml"),
                     Path::new("config.toml"),
                 )
@@ -496,9 +504,9 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
     // ---- Managed Agent Skills (project + global roots) ----
     if want(crate::cli::UninstallOnly::Skills) {
         let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
-        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-        let grok_home = install_mcp::grok_home().ok();
-        let copilot_home = install_mcp::copilot_home_in(std::env::var_os("COPILOT_HOME")).ok();
+        let appdata = env.var_os("APPDATA").map(PathBuf::from);
+        let grok_home = install_mcp::grok_home_in(env.var_os("GROK_HOME")).ok();
+        let copilot_home = install_mcp::copilot_home_in(env.var_os("COPILOT_HOME")).ok();
         for root in skill_roots(
             &cwd,
             home.as_deref(),
@@ -727,7 +735,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     let name = args.mcp_name.clone();
     let url = args.mcp_url.clone();
 
-    let plan = build_plan(&args, &config.data_dir)?;
+    let plan = build_plan(&args, &config.data_dir, &config.runtime_env)?;
     print_plan(&plan);
     // The marketplace plugins carry hooks, MCP and skills together, so only a
     // full uninstall removes them; the harness's own CLI does the removal.
@@ -1838,6 +1846,42 @@ mod tests {
         assert_eq!(
             service_main_pid(ServiceManager::Launchd, &runner("515")),
             Some(515)
+        );
+    }
+
+    /// The skill sweep finds a global Copilot CLI skill under the COPILOT_HOME
+    /// `Config::load` captured (invariant #1), not one re-read from the live
+    /// process.
+    #[test]
+    fn skill_sweep_uses_the_captured_copilot_home() {
+        let copilot_home = tempfile::tempdir().unwrap();
+        let skill = copilot_home
+            .path()
+            .join(SKILLS_DIR)
+            .join(MANAGED_SKILLS[0].relative_path);
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, MANAGED_SKILLS[0].content).unwrap();
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "COPILOT_HOME",
+            copilot_home.path().to_str().unwrap(),
+        )]);
+        let args = UninstallArgs {
+            apply: false,
+            purge_data: false,
+            only: Some(crate::cli::UninstallOnly::Skills),
+            mcp_name: None,
+            mcp_url: String::new(),
+            yes: false,
+            profile: None,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let plan = build_plan(&args, data.path(), &env).unwrap();
+        assert!(
+            plan.iter().any(|change| matches!(
+                change,
+                PlannedChange::DeleteFile { path, .. } if *path == skill
+            )),
+            "{plan:?}"
         );
     }
 
