@@ -71,6 +71,28 @@ travel as one percent-encoded JSON-array `aliases` query value on both hook and
 handoff requests, and are ignored unless the checkout supplies a normalized
 hostful git-remote identity.
 
+## Create a marker interactively
+
+Run this from anywhere inside a checkout to create a marker at the current
+worktree root:
+
+```bash
+ai-memory project init
+```
+
+The command asks for `workspace` and `project`. Each default is the scope the
+CLI and hooks already resolve for the checkout: an inherited marker's value,
+else the project derived from the normalized `upstream`, then `origin`, remote
+(`github.com/acme/api` → `default` / `acme-api`), else the root directory name.
+Accepting the defaults therefore pins the scope your memory already lives in.
+Outside Git, the marker is written to the current directory.
+
+A name may not contain `/`, `\`, whitespace or control characters. The
+command needs an interactive terminal, never overwrites an existing marker,
+and writes only `workspace` and `project`, so every other key keeps its
+default until you add it. In a repository, commit the file so every checkout
+and worktree routes the same way.
+
 ## Schema
 
 ```toml

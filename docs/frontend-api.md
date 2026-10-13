@@ -160,13 +160,20 @@ GET /api/v1/projects?workspace=NAME   # projects in one workspace
 ```json
 [
   {
+    "workspace_id": "0193e7a1-0000-7000-8000-00000000000a",
     "workspace_name": "default",
+    "project_id": "0193e7a1-0000-7000-8000-00000000000b",
     "project_name": "ai-memory",
     "page_count": 138,
     "last_updated": "2026-05-28T14:02:11.123Z"
   }
 ]
 ```
+
+`project_id` is the stable address of a project: names can collide (a legacy
+twin row can carry another project's old name), and the admin project
+operations accept the id where the name is ambiguous. A restricted project's
+row, id included, is hidden from a caller without a grant.
 
 ### 4.3 Pages (list)
 
@@ -224,6 +231,9 @@ links + back-links.
 `id` is the latest version's id. It changes with every new version, so it is
 the token to pass back as `expected_page_id` to a conditional
 `memory_write_page` or `memory_delete_page`.
+
+`created_at` is when the page's oldest retained version was written, so it
+stays put across rewrites; `updated_at` is when the latest version was written.
 
 `404` for missing workspace/project, missing page row, or missing file
 on disk (the body is read from the markdown file at request time).

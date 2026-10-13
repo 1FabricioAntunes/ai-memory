@@ -1882,10 +1882,17 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
 Grok ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
-so those hooks do not accept the handoff. The first `PostToolUse` prints
+so those hooks do not accept the handoff. `install-hooks --agent grok --apply`
+also writes `$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
+`memory_handoff_list`. Grok reaches MCP tools only through its `use_tool`
+meta-tool, so the rule hands the model the qualified catalog key
+`ai-memory__memory_handoff_list` instead of leaving it to `search_tool`. That
+call comes before any file read, and the rule corrects `workspace`/`project`
+from `./.ai-memory.toml` only when the list comes back empty or with a scope error. The
+first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
-`[briefing]`). The model sees it after that tool result, not before the
-first prompt. A session with no tool call leaves the handoff for
+`[briefing]`). The model sees it after that tool result. A session with no
+tool call and without that rule leaves the handoff for
 `memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed, ZCode,
 DeepSeek Harness (DSH), and Prime Agent are MCP-only here, so you'll need to
 nudge the model to call `memory_query` / `memory_handoff_accept` itself.
@@ -2706,10 +2713,15 @@ llama.cpp, HTTP 400 from most gateways). Lower both limits so their sum fits
 the real context window, with additional headroom for tokenizer variance:
 
 ```bash
-# e.g. a model loaded with an 8k context window
--e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=6500
+# e.g. a model loaded with a 12k context window
+-e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=10000
 -e AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS=1000
 ```
+
+An 8k window cannot hold the default floor (8,350 input tokens at the 0.8
+margin). It fits with `AI_MEMORY_CONSOLIDATION__INPUT_TOKEN_SAFETY_MARGIN=1.0`
+and about 6,700 input tokens plus 1,000 output, at the cost of the headroom the
+margin keeps for dense text such as Portuguese or code (#884).
 
 The double underscore separates the `[consolidation]` section from each key.
 The input target accounts for the rendered observations, current page body,
@@ -2718,9 +2730,12 @@ schema, and provider-envelope reserve. Tokenizers differ, so this is a
 conservative estimate rather than an exact provider token count. An automatic
 checkpoint provider failure degrades to a rule-based page rather than losing
 the checkpoint, but right-sized limits are what allow LLM consolidation to
-succeed. Startup rejects input targets below 6,000 and output limits below
-1,000 because the batch schema and a useful response cannot fit reliably below
-those floors.
+succeed. Startup rejects a budget that leaves too little room for observations
+after the fixed prompts and the structured-output schema -- 8,350 input tokens
+at the default `input_token_safety_margin` of 0.8 -- and rejects output limits
+below 1,000, because the batch schema and a useful response cannot fit reliably
+below those floors. Lowering the safety margin shrinks the character budget, so
+a smaller margin needs a proportionally larger `max_input_tokens`.
 
 ---
 
@@ -2842,15 +2857,15 @@ ai-memory install-skills --target-dir .custom/skills --force
 | `--scope <scope>` | Install into this project or the current user's global skill roots. Values: `project`, `global`. Defaults to `project`. |
 | `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, Grok's skill root, GitHub Copilot CLI's skill root, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `copilot-cli`, `both`. Defaults to `claude-code`. |
 | `--target-dir <dir>` | Write managed skill directories below an explicit root; `--scope` and `--agent` are ignored. |
-| `--print` | Print target paths and `SKILL.md` contents without writing files. |
-| `--force` | Replace unmanaged same-name skills; without it, user-authored same-name skills are preserved. |
+| `--print` | Print target paths and `SKILL.md` contents without writing files. A global Grok plan also prints `$GROK_HOME/rules/ai-memory-handoff.md`. |
+| `--force` | Replace unmanaged same-name skills (and, for global Grok, an unmanaged first-turn rule); without it, user-authored same-name files are preserved. |
 
 Default skill target roots:
 
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` |
 |---|---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`) | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 

@@ -24,6 +24,7 @@
 pub mod antigravity;
 mod assistant_capture;
 pub mod capture_policy;
+pub mod drop_list;
 mod grants;
 pub mod log;
 pub mod payload;
@@ -50,6 +51,7 @@ pub use capture_policy::{
     absolute_tool_location_paths, capture_lookup_locations, describe_invalid_capture_config,
     glob_segment_matches, glob_walk, repository_admits_capture, tool_call_payload, valid_call_id,
 };
+pub use drop_list::IngestDropList;
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
     USER_PROMPT_EXCERPT_MAX_BYTES, agent_from_payload, cap_lifecycle_body_for_client,

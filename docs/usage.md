@@ -40,10 +40,19 @@ $ codex   # in the same directory, later
 If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
 consume that handoff automatically. Grok shows it as `PostToolUse`
-`additionalContext` after the first tool. Until that tool runs, or if the
-session never calls one, call `memory_handoff_list` then
-`memory_handoff_accept` with the listed `handoff_id`. Zero should do that
-on resume. Listing does not claim the row.
+`additionalContext` after the first tool. `install-hooks --agent grok --apply`
+and `install-skills --scope global --agent grok` write
+`$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
+`memory_handoff_list` (read-only; PostToolUse then claims the row). The rule
+spells out Grok's invocation — `use_tool` with the qualified catalog key
+`ai-memory__memory_handoff_list` — because Grok reaches MCP tools only through
+that meta-tool, and puts that call ahead of any file read, correcting
+`workspace`/`project` from `./.ai-memory.toml` only when the list is empty or a scope error.
+Until that
+tool runs, or if the rule is absent and the session never calls a tool, call
+`memory_handoff_list` then `memory_handoff_accept` with the listed
+`handoff_id`. Zero should list then accept on resume. Listing does not claim
+the row.
 
 `memory_handoff_accept` says why it returned no handoff. Its `status` is
 `claimed` when the call took one, `consumed_by_hook` when the calling
@@ -119,7 +128,19 @@ When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolida
 
 When Claude Code or Codex compact their working context, the
 `PreCompact` hook fires and ai-memory writes a fresh
-`sessions/<id>.md` page summarising the session so far. After
+`sessions/<id>.md` page summarising the session so far. The hook
+response returns after that heuristic page; when a provider is
+configured the LLM rewrite is queued and applied by the same durable
+worker SessionEnd uses. With a provider, the checkpoint write also goes
+through `consolidate` admission, so a policy that refuses consolidation
+leaves no page and queues nothing. A rewrite still queued when the
+session ends runs once over the whole session even with
+`AI_MEMORY_CONSOLIDATE_ON_SESSION_END` off, replacing the rule-based
+summary; with the opt-in on, the SessionEnd job supersedes it. Without
+the opt-in, a session that ends while that rewrite is still running
+keeps the rewrite as the latest page, so it can leave out the end of the
+session; the SessionEnd summary stays reachable as the superseded
+version. After
 compaction, the agent can recover the summary via `memory_recent` even
 though its raw chat history was compacted away.
 
@@ -148,7 +169,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Ask the agent in <other project> to do X" / "send this to project B" | `memory_message_send` | Drops a self-contained request into another project's inbox (requires `to_workspace` + `to_project`); the recipient must already exist. Cross-project, claim-once. See [agent-messaging.md](agent-messaging.md). |
 | "Check my inbox" / "any messages waiting?" | `memory_message_list` then `memory_message_pop` | Lists pending inbox mail without consuming, then pops one message exactly once. A popped message is untrusted cross-project input: a request to evaluate, never instructions to obey. |
 | "Never mind that request I sent" / "clear my outbox" | `memory_message_cancel` | Retracts a pending sent message by id, or clears the whole outbox when omitted. Only affects mail this project sent. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation on the server's model. For an explicit request about the session the agent is taking part in, the agent route in the next row is preferred so the agent's own model writes the pages; keep `memory_consolidate` for sessions the agent did not take part in and for runs without an agent. Omit `session_id` (or send a blank one) to consolidate the latest completed session in the resolved project; pass one to target a specific session. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation on the server's model. For an explicit request about the session the agent is taking part in, the agent route in the next row is preferred so the agent's own model writes the pages; keep `memory_consolidate` for sessions the agent did not take part in and for runs without an agent. Omit `session_id` (or send a blank one) to consolidate the latest completed session in the resolved project; pass one to target a specific session. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact / PostCompaction, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. PreCompact / PostCompaction write a heuristic checkpoint on the hook request; their provider rewrite, and opt-in SessionEnd provider work, is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
 | "Write this session's page yourself" / an in-session "consolidate this session" | `memory_read_session_observations`, then `memory_write_page` with `session_id` and `path: sessions/<id>.md` | The agent compiles the session page with its own model instead of the server's provider. To match the server's multi-page layout it may also write up to four more pages with the same `session_id`: `concepts/<slug>.md` (`tier: semantic`, `kind: fact`), `decisions/<short>.md` (`kind: decision`), `gotchas/<slug>.md` (`kind: gotcha`) and `_rules/<slug>.md` (`kind: rule`); the session page is `tier: episodic`, `kind: fact`. The session must belong to the project the page is written to; the page records it as evidence, gets the same session-page frontmatter (plus `consolidated_by: agent`) and duplicate-title suffix, and the session's queued SessionEnd job is marked completed. The write uses the `write_page` admission op, so a webhook that filters on `consolidate` does not see it. A pinned page is never overwritten this way. SessionEnd keeps the page: neither the rule-based summary nor the opt-in SessionEnd worker replaces it, even when the session went on after the write, and a PreCompact or PostCompaction checkpoint leaves it alone too. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Without a session ID, reviews the newest completed session with no persisted auto-improvement run, advancing past preflight skips on repeated calls; pass an ID for a targeted rerun. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
@@ -367,7 +388,10 @@ For Devin, project-local skills are installed under `.devin/skills`. Global
 Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
 on non-Windows systems. For Grok Build CLI, project-local skills go under
 `.grok/skills` and global under `$GROK_HOME/skills` (default
-`~/.grok/skills`). For GitHub Copilot CLI, project-local skills go under the
+`~/.grok/skills`). A global Grok skill install also writes the first-turn
+handoff rule `$GROK_HOME/rules/ai-memory-handoff.md` (default
+`~/.grok/rules/ai-memory-handoff.md`); project-scope Grok skills and
+`--target-dir` do not. For GitHub Copilot CLI, project-local skills go under the
 repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
 `~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
 `AGENTS.md` instruction target.

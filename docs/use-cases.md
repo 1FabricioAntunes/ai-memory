@@ -117,10 +117,12 @@
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
-  cannot show that text before the first prompt. The first tool's
-  `PostToolUse` hook adds it as `additionalContext`. If the session never
-  calls a tool, ask Grok to call `memory_handoff_accept`. Zero still must
-  call `memory_handoff_accept`.
+  cannot show that text before the first prompt: the first-turn rule
+  `install-hooks --agent grok` installs has it call `memory_handoff_list`
+  first, and that tool's `PostToolUse` hook adds the handoff as
+  `additionalContext`. Without the rule, ask Grok to list and then accept the
+  handoff. Zero still must call `memory_handoff_list` then
+  `memory_handoff_accept`.
 - **"What did we decide about X six weeks ago?"** Use `memory_query X` from
   the agent for FTS5 fused with entity matches and linked-page expansion (plus
   vector similarity when an embedder is configured). For a quick terminal-only

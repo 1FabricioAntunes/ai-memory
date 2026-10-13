@@ -611,6 +611,23 @@ Additional boundary rules:
   wrong hash makes `brew install` fail for everyone. This is a mandatory,
   recurring post-release step (it has been forgotten repeatedly); do not rely
   on a contributor PR to the tap to remember it.
+- **Every release re-runs the retrieval benchmark and compares it with the
+  previous release.** Before tagging, run the LongMemEval-S harness
+  (`evals/`, see `docs/benchmarks/README.md`) on the release-candidate SHA:
+  the full 470-question set for zero-LLM FTS and for the default local
+  embeddings, with the same flags as the last published run. Diff every
+  slice, not only the overall number, against the previous release's
+  published report for accuracy (`hit@k`, `recall@k`), latency (query
+  p50/p95), context tokens (raw and top-five) and ingest throughput. For each
+  material change, decide whether it was warranted: a deliberate trade the
+  CHANGELOG states (for example more tokens for a measured accuracy gain), or
+  a regression we introduced. An unwarranted regression blocks the release
+  until it is fixed. Run-to-run noise is about ±0.005 overall and ±0.02–0.03
+  on small slices; a larger drop, or one slice drifting down release after
+  release, is not noise. Publish the fresh numbers in `docs/benchmarks/` and
+  keep `docs/comparison.md` and `docs/competitive-parity.md` in step with
+  them. A release that touches retrieval should improve these numbers, not
+  merely hold them.
 - **Reclaim build storage after every release — run `cargo clean`.** The
   multi-worktree, multi-target-dir release flow (integration worktrees, per-agent
   worktrees, separate `CARGO_TARGET_DIR`s) leaves many stale 100–180 MB test

@@ -60,7 +60,12 @@ script bundles are compatibility fallbacks and do not enforce capture-policy
 v1. Grok and Zero capture lifecycle events, but both ignore
 SessionStart stdout, so ai-memory does not auto-inject handoffs for them.
 SessionStart handoff injection works only for clients that consume startup-hook
-stdout (or their equivalent context-injection result); Grok and Zero must call
+stdout (or their equivalent context-injection result). Grok's first-turn rule
+(`$GROK_HOME/rules/ai-memory-handoff.md`, installed with the Grok hooks and
+with global Grok skills) has the model call `memory_handoff_list` through
+`use_tool` with the qualified catalog key `ai-memory__memory_handoff_list`, so
+the first `PostToolUse` can claim the baton; Zero must call
+`memory_handoff_list` then
 `memory_handoff_accept` when resuming.
 
 Capture exclusions are separate from MCP registration. Native hook commands and
@@ -82,7 +87,7 @@ endpoint. The trade-off:
 | | What you get | What you don't get |
 |---|---|---|
 | **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries; no auto-handoff at session boundaries |
-| **MCP + hooks** | All of the above *plus* bounded sanitized prompt/tool-lifecycle observations captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Hook observations are not complete native transcripts. Grok delivers the handoff on the first `PostToolUse`. Zero discards SessionStart stdout; ask it to call `memory_handoff_accept`. |
+| **MCP + hooks** | All of the above *plus* bounded sanitized prompt/tool-lifecycle observations captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Hook observations are not complete native transcripts. Grok delivers the handoff on the first `PostToolUse`; its first-turn rule calls `memory_handoff_list` so that tool exists. Zero discards SessionStart stdout; ask it to call `memory_handoff_list` then `memory_handoff_accept`. |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
@@ -1014,7 +1019,13 @@ that file and preserves all unrelated MCP servers.
 `ai-memory install-hooks --agent grok --apply`. Handoff injection is the
 first `PostToolUse` (`additionalContext` after the tool result). Grok
 ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
-so those events do not accept the handoff.
+so those events do not accept the handoff. `--apply` also writes
+`$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
+so the first turn calls `memory_handoff_list` through `use_tool` with the
+qualified catalog key `ai-memory__memory_handoff_list` (Grok exposes MCP tools
+only through that meta-tool), before any file read, and corrects the scope from
+`./.ai-memory.toml` only when that list is empty or a scope error; PostToolUse then claims the
+row.
 
 **Config file:** `install-mcp --client grok --apply` writes the user config at
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`). To use a project or
@@ -1057,9 +1068,11 @@ mirror Claude Code's vocabulary (`SessionStart`, `UserPromptSubmit`,
 native `ai-memory hook --event … --agent grok` commands. Session-end
 handoff *creation* works. Injection is the first `PostToolUse`: JSON
 `additionalContext` with the pending handoff and an opted-in `[briefing]`.
-`memory_handoff_accept` is still the path when the session has not called
-a tool yet (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
-`~/.grok/skills`).
+`memory_handoff_list` is the first-turn path when the managed Grok rule is
+installed (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
+`~/.grok/skills`; the rule lives under `$GROK_HOME/rules`).
+`memory_handoff_accept` remains the recovery path when that rule is absent
+and the session has not called a tool yet.
 
 Grok can also load MCP from Claude Code / Cursor compat sources when those
 compat flags are enabled, but first-party `install-mcp --client grok` is
@@ -1644,7 +1657,7 @@ that *starts* the next one - to play nicely with ai-memory:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart; `install-hooks --agent grok --apply` also installs a first-turn `memory_handoff_list` user rule so that tool exists. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. The OpenCode 2 beta plugin subscribes to the same event name on the

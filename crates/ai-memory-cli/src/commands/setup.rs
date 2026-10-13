@@ -406,6 +406,9 @@ async fn execute(
     } else {
         println!("auth: bearer token (owner-only file; never printed)");
     }
+    if let Some(hint) = web_sign_in_hint(&config, &endpoint) {
+        println!("{hint}");
+    }
     if problems.is_empty() {
         println!(
             "ai-memory is set up. Restart your agents so they load the new hooks and MCP entry."
@@ -419,6 +422,20 @@ async fn execute(
         "setup finished with {} problem(s); fix them and re-run `ai-memory setup`",
         problems.len()
     )
+}
+
+/// How a browser signs in to the web UI on a token-file install. With no
+/// human accounts the server answers `/web` with a Basic challenge, and the
+/// token file's contents are the password. The token itself is never printed.
+fn web_sign_in_hint(config: &Config, endpoint: &ServerEndpoint) -> Option<String> {
+    let file = config.auth.token_file.as_ref().filter(|file| file.loaded)?;
+    Some(format!(
+        "web UI: {} (the service runs with --enable-web); when the browser asks \
+         for a username and password, use any username and the contents of {} \
+         as the password",
+        endpoint.build_url("/web"),
+        file.path.display()
+    ))
 }
 
 async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> bool {
@@ -564,6 +581,27 @@ async fn memory_status(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A token-file install learns how to open the web UI: the URL and the
+    /// file to read, never the token. An inline or absent token prints no hint.
+    #[test]
+    fn web_hint_names_the_token_file_and_never_the_token() {
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".to_owned()), None);
+        let mut config = Config::default();
+        assert_eq!(web_sign_in_hint(&config, &endpoint), None);
+
+        config.auth.bearer_token = Some("inline-root-token".to_owned());
+        assert_eq!(web_sign_in_hint(&config, &endpoint), None);
+
+        let file = PathBuf::from("/data/auth-tokens/default");
+        config
+            .auth
+            .adopt_token_file(file.clone(), "file-root-token".to_owned());
+        let hint = web_sign_in_hint(&config, &endpoint).expect("token-file install gets a hint");
+        assert!(hint.contains("http://127.0.0.1:49374/web"), "{hint}");
+        assert!(hint.contains(&file.display().to_string()), "{hint}");
+        assert!(!hint.contains("file-root-token"), "{hint}");
+    }
 
     fn spec(home: &Path) -> user_service::ServiceSpec {
         user_service::ServiceSpec {

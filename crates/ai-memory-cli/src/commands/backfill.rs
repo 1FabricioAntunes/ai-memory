@@ -1515,6 +1515,7 @@ mod tests {
             per_user_slots: false,
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
+            ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-with-a-very-long-identifier-that-would-break-the-old-key";
@@ -1714,6 +1715,7 @@ mod tests {
             per_user_slots: false,
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
+            ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-resumed-across-two-offline-intervals";

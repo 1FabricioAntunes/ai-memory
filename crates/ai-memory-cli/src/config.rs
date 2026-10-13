@@ -601,6 +601,8 @@ pub struct Config {
     pub routing: RoutingSettings,
     /// Client-side hook spool retry policy.
     pub hook_spool: HookSpoolSettings,
+    /// `[ingest]` — server-side drop list for tool events (#1241).
+    pub ingest: IngestSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -1193,6 +1195,22 @@ pub struct RoutingSettings {
     pub mid_session: ai_memory_core::MidSessionRouting,
 }
 
+/// `[ingest]`: tool events the server drops whatever the client sends
+/// (#1241). Both lists are empty by default and apply to every project on the
+/// server. Validated once by [`Config::load`] into [`Self::drop_list`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IngestSettings {
+    /// Drop a tool event whose `tool_use_id` starts with one of these.
+    pub drop_tool_use_id_prefixes: Vec<String>,
+    /// Drop a tool event whose tool name equals one of these exactly.
+    pub drop_tool_names: Vec<String>,
+    /// The validated list the hook router checks. Set by [`Config::load`];
+    /// never read from or written to a config file.
+    #[serde(skip)]
+    pub drop_list: ai_memory_hooks::IngestDropList,
+}
+
 /// Client-side hook spool retry policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
@@ -1282,6 +1300,7 @@ impl Default for Config {
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
             hook_spool: HookSpoolSettings::default(),
+            ingest: IngestSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -2224,6 +2243,11 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
+        config.ingest.drop_list = ai_memory_hooks::IngestDropList::new(
+            config.ingest.drop_tool_use_id_prefixes.clone(),
+            config.ingest.drop_tool_names.clone(),
+        )
+        .map_err(|message| anyhow::anyhow!(message))?;
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -2235,16 +2259,58 @@ impl Config {
             anyhow::bail!("auto_improve.scheduler.experience_{message}");
         }
 
+        // The safety margin scales the input budget, so a non-positive value
+        // would starve every prompt and one above 1.0 would loosen the budget
+        // past the nominal token limit it is meant to tighten (#884). NaN also
+        // fails every comparison below, so it is rejected here too.
+        //
+        // Validated before the floor check below, which needs a trustworthy
+        // margin to compute the effective budget.
+        let safety_margin = config.consolidation.input_token_safety_margin;
+        if !(safety_margin > 0.0 && safety_margin <= 1.0) {
+            anyhow::bail!(
+                "consolidation.input_token_safety_margin must be in (0.0, 1.0] \
+                 (got {safety_margin}); it scales the approximate input-token budget"
+            );
+        }
+
         // Fail at startup rather than shipping a prompt that is all scaffolding
         // and no observations: below this floor the fixed system prompt and page
         // conventions consume the entire budget, so every consolidation would
         // either be evidence-free or rejected by the provider.
+        //
+        // The floor is a *character* budget -- what the builders actually need
+        // to hold the fixed prompts plus MIN_OBSERVATION_RESERVE_CHARS of
+        // evidence -- expressed in tokens at the default margin. Comparing the
+        // configured budget against it therefore has to put both sides on the
+        // same footing: the configured budget at ITS margin, the requirement at
+        // the DEFAULT margin.
+        //
+        // Scoring the configured side at the default margin instead would make
+        // the check a no-op, because the margin cancels out of both sides and
+        // it collapses back to `max_input_tokens < MIN_CONSOLIDATION_MAX_INPUT_TOKENS`
+        // -- the raw-count comparison this replaced. Doing it this way is what
+        // makes a lowered margin demand more tokens, which is the point: the
+        // margin exists to buy headroom on dense corpora (#884), and buying it
+        // by shrinking the budget below what the prompt needs is exactly the
+        // case that used to pass and then omit every observation (#1234).
         let min_input_tokens = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
-        if config.consolidation.max_input_tokens < min_input_tokens {
+        let required_input_chars = ai_memory_consolidate::effective_input_chars(
+            min_input_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        );
+        let effective_input_chars = ai_memory_consolidate::effective_input_chars(
+            config.consolidation.max_input_tokens,
+            safety_margin,
+        );
+        if effective_input_chars < required_input_chars {
             anyhow::bail!(
-                "consolidation.max_input_tokens must be at least {min_input_tokens} \
-                 (got {}); below that the system prompt and page conventions leave \
-                 no room for observations",
+                "consolidation.max_input_tokens must leave at least {required_input_chars} \
+                 characters for the prompt ({min_input_tokens} tokens at the default \
+                 input_token_safety_margin) (got {}, which is {effective_input_chars} at \
+                 input_token_safety_margin = {safety_margin}); below that the system \
+                 prompt and page conventions leave no room for observations. Raise \
+                 max_input_tokens, or raise input_token_safety_margin towards 1.0",
                 config.consolidation.max_input_tokens
             );
         }
@@ -2256,21 +2322,6 @@ impl Config {
                 config.consolidation.max_output_tokens
             );
         }
-        // The safety margin scales the input budget, so a non-positive value
-        // would starve every prompt and one above 1.0 would loosen the budget
-        // past the nominal token limit it is meant to tighten (#884). NaN also
-        // fails every comparison below, so it is rejected here too.
-        let safety_margin = config.consolidation.input_token_safety_margin;
-        if !(safety_margin > 0.0 && safety_margin <= 1.0) {
-            anyhow::bail!(
-                "consolidation.input_token_safety_margin must be in (0.0, 1.0] \
-                 (got {safety_margin}); it scales the approximate input-token budget"
-            );
-        }
-        // The safety margin scales the input budget, so a non-positive value
-        // would starve every prompt and one above 1.0 would loosen the budget
-        // past the nominal token limit it is meant to tighten (#884). NaN also
-        // fails every comparison below, so it is rejected here too.
         // Zero (or a sub-second remainder rounded down) would cut every
         // provider request off before it is sent.
         if config.llm_timeout_secs == 0 {
@@ -4259,6 +4310,62 @@ mod tests {
         }
     }
 
+    /// #1234: the floor's promise is a *character* budget -- enough room for
+    /// the fixed prompts plus `MIN_OBSERVATION_RESERVE_CHARS` of evidence -- so
+    /// the check has to score the configured budget at its own margin against
+    /// that requirement at the default margin. 8,000 tokens is the case that
+    /// used to load and then send every observation to the omission marker:
+    /// it clears the requirement at margin 1.0 but not at the default 0.8.
+    #[test]
+    fn load_rejects_a_budget_whose_effective_size_is_below_the_floor() {
+        // Clears the character requirement at margin 1.0, misses it at 0.8.
+        for (tokens, margin) in [(8_000, 0.8), (8_000, 0.6), (8_000, 0.5), (9_000, 0.7)] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[consolidation]
+max_input_tokens = {tokens}
+                     input_token_safety_margin = {margin}
+"
+                ),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("a budget too small at its own margin must fail closed");
+            assert!(
+                error.to_string().contains("consolidation.max_input_tokens"),
+                "unexpected error for {tokens} tokens at margin {margin}: {error:#}"
+            );
+        }
+    }
+
+    /// Controls for the test above, so a blanket rejection cannot pass for a
+    /// working guard: the same token counts are accepted once the margin is
+    /// high enough to clear the requirement, and 8,000 at margin 1.0 -- which
+    /// the reject test deliberately excludes -- must still load.
+    #[test]
+    fn load_accepts_a_budget_whose_effective_size_clears_the_floor() {
+        for (tokens, margin) in [(8_000, 1.0), (10_000, 0.8), (10_000, 0.7)] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[consolidation]
+max_input_tokens = {tokens}
+                     input_token_safety_margin = {margin}
+"
+                ),
+            )
+            .unwrap();
+            let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect("a budget that clears the requirement must load");
+            assert_eq!(cfg.consolidation.max_input_tokens, tokens);
+        }
+    }
+
     #[test]
     fn load_rejects_a_consolidation_output_limit_too_small_for_json() {
         let min = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
@@ -4324,20 +4431,91 @@ mod tests {
         );
     }
 
-    /// A small-context provider needs both sides of the context allocation to
-    /// survive the config round-trip.
+    /// The small-context examples in `docs/install.md` and
+    /// `docs/llm-providers.md` must be configs that actually load. These are
+    /// the literal values those docs quote, copied by hand: keep them in step
+    /// when the docs change, so an example does not go stale the way
+    /// `max_input_tokens = 6500` did once the floor moved (#1234).
     #[test]
-    fn load_accepts_a_small_context_consolidation_budget() {
+    fn documented_small_context_examples_load() {
+        for (doc, tokens, output, margin) in [
+            ("docs/install.md", 10_000, 1_000, 0.8),
+            ("docs/install.md (8k window)", 6_700, 1_000, 1.0),
+            ("docs/llm-providers.md", 10_000, 1_000, 0.8),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[consolidation]
+max_input_tokens = {tokens}
+max_output_tokens = {output}
+input_token_safety_margin = {margin}
+"
+                ),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .unwrap_or_else(|error| panic!("{doc}'s example no longer loads: {error:#}"));
+        }
+    }
+
+    /// A small-context provider needs both sides of the context allocation to
+    /// survive the config round-trip. The budget is derived from the floor
+    /// rather than written out, so the test keeps meaning "the smallest
+    /// accepted budget round-trips" when the floor moves (#1234) instead of
+    /// pinning a number the floor happens to allow today.
+    /// `[ingest]` is read once into the validated drop list the hook router
+    /// checks, and an out-of-bounds entry fails startup instead of being
+    /// silently ignored (#1241).
+    #[test]
+    fn ingest_drop_lists_load_into_the_router_list_and_reject_bad_entries() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "[consolidation]\nmax_input_tokens = 7000\nmax_output_tokens = 1000\n",
+            "[ingest]\ndrop_tool_use_id_prefixes = [\"toolu_plugin_\"]\ndrop_tool_names = [\"mcp__noisy__poll\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            config.ingest.drop_list,
+            ai_memory_hooks::IngestDropList::new(
+                vec!["toolu_plugin_".into()],
+                vec!["mcp__noisy__poll".into()]
+            )
+            .unwrap()
+        );
+
+        std::fs::write(&config_path, "[ingest]\ndrop_tool_names = [\" \"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("drop_tool_names"),
+            "{error:#}"
+        );
+
+        // Default: empty, so nothing is dropped.
+        assert_eq!(
+            Config::default().ingest.drop_list,
+            ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    #[test]
+    fn load_accepts_a_small_context_consolidation_budget() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let small = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
+        let output = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
+        std::fs::write(
+            &config_path,
+            format!("[consolidation]\nmax_input_tokens = {small}\nmax_output_tokens = {output}\n"),
         )
         .unwrap();
         let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
-        assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
-        assert_eq!(cfg.consolidation.max_output_tokens, 1_000);
+        assert_eq!(cfg.consolidation.max_input_tokens, small);
+        assert_eq!(cfg.consolidation.max_output_tokens, output);
     }
 
     /// `AI_MEMORY_LLM_TIMEOUT_SECS` (figment maps it to this field) exists so
