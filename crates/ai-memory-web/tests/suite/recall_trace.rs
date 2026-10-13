@@ -387,3 +387,35 @@ async fn project_search_fails_closed_on_unknown_and_partial_scope() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
     }
 }
+
+#[tokio::test]
+async fn search_scope_selector_lists_only_readable_projects() {
+    let f = fixture(true).await;
+    let alice = human(&f.store, "alice").await;
+    let bob = human(&f.store, "bob").await;
+    f.store
+        .writer
+        .grant_memory(alice, f.alpha, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let app = web(&f, Recall::default());
+    let uri = "/web/search?q=token";
+
+    let (status, body) = get(&app, uri, Some(bob)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for hidden in ["default/alpha", "default/beta"] {
+        assert!(!body.contains(hidden), "bob sees {hidden}: {body}");
+    }
+    // A hand-typed scope is refused, not listed.
+    let (status, body) = get(&app, "/web/search?q=token&scope=default/alpha", Some(bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.contains("notes/rotation.md"), "{body}");
+
+    // Controls: the granted reader sees alpha only, an unrestricted viewer both.
+    let (_, body) = get(&app, uri, Some(alice)).await;
+    assert!(body.contains(r#"<option value="default/alpha">"#), "{body}");
+    assert!(!body.contains("default/beta"), "{body}");
+    let (_, body) = get(&app, uri, None).await;
+    assert!(body.contains(r#"<option value="default/alpha">"#), "{body}");
+    assert!(body.contains(r#"<option value="default/beta">"#), "{body}");
+}

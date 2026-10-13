@@ -12,6 +12,7 @@
 //!   viewer may read, as `memory_query(global=true)` does. Its trace is the
 //!   FTS time alone; there are no per-hit streams to show.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ai_memory_store::{SearchExplain, StreamTimings};
@@ -24,7 +25,8 @@ use serde::Deserialize;
 use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
-    HitTrace, SearchHit, SearchView, StreamTraceRow, TimingRow, encode_segment, page_href,
+    HitTrace, ScopeGroup, ScopeOption, SearchHit, SearchView, StreamTraceRow, TimingRow,
+    encode_segment, page_href, project_href,
 };
 
 /// Hits a cross-project search returns when the request names no `limit`.
@@ -46,6 +48,10 @@ pub(crate) struct SearchParams {
     /// Project of a project search; must come with `workspace`.
     #[serde(default)]
     pub project: Option<String>,
+    /// `workspace/project` from the search page's selector; empty means every
+    /// project. Wins over `workspace` + `project` when both are sent.
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Most hits to show, clamped to `1..=100`.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -77,19 +83,30 @@ pub(crate) async fn handler(
         .as_deref()
         .is_some_and(|v| matches!(v, "1" | "true" | "on" | "yes"));
     let viewer = viewer.map(|axum::Extension(viewer)| viewer.user());
-    let scope = match (
-        non_empty(params.workspace.as_deref()),
-        non_empty(params.project.as_deref()),
-    ) {
-        (Some(workspace), Some(project)) => Some((workspace.to_owned(), project.to_owned())),
-        (None, None) => None,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "workspace and project must be provided together",
-            )
-                .into_response();
-        }
+    let scope = match non_empty(params.scope.as_deref()) {
+        Some(value) => match value.split_once('/') {
+            Some((workspace, project)) if !workspace.is_empty() && !project.is_empty() => {
+                Some((workspace.to_owned(), project.to_owned()))
+            }
+            _ => {
+                return (StatusCode::BAD_REQUEST, "scope must be workspace/project")
+                    .into_response();
+            }
+        },
+        None => match (
+            non_empty(params.workspace.as_deref()),
+            non_empty(params.project.as_deref()),
+        ) {
+            (Some(workspace), Some(project)) => Some((workspace.to_owned(), project.to_owned())),
+            (None, None) => None,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "workspace and project must be provided together",
+                )
+                    .into_response();
+            }
+        },
     };
     let internal = |error: ai_memory_store::StoreError| {
         tracing::error!(%error, "web search failed");
@@ -187,10 +204,42 @@ pub(crate) async fn handler(
     }
 
     let (workspace, project) = scope.unwrap_or_default();
+    // Only readable projects, like the home page's cards, so the selector
+    // never names a repository the viewer cannot open.
+    let summaries = match state.reader.list_projects_with_stats(viewer).await {
+        Ok(summaries) => summaries,
+        Err(error) => return internal(error),
+    };
+    // The reader returns projects newest first, which interleaves
+    // workspaces; group and order by name instead.
+    let mut by_workspace: BTreeMap<String, Vec<ScopeOption>> = BTreeMap::new();
+    for s in summaries {
+        let option = ScopeOption {
+            value: format!("{}/{}", s.workspace_name, s.project_name),
+            selected: s.workspace_name == workspace && s.project_name == project,
+            label: s.project_name,
+        };
+        by_workspace
+            .entry(s.workspace_name)
+            .or_default()
+            .push(option);
+    }
+    let scope_groups: Vec<ScopeGroup> = by_workspace
+        .into_iter()
+        .map(|(workspace, mut projects)| {
+            projects.sort_by(|a, b| a.label.cmp(&b.label));
+            ScopeGroup {
+                workspace,
+                projects,
+            }
+        })
+        .collect();
     let hit_count = hits.len();
     let global_href = format!("search?q={}", encode_segment(&query));
     let view = SearchView {
         global_href,
+        project_href: project_href(&workspace, &project),
+        scope_groups,
         query,
         hits,
         hit_count,

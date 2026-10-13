@@ -462,6 +462,13 @@ and [0.x](docs/changelog/0.x.md).
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites
   unedited files of an earlier export in place. (#1164)
+- Changed the header search box in `/web` to search the project you are
+  viewing. On a project, page, namespace or history view it now sends
+  `workspace` and `project` with the query, and its label and placeholder name
+  the project. The search page gained a "Search in" selector (`scope=<workspace>/<project>`)
+  that lists only the projects the viewer may read, an "in workspace/project ×"
+  chip that clears the scope, a breadcrumb, and a "Search all projects" button
+  when a scoped search finds nothing. (#1245)
 
 ### Removed
 - Removed the 1.x compatibility-token commands `ai-memory user add`,
