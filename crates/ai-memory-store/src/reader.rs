@@ -1237,6 +1237,13 @@ pub struct PageHitWithMeta {
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
+    /// Semantic kind, so the web search can filter without a second lookup.
+    /// Not serialized: the MCP `global_hits` shape stays as it was.
+    #[serde(skip)]
+    pub kind: String,
+    /// Memory tier; see `kind`.
+    #[serde(skip)]
+    pub tier: String,
 }
 
 /// One raw observation fallback hit returned when compiled wiki pages miss.
@@ -2618,6 +2625,8 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        kind,
+                        tier,
                     },
                     authority,
                 ));
@@ -3500,7 +3509,8 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
-                        CAST(pages.updated_at AS REAL) AS rank \
+                        CAST(pages.updated_at AS REAL) AS rank, \
+                        {kind_expr} AS kind, pages.tier \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
@@ -3508,6 +3518,7 @@ impl ReaderPool {
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
                 descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
+                kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json"),
                 not_expired = not_expired("pages", "?2"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -3521,11 +3532,22 @@ impl ReaderPool {
                 let title: String = row.get(3)?;
                 let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
                 let rank: f64 = row.get(5)?;
-                Ok((workspace_name, project_name, path, title, snippet, rank))
+                let kind: String = row.get(6)?;
+                let tier: String = row.get(7)?;
+                Ok((
+                    workspace_name,
+                    project_name,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    kind,
+                    tier,
+                ))
             })?;
             let mut hits = Vec::new();
             for row in rows {
-                let (workspace_name, project_name, path, title, snippet, rank) = row?;
+                let (workspace_name, project_name, path, title, snippet, rank, kind, tier) = row?;
                 hits.push(PageHitWithMeta {
                     workspace_name,
                     project_name,
@@ -3533,6 +3555,8 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    kind,
+                    tier,
                 });
             }
             Ok(hits)
@@ -8437,6 +8461,52 @@ impl ReaderPool {
                 .query_row(&sql, params![page_id.as_bytes()], page_meta_from_row)
                 .optional()?;
             row_opt.transpose()
+        })
+        .await
+    }
+
+    /// Semantic kind and tier of each latest page in `page_ids`, in one query.
+    ///
+    /// Ids that name no latest page are absent from the map. The caller has
+    /// already scoped the ids (they come from a search the viewer was allowed
+    /// to run), so this reads no repository the viewer could not.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_kinds_tiers_by_ids(
+        &self,
+        page_ids: &[PageId],
+    ) -> StoreResult<std::collections::HashMap<PageId, (String, String)>> {
+        if page_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let id_blobs: Vec<Value> = page_ids
+            .iter()
+            .map(|id| Value::Blob(id.as_bytes().to_vec()))
+            .collect();
+        self.with_conn(move |conn| {
+            let placeholders = std::iter::repeat_n("?", id_blobs.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT pg.id, {kind_expr}, pg.tier FROM pages pg \
+                 WHERE pg.is_latest = 1 AND pg.id IN ({placeholders})",
+                kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(id_blobs.iter()), |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let (id, kind, tier) = row?;
+                out.insert(PageId::from_slice(&id)?, (kind, tier));
+            }
+            Ok(out)
         })
         .await
     }

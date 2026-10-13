@@ -526,3 +526,151 @@ async fn project_search_shows_observation_excerpts_only_to_the_sessions_owner() 
         assert!(body.contains("plutonium"), "{uri}: owner's excerpt: {body}");
     }
 }
+
+/// A procedural `procedures/rotate.md` in `alpha`, matching the same query as
+/// the fixture's `fact`/`semantic` pages.
+async fn add_procedure(f: &Fixture) {
+    let ws = f
+        .store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    f.wiki
+        .write_page(WritePageRequest {
+            frontmatter: serde_json::json!({"kind": "procedure"}),
+            tier: Tier::Procedural,
+            ..req(
+                ws,
+                f.alpha,
+                "procedures/rotate.md",
+                "# Rotate\n\nRun the token rotation script every week.",
+            )
+        })
+        .await
+        .unwrap();
+}
+
+fn hit_paths(body: &str) -> Vec<String> {
+    body.split("data-hit-path=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn search_filters_a_project_by_kind_and_tier_keeping_rank_order() {
+    let f = fixture(false).await;
+    add_procedure(&f).await;
+    let app = web(&f, Recall::default());
+    let base = "/web/search?q=token%20rotation&workspace=default&project=alpha";
+
+    let (status, body) = get(&app, base, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let all = hit_paths(&body);
+    assert!(all.contains(&"procedures/rotate.md".to_owned()), "{all:?}");
+    assert!(all.contains(&"notes/rotation.md".to_owned()), "{all:?}");
+
+    let (_, body) = get(&app, &format!("{base}&kind=procedure"), None).await;
+    assert_eq!(hit_paths(&body), ["procedures/rotate.md"], "{body}");
+    let (_, body) = get(&app, &format!("{base}&tier=procedural"), None).await;
+    assert_eq!(hit_paths(&body), ["procedures/rotate.md"], "{body}");
+
+    // The survivors of `kind=fact` are the unfiltered list minus the
+    // procedure, in the same order: the filter runs after ranking.
+    let expected: Vec<_> = all
+        .iter()
+        .filter(|p| *p != "procedures/rotate.md")
+        .cloned()
+        .collect();
+    let (_, body) = get(&app, &format!("{base}&kind=fact&tier=semantic"), None).await;
+    assert_eq!(hit_paths(&body), expected, "{body}");
+
+    // Filters combine with AND, and an empty result says why.
+    let (status, body) = get(&app, &format!("{base}&kind=procedure&tier=semantic"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(hit_paths(&body).is_empty(), "{body}");
+    assert!(body.contains("with these filters"), "{body}");
+
+    // The selects keep the current choice.
+    let (_, body) = get(
+        &app,
+        &format!("{base}&kind=procedure&tier=procedural"),
+        None,
+    )
+    .await;
+    assert!(
+        body.contains(r#"<option value="procedure" selected>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<option value="procedural" selected>"#),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn cross_project_search_filters_by_kind_and_rejects_an_unknown_tier() {
+    let f = fixture(false).await;
+    add_procedure(&f).await;
+    let app = web(&f, Recall::default());
+
+    let (_, body) = get(&app, "/web/search?q=token%20rotation&kind=procedure", None).await;
+    assert_eq!(hit_paths(&body), ["procedures/rotate.md"], "{body}");
+    // Control: without the filter beta's page is there too.
+    let (_, body) = get(&app, "/web/search?q=token%20rotation", None).await;
+    assert!(body.contains("notes/beta-rotation.md"), "{body}");
+
+    for uri in [
+        "/web/search?q=token&tier=bogus",
+        "/web/search?q=token&workspace=default&project=alpha&tier=bogus",
+    ] {
+        let (status, _) = get(&app, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
+/// A filter only narrows: it never reaches a project the viewer may not read.
+#[tokio::test]
+async fn kind_filter_does_not_widen_what_a_viewer_can_read() {
+    let f = fixture(true).await;
+    add_procedure(&f).await;
+    let alice = human(&f.store, "alice").await;
+    let bob = human(&f.store, "bob").await;
+    f.store
+        .writer
+        .grant_memory(alice, f.alpha, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let app = web(&f, Recall::default());
+
+    for uri in [
+        "/web/search?q=token%20rotation&kind=fact",
+        "/web/search?q=token%20rotation&kind=procedure&tier=procedural",
+    ] {
+        let (status, body) = get(&app, uri, Some(bob)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(hit_paths(&body).is_empty(), "bob sees hits: {body}");
+    }
+    let (status, body) = get(
+        &app,
+        "/web/search?q=token%20rotation&scope=default/alpha&kind=procedure",
+        Some(bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.contains("procedures/rotate.md"), "{body}");
+
+    // Controls: alice reads alpha, not beta; an unrestricted viewer reads both.
+    let (_, body) = get(
+        &app,
+        "/web/search?q=token%20rotation&kind=fact",
+        Some(alice),
+    )
+    .await;
+    assert!(body.contains("notes/rotation.md"), "{body}");
+    assert!(!body.contains("notes/beta-rotation.md"), "{body}");
+    let (_, body) = get(&app, "/web/search?q=token%20rotation&kind=fact", None).await;
+    assert!(body.contains("notes/beta-rotation.md"), "{body}");
+}

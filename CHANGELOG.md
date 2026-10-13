@@ -12,6 +12,12 @@ and [0.x](docs/changelog/0.x.md).
 ## [Unreleased]
 
 ### Added
+- Added kind and tier filters to the web search. The search page in `/web`
+  has "Kind" and "Tier" selects, and `/web/search` accepts `kind` and `tier`
+  for both a project search and a cross-project one. The filter runs after
+  ranking, so the hits that remain keep the order `memory_query` gives them,
+  and a project search looks through its top 100 matches rather than the
+  first page of results. An unknown `tier` is a 400. (#1248)
 - Added backlinks, outgoing links and an outline to the web page view. A page
   in `/web` now has a side column (below the text on narrow screens) with "On
   this page", the h2 and h3 headings linked to their anchors (shown from two

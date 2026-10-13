@@ -11,10 +11,15 @@
 //! - **Cross-project search** (no scope): FTS5 over every repository the
 //!   viewer may read, as `memory_query(global=true)` does. Its trace is the
 //!   FTS time alone; there are no per-hit streams to show.
+//!
+//! `kind` and `tier` narrow either mode *after* ranking, so the surviving
+//! hits keep the order `memory_query` gives them.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use ai_memory_core::Tier;
 use ai_memory_store::{SearchExplain, StreamTimings};
 use askama::Template;
 use axum::extract::{Query, State};
@@ -25,8 +30,8 @@ use serde::Deserialize;
 use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
-    HitTrace, ScopeGroup, ScopeOption, SearchHit, SearchView, StreamTraceRow, TimingRow,
-    encode_segment, page_href, project_href,
+    FilterOption, HitTrace, ScopeGroup, ScopeOption, SearchHit, SearchView, StreamTraceRow,
+    TimingRow, encode_segment, page_href, project_href,
 };
 
 /// Hits a cross-project search returns when the request names no `limit`.
@@ -35,6 +40,22 @@ const GLOBAL_DEFAULT_LIMIT: usize = 50;
 const SCOPED_DEFAULT_LIMIT: usize = 20;
 /// Upper bound on `limit`, the same clamp `memory_query` applies.
 const MAX_LIMIT: usize = 100;
+/// Page kinds the filter offers: the kinds a path convention implies, which
+/// are also the ones the consolidator writes.
+const KINDS: [&str; 10] = [
+    "rule",
+    "slot",
+    "session",
+    "decision",
+    "gotcha",
+    "concept",
+    "procedure",
+    "note",
+    "preference",
+    "fact",
+];
+/// Memory tiers the filter offers, in `Tier` declaration order.
+const TIERS: [&str; 4] = ["working", "episodic", "semantic", "procedural"];
 
 /// Query-string parameters for the search endpoint.
 #[derive(Debug, Deserialize)]
@@ -52,6 +73,12 @@ pub(crate) struct SearchParams {
     /// project. Wins over `workspace` + `project` when both are sent.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Keep only pages of this kind; empty keeps every kind.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Keep only pages of this tier; empty keeps every tier.
+    #[serde(default)]
+    pub tier: Option<String>,
     /// Most hits to show, clamped to `1..=100`.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -109,6 +136,26 @@ pub(crate) async fn handler(
             }
         },
     };
+    let kind = non_empty(params.kind.as_deref()).map(str::to_owned);
+    let tier = match non_empty(params.tier.as_deref()) {
+        Some(value) if Tier::from_str(value).is_ok() => Some(value.to_owned()),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "tier must be working, episodic, semantic or procedural",
+            )
+                .into_response();
+        }
+        None => None,
+    };
+    let filtered = kind.is_some() || tier.is_some();
+    let keeps = |hit_kind: &str, hit_tier: &str| {
+        kind.as_deref().is_none_or(|k| k == hit_kind)
+            && tier.as_deref().is_none_or(|t| t == hit_tier)
+    };
+    // A filter runs after ranking, so the ranker is asked for the most it can
+    // return and the limit is applied to what survives.
+    let fetch_limit = |limit: usize| if filtered { MAX_LIMIT + 1 } else { limit + 1 };
     let internal = |error: ai_memory_store::StoreError| {
         tracing::error!(%error, "web search failed");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -138,7 +185,7 @@ pub(crate) async fn handler(
                     &state,
                     &[(resolved.workspace_id, resolved.project_id)],
                     &query,
-                    limit + 1,
+                    fetch_limit(limit),
                     explain,
                     &super::api::owner_filter_for(actor),
                 )
@@ -149,8 +196,22 @@ pub(crate) async fn handler(
                 };
                 timings = result.timings;
                 streams_active = result.streams_active;
-                truncated = result.hits.len() > limit;
-                for (position, (hit, details)) in result.hits.into_iter().take(limit).enumerate() {
+                // The trace position is the rank before filtering.
+                let mut ranked: Vec<_> = result.hits.into_iter().enumerate().collect();
+                if filtered {
+                    let ids: Vec<_> = ranked.iter().map(|(_, (hit, _))| hit.id).collect();
+                    let facets = match state.reader.page_kinds_tiers_by_ids(&ids).await {
+                        Ok(facets) => facets,
+                        Err(error) => return internal(error),
+                    };
+                    ranked.retain(|(_, (hit, _))| {
+                        facets
+                            .get(&hit.id)
+                            .is_some_and(|(hit_kind, hit_tier)| keeps(hit_kind, hit_tier))
+                    });
+                }
+                truncated = ranked.len() > limit;
+                for (position, (hit, details)) in ranked.into_iter().take(limit) {
                     let path = hit.path.as_str().to_owned();
                     hits.push(SearchHit {
                         href: page_href(workspace, project, &path),
@@ -175,7 +236,7 @@ pub(crate) async fn handler(
             let started = explain.then(std::time::Instant::now);
             let raw = match state
                 .reader
-                .search_pages_with_meta(query.clone(), limit + 1, None, viewer)
+                .search_pages_with_meta(query.clone(), fetch_limit(limit), None, viewer)
                 .await
             {
                 Ok(raw) => raw,
@@ -188,6 +249,10 @@ pub(crate) async fn handler(
                 });
                 streams_active = vec!["fts"];
             }
+            let raw: Vec<_> = raw
+                .into_iter()
+                .filter(|h| keeps(&h.kind, &h.tier))
+                .collect();
             truncated = raw.len() > limit;
             for h in raw.into_iter().take(limit) {
                 let path = h.path.as_str().to_owned();
@@ -237,6 +302,8 @@ pub(crate) async fn handler(
         })
         .collect();
     let hit_count = hits.len();
+    let kind_options = filter_options(&KINDS, kind.as_deref());
+    let tier_options = filter_options(&TIERS, tier.as_deref());
     let global_href = format!("search?q={}", encode_segment(&query));
     let view = SearchView {
         global_href,
@@ -245,6 +312,9 @@ pub(crate) async fn handler(
         query,
         hits,
         hit_count,
+        filtered,
+        kind_options,
+        tier_options,
         workspace,
         project,
         explain,
@@ -265,6 +335,22 @@ pub(crate) async fn handler(
         Ok(html) => Html(html).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// The options of one filter select, with the current value marked. A value
+/// outside `known` (a custom frontmatter kind) is kept so the form round-trips.
+fn filter_options(known: &[&str], current: Option<&str>) -> Vec<FilterOption> {
+    let mut values: Vec<&str> = known.to_vec();
+    if let Some(current) = current.filter(|c| !known.contains(c)) {
+        values.push(current);
+    }
+    values
+        .into_iter()
+        .map(|value| FilterOption {
+            value: value.to_owned(),
+            selected: current == Some(value),
+        })
+        .collect()
 }
 
 fn dash() -> String {
