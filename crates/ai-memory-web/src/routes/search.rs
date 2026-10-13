@@ -75,6 +75,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Query(params): Query<SearchParams>,
 ) -> Response {
     let query = params.q.trim().to_owned();
@@ -139,6 +140,7 @@ pub(crate) async fn handler(
                     &query,
                     limit + 1,
                     explain,
+                    &super::api::owner_filter_for(actor),
                 )
                 .await
                 {

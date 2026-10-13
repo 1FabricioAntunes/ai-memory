@@ -796,6 +796,9 @@ struct ProjectSearchOptions<'a> {
     include_expired: bool,
     explain: bool,
     include_superseded: bool,
+    /// The caller's session-timeline owner filter: observation excerpts come
+    /// only from sessions it admits.
+    owner: &'a ai_memory_core::OwnerFilter,
 }
 
 /// Borrow an embedded query as the store's vector-stream input.
@@ -2433,6 +2436,7 @@ impl AiMemoryServer {
                     expiry_cutoff_us: expiry_cutoff,
                     include_superseded: options.include_superseded,
                     explain: options.explain,
+                    owner: options.owner,
                 },
             )
             .await
@@ -2780,6 +2784,12 @@ impl AiMemoryServer {
         // Explain-only: per-stream timings of the primary search, summed over
         // `scopes`. `None` on the normal path, which reads no clocks for it.
         let mut timings: Option<ai_memory_store::StreamTimings> = None;
+        // Session pages are shared and every operator's observations may vote
+        // for them, but observation text (a hit's excerpt, explain's
+        // observation ids, the raw fallback) follows the session timeline's
+        // owner rule.
+        let owner_filter =
+            ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(&parts));
         let options = ProjectSearchOptions {
             query: &args.query,
             query_vec: query_vec.as_ref(),
@@ -2787,6 +2797,7 @@ impl AiMemoryServer {
             include_expired,
             explain,
             include_superseded,
+            owner: &owner_filter,
         };
         let hits = if let Some(scopes) = &resolved_scopes {
             self.search_scopes(scopes, options).await
@@ -2828,7 +2839,13 @@ impl AiMemoryServer {
             for &(ws, proj) in scopes {
                 let mut scope_obs = self
                     .reader
-                    .search_observations_for_project(ws, proj, query.clone(), limit)
+                    .search_observations_for_project_as(
+                        ws,
+                        proj,
+                        query.clone(),
+                        limit,
+                        owner_filter.clone(),
+                    )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 obs.append(&mut scope_obs);
@@ -2850,7 +2867,7 @@ impl AiMemoryServer {
                 )
                 .await?;
             self.reader
-                .search_observations_for_project(ws, proj, query, limit)
+                .search_observations_for_project_as(ws, proj, query, limit, owner_filter.clone())
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
@@ -2899,6 +2916,7 @@ impl AiMemoryServer {
                                     include_expired,
                                     explain,
                                     include_superseded,
+                                    owner: &owner_filter,
                                 },
                             )
                             .await
@@ -2968,6 +2986,7 @@ impl AiMemoryServer {
                                     include_expired,
                                     explain,
                                     include_superseded,
+                                    owner: &owner_filter,
                                 },
                             )
                             .await
@@ -10933,6 +10952,154 @@ mod tests {
             "expected raw fallback; got {text}"
         );
         assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+    }
+
+    /// `memory_query` hands the store the caller's session-timeline owner
+    /// filter. Operator B searching words only operator A's owned session
+    /// holds gets A's shared session page (the vote stays), but no excerpt of
+    /// A's observation, no observation id in `explain`, and no raw fallback
+    /// hit. Control: A gets all three.
+    #[tokio::test]
+    async fn memory_query_shows_observation_text_only_to_its_sessions_owner() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let owner = ai_memory_core::IdentityKey::User("alice".into()).storage_key();
+        let mut observation_ids = Vec::new();
+        let mut sessions = Vec::new();
+        for (body, with_page) in [
+            ("alice private quokka rollout detail", true),
+            ("alice private wombat rollout detail", false),
+        ] {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: Some(owner.clone()),
+                })
+                .await
+                .unwrap();
+            observation_ids.push(
+                store
+                    .writer
+                    .insert_observation(Sanitized::new(
+                        NewObservation {
+                            occurred_at: None,
+                            session_id,
+                            workspace_id: ws,
+                            project_id: proj,
+                            kind: ObservationKind::UserPrompt,
+                            extension: None,
+                            source_event: None,
+                            title: "prompt".into(),
+                            body: body.into(),
+                            importance: 5,
+                        },
+                        &Sanitizer::builtin(),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            if with_page {
+                store
+                    .writer
+                    .upsert_page(NewPage {
+                        workspace_id: ws,
+                        project_id: proj,
+                        path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+                        title: "Alice session".into(),
+                        body: "Alice worked on the release.".into(),
+                        tier: Tier::Episodic,
+                        frontmatter_json: serde_json::json!({}),
+                        pinned: false,
+                        links: Vec::new(),
+                        author_id: None,
+                        expires_at: None,
+                        entities: Vec::new(),
+                        evidence: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            sessions.push(session_id);
+        }
+        let parts_for = |user: &str| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(ai_memory_core::AuthLevel::User);
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some(user.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            });
+            parts
+        };
+        let query = |user: &str, term: &str| {
+            let server = server.clone();
+            let parts = parts_for(user);
+            let term = term.to_string();
+            async move {
+                let result = server
+                    .memory_query(
+                        Parameters(QueryArgs {
+                            query: term,
+                            limit: Some(5),
+                            project: Some("scratch".into()),
+                            scopes: Vec::new(),
+                            workspace: Some("default".into()),
+                            global: None,
+                            include_expired: None,
+                            include_superseded: None,
+                            pin_first: None,
+                            explain: Some(true),
+                            as_of: None,
+                            answer: None,
+                            reasoning: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+                    .unwrap();
+                let text = result.content[0].as_text().unwrap().text.clone();
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()
+            }
+        };
+        let session_path = format!("sessions/{}.md", sessions[0]);
+
+        let bob = query("bob", "quokka").await;
+        let hit = bob["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["path"] == session_path.as_str())
+            .unwrap_or_else(|| panic!("the shared session page still ranks for bob: {bob}"));
+        let rendered = bob.to_string();
+        assert!(!rendered.contains("quokka"), "no excerpt for bob: {bob}");
+        assert!(
+            !rendered.contains(&observation_ids[0].to_string()),
+            "no observation id for bob: {bob}"
+        );
+        assert_eq!(hit["score_details"]["observation_rank"], 1, "{bob}");
+        let bob_raw = query("bob", "wombat").await;
+        assert!(
+            bob_raw["raw_hits"].as_array().is_none_or(Vec::is_empty),
+            "no raw hit from alice's session for bob: {bob_raw}"
+        );
+
+        let alice = query("alice", "quokka").await;
+        assert!(alice.to_string().contains("quokka"), "{alice}");
+        assert!(
+            alice.to_string().contains(&observation_ids[0].to_string()),
+            "{alice}"
+        );
+        let alice_raw = query("alice", "wombat").await;
+        assert_eq!(
+            alice_raw["raw_hits"].as_array().map(Vec::len),
+            Some(1),
+            "{alice_raw}"
+        );
     }
 
     #[tokio::test]

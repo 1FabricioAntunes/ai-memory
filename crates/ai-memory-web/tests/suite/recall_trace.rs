@@ -419,3 +419,110 @@ async fn search_scope_selector_lists_only_readable_projects() {
     assert!(body.contains(r#"<option value="default/alpha">"#), "{body}");
     assert!(body.contains(r#"<option value="default/beta">"#), "{body}");
 }
+
+/// Web and `/api/v1` project search apply `memory_query`'s owner rule to
+/// observation text: another operator's owned session still lifts its shared
+/// session page, but the hit shows the page's own snippet and the trace no
+/// observation id. Control: the session's owner sees the excerpt.
+#[tokio::test]
+async fn project_search_shows_observation_excerpts_only_to_the_sessions_owner() {
+    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+
+    let f = fixture(false).await;
+    let ws = f
+        .store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let session_id = SessionId::new();
+    f.store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session_id,
+            workspace_id: ws,
+            project_id: f.alpha,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: Some(ai_memory_core::IdentityKey::User("alice".into()).storage_key()),
+        })
+        .await
+        .unwrap();
+    let observation_id = f
+        .store
+        .writer
+        .insert_observation(ai_memory_core::Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id: ws,
+                project_id: f.alpha,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "quokka plutonium shipment notes".into(),
+                importance: 5,
+            },
+            &ai_memory_core::Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    f.store
+        .writer
+        .upsert_page(ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: f.alpha,
+            path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+            title: "Alice session".into(),
+            body: "Alice reviewed the release.".into(),
+            tier: Tier::Episodic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let app = web(&f, Recall::default());
+    let as_operator = |user: &'static str, uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let request = Request::builder()
+                .uri(uri)
+                .extension(ActorContext {
+                    user: Some(user.into()),
+                    ..ActorContext::default()
+                })
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(request).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    let session_path = format!("sessions/{session_id}.md");
+    for uri in [
+        "/web/search?q=quokka&workspace=default&project=alpha&explain=1",
+        "/api/v1/search?q=quokka&workspace=default&project=alpha",
+    ] {
+        let (status, body) = as_operator("bob", uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body.contains(&session_path), "{uri}: vote kept: {body}");
+        assert!(!body.contains("plutonium"), "{uri}: excerpt leaked: {body}");
+        assert!(
+            !body.contains(&observation_id.to_string()),
+            "{uri}: observation id leaked: {body}"
+        );
+        let (status, body) = as_operator("alice", uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body.contains("plutonium"), "{uri}: owner's excerpt: {body}");
+    }
+}

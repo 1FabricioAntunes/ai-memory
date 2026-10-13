@@ -164,9 +164,14 @@ from hook paths.
    `sessions/<id>.md` page in that scope. The vote never crosses projects (both
    the observation and the page are scope-filtered), a session without a page
    contributes nothing, and nothing is written. Setting it to `false` restores
-   the earlier ranking byte for byte. If
+   the earlier ranking byte for byte. Every operator's observations vote, since
+   session pages are shared, but a vote's excerpt and observation ids are
+   attached only when the caller may read that session under the session
+   timeline's owner rule (their own sessions and unattributed ones); otherwise
+   the hit shows the page's own snippet. If
    compiled wiki pages miss entirely in default, explicit project, or explicit
-   `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`;
+   `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`, from
+   sessions the caller may read under that same rule;
    `global=true` searches compiled wiki pages across projects only. Page hits
    bump `access_count` + `last_accessed_at`, the M8 reinforcement term, which
    `memory_feedback` complements with explicit per-page salience. Identified

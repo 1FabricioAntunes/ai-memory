@@ -695,10 +695,59 @@ struct ObservationVote {
     title: String,
     /// FTS5 snippet of the session's best-ranked matching observation.
     /// Observations are sanitized and bounded on the way in, and the snippet
-    /// is a bounded window over that stored text.
-    snippet: String,
-    /// Best-ranked first, at most [`OBSERVATION_STREAM_IDS_PER_PAGE`].
+    /// is a bounded window over that stored text. `None` when the caller's
+    /// owner filter may not read the session: the vote still counts, since
+    /// session pages are shared, but the observation text stays with its
+    /// owner.
+    snippet: Option<String>,
+    /// Best-ranked first, at most [`OBSERVATION_STREAM_IDS_PER_PAGE`]; empty
+    /// under the same rule as `snippet`.
     observation_ids: Vec<ObservationId>,
+}
+
+/// The voting sessions whose observations `owner_filter` may not read, by
+/// the session-timeline rule ([`OwnerFilter::admits`] on `sessions.actor_user`).
+///
+/// `OwnerFilter::Any` hides nothing and reads nothing, so the single-user and
+/// evaluation paths run exactly the query they ran before. One batched read
+/// over at most the stream's candidate sessions otherwise.
+fn sessions_hidden_from(
+    conn: &rusqlite::Connection,
+    owner_filter: &OwnerFilter,
+    sessions: &[(SessionId, String, Vec<ObservationId>)],
+) -> StoreResult<std::collections::HashSet<SessionId>> {
+    let mut hidden = std::collections::HashSet::new();
+    if matches!(owner_filter, OwnerFilter::Any) || sessions.is_empty() {
+        return Ok(hidden);
+    }
+    let placeholders = vec!["?"; sessions.len()].join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, actor_user FROM sessions WHERE id IN ({placeholders})"
+    ))?;
+    let ids: Vec<Value> = sessions
+        .iter()
+        .map(|(session_id, _, _)| Value::Blob(session_id.as_bytes().to_vec()))
+        .collect();
+    let rows = stmt.query_map(params_from_iter(ids.iter()), |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut known = std::collections::HashSet::new();
+    for row in rows {
+        let (id_bytes, actor_user) = row?;
+        let session_id = SessionId::from_slice(&id_bytes)?;
+        known.insert(session_id);
+        if !owner_filter.admits(actor_user.as_deref()) {
+            hidden.insert(session_id);
+        }
+    }
+    // An observation whose session row is gone has no owner to check
+    // against; keep its text back rather than guess.
+    for (session_id, _, _) in sessions {
+        if !known.contains(session_id) {
+            hidden.insert(*session_id);
+        }
+    }
+    Ok(hidden)
 }
 
 /// Which seed page pulled a hit in via graph expansion, and the link
@@ -774,6 +823,9 @@ pub struct HybridSearch<'a> {
     pub include_superseded: bool,
     /// Attach per-hit [`SearchExplain`] and per-stream [`StreamTimings`].
     pub explain: bool,
+    /// Who is asking, as the session timeline sees them: an observation
+    /// excerpt is attached only from a session this filter admits.
+    pub owner: &'a OwnerFilter,
 }
 
 /// Per-query wall time of each retrieval stream, in milliseconds, for an
@@ -2946,6 +2998,10 @@ impl ReaderPool {
         out.truncate(limit);
         Ok(out)
     }
+    /// Raw-observation FTS over one project, with no owner filter: every
+    /// session's observations. Internal callers and tests use this; a
+    /// caller answering on someone's behalf uses
+    /// [`Self::search_observations_for_project_as`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2956,12 +3012,49 @@ impl ReaderPool {
         query: String,
         limit: usize,
     ) -> StoreResult<Vec<ObservationHit>> {
+        self.search_observations_for_project_as(
+            workspace_id,
+            project_id,
+            query,
+            limit,
+            OwnerFilter::Any,
+        )
+        .await
+    }
+
+    /// Raw-observation FTS over one project, limited to sessions
+    /// `owner_filter` admits: the rule `memory_read_session_observations`
+    /// and the web session timeline apply (the caller's own sessions plus
+    /// unattributed ones). Another operator's owned session contributes no
+    /// hit.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn search_observations_for_project_as(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        limit: usize,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<Vec<ObservationHit>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => {
+                    " AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = observations.session_id \
+                       AND (s.actor_user IS NULL OR s.actor_user = ?5))"
+                }
+                OwnerFilter::Unattributed => {
+                    " AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = observations.session_id \
+                       AND s.actor_user IS NULL)"
+                }
+            };
+            let mut stmt = conn.prepare(&format!(
                 "SELECT observations.id, observations.session_id, observations.kind, \
                         observations.title, \
                         snippet(observations_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
@@ -2970,37 +3063,44 @@ impl ReaderPool {
                  JOIN observations ON observations.rowid = observations_fts.rowid \
                  WHERE observations_fts MATCH ?1 \
                    AND observations.workspace_id = ?2 \
-                   AND observations.project_id = ?3 \
+                   AND observations.project_id = ?3{owner_clause} \
                  ORDER BY observations_fts.rank \
                  LIMIT ?4",
-            )?;
+            ))?;
+            let actor = match &owner_filter {
+                OwnerFilter::User(user) => Some(user.as_str()),
+                OwnerFilter::Any | OwnerFilter::Unattributed => None,
+            };
+            let mut sql_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(5);
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![
-                    fts_query,
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    limit as i64,
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let session_bytes: Vec<u8> = row.get(1)?;
-                    let kind: String = row.get(2)?;
-                    let title: String = row.get(3)?;
-                    let snippet: String = row.get(4)?;
-                    let rank: f64 = row.get(5)?;
-                    let created_us: i64 = row.get(6)?;
-                    Ok((
-                        id_bytes,
-                        session_bytes,
-                        kind,
-                        title,
-                        snippet,
-                        rank,
-                        created_us,
-                    ))
-                },
-            )?;
+            let limit = limit as i64;
+            sql_params.push(&fts_query);
+            sql_params.push(&ws_bytes);
+            sql_params.push(&proj_bytes);
+            sql_params.push(&limit);
+            if let Some(actor) = &actor {
+                sql_params.push(actor);
+            }
+            let rows = stmt.query_map(sql_params.as_slice(), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let session_bytes: Vec<u8> = row.get(1)?;
+                let kind: String = row.get(2)?;
+                let title: String = row.get(3)?;
+                let snippet: String = row.get(4)?;
+                let rank: f64 = row.get(5)?;
+                let created_us: i64 = row.get(6)?;
+                Ok((
+                    id_bytes,
+                    session_bytes,
+                    kind,
+                    title,
+                    snippet,
+                    rank,
+                    created_us,
+                ))
+            })?;
 
             let mut hits = Vec::new();
             for row in rows {
@@ -3041,6 +3141,7 @@ impl ReaderPool {
         query: &str,
         candidate_limit: usize,
         cutoff: i64,
+        owner_filter: OwnerFilter,
     ) -> StoreResult<Vec<ObservationVote>> {
         let fts_query = normalize_fts_query(query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
@@ -3128,6 +3229,7 @@ impl ReaderPool {
             if sessions.is_empty() {
                 return Ok(Vec::new());
             }
+            let hidden = sessions_hidden_from(&tx, &owner_filter, &sessions)?;
 
             let mut sql_params: Vec<Value> = Vec::with_capacity(sessions.len() + 3);
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
@@ -3174,12 +3276,17 @@ impl ReaderPool {
                 let Some((page_id, title)) = pages.remove(&path) else {
                     continue;
                 };
+                let readable = !hidden.contains(&session_id);
                 votes.push(ObservationVote {
                     page_id,
                     path: PagePath::new(path)?,
                     title,
-                    snippet,
-                    observation_ids,
+                    snippet: readable.then_some(snippet),
+                    observation_ids: if readable {
+                        observation_ids
+                    } else {
+                        Vec::new()
+                    },
                 });
                 if votes.len() == candidate_limit {
                     break;
@@ -5963,6 +6070,7 @@ impl ReaderPool {
                 expiry_cutoff_us,
                 false,
                 include_superseded,
+                &OwnerFilter::Any,
             )
             .await?
             .0
@@ -6040,6 +6148,7 @@ impl ReaderPool {
                 expiry_cutoff_us,
                 true,
                 include_superseded,
+                &OwnerFilter::Any,
             )
             .await?;
         // Belief-strength fields (`evidence_count`, `confidence`,
@@ -6103,6 +6212,7 @@ impl ReaderPool {
                     search.expiry_cutoff_us,
                     search.explain,
                     search.include_superseded,
+                    search.owner,
                 )
                 .await?;
             if search.explain {
@@ -6185,6 +6295,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         explain: bool,
         include_superseded: bool,
+        owner_filter: &OwnerFilter,
     ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings)> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Stream timings exist only for explain: `explain.then(Instant::now)`
@@ -6338,6 +6449,7 @@ impl ReaderPool {
                     &observation_query,
                     candidate_limit,
                     cutoff,
+                    owner_filter.clone(),
                 )
                 .await?;
             timings.observation_ms = elapsed_ms(started);
@@ -6493,10 +6605,15 @@ impl ReaderPool {
                 observation_snippet: None,
             });
             entry.score += contrib;
-            if entry.title.is_empty() {
-                entry.title = vote.title;
+            // A vote from a session the caller may not read still ranks the
+            // shared page, but leaves its title empty so the descriptor fill
+            // below gives the hit the page's own title and snippet.
+            if vote.snippet.is_some() {
+                if entry.title.is_empty() {
+                    entry.title = vote.title;
+                }
+                entry.observation_snippet = vote.snippet;
             }
-            entry.observation_snippet = Some(vote.snippet);
             if let Some(details) = &mut entry.explain {
                 details.observation_rank = Some(rank + 1);
                 details.observation_ids = vote.observation_ids;
@@ -12673,6 +12790,7 @@ mod tests {
                 None,
                 explain,
                 false,
+                &OwnerFilter::Any,
             )
         };
         let (_, off) = search(false).await.unwrap();

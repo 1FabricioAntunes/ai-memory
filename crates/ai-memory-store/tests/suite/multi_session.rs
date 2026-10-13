@@ -3505,3 +3505,163 @@ async fn another_operators_observations_lift_their_session_page_in_a_shared_proj
     assert_eq!(hits[0].0.path.as_str(), format!("sessions/{sid}.md"));
     assert_eq!(hits[0].1.observation_ids, vec![evidence]);
 }
+
+/// Begin a session owned by `owner` (`None`: unattributed, as a single-user
+/// server or a legacy row stores it).
+async fn owned_session(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    owner: Option<String>,
+) -> SessionId {
+    let id = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: Some("/repo".into()),
+            actor_user: owner,
+        })
+        .await
+        .unwrap();
+    id
+}
+
+async fn explained_search_as(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    query: &str,
+    owner: &OwnerFilter,
+) -> Vec<(ai_memory_store::PageHit, ai_memory_store::SearchExplain)> {
+    store
+        .reader
+        .hybrid_search_scopes(
+            &[(ws, proj)],
+            ai_memory_store::HybridSearch {
+                query,
+                vector: None,
+                limit: 10,
+                expiry_cutoff_us: None,
+                include_superseded: false,
+                explain: true,
+                owner,
+            },
+        )
+        .await
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|(hit, details)| (hit, details.unwrap()))
+        .collect()
+}
+
+/// Session pages are shared (invariant #16), so another operator's
+/// observations may still vote for one. The observation text is not: the
+/// excerpt a vote attaches, the observation ids in `explain`, and the
+/// raw-observation fallback follow the session timeline's owner rule, so
+/// operator B searching A's words learns that A's session page matches but
+/// never reads A's observation. Controls: A sees their own excerpt, and an
+/// unattributed session's excerpt reaches everyone, as does the unfiltered
+/// single-user path.
+#[tokio::test]
+async fn observation_excerpts_follow_the_session_owner_while_the_vote_stays_shared() {
+    use super::retrieval_observation_stream::{observe, session_page};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = OwnerFilter::User(operator("alice"));
+    let bob = OwnerFilter::User(operator("bob"));
+
+    let a_session = owned_session(&store, ws, proj, Some(operator("alice"))).await;
+    session_page(&store, ws, proj, a_session, "Alice worked on the build.").await;
+    let a_obs = observe(
+        &store,
+        ws,
+        proj,
+        a_session,
+        "alice private quasar credentials discussion",
+    )
+    .await;
+    let shared_session = owned_session(&store, ws, proj, None).await;
+    session_page(&store, ws, proj, shared_session, "A legacy session.").await;
+    let shared_obs = observe(&store, ws, proj, shared_session, "the zebra migration plan").await;
+
+    let a_path = format!("sessions/{a_session}.md");
+
+    // B: the vote still lifts A's shared session page, but nothing of A's
+    // observation comes with it.
+    let hits = explained_search_as(&store, ws, proj, "quasar", &bob).await;
+    let (hit, details) = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == a_path)
+        .expect("the shared session page still ranks for B");
+    assert_eq!(details.observation_rank, Some(1));
+    assert!(details.observation_ids.is_empty(), "{details:?}");
+    assert!(!hit.snippet.contains("quasar"), "{}", hit.snippet);
+    assert!(!hit.snippet.contains("credentials"), "{}", hit.snippet);
+    assert!(
+        hit.snippet.contains("Alice worked"),
+        "page's own snippet: {}",
+        hit.snippet
+    );
+    assert!(!hit.title.is_empty());
+    for filter in [&bob, &OwnerFilter::Unattributed] {
+        let raw = store
+            .reader
+            .search_observations_for_project_as(ws, proj, "quasar".into(), 10, filter.clone())
+            .await
+            .unwrap();
+        assert!(
+            raw.is_empty(),
+            "{filter:?} must get no raw hit from A: {raw:?}"
+        );
+    }
+
+    // Control: A reads their own excerpt and raw hit.
+    let hits = explained_search_as(&store, ws, proj, "quasar", &alice).await;
+    let (hit, details) = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == a_path)
+        .unwrap();
+    assert_eq!(details.observation_ids, vec![a_obs]);
+    assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
+    let raw = store
+        .reader
+        .search_observations_for_project_as(ws, proj, "quasar".into(), 10, alice.clone())
+        .await
+        .unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].session_id, a_session);
+
+    // Control: an unattributed session's excerpt reaches every viewer.
+    let shared_path = format!("sessions/{shared_session}.md");
+    for filter in [&alice, &bob, &OwnerFilter::Unattributed, &OwnerFilter::Any] {
+        let hits = explained_search_as(&store, ws, proj, "zebra", filter).await;
+        let (hit, details) = hits
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == shared_path)
+            .unwrap();
+        assert_eq!(details.observation_ids, vec![shared_obs], "{filter:?}");
+        assert!(hit.snippet.contains("zebra"), "{filter:?}: {}", hit.snippet);
+        let raw = store
+            .reader
+            .search_observations_for_project_as(ws, proj, "zebra".into(), 10, filter.clone())
+            .await
+            .unwrap();
+        assert_eq!(raw.len(), 1, "{filter:?}");
+    }
+
+    // Control: the unfiltered single-user path is unchanged.
+    let hits = explained_search_as(&store, ws, proj, "quasar", &OwnerFilter::Any).await;
+    let (hit, _) = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == a_path)
+        .unwrap();
+    assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
+}
