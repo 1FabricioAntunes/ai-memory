@@ -39,9 +39,9 @@ pub(crate) struct RecapQuery {
 /// never publishes the active project and never records an observation, so
 /// a reload cannot take a baton a parallel session's successor needs.
 ///
-/// `400` without a session id; `403` with the reason when the viewer may not
-/// read the session's project (the hook client never injects it); otherwise
-/// `200` with the recap, a notice, or an empty body on an internal error.
+/// `400` without a session id; otherwise `200` with the recap, a notice, or an
+/// empty body on an internal error. A viewer without read access on the
+/// session's project gets the same notice as an unknown id.
 pub(crate) async fn handle_recap(
     State(state): State<Arc<HookState>>,
     Query(query): Query<RecapQuery>,
@@ -61,13 +61,10 @@ pub(crate) async fn handle_recap(
     let budget = clamp_budget(query.budget.as_deref());
     match build_recap(&state, raw, budget, actor, viewer).await {
         Ok(body) => (StatusCode::OK, body),
-        Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
-            Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
-            _ => {
-                warn!(error = %e, agent = ?query.agent, "recap failed");
-                (StatusCode::OK, String::new())
-            }
-        },
+        Err(e) => {
+            warn!(error = %e, agent = ?query.agent, "recap failed");
+            (StatusCode::OK, String::new())
+        }
     }
 }
 
@@ -82,8 +79,23 @@ async fn build_recap(
     let Some((ws, proj)) = state.reader.session_project_ids(session_id).await? else {
         return Ok(no_session_notice());
     };
-    crate::grants::authorize_resolved(&state.reader, Some((ws, proj)), viewer, ProjectAccess::Read)
-        .await?;
+    // A refusal reads like an unknown id. The refusal text names the project,
+    // and even a bare 403 would confirm the id exists, so a DB user probing
+    // session ids learns nothing either way.
+    if let Err(e) = crate::grants::authorize_resolved(
+        &state.reader,
+        Some((ws, proj)),
+        viewer,
+        ProjectAccess::Read,
+    )
+    .await
+    {
+        return if e.is_forbidden() {
+            Ok(no_session_notice())
+        } else {
+            Err(e.into())
+        };
+    }
     // The owner filter `/handoff` uses: one operator's session and batons are
     // not another's to read, and an unowned (single-operator) one stays shared.
     let owner_filter = match &actor {
@@ -1037,7 +1049,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn db_user_without_grant_on_restricted_project_gets_403() {
+        async fn db_user_without_grant_reads_a_session_as_unknown() {
             use ai_memory_core::{NewUser, UserRole};
             let tmp = TempDir::new().unwrap();
             let state = crate::router::tests::make_state(&tmp).await;
@@ -1063,9 +1075,26 @@ mod tests {
             let state = Arc::new(state);
             let sid = seed(&state, None, &compacted_rows()).await;
             let (status, body) = recap(&state, Some(sid.to_string()), None, None, Some(bob)).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-            assert!(body.contains("not authorized"), "{body}");
+            // A refusal answers exactly like an unknown id: a 403, or a body
+            // naming the project, would tell a prober which project owns the id.
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body, no_session_notice());
+            assert!(!body.contains("scratch"), "project name leaked: {body}");
             assert!(!body.contains("WINDOW-PROMPT"), "leaked: {body}");
+            // Control: the same session is readable once Bob holds a read grant.
+            state
+                .writer
+                .grant_memory(
+                    bob,
+                    state.project_id,
+                    ai_memory_store::GrantLevel::Read,
+                    None,
+                )
+                .await
+                .unwrap();
+            let (status, body) = recap(&state, Some(sid.to_string()), None, None, Some(bob)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("WINDOW-PROMPT"), "{body}");
         }
 
         #[tokio::test]
