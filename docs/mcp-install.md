@@ -16,7 +16,8 @@ Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > `[auth].bearer_token_file` (every fresh `ai-memory init`, and
 > `ai-memory auth enable`), `install-mcp` never writes it into a client's
 > config. Claude Code gets the session-aware `ai-memory mcp-bridge` stdio
-> entry; Codex (`bearer_token_env_var`), Prime Agent (`bearerTokenEnvVar`) and
+> entry, and Muse Code always gets one (`mcp-bridge --agent muse`, which reads
+> the token file itself); Codex (`bearer_token_env_var`), Prime Agent (`bearerTokenEnvVar`) and
 > Factory Droid (`Bearer ${AI_MEMORY_AUTH_TOKEN}` in `headers`) name
 > `AI_MEMORY_AUTH_TOKEN`, which you export where you start them. Every
 > other client gets a local stdio entry, in its own format, that runs
@@ -78,7 +79,7 @@ manual container/script extraction and explicit compatibility overrides.
 Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop's ordinary Chat surface, VS Code Copilot, Zed, and Muse Code
+Claude Desktop's ordinary Chat surface, VS Code Copilot and Zed
 are **MCP-only** here:
 they expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
@@ -509,67 +510,72 @@ Sources: <https://zed.dev/docs/ai/mcp>,
 
 ## Muse Code
 
-**Status:** MCP supported through Muse Code's native streamable-HTTP
-transport, including bearer authentication. No lifecycle-hook integration
-and no managed-workstream adapter.
+**Status:** MCP and lifecycle hooks are supported. The MCP entry is a
+session-aware stdio bridge, the `SessionStart` hook injects the pending
+handoff, and Muse's `SessionEnd` closes the session. No managed workstream.
 
-**Config file:** `~/.config/muse/settings.json`. Muse also reads
-`$XDG_CONFIG_HOME` for its skill roots; on a non-default XDG setup pass the
-concrete path with `--config-file`.
+**Config file:** `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, the same
+file `install-hooks --agent muse` writes its hooks into.
 
-Servers live under the top-level snake_case `mcp_servers` key. Note the
-casing: `mcpServers`, which most other clients use, is ignored here.
+```bash
+ai-memory install-mcp --client muse --apply
+ai-memory install-hooks --agent muse --apply
+```
+
+Muse gives its stdio MCP servers `MUSE_SESSION_ID`, while a streamable-HTTP
+entry carries no session id, so the entry runs the bridge, which forwards that
+id as the actor session:
 
 ```json
 {
   "schema_version": 1,
-  "mcp_servers": {
+  "mcpServers": {
     "ai-memory": {
-      "transport": "streamable_http",
-      "url": "http://127.0.0.1:49374/mcp",
-      "headers": {
-        "Authorization": "Bearer <token>"
-      },
-      "enabled": true,
+      "type": "stdio",
+      "command": "ai-memory",
+      "args": ["mcp-bridge", "--agent", "muse",
+               "--server-url", "http://127.0.0.1:49374/mcp",
+               "--data-dir", "/home/you/.local/share/ai-memory"],
       "mode": "optional"
     }
   }
 }
 ```
 
-Print or apply the configuration with:
+Muse starts stdio servers with a cleared environment, so the entry names the
+install's data dir and the bridge reads the server's token from there at
+launch. A token passed explicitly with `--auth-token` is written to the
+entry's `env` as `AI_MEMORY_AUTH_TOKEN`; treat the file as private then. The
+bridge reads only `MUSE_SESSION_ID` when started with `--agent muse` (and only
+`CLAUDE_CODE_SESSION_ID` for Claude Code), so an id inherited from another
+harness's terminal is never forwarded, and it refuses to start without its
+own id.
 
-```bash
-ai-memory install-mcp --client muse
-ai-memory install-mcp --client muse --apply \
-  --server-url "http://homelab:49374/mcp" \
-  --auth-token "$TOKEN"
-```
-
-Two details of Muse's schema are worth knowing before hand-editing the file:
+Three details of Muse's schema are worth knowing before hand-editing the file:
 
 - **`"schema_version": 1` is mandatory.** A settings file that omits it fails
-  *every* `muse` command at startup with `malformed settings file`. `--apply`
+  every `muse` command at startup with `malformed settings file`. `--apply`
   adds the key when it is missing and never rewrites an existing value, so a
   future schema is not silently downgraded.
+- **`mcpServers` or `mcp_servers`, never both.** Muse reads servers from
+  `mcpServers` (`"type": "stdio"`) or the legacy `mcp_servers`
+  (`"transport": "stdio"`), and ignores every MCP server when both maps are
+  present. `--apply` uses `mcp_servers` when the file already has it, else
+  `mcpServers`, and refuses a file that already holds both;
+  `ai-memory doctor` reports that state.
 - **`mode` defaults to `required`**, and a required server that fails to start
-  aborts the whole Muse run. ai-memory writes `"mode": "optional"` explicitly
-  so an unreachable memory server costs you recall rather than the session.
+  aborts the whole Muse run. ai-memory writes `"mode": "optional"`, so an
+  unreachable memory server only costs you recall and the session goes on.
 
-A non-default `framing` value is rejected on `streamable_http`, so the
-generated entry omits the key.
+`install-hooks --agent muse` run without `--server-url` reads the URL back
+from this entry. The hook installer and its events are described in
+[`install.md`](install.md#meta-muse-code).
 
 **Skills:** no extra step is needed. Muse Code loads user skills from
 `$XDG_CONFIG_HOME/muse/skills` and `~/.agents/skills`, and
 `ai-memory install-skills` already writes the cross-client `~/.agents/skills`
 root, so the ai-memory routing skills are visible to Muse. Confirm with
 `muse skills list`.
-
-Muse Code documents a lifecycle hook surface, but the output contract of its
-`SessionStart` event is not specified, so automatic capture and automatic
-handoff injection are not claimed here. Ask the agent to call
-`memory_handoff_begin` before leaving and `memory_handoff_accept` when
-resuming when you need continuity.
 
 Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 <https://dev.meta.ai/docs/muse-code/extending>.

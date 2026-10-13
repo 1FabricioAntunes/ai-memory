@@ -675,11 +675,13 @@ server keeps the same auth, scope resolver, and tool handlers as direct HTTP
 clients. It has two modes, chosen by the entry that launches it:
 
 - session-aware (Claude Code, `install-mcp --client claude-code
-  --session-aware`, and every Claude Code entry on a token-file install): it
-  injects the inherited `CLAUDE_CODE_SESSION_ID` as
-  `X-Memory-Actor-Session-Id` and fails closed without one, so a
-  registration meant for per-session routing never silently degrades to the
-  shared slot;
+  --session-aware`, and every Claude Code entry on a token-file install; and
+  Meta Muse Code, whose entry is always `mcp-bridge --agent muse`): it
+  injects the launching harness's inherited session id
+  (`CLAUDE_CODE_SESSION_ID`, or `MUSE_SESSION_ID` with `--agent muse`, never
+  the other one) as `X-Memory-Actor-Session-Id` and fails closed without it,
+  so a registration meant for per-session routing never silently degrades to
+  the shared slot;
 - session-less (`--no-session-id`, every other client on a token-file
   install): it forwards no session identity and ignores an inherited
   `CLAUDE_CODE_SESSION_ID`, which a client started from a Claude Code
@@ -1406,7 +1408,9 @@ needs a manual change.
 
 A token read from the file is never written into a harness config or onto a
 command line. `install-mcp` gives Claude Code the session-aware
-`ai-memory mcp-bridge` stdio entry, which reads the file itself; Codex,
+`ai-memory mcp-bridge` stdio entry, which reads the file itself, and Meta Muse
+Code always has one (`--agent muse`, with the install's `--data-dir` because
+Muse clears the environment of its stdio servers); Codex,
 Prime Agent and Factory Droid reference `AI_MEMORY_AUTH_TOKEN` by name; every other client gets
 a stdio entry, in its own config format, for `ai-memory mcp-bridge
 --no-session-id`. ZCode keeps HTTP entries only and is refused.

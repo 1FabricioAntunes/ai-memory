@@ -383,12 +383,13 @@ and [0.x](docs/changelog/0.x.md).
   `[auth] bearer_token` is a startup error, and a server whose configured file
   is missing or empty refuses to start. A token read from the file is never
   written into a harness config: `install-mcp` registers Claude Code through
-  the session-aware `ai-memory mcp-bridge`, gives Codex and Prime Agent a
+  the session-aware `ai-memory mcp-bridge` (Muse Code always gets the bridge,
+  as `mcp-bridge --agent muse`), gives Codex and Prime Agent a
   reference to `$AI_MEMORY_AUTH_TOKEN`, and writes every other client a stdio
   entry for `ai-memory mcp-bridge --no-session-id` in that client's own config
   format (OpenCode, OpenCode 2, Cursor, Claude Desktop, Gemini CLI, OpenClaw,
   OMP, Antigravity CLI, Zero, Devin, Grok, Kimi Code, Kiro CLI, Command Code,
-  Copilot CLI, Swival, VS Code, Zed, Muse Code; DeepSeek Harness's printed
+  Copilot CLI, Swival, VS Code, Zed; DeepSeek Harness's printed
   patch too). Only ZCode, whose config keeps HTTP entries only, is refused with
   the manual option. `uninstall` recognises these entries.
   `install-hooks --apply` stores the token in the hook credential files only.
@@ -438,6 +439,52 @@ and [0.x](docs/changelog/0.x.md).
   applies to them: verified against the Droid 0.240.0 tool schemas; no
   tool-call id in Droid payloads. `setup-agent --agent droid` prints the
   hook config and `uninstall` removes both entries. (#1240)
+- Added first-class Meta Muse Code support. `install-hooks --agent muse`
+  (aliases `muse-code`, `musecode`) merges native
+  `ai-memory hook --event … --agent muse` commands for eight events
+  (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `PostToolUseFailure`, `PreCompact`, `Stop`, `SessionEnd`) into the `hooks`
+  key of `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, with an empty
+  matcher, a 30-second timeout and the server URL and data dir baked in,
+  since Muse runs hooks with a cleared environment. It keeps
+  `"schema_version": 1`, every other key and your own hooks, writes a backup
+  when it changes the file, and changes nothing on a re-run. Sessions are
+  recorded as agent `muse` under Muse's own session id (migration V80). The
+  `SessionStart` hook delivers the pending handoff through
+  `hookSpecificOutput.additionalContext`, the `SessionStart` and
+  `UserPromptSubmit` hooks print nothing when there is nothing to deliver
+  (Muse adds that stdout to the model's context), and Muse's own `SessionEnd`
+  closes the session. Muse's `read_file`, `write_file`, `edit_file`,
+  `apply_patch`, `search`, `bash`, `monitor`, `web_fetch` and memory tools map
+  to the file, search and shell families, with a relative `path` resolved
+  lexically against `cwd`, so `[capture] ignore_paths` and the server drop
+  list apply; Muse's `tool_use_id` is kept as the call id. `SubagentStart` and
+  `SubagentStop` are not wired, because Muse fires them every turn for its
+  built-in reminder observers. `install-mcp --client muse` now writes a stdio
+  `ai-memory mcp-bridge --agent muse` entry with `"mode": "optional"` and the
+  install's `--data-dir`, replacing the streamable-HTTP entry, so Muse is a
+  session-aware client: the new `mcp-bridge --agent muse` forwards
+  `MUSE_SESSION_ID` and reads no other harness's variable (`--agent
+  claude-code`, the default, reads only `CLAUDE_CODE_SESSION_ID`). The entry
+  goes under `mcpServers`, or under the legacy `mcp_servers` when the file
+  already uses it, never both; a file holding both maps, which makes Muse
+  ignore every MCP server, is refused and reported by `doctor`. The settings
+  path follows `XDG_CONFIG_HOME`. The Claude Code plugin launcher records an
+  event as `muse` when Muse runs it (`MUSE_PLUGIN_ID` with `MUSE_SESSION_ID`),
+  skipping the events the Muse settings hooks deliver, its subagent events and
+  folderless sessions. `setup` detects Muse by its config or data directory,
+  `setup-agent --agent muse` prints the hook config, `doctor` reports the Muse
+  wiring, `uninstall` removes the hooks and the entry from either map, the
+  Docker wrapper forwards `MUSE_SESSION_ID`, and the routing snippet lists
+  Muse Code among the `AGENTS.md` harnesses. Verified offline against Muse
+  Code 1.4.7 hook payloads, and end to end with the real Muse binary in an
+  isolated network namespace against a stand-in model provider: capture of
+  all eight events, exclusions on relative and absolute paths, MCP calls
+  routed by session, handoff injection and the timeout unit. Not verified:
+  interactive `SessionStart` sources and `SessionEnd` reasons, `PreCompact`
+  payloads, `apply_patch` and `monitor` input shapes, macOS and Windows paths,
+  and the plugin from the marketplace, which Muse Code 1.4.7 refuses to
+  install because its `.mcp.json` uses `${user_config.*}` placeholders.
 - Added an optional TypeScript client SDK in `companions/ai-memory-ts` for
   programs that are not coding-agent harnesses: custom agents, bots, editor
   and app extensions, scripts and CI jobs. `AiMemoryClient` wraps the page,

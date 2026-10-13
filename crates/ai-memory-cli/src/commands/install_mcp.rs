@@ -48,11 +48,11 @@ enum JsonMcpLocation {
     RootServers,
     /// Top-level `context_servers` key used by Zed's settings.json.
     RootContextServers,
-    /// Top-level snake_case `mcp_servers` key used by Muse Code's
-    /// settings.json. Distinct from `RootMcpServers` purely by casing —
-    /// Muse documents `mcp_servers`, and the camelCase spelling every
-    /// other client uses would be ignored.
-    RootMcpServersSnake,
+    /// Muse Code's settings.json: the top-level `mcpServers` map, or the
+    /// legacy snake_case `mcp_servers` when the file already uses it. Muse
+    /// drops the whole MCP block when both are present, so exactly one is
+    /// ever written (see [`muse_servers_key`]).
+    MuseServers,
 }
 
 /// Run the `install-mcp` subcommand.
@@ -121,6 +121,14 @@ pub(crate) fn run_with_opencode_dialect(
         auth_token,
         ..args
     };
+    // Muse starts stdio servers with a cleared environment (`HOME`, `PATH`
+    // and its own `MUSE_SESSION_ID`), so the bridge it launches finds this
+    // install's config and token only through an explicit `--data-dir`, as
+    // the Muse hooks do. Not from inside the Docker helper, whose data dir is
+    // a container path the host-side bridge cannot open.
+    if args.client == McpClient::Muse && config.runtime_env.host_cwd().is_none() {
+        args.bridge_data_dir = Some(config.data_dir.clone());
+    }
     if args.auth_token.is_none()
         && let Some(token_file) = token_file
     {
@@ -165,7 +173,8 @@ pub(crate) fn run_with_opencode_dialect(
 /// Wire a client to a server whose bearer lives in `[auth].bearer_token_file`
 /// without writing the token into the client's config.
 ///
-/// - Claude Code gets the session-aware `ai-memory mcp-bridge` entry.
+/// - Claude Code gets the session-aware `ai-memory mcp-bridge` entry, and
+///   Muse Code already has one (its entry is always the bridge).
 /// - Codex, Prime Agent and Droid reference `AI_MEMORY_AUTH_TOKEN` by name,
 ///   the form their writers already use and each client documents.
 /// - Pi is unchanged: its generated extension reads the hook credential file.
@@ -180,7 +189,7 @@ fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> 
     match args.client {
         McpClient::ClaudeCode => args.session_aware = true,
         McpClient::Codex | McpClient::PrimeAgent | McpClient::Droid => args.token_env_var = true,
-        McpClient::Pi => {}
+        McpClient::Pi | McpClient::Muse => {}
         McpClient::Zcode => bail!(
             "this server's bearer token lives in {path} and ai-memory does not copy it into \
              another program's config. ZCode keeps only HTTP entries (`type`/`url`/`headers`), \
@@ -292,15 +301,18 @@ pub(crate) fn existing_entry_endpoint(
     .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
     .value
     .map_or(serde_json::Value::Null, Into::into);
-    let pointer = match location {
-        JsonMcpLocation::RootMcpServers => "/mcpServers",
-        JsonMcpLocation::RootMcp => "/mcp",
-        JsonMcpLocation::NestedMcpServers => "/mcp/servers",
-        JsonMcpLocation::RootServers => "/servers",
-        JsonMcpLocation::RootContextServers => "/context_servers",
-        JsonMcpLocation::RootMcpServersSnake => "/mcp_servers",
+    let pointers: &[&str] = match location {
+        JsonMcpLocation::RootMcpServers => &["/mcpServers"],
+        JsonMcpLocation::RootMcp => &["/mcp"],
+        JsonMcpLocation::NestedMcpServers => &["/mcp/servers"],
+        JsonMcpLocation::RootServers => &["/servers"],
+        JsonMcpLocation::RootContextServers => &["/context_servers"],
+        JsonMcpLocation::MuseServers => &["/mcpServers", "/mcp_servers"],
     };
-    let Some(entry) = root.pointer(pointer).and_then(|servers| servers.get(name)) else {
+    let Some(entry) = pointers
+        .iter()
+        .find_map(|pointer| root.pointer(pointer).and_then(|servers| servers.get(name)))
+    else {
         return Ok(None);
     };
     if let Some(url) = ["url", "httpUrl", "serverUrl"]
@@ -364,13 +376,6 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
             "enabled": true,
             "command": BRIDGE_COMMAND,
             "args": bridge,
-        }),
-        McpClient::Muse => json!({
-            "transport": "stdio",
-            "command": BRIDGE_COMMAND,
-            "args": bridge,
-            "enabled": true,
-            "mode": "optional",
         }),
         McpClient::OpenCode => json!({"type": "local", "command": opencode_argv, "enabled": true}),
         McpClient::OpenCode2 => json!({"type": "local", "command": opencode_argv}),
@@ -631,10 +636,9 @@ pub(crate) fn mcp_config_path_with(
             };
             zed_config_path_in(&config_dir, std::env::consts::OS)
         }
-        // Muse Code documents `~/.config/muse/settings.json`; it also reads
-        // $XDG_CONFIG_HOME for its skill roots, so --config-file covers
-        // non-default XDG setups (same policy as Zero above).
-        McpClient::Muse => home()?.join(".config").join("muse").join("settings.json"),
+        // Muse Code keeps its user settings at
+        // ${XDG_CONFIG_HOME:-~/.config}/muse/settings.json.
+        McpClient::Muse => muse_settings_path_in(env("XDG_CONFIG_HOME"), home_dir())?,
         // Prime Agent's agent dir is $PRIME_AGENT_CODING_AGENT_DIR when set,
         // else ~/.prime/agent; user MCP servers live in its settings.json
         // (a project's `.prime/agent/settings.json` overrides it: pass that
@@ -827,6 +831,30 @@ pub(crate) fn copilot_home_in(env_override: Option<std::ffi::OsString>) -> Resul
     Ok(home_dir()
         .context("could not locate $HOME for Copilot CLI configuration")?
         .join(".copilot"))
+}
+
+/// Meta Muse Code's user settings file,
+/// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`: the one file both its
+/// hooks and its MCP servers live in. `XDG_CONFIG_HOME` counts only when set
+/// to an absolute path, as the XDG base-directory spec requires; a blank or
+/// relative value falls back to `<home>/.config`. Lexical only: the path is
+/// never canonicalized.
+///
+/// # Errors
+/// No usable `XDG_CONFIG_HOME` and no home directory.
+pub(crate) fn muse_settings_path_in(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let config_root = match crate::commands::path_util::agent_config_home(xdg_config_home)
+        .filter(|dir| dir.is_absolute())
+    {
+        Some(dir) => dir,
+        None => home
+            .context("could not locate $HOME for ~/.config/muse/settings.json")?
+            .join(".config"),
+    };
+    Ok(config_root.join("muse").join("settings.json"))
 }
 
 /// Factory Droid's user configuration root, `~/.factory`, under an injected
@@ -1035,7 +1063,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         }
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
-        McpClient::Muse => Some(JsonMcpLocation::RootMcpServersSnake),
+        McpClient::Muse => Some(JsonMcpLocation::MuseServers),
         McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
     }
 }
@@ -1379,12 +1407,14 @@ fn upsert_json_mcp_entry(
                 .context("`context_servers` is present but not an object")?;
             servers.insert(args.name.clone(), entry);
         }
-        JsonMcpLocation::RootMcpServersSnake => {
+        JsonMcpLocation::MuseServers => {
+            let key = muse_servers_key(root)?;
+            let entry = muse_entry_for_key(entry, key);
             let servers = root
-                .entry("mcp_servers")
+                .entry(key)
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
-                .context("`mcp_servers` is present but not an object")?;
+                .with_context(|| format!("`{key}` is present but not an object"))?;
             servers.insert(args.name.clone(), entry);
         }
     }
@@ -1422,9 +1452,9 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
             // `schema_version` rides along: a hand-merged Muse settings.json
             // without it fails every command at startup, so the printed
             // snippet has to carry the key the same way --apply does.
-            JsonMcpLocation::RootMcpServersSnake => json!({
+            JsonMcpLocation::MuseServers => json!({
                 "schema_version": 1,
-                "mcp_servers": { args.name.as_str(): entry }
+                "mcpServers": { args.name.as_str(): entry }
             }),
         };
     Ok(serde_json::to_string_pretty(&fragment)?)
@@ -1737,27 +1767,81 @@ fn build_mcp_entry_zcode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Object(entry))
 }
 
-/// Muse Code MCP entry: `transport: "streamable_http"` + `url` + optional
-/// `headers` under `~/.config/muse/settings.json`'s `mcp_servers` map.
+/// Muse Code MCP entry, in the `mcpServers` shape: a stdio
+/// `ai-memory mcp-bridge --agent muse` that forwards the `MUSE_SESSION_ID`
+/// Muse gives its stdio servers as the actor session id, so unscoped calls
+/// follow the session's own project. A streamable-HTTP entry would carry no
+/// session id at all. [`muse_entry_for_key`] renames `type` to `transport`
+/// for a file that keeps the legacy `mcp_servers` map.
 ///
-/// `mode` is written explicitly because Muse Code defaults it to
-/// `required`, and a required server that fails to start aborts the whole
-/// run. Memory is an augmentation, so an unreachable server should cost
-/// the user their recall, not their coding session. No `framing` key is
-/// emitted: a non-default `framing` on `streamable_http` fails Muse's own
-/// validation.
+/// Muse starts stdio servers with a cleared environment, so the entry names
+/// the install's data dir (`--data-dir`, when [`InstallMcpArgs::bridge_data_dir`]
+/// is set) and the bridge reads its bearer from that install's config
+/// (`[auth].bearer_token_file`) at launch; a token given explicitly is
+/// passed in `env` the way Claude Code's session-aware entry carries it. `mode` is written
+/// explicitly because Muse defaults it to `required`, which aborts the whole
+/// run when the server cannot start; ai-memory augments a session and must
+/// never gate it.
 fn build_mcp_entry_muse(args: &InstallMcpArgs) -> Result<serde_json::Value> {
-    let bearer = bearer_header_value(args.auth_token.as_deref());
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
-    entry.insert("transport".into(), json!("streamable_http"));
-    entry.insert("url".into(), json!(server_url));
-    if let Some(b) = bearer {
-        entry.insert("headers".into(), json!({"Authorization": b}));
+    entry.insert("type".into(), json!("stdio"));
+    entry.insert("command".into(), json!(BRIDGE_COMMAND));
+    let mut argv = vec![
+        json!("mcp-bridge"),
+        json!("--agent"),
+        json!("muse"),
+        json!("--server-url"),
+        json!(base_url),
+    ];
+    if let Some(data_dir) = &args.bridge_data_dir {
+        argv.push(json!("--data-dir"));
+        argv.push(json!(data_dir.to_string_lossy()));
     }
-    entry.insert("enabled".into(), json!(true));
+    entry.insert("args".into(), serde_json::Value::Array(argv));
+    if let Some(token) = &args.auth_token {
+        entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
+    }
     entry.insert("mode".into(), json!("optional"));
     Ok(serde_json::Value::Object(entry))
+}
+
+/// The server map a Muse settings file takes ai-memory's entry under: the
+/// legacy `mcp_servers` when the file already has it, else `mcpServers`.
+/// Muse drops its whole MCP block when both keys are present, so adding the
+/// second would disconnect every server the user has; a file that already
+/// holds both is refused.
+///
+/// # Errors
+/// Both keys are present.
+fn muse_servers_key(root: &serde_json::Map<String, serde_json::Value>) -> Result<&'static str> {
+    match (
+        root.contains_key("mcpServers"),
+        root.contains_key("mcp_servers"),
+    ) {
+        (true, true) => bail!(
+            "this Muse settings file has both `mcpServers` and `mcp_servers`, and Muse ignores \
+             every MCP server when both are present. Move the servers into one of the two maps \
+             and re-run this command."
+        ),
+        (false, true) => Ok("mcp_servers"),
+        _ => Ok("mcpServers"),
+    }
+}
+
+/// [`build_mcp_entry_muse`]'s entry for the map it goes under: the legacy
+/// `mcp_servers` names the transport `transport`, `mcpServers` names it
+/// `type`.
+fn muse_entry_for_key(entry: serde_json::Value, key: &str) -> serde_json::Value {
+    let serde_json::Value::Object(mut entry) = entry else {
+        return entry;
+    };
+    if key == "mcp_servers"
+        && let Some(kind) = entry.remove("type")
+    {
+        entry.insert("transport".into(), kind);
+    }
+    serde_json::Value::Object(entry)
 }
 
 /// Insert / replace `[mcp_servers.<name>]` in a Codex `config.toml`.
@@ -2128,16 +2212,29 @@ fn render_zcode(args: &InstallMcpArgs) -> Result<String> {
 }
 
 fn render_muse(args: &InstallMcpArgs) -> Result<String> {
+    let token_note = if args.auth_token.is_some() {
+        "# The entry carries the token in `env`; treat settings.json as\n\
+         # sensitive (chmod 600).\n"
+    } else {
+        ""
+    };
     Ok(format!(
-        "# Muse Code (Meta) — merge into ~/.config/muse/settings.json\n\
+        "# Meta Muse Code — merge into ${{XDG_CONFIG_HOME:-~/.config}}/muse/settings.json\n\
          # (or re-run this command with --apply), then start a new session.\n\
          #\n\
          # Keep \"schema_version\": 1 — without it every muse command fails\n\
          # at startup with `malformed settings file`.\n\
          #\n\
-         # mode is set to \"optional\" on purpose: Muse defaults it to\n\
-         # \"required\", which aborts the whole run when the server is\n\
-         # unreachable. Auth goes in the headers map.\n\
+         # If the file already keeps its servers under the legacy `mcp_servers`\n\
+         # map, put the entry there instead, with `\"transport\": \"stdio\"` in\n\
+         # place of `\"type\": \"stdio\"`: Muse ignores every MCP server when both\n\
+         # maps are present.\n\
+         #\n\
+         # The bridge forwards MUSE_SESSION_ID, so unscoped memory calls follow\n\
+         # the session's project. mode is \"optional\" on purpose: Muse defaults\n\
+         # it to \"required\", which aborts the whole run when the server cannot\n\
+         # start. Pair with `ai-memory install-hooks --agent muse` for capture.\n\
+         {token_note}\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
@@ -2468,6 +2565,7 @@ mod tests {
             flavor: None,
             token_env_var: false,
             stdio_bridge: false,
+            bridge_data_dir: None,
         }
     }
 
@@ -2483,6 +2581,7 @@ mod tests {
             flavor: None,
             token_env_var: false,
             stdio_bridge: false,
+            bridge_data_dir: None,
         }
     }
 
@@ -2561,23 +2660,42 @@ mod tests {
         }
     }
 
+    /// Muse's entry is the session-aware stdio bridge for `--agent muse`, so
+    /// Muse forwards `MUSE_SESSION_ID`; a streamable-HTTP entry would carry no
+    /// session id. `mode` is `optional` because Muse's default `required`
+    /// aborts the whole run when the server cannot start. An explicit token
+    /// rides `env`, never the command line.
     #[test]
-    fn muse_entry_uses_documented_streamable_http_shape() {
-        let entry = build_json_mcp_entry(&args_with_token(McpClient::Muse)).unwrap();
-
-        assert_eq!(entry["transport"], "streamable_http");
-        assert_eq!(entry["url"], "http://127.0.0.1:49374/mcp");
+    fn muse_entry_is_the_session_aware_bridge() {
+        let entry = build_json_mcp_entry(&args_for(McpClient::Muse)).unwrap();
         assert_eq!(
-            entry["headers"]["Authorization"],
-            "Bearer test-token-deadbeef"
+            entry,
+            json!({
+                "type": "stdio",
+                "command": "ai-memory",
+                "args": ["mcp-bridge", "--agent", "muse", "--server-url", "http://127.0.0.1:49374/mcp"],
+                "mode": "optional",
+            })
         );
-        assert_eq!(entry["enabled"], true);
-        // `required` is Muse's default and aborts the entire run when the
-        // memory server is unreachable.
-        assert_eq!(entry["mode"], "optional");
-        // A non-default `framing` on streamable_http fails Muse validation,
-        // so the entry must not carry the key at all.
-        assert!(entry.get("framing").is_none(), "{entry:#}");
+        let with_token = build_json_mcp_entry(&args_with_token(McpClient::Muse)).unwrap();
+        assert_eq!(
+            with_token["env"]["AI_MEMORY_AUTH_TOKEN"],
+            "test-token-deadbeef"
+        );
+        assert!(
+            !with_token["args"].to_string().contains("test-token"),
+            "{with_token:#}"
+        );
+        assert!(bridge_entry_url(&entry).is_some());
+
+        // Muse clears the environment of its stdio servers, so the install's
+        // data dir rides the entry.
+        let mut args = args_for(McpClient::Muse);
+        args.bridge_data_dir = Some(PathBuf::from("/srv/ai-memory"));
+        let baked = build_json_mcp_entry(&args).unwrap();
+        assert_eq!(baked["args"][5], "--data-dir");
+        assert_eq!(baked["args"][6], "/srv/ai-memory");
+        assert_eq!(bridge_entry_url(&baked), Some("http://127.0.0.1:49374/mcp"));
     }
 
     #[test]
@@ -2585,8 +2703,8 @@ mod tests {
         let mut root = serde_json::Map::new();
         root.insert("telemetry".into(), json!({"enabled": false}));
         root.insert(
-            "mcp_servers".into(),
-            json!({"my-tools": {"transport": "stdio", "command": "my-mcp-server"}}),
+            "hooks".into(),
+            json!({"Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]}),
         );
 
         upsert_json_mcp_entry(&mut root, &args_for(McpClient::Muse)).unwrap();
@@ -2594,10 +2712,115 @@ mod tests {
         // Without this key every muse command fails at startup.
         assert_eq!(root["schema_version"], 1);
         assert_eq!(root["telemetry"]["enabled"], false);
-        assert_eq!(root["mcp_servers"]["my-tools"]["command"], "my-mcp-server");
+        assert_eq!(root["hooks"]["Stop"][0]["hooks"][0]["command"], "notify");
+        assert_eq!(root["mcpServers"]["ai-memory"]["type"], "stdio");
+        assert!(!root.contains_key("mcp_servers"), "{root:#?}");
+    }
+
+    /// Adversarial: Muse drops every MCP server when `mcpServers` and the
+    /// legacy `mcp_servers` are both present. A file that keeps the legacy
+    /// map gets the entry there (in its `transport` spelling) and never a
+    /// second map; a file that already has both is refused and left as it
+    /// was. Control: a file with neither gets `mcpServers`.
+    #[test]
+    fn muse_upsert_writes_exactly_one_server_map() {
+        let mut legacy = serde_json::Map::new();
+        legacy.insert("schema_version".into(), json!(1));
+        legacy.insert(
+            "mcp_servers".into(),
+            json!({"my-tools": {"transport": "stdio", "command": "my-mcp-server"}}),
+        );
+        upsert_json_mcp_entry(&mut legacy, &args_for(McpClient::Muse)).unwrap();
+        assert!(!legacy.contains_key("mcpServers"), "{legacy:#?}");
+        let ours = &legacy["mcp_servers"]["ai-memory"];
+        assert_eq!(ours["transport"], "stdio");
+        assert!(ours.get("type").is_none(), "{ours:#}");
+        assert_eq!(ours["mode"], "optional");
         assert_eq!(
-            root["mcp_servers"]["ai-memory"]["transport"],
-            "streamable_http"
+            legacy["mcp_servers"]["my-tools"]["command"],
+            "my-mcp-server"
+        );
+
+        let mut both = serde_json::Map::new();
+        both.insert("mcpServers".into(), json!({"a": {"type": "stdio"}}));
+        both.insert("mcp_servers".into(), json!({"b": {"transport": "stdio"}}));
+        let before = both.clone();
+        let error = upsert_json_mcp_entry(&mut both, &args_for(McpClient::Muse)).unwrap_err();
+        assert!(error.to_string().contains("both"), "{error:#}");
+        assert_eq!(both, before, "a refused file is not touched");
+
+        let mut empty = serde_json::Map::new();
+        upsert_json_mcp_entry(&mut empty, &args_for(McpClient::Muse)).unwrap();
+        assert!(empty.contains_key("mcpServers"));
+        assert!(!empty.contains_key("mcp_servers"));
+    }
+
+    /// `--apply` against a real file: idempotent, keeps unknown keys and the
+    /// user's own hooks, writes the bridge, and refuses (leaving the file
+    /// byte-identical) when both server maps are present. The endpoint is read
+    /// back from either map.
+    #[test]
+    fn muse_apply_is_idempotent_and_refuses_both_server_maps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"schema_version":1,"theme":"dark","mcp_servers":{"x":{"transport":"stdio","command":"x"}}}"#,
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::Muse);
+        args.apply = true;
+        args.config_file = Some(file.clone());
+        args.server_url = Some(DEFAULT_MCP_URL.into());
+        apply_to_config_file(&args).unwrap();
+        let first = std::fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["theme"], "dark");
+        assert_eq!(root["mcp_servers"]["ai-memory"]["args"][2], "muse");
+        assert!(root.get("mcpServers").is_none());
+        assert_eq!(
+            existing_entry_endpoint(McpClient::Muse, &file, "ai-memory")
+                .unwrap()
+                .as_deref(),
+            Some(DEFAULT_MCP_URL)
+        );
+
+        let both = tmp.path().join("both.json");
+        let text = r#"{"schema_version":1,"mcpServers":{},"mcp_servers":{}}"#;
+        std::fs::write(&both, text).unwrap();
+        args.config_file = Some(both.clone());
+        assert!(apply_to_config_file(&args).is_err());
+        assert_eq!(std::fs::read_to_string(&both).unwrap(), text);
+    }
+
+    /// Muse resolves its settings under `XDG_CONFIG_HOME` when that is an
+    /// absolute path, else under `~/.config`; a blank or relative value is
+    /// ignored.
+    #[test]
+    fn muse_settings_path_follows_xdg_config_home() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            muse_settings_path_in(None, home.clone()).unwrap(),
+            Path::new("/home/u/.config/muse/settings.json")
+        );
+        assert_eq!(
+            muse_settings_path_in(Some("/xdg".into()), home.clone()).unwrap(),
+            Path::new("/xdg/muse/settings.json")
+        );
+        for ignored in ["", "  ", "relative/dir"] {
+            assert_eq!(
+                muse_settings_path_in(Some(ignored.into()), home.clone()).unwrap(),
+                Path::new("/home/u/.config/muse/settings.json"),
+                "{ignored:?}"
+            );
+        }
+        assert!(muse_settings_path_in(None, None).is_err());
+        let env = |name: &str| (name == "XDG_CONFIG_HOME").then(|| "/xdg2".into());
+        assert_eq!(
+            mcp_config_path_with(McpClient::Muse, &env).unwrap(),
+            Path::new("/xdg2/muse/settings.json")
         );
     }
 
@@ -2618,8 +2841,9 @@ mod tests {
         let rendered = render_muse(&args_for(McpClient::Muse)).unwrap();
 
         assert!(rendered.contains("\"schema_version\": 1"), "{rendered}");
-        assert!(rendered.contains("\"mcp_servers\""), "{rendered}");
-        assert!(!rendered.contains("\"mcpServers\""), "{rendered}");
+        assert!(rendered.contains("\"mcpServers\""), "{rendered}");
+        assert!(rendered.contains("\"--agent\""), "{rendered}");
+        assert!(rendered.contains("\"optional\""), "{rendered}");
     }
 
     #[test]
@@ -3799,8 +4023,8 @@ mod tests {
                     assert!(text.contains("mcp-bridge"), "{client:?}: {text}");
                     assert_eq!(
                         text.contains("--no-session-id"),
-                        client != McpClient::ClaudeCode,
-                        "only Claude Code forwards a session id: {text}"
+                        !matches!(client, McpClient::ClaudeCode | McpClient::Muse),
+                        "only Claude Code and Muse forward a session id: {text}"
                     );
                 }
             }
@@ -3824,7 +4048,6 @@ mod tests {
         assert_eq!(entry(McpClient::CopilotCli)["type"], "local");
         assert_eq!(entry(McpClient::CopilotCli)["tools"][0], "*");
         assert_eq!(entry(McpClient::CommandCode)["transport"], "stdio");
-        assert_eq!(entry(McpClient::Muse)["mode"], "optional");
         assert_eq!(entry(McpClient::VsCodeCopilot)["type"], "stdio");
         assert!(entry(McpClient::Zed).get("type").is_none());
         // Kimi Code's schema dialect rides the bridge's upstream URL.

@@ -541,6 +541,13 @@ fn write_success_response<W: std::io::Write>(
         // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
         Ok(())
+    } else if agent == AgentKind::Muse
+        && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
+    {
+        // Muse adds SessionStart and UserPromptSubmit stdout to the turn as
+        // developer context, so a capture-only reply stays empty rather than
+        // put `{}` in front of the model on every prompt.
+        Ok(())
     } else if event == HookEvent::UserPrompt && agent.user_prompt_injects_handoff() {
         // Kimi Code injects any non-empty UserPromptSubmit stdout into the turn
         // verbatim, so a `{}` here would become user-visible text on every
@@ -5752,6 +5759,100 @@ mod tests {
         );
     }
 
+    /// Muse injects SessionStart's `hookSpecificOutput.additionalContext` as
+    /// developer context (verified offline on Muse Code 1.4.7), so `--agent
+    /// muse` fetches the handoff for the payload's UUIDv7 session id and
+    /// prints Claude Code's envelope.
+    #[tokio::test]
+    async fn muse_session_start_prints_hook_specific_handoff_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "MUSE-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            HookArgs {
+                agent: "muse".into(),
+                ..copilot_cli_hook_args("session-start", &base)
+            },
+            serde_json::json!({
+                "cwd": tmp.path(),
+                "hook_event_name": "SessionStart",
+                "model": "muse-wonder-1.0",
+                "model_provider": "meta",
+                "permission_mode": "bypassPermissions",
+                "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+                "source": "startup",
+                "transcript_path": null
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "MUSE-HANDOFF",
+                }
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=muse")
+                    && request.contains("session_id=01a13669-dc61-7a72-b5ec-ad2f300ffd26")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    /// Muse adds SessionStart and UserPromptSubmit stdout to the turn as
+    /// developer context, so with no handoff to deliver the hook prints
+    /// nothing there, never `{}`. Control: its Stop still replies `{}`, and
+    /// Droid's prompt hook still prints `{}`.
+    #[tokio::test]
+    async fn muse_context_events_print_nothing_without_a_handoff() {
+        let run = |agent: &'static str, event: &'static str| async move {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, _requests) = serve_requests("404 Not Found", "").await;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(tmp.path().join("data")),
+                HookArgs {
+                    agent: agent.into(),
+                    ..copilot_cli_hook_args(event, &base)
+                },
+                serde_json::json!({
+                    "cwd": tmp.path(),
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "Please do the file steps.",
+                    "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+                    "transcript_path": null,
+                    "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+                })
+                .to_string(),
+                &mut stdout,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+            String::from_utf8(stdout).unwrap()
+        };
+        assert_eq!(run("muse", "user-prompt-submit").await, "");
+        assert_eq!(run("muse", "session-start").await, "");
+        assert_eq!(run("muse", "stop").await.trim(), "{}");
+        assert_eq!(run("droid", "user-prompt-submit").await.trim(), "{}");
+    }
+
     // ── #992: per-repository server profiles ─────────────────────────────
 
     /// Register `name` in `data_dir` with a token and the given roots.
@@ -5950,6 +6051,118 @@ mod tests {
         );
         assert_eq!(entries[1].token.as_deref(), Some("tok-b"));
         assert_eq!(entries[1].profile.as_deref(), Some("team-b"));
+    }
+
+    /// Front door for Meta Muse Code's settings.json hooks (adversarial),
+    /// with Muse Code 1.4.7 payload shapes: a prompt from a marked checkout
+    /// is scoped by its marker, routed to the marker's server profile with
+    /// the profile's token (never the install's), and keyed by the payload's
+    /// UUIDv7 session id; a `read_file` of an ignored relative path from that
+    /// checkout is dropped before the spool while a control path is kept;
+    /// allowlist mode emits nothing from an unmarked checkout (printing
+    /// nothing either), and the same prompt without allowlist is captured.
+    #[tokio::test]
+    async fn muse_hooks_honour_marker_scope_profiles_exclusions_and_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let repo = repo_with_marker(
+            tmp.path(),
+            "repo",
+            "workspace = \"mw\"\nproject = \"mp\"\nserver = \"team-a\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        );
+        register_profile(
+            &data_dir,
+            "team-a",
+            "https://a.example",
+            &[&repo],
+            Some("tok-a"),
+        );
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+        let session = "01a13669-dc61-7a72-b5ec-ad2f300ffd26";
+        let muse = |event: &str| {
+            let mut args = claude_args(event, "https://default.example");
+            args.agent = "muse".into();
+            args
+        };
+        let run = |args: HookArgs, payload: serde_json::Value| {
+            let data_dir = data_dir.clone();
+            async move {
+                let mut stdout = Vec::new();
+                run_with_payload(
+                    Some(data_dir),
+                    args,
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| panic!("a Muse event must only spool"),
+                )
+                .await
+                .unwrap();
+                stdout
+            }
+        };
+        let prompt = |cwd: &Path| {
+            serde_json::json!({
+                "cwd": cwd,
+                "hook_event_name": "UserPromptSubmit",
+                "model": "muse-wonder-1.0",
+                "model_provider": "meta",
+                "permission_mode": "bypassPermissions",
+                "prompt": "Please do the file steps.",
+                "session_id": session,
+                "transcript_path": null,
+                "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+            })
+        };
+        let read = |path: &str| {
+            serde_json::json!({
+                "cwd": repo,
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "tool_input": {"path": path},
+                "tool_name": "read_file",
+                "tool_response": format!("Read text file `{path}`.\n1|SECRET-BODY"),
+                "tool_use_id": "call_bc48188330cd",
+                "transcript_path": null
+            })
+        };
+
+        run(muse("user-prompt-submit"), prompt(&repo)).await;
+        let spool = hook_spool::spool_dir(&data_dir);
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        let url = &entries[0].url;
+        assert!(url.starts_with("https://a.example/hook?"), "{url}");
+        assert_eq!(entries[0].token.as_deref(), Some("tok-a"));
+        assert_eq!(query_param(url, "agent"), Some("muse"));
+        assert_eq!(query_param(url, "workspace"), Some("mw"));
+        assert_eq!(query_param(url, "project"), Some("mp"));
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["session_id"], session);
+
+        run(muse("post-tool-use"), read("secret/a.txt")).await;
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "an ignored relative path is dropped before the spool"
+        );
+        run(muse("post-tool-use"), read("src/lib.rs")).await;
+        assert_eq!(read_spooled_entries(&spool).len(), 2, "control path kept");
+
+        let unmarked = tmp.path().join("unmarked");
+        std::fs::create_dir_all(&unmarked).unwrap();
+        let mut allowlist = muse("user-prompt-submit");
+        allowlist.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+        let stdout = run(allowlist, prompt(&unmarked)).await;
+        assert!(stdout.is_empty(), "{:?}", String::from_utf8_lossy(&stdout));
+        assert_eq!(read_spooled_entries(&spool).len(), 2, "allowlist drop");
+        run(muse("user-prompt-submit"), prompt(&unmarked)).await;
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 3, "control: denylist captures it");
+        assert!(
+            entries[2].url.starts_with("https://default.example/hook?"),
+            "{}",
+            entries[2].url
+        );
     }
 
     /// Backward compatibility: without a `server` key the install default is

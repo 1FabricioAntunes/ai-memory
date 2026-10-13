@@ -192,6 +192,9 @@ struct DoctorReport {
     /// The ai-memory marketplace plugins installed for Claude Code and Codex,
     /// with version skew and any parallel settings-file wiring (#1166).
     plugins: Vec<PluginReport>,
+    /// Meta Muse Code's settings file, when there is one: whether ai-memory's
+    /// hooks and MCP entry are in it, and the two shapes that break Muse.
+    muse: Option<MuseReport>,
 }
 
 /// One installed ai-memory marketplace plugin and what else wires the same
@@ -645,6 +648,10 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     })
     .await;
 
+    let muse = super::install_hooks::muse_settings_path(&config.runtime_env)
+        .ok()
+        .and_then(|path| muse_report(&path));
+
     let auth_posture = identity.as_ref().map(|identity| {
         crate::local_auth::AuthPosture::classify(identity.level == "anonymous", &ep.url)
     });
@@ -667,6 +674,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         codex_hooks,
         agentmemory_residue,
         plugins,
+        muse,
     };
 
     if args.json {
@@ -695,6 +703,76 @@ async fn codex_hook_trust(
         cwd,
     )
     .await
+}
+
+/// What `doctor` reads from Meta Muse Code's `settings.json`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct MuseReport {
+    settings: String,
+    /// The `hooks` key carries `install-hooks --agent muse` entries.
+    hooks_wired: bool,
+    /// The server map holding an `ai-memory` entry, if any.
+    mcp_entry: Option<&'static str>,
+    /// Both `mcpServers` and `mcp_servers` are present: Muse then ignores
+    /// every MCP server.
+    conflicting_server_maps: bool,
+    /// No `schema_version`: every muse command fails at startup.
+    schema_version_missing: bool,
+}
+
+/// [`MuseReport`] for the settings file at `path`; `None` when it does not
+/// exist or is not a JSON object.
+fn muse_report(path: &Path) -> Option<MuseReport> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let root = root.as_object()?;
+    let mcp_entry = ["mcpServers", "mcp_servers"].into_iter().find(|key| {
+        root.get(*key)
+            .and_then(|servers| servers.get("ai-memory"))
+            .is_some()
+    });
+    Some(MuseReport {
+        settings: path.display().to_string(),
+        hooks_wired: super::install_hooks::settings_file_carries_ai_memory_hooks(path),
+        mcp_entry,
+        conflicting_server_maps: root.contains_key("mcpServers")
+            && root.contains_key("mcp_servers"),
+        schema_version_missing: !root.contains_key("schema_version"),
+    })
+}
+
+/// Human lines for Muse's settings file; empty without one.
+fn render_muse(report: Option<&MuseReport>) -> String {
+    let Some(report) = report else {
+        return String::new();
+    };
+    let mut out = format!(
+        "  muse: {} (hooks {}, MCP entry {})\n",
+        report.settings,
+        if report.hooks_wired {
+            "wired"
+        } else {
+            "not wired: run `ai-memory install-hooks --agent muse --apply`"
+        },
+        report
+            .mcp_entry
+            .map_or_else(|| "absent".to_owned(), |key| format!("under `{key}`")),
+    );
+    if report.conflicting_server_maps {
+        out.push_str(&format!(
+            "⚠ {} has both `mcpServers` and `mcp_servers`, so Muse ignores every MCP server. \
+             Move the servers into one of the two maps.\n",
+            report.settings
+        ));
+    }
+    if report.schema_version_missing {
+        out.push_str(&format!(
+            "⚠ {} has no \"schema_version\", so every muse command fails at startup. Add \
+             \"schema_version\": 1.\n",
+            report.settings
+        ));
+    }
+    out
 }
 
 /// The installed ai-memory plugins, each with what else wires its harness.
@@ -1030,6 +1108,7 @@ fn render_human(report: &DoctorReport) {
     }
     print!("{}", render_capture_health(report));
     print!("{}", render_plugins(&report.plugins));
+    print!("{}", render_muse(report.muse.as_ref()));
     print!(
         "{}",
         super::agentmemory_residue::render(&report.agentmemory_residue)
@@ -1161,7 +1240,43 @@ mod tests {
             codex_hooks,
             agentmemory_residue: Vec::new(),
             plugins: Vec::new(),
+            muse: None,
         }
+    }
+
+    /// Doctor reads Muse's settings file: the wiring it finds, and the two
+    /// shapes that break Muse (both server maps, no `schema_version`).
+    #[test]
+    fn doctor_reports_muse_wiring_and_breaking_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        assert_eq!(muse_report(&path), None);
+        assert_eq!(render_muse(None), "");
+
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"mcp_servers":{"ai-memory":{"transport":"stdio"}},"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/ai-memory hook --event stop --agent muse --server-url http://127.0.0.1:49374"}]}]}}"#,
+        )
+        .unwrap();
+        let wired = muse_report(&path).unwrap();
+        assert!(wired.hooks_wired);
+        assert_eq!(wired.mcp_entry, Some("mcp_servers"));
+        assert!(!wired.conflicting_server_maps);
+        assert!(!wired.schema_version_missing);
+        let text = render_muse(Some(&wired));
+        assert!(text.contains("hooks wired"), "{text}");
+        assert!(!text.contains('⚠'), "{text}");
+
+        std::fs::write(&path, r#"{"mcpServers":{},"mcp_servers":{}}"#).unwrap();
+        let broken = muse_report(&path).unwrap();
+        assert!(!broken.hooks_wired);
+        assert_eq!(broken.mcp_entry, None);
+        assert!(broken.conflicting_server_maps);
+        assert!(broken.schema_version_missing);
+        let text = render_muse(Some(&broken));
+        assert!(text.contains("ignores every MCP server"), "{text}");
+        assert!(text.contains("schema_version"), "{text}");
+        assert!(text.contains("not wired"), "{text}");
     }
 
     /// Doctor reports the plugin and every way the same harness is wired

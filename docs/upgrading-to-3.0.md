@@ -46,9 +46,9 @@ For the full list of changes, see the 3.0.0 section of
    - A server on another host: upgrade it there as well. `ai-memory upgrade`
      on a client machine only refreshes the local client and hooks.
 2. Restart the server if the upgrade did not. On the first start it applies
-   migrations V77, V78 and V79 before it accepts traffic. V78 and V79 rebuild
-   the `sessions` and `users` tables, so the first start on a large store can
-   take longer than usual.
+   migrations V77 to V80 before it accepts traffic. V78, V79 and V80 rebuild
+   the `sessions` and `users` tables (V78 and V80 `sessions`, V79 `users`), so
+   the first start on a large store can take longer than usual.
 3. Check the result:
 
    ```bash

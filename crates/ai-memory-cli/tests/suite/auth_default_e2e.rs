@@ -87,6 +87,7 @@ mod slow {
                 // A developer (or agent) running these tests from Claude Code
                 // has its session id exported; a child must not inherit it.
                 .env_remove("CLAUDE_CODE_SESSION_ID")
+                .env_remove("MUSE_SESSION_ID")
                 .current_dir(&self.home);
             cmd
         }
@@ -646,6 +647,21 @@ mod slow {
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("CLAUDE_CODE_SESSION_ID is missing"),
             "the session-aware mode keeps failing closed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Muse's bridge reads only MUSE_SESSION_ID: an inherited Claude id
+        // does not stand in for it.
+        let mut muse = install.cmd();
+        let out = muse
+            .args(["mcp-bridge", "--agent", "muse", "--server-url", &base])
+            .env("CLAUDE_CODE_SESSION_ID", "inherited-from-a-claude-terminal")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("MUSE_SESSION_ID is missing"),
+            "the Muse bridge fails closed without its own id: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }

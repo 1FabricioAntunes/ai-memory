@@ -266,6 +266,12 @@ fn build_plan(
                 install_hooks::droid_hooks_path()?,
                 HookConfigShape::FlatHookFile,
             ),
+            // Muse keeps its hooks under the usual `hooks` key of the
+            // settings.json its MCP servers live in, beside `schema_version`.
+            (
+                install_hooks::muse_settings_path(env)?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {
@@ -452,6 +458,8 @@ fn build_plan(
                 )
             } else if matches!(client, Omp) {
                 omp_dirs.iter().map(|dir| dir.join("mcp.json")).collect()
+            } else if matches!(client, Muse) {
+                vec![install_hooks::muse_settings_path(env)?]
             } else {
                 let Ok(path) = install_mcp::mcp_config_path(client) else {
                     continue;
@@ -1503,9 +1511,9 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Zed => Some(&["context_servers"]),
-        // Muse Code spells the key snake_case; the camelCase spelling the
-        // clients above use would leave the entry behind.
-        McpClient::Muse => Some(&["mcp_servers"]),
+        // Muse reads `mcpServers` or the legacy `mcp_servers`;
+        // `strip_mcp_json` sweeps both.
+        McpClient::Muse => Some(&["mcpServers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
     }
 }
@@ -1647,38 +1655,57 @@ fn strip_mcp_json(
     let Some(path) = mcp_servers_path(client) else {
         return Ok((content.to_string(), Vec::new()));
     };
+    let legacy: &[&str] = &["mcp_servers"];
+    let paths: Vec<&[&str]> = if client == McpClient::Muse {
+        vec![path, legacy]
+    } else {
+        vec![path]
+    };
     let mut removed = Vec::new();
     let new_content = mutate_json(content, |root| {
-        let mut cursor: &mut serde_json::Map<String, serde_json::Value> = root;
-        for (depth, key) in path.iter().enumerate() {
-            let is_last = depth == path.len() - 1;
-            if is_last {
-                let Some(servers) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
-                    return Ok(());
-                };
-                let keys: Vec<String> = servers.keys().cloned().collect();
-                for k in keys {
-                    let ours = servers
-                        .get(&k)
-                        .is_some_and(|e| mcp_entry_is_ours(&k, e, name, url));
-                    if ours {
-                        servers.remove(&k);
-                        removed.push(k);
-                    }
-                }
-                if servers.is_empty() {
-                    cursor.remove(*key);
-                }
-            } else {
-                let Some(next) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
-                    return Ok(());
-                };
-                cursor = next;
-            }
+        for path in &paths {
+            strip_mcp_json_at(root, path, name, url, &mut removed);
         }
         Ok(())
     })?;
     Ok((new_content, removed))
+}
+
+/// [`strip_mcp_json`] for the server map at one key path.
+fn strip_mcp_json_at(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[&str],
+    name: Option<&str>,
+    url: &str,
+    removed: &mut Vec<String>,
+) {
+    let mut cursor: &mut serde_json::Map<String, serde_json::Value> = root;
+    for (depth, key) in path.iter().enumerate() {
+        let is_last = depth == path.len() - 1;
+        if is_last {
+            let Some(servers) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
+                return;
+            };
+            let keys: Vec<String> = servers.keys().cloned().collect();
+            for k in keys {
+                let ours = servers
+                    .get(&k)
+                    .is_some_and(|e| mcp_entry_is_ours(&k, e, name, url));
+                if ours {
+                    servers.remove(&k);
+                    removed.push(k);
+                }
+            }
+            if servers.is_empty() {
+                cursor.remove(*key);
+            }
+        } else {
+            let Some(next) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
+                return;
+            };
+            cursor = next;
+        }
+    }
 }
 
 /// Remove ai-memory's Codex MCP table by name or `url`. Returns new

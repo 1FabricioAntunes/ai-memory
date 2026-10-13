@@ -6226,6 +6226,7 @@ impl AiMemoryServer {
                 "command_code": "AGENTS.md",
                 "grok": "AGENTS.md",
                 "copilot_cli": "AGENTS.md",
+                "muse": "AGENTS.md",
                 "default": "AGENTS.md"
             },
             "managed_skills": managed_skills,
@@ -8721,12 +8722,25 @@ mod tests {
         }
     }
 
+    /// Muse Code reads `AGENTS.md` first and the cross-agent `.agents/skills`
+    /// root, so the installed snippet routes it there.
+    #[test]
+    fn installed_prompt_surface_routes_muse_to_agents_md() {
+        let installed = installed_ai_memory_prompt_surface();
+        assert!(
+            installed.contains("GitHub Copilot CLI / Muse Code")
+                && installed.contains("Copilot CLI / Muse Code -> `AGENTS.md`")
+                && installed.contains(".agents/skills"),
+            "installed snippet must route Muse Code to AGENTS.md and .agents/skills"
+        );
+    }
+
     #[test]
     fn installed_prompt_surface_routes_copilot_cli_to_agents_md() {
         let installed = installed_ai_memory_prompt_surface();
         assert!(
             installed.contains("GitHub Copilot CLI")
-                && installed.contains("Copilot CLI -> `AGENTS.md`")
+                && installed.contains("Command Code / Copilot CLI / Muse Code -> `AGENTS.md`")
                 && installed.contains(".github/skills"),
             "installed snippet and managed skills must route Copilot CLI to AGENTS.md and .github/skills"
         );

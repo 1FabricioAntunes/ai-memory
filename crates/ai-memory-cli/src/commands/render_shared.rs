@@ -123,6 +123,34 @@ pub(crate) const DROID_EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// Meta Muse Code lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-settings.json, native hook-event script stem)`; Muse has
+/// no script bundle, so the `.sh` name only carries the event token the
+/// native command is rendered with.
+///
+/// Claude Code's vocabulary plus `PostToolUseFailure`, which Muse fires
+/// instead of `PostToolUse` when a tool fails (the server aliases it to
+/// `post-tool-use` and reads the outcome from `error`). `SubagentStart` and
+/// `SubagentStop` are left out: Muse Code 1.4.7 fires them for its built-in
+/// reminder observers on every turn, each under its own session id, so wiring
+/// them would open several empty sessions per prompt. Muse fires a real
+/// `SessionEnd`, so no `finalize-session` step is needed.
+pub(crate) const MUSE_EVENTS: [(&str, &str); 8] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
+/// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
+/// seconds, like the Claude Code plugins it loads. The capture POST is
+/// fire-and-forget; `SessionStart` also fetches a handoff.
+pub(crate) const MUSE_HOOK_TIMEOUT_SECS: u64 = 30;
+
 /// Kiro CLI v2-engine lifecycle events. Each pair is
 /// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
 ///
@@ -1067,6 +1095,48 @@ pub(crate) fn build_droid_hooks_payload(
             project_strategy,
         ),
     )
+}
+
+/// `{"hooks": <event map>}` for Meta Muse Code: the `hooks` key of
+/// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, in Claude Code's nested
+/// shape with an empty matcher (every tool, every `SessionStart` source).
+/// Muse runs each `command` through a shell with a cleared environment and
+/// the Claude Code-shaped event JSON on stdin, so every entry invokes the
+/// native `ai-memory hook` command with its server, data dir and agent baked
+/// in; there is no script bundle, whatever `AI_MEMORY_HOOK_PLATFORM` asks
+/// for. Each handler carries [`MUSE_HOOK_TIMEOUT_SECS`].
+pub(crate) fn build_muse_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    let mut payload = build_hook_payload_for_platform(
+        &MUSE_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "muse",
+            data_dir,
+            project_strategy,
+        ),
+    );
+    if let Some(events) = payload.get_mut("hooks").and_then(Value::as_object_mut) {
+        for groups in events.values_mut().filter_map(Value::as_array_mut) {
+            for handler in groups
+                .iter_mut()
+                .filter_map(|group| group.get_mut("hooks").and_then(Value::as_array_mut))
+                .flatten()
+                .filter_map(Value::as_object_mut)
+            {
+                handler.insert("timeout".into(), Value::from(MUSE_HOOK_TIMEOUT_SECS));
+            }
+        }
+    }
+    payload
 }
 
 /// Pool (Poolside Agent CLI) `.poolside/settings.yaml` `hooks:` block for

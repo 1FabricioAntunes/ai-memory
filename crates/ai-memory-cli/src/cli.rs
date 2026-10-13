@@ -2422,6 +2422,16 @@ pub enum AgentChoice {
     /// Droid's own `SessionEnd` closes the session.
     #[value(alias = "factory-droid")]
     Droid,
+    /// Meta Muse Code (`muse`) — lifecycle hooks merged into the `hooks` key
+    /// of `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, keeping its
+    /// `schema_version` and every other key. Muse sends Claude Code-shaped
+    /// hook payloads on stdin with a cleared environment, so each entry runs
+    /// ai-memory's native `hook` command with the server, data dir and agent
+    /// baked in; there is no script bundle. SessionStart stdout
+    /// (`hookSpecificOutput.additionalContext`) carries the handoff, and
+    /// Muse's own `SessionEnd` closes the session.
+    #[value(alias = "muse-code", alias = "musecode")]
+    Muse,
 }
 
 impl AgentChoice {
@@ -2454,6 +2464,7 @@ impl AgentChoice {
             Self::Hermes => AgentKind::Hermes,
             Self::CopilotCli => AgentKind::CopilotCli,
             Self::Droid => AgentKind::Droid,
+            Self::Muse => AgentKind::Muse,
         }
     }
 
@@ -2473,7 +2484,8 @@ impl AgentChoice {
             | Self::Zero
             | Self::Zcode
             | Self::Hermes
-            | Self::Droid => None,
+            | Self::Droid
+            | Self::Muse => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2703,21 +2715,23 @@ pub enum McpClient {
     /// `context_servers` map. This integration is MCP-only because Zed
     /// does not expose ai-memory-compatible lifecycle hooks.
     Zed,
-    /// Muse Code (Meta) — `~/.config/muse/settings.json`, servers under a
-    /// top-level snake_case `mcp_servers` map with `transport:
-    /// "streamable_http"` + `url` + `headers`.
+    /// Meta Muse Code — `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`.
+    /// The entry is a stdio `ai-memory mcp-bridge --agent muse`, which
+    /// forwards the `MUSE_SESSION_ID` Muse gives its stdio servers, so Muse
+    /// is a session-aware client (a streamable-HTTP entry carries no session
+    /// id).
     ///
-    /// Two documented constraints shape the generated entry. The settings
-    /// file must carry `"schema_version": 1` or *every* Muse Code command
-    /// fails at startup with `malformed settings file`, so the writer adds
-    /// the key when it is absent and never rewrites an existing value. And
-    /// `mode` defaults to `required`, which aborts the whole Muse run when
-    /// the server is unreachable; ai-memory augments a session rather than
-    /// gating it, so the entry sets `mode: "optional"` explicitly.
-    ///
-    /// MCP-only: Muse Code's hook surface is documented but its
-    /// `SessionStart` output contract is not, so lifecycle capture and
-    /// managed workstreams are not claimed. See `install-mcp --client muse`.
+    /// Muse reads servers from `mcpServers` (`type: "stdio"`) or the legacy
+    /// `mcp_servers` (`transport: "stdio"`), and drops the whole MCP block
+    /// when both are present. The writer uses `mcp_servers` when the file
+    /// already has it, else `mcpServers`, never adds the second, and refuses
+    /// a file that already holds both. The settings file must carry
+    /// `"schema_version": 1` or every Muse command fails at startup, so the
+    /// writer adds the key when it is absent and never rewrites an existing
+    /// value. `mode` defaults to `required`, which aborts the whole Muse run
+    /// when the server cannot start, so the entry sets `mode: "optional"`.
+    /// Pair with `install-hooks --agent muse` for lifecycle capture.
+    #[value(alias = "muse-code", alias = "musecode")]
     Muse,
     /// DeepSeek Harness (DSH) - MCP-only. DSH has no fixed JSON/TOML MCP
     /// config: the client is a Cordis plugin entry
@@ -3259,6 +3273,12 @@ pub struct InstallMcpArgs {
     /// in `[auth].bearer_token_file`.
     #[arg(skip)]
     pub stdio_bridge: bool,
+    /// The data dir a bridge entry passes as `--data-dir`, for a client that
+    /// starts its MCP servers with a cleared environment (Muse Code), where
+    /// the bridge could not otherwise find this install's config and token.
+    /// Set by the installer, never a flag.
+    #[arg(skip)]
+    pub bridge_data_dir: Option<std::path::PathBuf>,
 }
 
 /// Arguments for the internal stdio-to-HTTP MCP bridge.
@@ -3268,10 +3288,40 @@ pub struct McpBridgeArgs {
     #[arg(long)]
     pub server_url: Option<String>,
     /// Run as a plain stdio-to-HTTP bridge that forwards no session identity,
-    /// for MCP clients other than Claude Code. Without it the bridge forwards
-    /// `CLAUDE_CODE_SESSION_ID` and refuses to start when it is missing.
+    /// for MCP clients other than Claude Code and Muse Code. Without it the
+    /// bridge forwards the session id of the `--agent` that launched it and
+    /// refuses to start when it is missing.
     #[arg(long)]
     pub no_session_id: bool,
+    /// The harness that launches this session-aware bridge, which names the
+    /// one variable its session id is read from: `claude-code` (the default)
+    /// reads `CLAUDE_CODE_SESSION_ID`, `muse` reads `MUSE_SESSION_ID`. The
+    /// other variable is never consulted, so an id inherited from a
+    /// different harness's terminal is not forwarded.
+    #[arg(long, value_enum, default_value_t = BridgeAgent::ClaudeCode)]
+    pub agent: BridgeAgent,
+}
+
+/// The harness a session-aware `mcp-bridge` forwards the session id of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum BridgeAgent {
+    /// Claude Code: `CLAUDE_CODE_SESSION_ID`.
+    #[default]
+    ClaudeCode,
+    /// Meta Muse Code: `MUSE_SESSION_ID`.
+    #[value(alias = "muse-code", alias = "musecode")]
+    Muse,
+}
+
+impl BridgeAgent {
+    /// The variable this harness puts its session id in.
+    #[must_use]
+    pub const fn session_env(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "CLAUDE_CODE_SESSION_ID",
+            Self::Muse => "MUSE_SESSION_ID",
+        }
+    }
 }
 
 /// Transport for the MCP server.
@@ -4522,6 +4572,42 @@ mod tests {
             };
             assert_eq!(args.client, McpClient::Droid);
         }
+    }
+
+    #[test]
+    fn muse_install_hooks_install_mcp_and_mcp_bridge_parse_with_their_aliases() {
+        for alias in ["muse", "muse-code", "musecode"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::Muse);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Muse);
+            // Native commands only: there is no `hooks/muse` bundle.
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::Muse);
+
+            let bridge = Cli::try_parse_from(["ai-memory", "mcp-bridge", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::McpBridge(args) = bridge.command else {
+                panic!("expected mcp-bridge");
+            };
+            assert_eq!(args.agent, BridgeAgent::Muse);
+            assert_eq!(args.agent.session_env(), "MUSE_SESSION_ID");
+        }
+        let bridge = Cli::try_parse_from(["ai-memory", "mcp-bridge"]).unwrap();
+        let Command::McpBridge(args) = bridge.command else {
+            panic!("expected mcp-bridge");
+        };
+        assert_eq!(args.agent, BridgeAgent::ClaudeCode);
+        assert_eq!(args.agent.session_env(), "CLAUDE_CODE_SESSION_ID");
     }
 
     #[test]

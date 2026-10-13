@@ -80,6 +80,7 @@ impl Sandbox {
             .env("AI_MEMORY_AUTO_IMPROVE__SCHEDULER__ENABLED", "false")
             .env("RUST_LOG", "off")
             .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("MUSE_SESSION_ID")
             .current_dir(&self.home)
             .stdin(Stdio::null());
         if let Some(port) = port {

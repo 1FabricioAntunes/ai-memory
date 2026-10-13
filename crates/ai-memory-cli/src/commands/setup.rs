@@ -155,11 +155,15 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
 
     let written_config = init_config_path(config, config_path);
     let agents = if args.agents.is_empty() {
-        detect_agents(
+        let mut found = detect_agents(
             &home,
             &|harness| doctor::relocated_session_dir_with(harness, &env),
             &|client| install_mcp::mcp_config_path_with(client, &env).ok(),
-        )
+        );
+        if muse_detected(&home, &env) {
+            found.push(AgentChoice::Muse);
+        }
+        found
     } else {
         dedup(args.agents.iter().copied())
     };
@@ -244,6 +248,27 @@ fn detect_agents(
             (store.is_dir() || config).then_some(agent)
         });
     dedup(found)
+}
+
+/// Whether Meta Muse Code has run for this user: its config directory
+/// (`${XDG_CONFIG_HOME:-~/.config}/muse`) or its data directory
+/// (`${XDG_DATA_HOME:-~/.local/share}/muse`, where its sessions live) exists.
+/// Muse has no native-session adapter, so it is found by these directories
+/// rather than by [`detect_agents`]. Each XDG variable counts only when it is
+/// an absolute path, lexically.
+fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    let xdg = |name: &str, fallback: &[&str]| {
+        super::path_util::agent_config_home(env(name))
+            .filter(|dir| dir.is_absolute())
+            .unwrap_or_else(|| {
+                fallback
+                    .iter()
+                    .fold(home.to_path_buf(), |dir, part| dir.join(part))
+            })
+            .join("muse")
+    };
+    xdg("XDG_CONFIG_HOME", &[".config"]).is_dir()
+        || xdg("XDG_DATA_HOME", &[".local", "share"]).is_dir()
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -580,6 +605,7 @@ fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<Strin
                 flavor: None,
                 token_env_var: false,
                 stdio_bridge: false,
+                bridge_data_dir: None,
             };
             if let Err(error) = install_mcp::run_with_opencode_dialect(config, args, dialect) {
                 problems.push(format!("install-mcp: {error:#}"));
@@ -693,6 +719,30 @@ mod tests {
     /// link that survives `brew upgrade` and `brew cleanup`, falling back to
     /// the `<prefix>/bin` link; a link to some other binary never wins.
     #[cfg(unix)]
+    /// Muse is detected by its config or data directory under the home or
+    /// the absolute XDG roots, and not otherwise.
+    #[test]
+    fn muse_is_detected_by_its_config_or_data_directory() {
+        let none = |_: &str| -> Option<OsString> { None };
+        let home = tempfile::tempdir().unwrap();
+        assert!(!muse_detected(home.path(), &none));
+        std::fs::create_dir_all(home.path().join(".local/share/muse/sessions")).unwrap();
+        assert!(muse_detected(home.path(), &none));
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/muse")).unwrap();
+        assert!(muse_detected(home.path(), &none));
+
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(xdg.path().join("muse")).unwrap();
+        let xdg_path = xdg.path().as_os_str().to_owned();
+        let env = move |name: &str| (name == "XDG_CONFIG_HOME").then(|| xdg_path.clone());
+        assert!(muse_detected(home.path(), &env));
+        assert_eq!(skills_for(AgentChoice::Muse), InstallSkillsAgent::Agents);
+        assert_eq!(AgentPlan::new(AgentChoice::Muse).mcp, Some(McpClient::Muse));
+    }
+
     #[test]
     fn a_cellar_binary_is_recorded_through_its_stable_homebrew_link() {
         use std::os::unix::fs::symlink;

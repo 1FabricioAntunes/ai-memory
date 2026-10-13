@@ -120,6 +120,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         emit_droid(&args)?;
         return Ok(());
     }
+    // Muse too: its settings.json hooks run the native `hook` command.
+    if matches!(args.agent, AgentChoice::Muse) {
+        emit_muse(&args)?;
+        return Ok(());
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -217,7 +222,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Zero
         | AgentChoice::Zcode
         | AgentChoice::Hermes
-        | AgentChoice::Droid => {
+        | AgentChoice::Droid
+        | AgentChoice::Muse => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -341,6 +347,32 @@ fn emit_droid(args: &SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
+/// Print the `hooks` block for Muse's `settings.json`. No scripts are staged:
+/// each entry runs the ai-memory binary's native `hook` command with Muse's
+/// event JSON on stdin, so the binary must be reachable on the host that runs
+/// Muse.
+fn emit_muse(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_muse_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload["hooks"]).context("serializing Muse hook config")?;
+    println!("# Meta Muse Code — merge under the `hooks` key of");
+    println!("# ${{XDG_CONFIG_HOME:-~/.config}}/muse/settings.json, keeping its");
+    println!("# \"schema_version\": 1. The `command` must be an ai-memory binary reachable");
+    println!("# on the host that runs Muse; prefer `ai-memory install-hooks --agent muse");
+    println!("# --apply` from that host so the path and data dir are resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 fn normalise_hook_server_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
@@ -426,6 +458,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
                 flavor: None,
                 token_env_var: false,
                 stdio_bridge: false,
+                bridge_data_dir: None,
             },
             Some(dialect),
         )?;

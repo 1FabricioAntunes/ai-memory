@@ -22,7 +22,8 @@ Linux or macOS it takes two commands, and neither needs root.
 
    `<self>` is one of `claude-code`, `codex`, `opencode`, `opencode2`,
    `gemini-cli`, `cursor`, `kimi-code`, `kiro-cli`, `grok`, `copilot-cli`,
-   `antigravity-cli`, `command-code`, `devin`, `droid`, `omp`, `pi`, `openclaw`
+   `antigravity-cli`, `command-code`, `devin`, `droid`, `muse`, `omp`, `pi`,
+   `openclaw`
    (`ai-memory setup --help` lists every value). Repeat `--agent` to wire
    several harnesses. Without `--agent`, `setup` wires every harness it finds
    under the home directory.

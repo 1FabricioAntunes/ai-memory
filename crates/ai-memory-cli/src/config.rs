@@ -695,6 +695,7 @@ pub struct RuntimeEnv {
     process_env: CapturedProcessEnv,
     capture_owner_active: bool,
     claude_code_session_id: Option<String>,
+    muse_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
     openai_api_key: Option<SecretString>,
@@ -745,6 +746,7 @@ impl RuntimeEnv {
             capture_owner_active: env_string("AI_MEMORY_CAPTURE_OWNER")
                 .is_some_and(|value| !value.trim().is_empty()),
             claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
+            muse_session_id: env_string("MUSE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             // CLAUDE_CODE_OAUTH_TOKEN is the name Claude Code reads the
             // `claude setup-token` token from; ANTHROPIC_OAUTH_TOKEN is our
@@ -847,6 +849,13 @@ impl RuntimeEnv {
         self.claude_code_session_id.as_deref()
     }
 
+    /// Meta Muse Code session id, which Muse sets for its stdio MCP servers
+    /// and hooks.
+    #[must_use]
+    pub fn muse_session_id(&self) -> Option<&str> {
+        self.muse_session_id.as_deref()
+    }
+
     /// Hook-spool attempt override captured from the process environment.
     #[must_use]
     pub fn hook_spool_max_attempts(&self) -> Option<&str> {
@@ -876,6 +885,15 @@ impl RuntimeEnv {
         Self {
             host_cwd: Some(host_cwd.into()),
             home_dir: Some(home_dir.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_session_ids_for_tests(claude_code: Option<&str>, muse: Option<&str>) -> Self {
+        Self {
+            claude_code_session_id: claude_code.map(str::to_owned),
+            muse_session_id: muse.map(str::to_owned),
             ..Self::default()
         }
     }

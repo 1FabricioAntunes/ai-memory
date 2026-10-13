@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -245,6 +245,17 @@ configure ai-memory@ai-memory`:
   --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
   the `hooks` key of `~/.factory/settings.json` while `hooks.json` does not
   exist) the plugin skips it, as it does for Claude's settings hooks.
+- Meta Muse Code reads `.claude-plugin/plugin.json` bundles, but Muse Code
+  1.4.7 refuses to install this one (`plugin declares a retained unsupported
+  MCP boundary`) because its `.mcp.json` uses `${user_config.*}`
+  placeholders; use `install-hooks --agent muse` and `install-mcp --client
+  muse` instead. The launcher is ready for a Muse that loads it: it tells Muse
+  apart by the `MUSE_PLUGIN_ID` and `MUSE_SESSION_ID` Muse sets for plugin
+  hooks and records the events as `muse`, skips an event that
+  `install-hooks --agent muse` hooks already deliver (a catch-all matcher
+  under the `hooks` key of `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`),
+  and drops the plugin's `SubagentStart` and `SubagentStop` events, which
+  `install-hooks --agent muse` never wires.
 - On Windows, Claude Code runs plugin hooks through Git Bash, which it
   already requires, so the launcher needs nothing else.
 - With the Docker wrapper, plugin hooks need a `bin/ai-memory` wrapper that runs
@@ -1707,6 +1718,77 @@ Droid's own `SessionEnd` closes the session, so `finalize-session` is not
 needed. Start a new droid session after installing so it loads the hooks.
 `ai-memory setup --agent droid` runs both installers; `setup` does not detect
 Droid on its own, and no managed workstream (`ai-memory run droid`) is claimed.
+
+### Meta Muse Code
+
+Muse Code (`muse`, also installed as `muse-code`) keeps its user settings in
+`${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, one file for both its
+hooks and its MCP servers. `install-hooks --agent muse` (aliases `muse-code`,
+`musecode`) merges lifecycle hooks under its `hooks` key and
+`install-mcp --client muse` merges the MCP entry, keeping
+`"schema_version": 1`, every other key and every entry you already have:
+
+```bash
+ai-memory install-mcp --client muse --apply
+ai-memory install-hooks --agent muse --apply
+```
+
+Muse fails every command at startup when `settings.json` has no
+`schema_version`, so both installers add `"schema_version": 1` when it is
+missing and never rewrite an existing value. Each `--apply` writes a backup
+next to the file when it changes it, and running it again changes nothing.
+
+Muse sends Claude Code-shaped JSON on stdin (`session_id`, `cwd`,
+`tool_name`, `tool_input`, `tool_use_id`, `tool_response`), so each entry
+runs the native `ai-memory hook --event … --agent muse` command with an empty
+matcher and a 30-second `timeout`. There is no script bundle. Muse runs hooks
+with a cleared environment (`HOME`, `PATH`, `PWD` and its own `MUSE_*`
+variables), so the server URL and the data dir are written into each
+command, and `AI_MEMORY_*` variables exported in your shell do not reach the
+hooks; run the installer again after changing either. The local spool,
+bearer auth and `[capture] ignore_paths` apply. Muse's `read_file`,
+`write_file`, `edit_file`, `apply_patch`, `search`, `bash`, `monitor`,
+`web_fetch` and memory tools map to the file, search and shell families
+those exclusions use, and a relative `path` is resolved against the session's
+`cwd`. A `project`-scope memory path lands under `.agents/memory/`; the
+personal memory scopes live outside the repository and are stored as
+metadata only while a `[capture]` marker is active.
+
+Eight events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure` (Muse fires it instead of `PostToolUse`
+when a tool fails), `PreCompact`, `Stop` and `SessionEnd`. `SubagentStart` and
+`SubagentStop` are left out: Muse fires them on every turn for its built-in
+reminder observers, each under its own session id, so wiring them would
+record several empty sessions per prompt. The `SessionStart` hook delivers the
+prior session's handoff through `hookSpecificOutput.additionalContext`,
+which Muse adds to the session as developer context, and Muse's own
+`SessionEnd` closes the session, so `finalize-session` is not needed. With no
+handoff to deliver, the `SessionStart` and `UserPromptSubmit` hooks print
+nothing, since Muse adds that stdout to the model's context too.
+
+The MCP entry is a stdio `ai-memory mcp-bridge --agent muse` with
+`"mode": "optional"` (Muse's default `required` aborts the run when a server
+cannot start). Muse gives its stdio servers `MUSE_SESSION_ID`, and the bridge
+forwards it, so Muse is a session-aware client: unscoped memory calls follow
+the session's own project. A streamable-HTTP entry would carry no session
+id. The entry goes under `mcpServers`, or under the legacy `mcp_servers` map
+when the file already has one, and never under both: Muse ignores every MCP
+server when both maps are present, so `--apply` refuses a file that already
+has both and `ai-memory doctor` reports it. The entry names the install's
+data dir (`--data-dir`) because the bridge starts in Muse's cleared
+environment, and the bridge reads the token from there; a token passed
+explicitly with `--auth-token` goes in the entry's `env` instead, so treat the
+file as private then. `ai-memory` must be on the `PATH` Muse starts with.
+
+The ai-memory routing skills need no extra step: Muse reads
+`~/.agents/skills`, which `install-skills` writes, and it reads `AGENTS.md`
+first among the instruction files. `ai-memory setup` detects Muse by its
+config or data directory and runs all three installers;
+`ai-memory setup --agent muse` names it explicitly. Muse also reads a
+project's `.muse/hooks.json` in a trusted workspace; ai-memory does not write
+it, because its commands carry this machine's paths. No managed workstream
+(`ai-memory run muse`) and no transcript backfill from
+`${XDG_DATA_HOME:-~/.local/share}/muse/sessions` are claimed yet.
 
 ### Hermes Agent (Nous Research)
 

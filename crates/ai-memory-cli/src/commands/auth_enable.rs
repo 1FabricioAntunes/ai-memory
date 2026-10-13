@@ -283,6 +283,7 @@ fn rewire(
         flavor,
         token_env_var: false,
         stdio_bridge: false,
+        bridge_data_dir: None,
     };
     // Name the OpenCode major version outright: both share one file, and
     // probing `opencode --version` here would pick one for both locations.

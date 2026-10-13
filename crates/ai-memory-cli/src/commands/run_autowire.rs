@@ -411,6 +411,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             flavor: None,
             token_env_var: false,
             stdio_bridge: false,
+            bridge_data_dir: None,
         });
     WireInstalls {
         opencode_dialect,

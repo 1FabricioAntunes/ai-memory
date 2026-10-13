@@ -430,6 +430,15 @@ pub(crate) fn droid_hooks_path() -> anyhow::Result<std::path::PathBuf> {
     .join("hooks.json"))
 }
 
+/// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json` — Meta Muse Code's user
+/// settings, whose `hooks` key holds its lifecycle hooks. `XDG_CONFIG_HOME`
+/// comes from the captured environment (invariant #1).
+pub(crate) fn muse_settings_path(
+    env: &crate::config::RuntimeEnv,
+) -> anyhow::Result<std::path::PathBuf> {
+    install_mcp::muse_settings_path_in(env.var_os("XDG_CONFIG_HOME"), home_dir())
+}
+
 /// `~/.config/zero/hooks.json` — Zero's user-level lifecycle hook config
 /// (issue #156). Zero resolves it under `$XDG_CONFIG_HOME` falling back to
 /// `~/.config`; like the OpenCode plugin path below we target the default
@@ -793,6 +802,10 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     if args.apply && args.agent == AgentChoice::Codex && args.config_file.is_none() {
         args.config_file = Some(codex_hooks_path(&config.runtime_env)?);
     }
+    // Muse's settings file follows XDG_CONFIG_HOME, resolved the same way.
+    if args.apply && args.agent == AgentChoice::Muse && args.config_file.is_none() {
+        args.config_file = Some(muse_settings_path(&config.runtime_env)?);
+    }
     // Preserve an existing `--capture-assistant` opt-in on a bare re-apply. There
     // is no negative flag, so a re-run without `--capture-assistant` (notably the
     // `ai-memory run` auto-wire, which always passes it off) must NOT silently
@@ -962,6 +975,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 };
                 apply_to_droid_hooks(&path, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::Muse => {
+                let path = args
+                    .config_file
+                    .clone()
+                    .context("internal: the Muse settings path is resolved before apply")?;
+                apply_to_muse_settings(&path, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -1117,6 +1137,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             )
         }
         AgentChoice::Droid => render_droid(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::Muse => render_muse(&server_url, auth, &config.data_dir, strategy),
     }
 }
 
@@ -1309,6 +1330,8 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::KiroCliV3 => kiro_cli_v3_hooks_path().ok()?,
             AgentChoice::CopilotCli => copilot_cli_hooks_path().ok()?,
             AgentChoice::Droid => droid_hooks_path().ok()?,
+            // `run` resolves it into `args.config_file` before any caller.
+            AgentChoice::Muse => return None,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -1656,14 +1679,7 @@ fn infer_installed_mcp_config(
             &["context_servers", "ai-memory"],
             "url",
         )),
-        // MCP-only client: no AgentChoice counterpart routes here. Muse
-        // Code's hook surface is documented, but its SessionStart output
-        // contract is not, so no lifecycle integration claims it yet.
-        McpClient::Muse => Ok(infer_json_mcp_config(
-            &content,
-            &["mcp_servers", "ai-memory"],
-            "url",
-        )),
+        McpClient::Muse => Ok(infer_muse_mcp_config(&content)),
         // MCP-only client: no AgentChoice counterpart routes here. Prime
         // Agent 0.10 has no lifecycle hooks, and its entry names the token
         // variable rather than carrying a bearer, so only the URL is there.
@@ -1738,6 +1754,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Hermes => None,
         AgentChoice::CopilotCli => Some(McpClient::CopilotCli),
         AgentChoice::Droid => Some(McpClient::Droid),
+        AgentChoice::Muse => Some(McpClient::Muse),
     }
 }
 
@@ -1815,6 +1832,41 @@ fn infer_json_mcp_config(
         .and_then(|headers| headers.get("Authorization"))
         .and_then(|v| v.as_str())
         .and_then(bearer_token_from_header);
+    Some(InferredMcpConfig {
+        hook_server_url,
+        auth_token,
+    })
+}
+
+/// Infer the hook server URL and bearer from Muse's `ai-memory` entry, under
+/// `mcpServers` or the legacy `mcp_servers`. The entry `install-mcp --client
+/// muse` writes is the stdio bridge, whose upstream is its `--server-url`
+/// argument and whose token, when one was given explicitly, is the literal
+/// `env.AI_MEMORY_AUTH_TOKEN`; an older streamable-HTTP entry carries `url`
+/// and an `Authorization` header instead. A `${...}` reference is never taken
+/// for a token.
+fn infer_muse_mcp_config(content: &str) -> Option<InferredMcpConfig> {
+    let root: serde_json::Value = serde_json::from_str(content).ok()?;
+    let entry = ["mcpServers", "mcp_servers"]
+        .iter()
+        .find_map(|key| root.get(*key)?.get("ai-memory"))?;
+    let hook_server_url = entry
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| install_mcp::bridge_entry_url(entry))
+        .and_then(hook_server_url_from_mcp_url);
+    let auth_token = entry
+        .get("headers")
+        .and_then(|headers| headers.get("Authorization"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(bearer_token_from_header)
+        .or_else(|| {
+            entry
+                .pointer("/env/AI_MEMORY_AUTH_TOKEN")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|token| !token.trim().is_empty() && !token.contains("${"));
     Some(InferredMcpConfig {
         hook_server_url,
         auth_token,
@@ -7009,6 +7061,102 @@ fn render_droid(
     Ok(())
 }
 
+/// Merge ai-memory's entries into the `hooks` key of Muse's `settings.json`,
+/// keeping `schema_version`, every unknown key and every other hook in it,
+/// idempotently, with a backup next to the file on change. Muse fails every
+/// command at startup when the file has no `schema_version`, so a new file
+/// gets `"schema_version": 1`; an existing value is never rewritten.
+fn apply_to_muse_settings(
+    path: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = super::render_shared::build_muse_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: build_muse_hooks_payload didn't return a hooks object")?;
+    let outcome = apply_atomic(path, |existing| {
+        mutate_json(existing, |root| {
+            root.entry("schema_version")
+                .or_insert_with(|| serde_json::Value::from(1));
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in the Muse settings.json but not an object")?;
+            for (event, value) in our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    print!("{MUSE_INSTALL_NOTES}");
+    Ok(())
+}
+
+const MUSE_INSTALL_NOTES: &str = "\
+# NOTE: Muse adds SessionStart's additionalContext to the session, so the
+#       prior session's handoff is delivered automatically, and its own
+#       SessionEnd closes the session.
+# NOTE: Muse runs hooks with a cleared environment, so the server URL and
+#       data dir are baked into each command; re-run this command after
+#       changing either. Start a new muse session to load the new hooks.
+";
+
+/// Print the `hooks` block for Muse's `settings.json` (dry-run counterpart of
+/// [`apply_to_muse_settings`]).
+fn render_muse(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_muse_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let mut snippet = serde_json::Map::new();
+    snippet.insert("schema_version".into(), serde_json::Value::from(1));
+    snippet.insert("hooks".into(), payload["hooks"].clone());
+    let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(snippet))
+        .context("serializing Muse hook config")?;
+    println!("# Meta Muse Code hook config — merge the `hooks` entries into");
+    println!("# ${{XDG_CONFIG_HOME:-~/.config}}/muse/settings.json, or re-run with --apply");
+    println!("# to merge them in place. Keep \"schema_version\": 1: without it every");
+    println!("# muse command fails at startup.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat the file as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
+    }
+    print!("{MUSE_INSTALL_NOTES}");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 fn render_devin(
     hooks_dir: &Path,
     server_url: &str,
@@ -7962,6 +8110,227 @@ mod tests {
         assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["matcher"], "Execute");
         assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+    }
+
+    fn muse_args(config_file: &Path) -> InstallHooksArgs {
+        InstallHooksArgs {
+            agent: AgentChoice::Muse,
+            config_file: Some(config_file.to_path_buf()),
+            ..default_hook_args()
+        }
+    }
+
+    /// `install-hooks --agent muse --apply` merges native `--agent muse`
+    /// commands under the `hooks` key of Muse's `settings.json`: one
+    /// catch-all (`matcher: ""`) group per event with a timeout in seconds,
+    /// `schema_version` and every unknown key kept, third-party hooks kept,
+    /// and a re-apply changes nothing.
+    #[test]
+    fn muse_apply_merges_native_hooks_into_settings_and_is_idempotent() {
+        let muse = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let settings = muse.path().join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({
+                "schema_version": 1,
+                "theme": "dark",
+                "mcpServers": {"x": {"type": "stdio", "command": "x", "mode": "optional"}},
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "bash",
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh", "timeout": 5}]
+                    }],
+                    "Notification": [{"hooks": [{"type": "command", "command": "notify-send hi"}]}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = muse_args(&settings);
+
+        apply_to_muse_settings(&settings, "http://memory:49374", None, data.path(), &args).unwrap();
+        let first = fs::read_to_string(&settings).unwrap();
+        apply_to_muse_settings(&settings, "http://memory:49374", None, data.path(), &args).unwrap();
+        assert_eq!(
+            first,
+            fs::read_to_string(&settings).unwrap(),
+            "re-apply is a no-op"
+        );
+        let backups = fs::read_dir(muse.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".bak-")
+            })
+            .count();
+        assert_eq!(backups, 1, "only the first apply changed the file");
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["schema_version"], 1);
+        assert_eq!(root["theme"], "dark");
+        assert_eq!(root["mcpServers"]["x"]["command"], "x");
+        let hooks = &root["hooks"];
+        for (event, script) in super::super::render_shared::MUSE_EVENTS {
+            let entries = hooks[event].as_array().unwrap();
+            let ours: Vec<_> = entries
+                .iter()
+                .filter(|e| is_ai_memory_hook_entry(e))
+                .collect();
+            assert_eq!(ours.len(), 1, "{event}: exactly one ai-memory entry");
+            assert_eq!(ours[0]["matcher"], "", "{event}");
+            let handler = &ours[0]["hooks"][0];
+            assert_eq!(handler["type"], "command", "{event}");
+            assert_eq!(
+                handler["timeout"],
+                super::super::render_shared::MUSE_HOOK_TIMEOUT_SECS,
+                "{event}"
+            );
+            let command = handler["command"].as_str().unwrap();
+            let stem = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!(" hook --event {stem} --agent muse --server-url ")),
+                "{event}: {command}"
+            );
+            assert!(
+                command.contains("--data-dir"),
+                "{event}: Muse clears the hook environment, so the data dir is baked in: {command}"
+            );
+            assert!(
+                !command.contains(".sh"),
+                "{event}: no script bundle: {command}"
+            );
+        }
+        assert!(hooks.get("SubagentStart").is_none());
+        assert!(hooks.get("SubagentStop").is_none());
+        assert_eq!(
+            hooks["Notification"][0]["hooks"][0]["command"],
+            "notify-send hi"
+        );
+        let pre = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["matcher"], "bash");
+        assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+    }
+
+    /// A new settings file gets `"schema_version": 1` (without it every
+    /// muse command fails at startup); an existing value is never rewritten;
+    /// a non-object `hooks` is refused.
+    #[test]
+    fn muse_apply_creates_schema_version_and_never_rewrites_it() {
+        let muse = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let fresh = muse.path().join("fresh").join("settings.json");
+        apply_to_muse_settings(
+            &fresh,
+            "http://memory:49374",
+            None,
+            data.path(),
+            &muse_args(&fresh),
+        )
+        .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(root["schema_version"], 1);
+
+        let future = muse.path().join("future.json");
+        fs::write(&future, r#"{"schema_version":2}"#).unwrap();
+        apply_to_muse_settings(
+            &future,
+            "http://memory:49374",
+            None,
+            data.path(),
+            &muse_args(&future),
+        )
+        .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&future).unwrap()).unwrap();
+        assert_eq!(root["schema_version"], 2);
+
+        let broken = muse.path().join("broken.json");
+        fs::write(&broken, r#"{"schema_version":1,"hooks":[]}"#).unwrap();
+        assert!(
+            apply_to_muse_settings(
+                &broken,
+                "http://memory:49374",
+                None,
+                data.path(),
+                &muse_args(&broken)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&broken).unwrap(),
+            r#"{"schema_version":1,"hooks":[]}"#
+        );
+    }
+
+    /// The default Muse settings path comes from the captured environment:
+    /// `XDG_CONFIG_HOME` when it is absolute.
+    #[test]
+    fn muse_settings_path_reads_xdg_config_home_from_the_runtime_env() {
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "XDG_CONFIG_HOME",
+            "/xdg-from-env",
+        )]);
+        assert_eq!(
+            muse_settings_path(&env).unwrap(),
+            Path::new("/xdg-from-env/muse/settings.json")
+        );
+    }
+
+    /// `install-hooks --agent muse` infers the server and an explicit token
+    /// from the bridge entry `install-mcp --client muse` writes, under either
+    /// server map, and from an older streamable-HTTP entry; a `${...}`
+    /// reference is never taken for a token.
+    #[test]
+    fn muse_mcp_inference_reads_the_bridge_entry_under_either_map() {
+        let bridge = |key: &str, token: &str| {
+            serde_json::json!({
+                "schema_version": 1,
+                key: {"ai-memory": {
+                    "type": "stdio",
+                    "command": "ai-memory",
+                    "args": ["mcp-bridge", "--agent", "muse", "--server-url", "http://memory:49374/mcp"],
+                    "env": {"AI_MEMORY_AUTH_TOKEN": token},
+                    "mode": "optional"
+                }}
+            })
+            .to_string()
+        };
+        for key in ["mcpServers", "mcp_servers"] {
+            let inferred = infer_muse_mcp_config(&bridge(key, "tok")).unwrap();
+            assert_eq!(
+                inferred.hook_server_url.as_deref(),
+                Some("http://memory:49374"),
+                "{key}"
+            );
+            assert_eq!(inferred.auth_token.as_deref(), Some("tok"), "{key}");
+        }
+        let reference =
+            infer_muse_mcp_config(&bridge("mcpServers", "${AI_MEMORY_AUTH_TOKEN}")).unwrap();
+        assert_eq!(reference.auth_token, None);
+        let legacy = serde_json::json!({"mcp_servers": {"ai-memory": {
+            "transport": "streamable_http",
+            "url": "http://old:49374/mcp",
+            "headers": {"Authorization": "Bearer old-token"}
+        }}})
+        .to_string();
+        let inferred = infer_muse_mcp_config(&legacy).unwrap();
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://old:49374")
+        );
+        assert_eq!(inferred.auth_token.as_deref(), Some("old-token"));
+        assert!(infer_muse_mcp_config(r#"{"mcpServers":{}}"#).is_none());
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::Muse),
+            Some(McpClient::Muse)
+        );
     }
 
     /// Droid reads `settings.json`'s `hooks` only while `hooks.json` is
