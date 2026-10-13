@@ -715,6 +715,45 @@ series, and scope is never a label. The route sits behind the same
 `require_root_for_multiuser_admin` gate as every `/admin/*` route: root-only once
 the deployment distinguishes operators. Counters reset on restart.
 
+### Web search and the recall trace
+
+A project search in the web UI (`/web/search` with `workspace` and `project`)
+and a scoped `/api/v1/search` (one project or `scopes`) rank through the same
+three shared steps as a `memory_query` project/scopes search:
+`ai_memory_llm::embed_search_query` embeds the query with the configured
+embedder, `ReaderPool::hybrid_search_scopes` fuses FTS5, entity, vector, graph
+and observation streams and applies the authority adjustment (merging several
+scopes by best rank, then rank, path and id), and the optional
+`ai_memory_llm::RerankStage` reorders a bounded prefix. `serve` reads the config
+once and hands the same embedder and rerank stage to the MCP server and to
+`WebState` (`ai_memory_web::Recall`); the stage's four-call concurrency gate is
+shared, so the web search cannot add provider calls past it. A search with no
+scope stays the cross-project FTS5 ranker, as `memory_query(global=true)` is.
+`ai-memory-mcp/tests/suite/web_search_parity.rs` holds the orders together.
+`explain=1` on a project search renders, per hit, each stream's rank, raw score
+and RRF contribution, the fused score, the authority multiplier, the intent
+boost and the rerank score when present, plus the per-stream timings
+(`StreamTimings`). A project search resolves its scope with the guarded no-create
+lookup, so a restricted project refuses a viewer with no grant before any ranking
+runs.
+
+### Web health panel
+
+`/web/health` is a read-only page behind the same `Capability::Admin` decision
+as `/web/pending` and `/admin/*`: root-only once the deployment distinguishes
+operators. It shows the hook counters (the `IngestMetrics` behind
+`/admin/metrics`, including the 429s from saturation and rate limiting), the
+writer queue depth, the hook spool and recovery journal under the server's data
+directory (`ServeHealthProbe` in `serve.rs`), the SessionEnd consolidation queue
+(`ReaderPool::session_consolidation_queue`: counts per state, last completion,
+oldest pending request), the configured embedder and both providers' passive
+health, and the derived-index and storage figures. `ai_memory_web::health::checks`
+turns those into warnings with the fix commands `ai-memory status` prints
+(`ai_memory_core::fix_lines`: `ai-memory recover`, `ai-memory compact --confirm`,
+`ai-memory embed`, `ai-memory embed --force`, and the LLM provider's retry hint).
+The page holds counts, timestamps and configured labels only; provider error text,
+page content and scope names never reach it.
+
 ## CLI subcommand surface
 
 ```
@@ -740,10 +779,26 @@ api-key                     export-okf           message
 doctor                      backfill             project
 reclaim-ledger-versions     repair-backfill-timestamps
 server                      backup-agents        restore-agents
-profile
+profile                     setup
 ```
 
 Run `ai-memory --help` for the full tree.
+
+`setup` is the one-step native install. It is a thin composition of existing
+library calls: `init` (which mints the root bearer on a fresh data dir), a
+per-user service rendered from `packaging/systemd/ai-memory-user.service` or
+the launchd LaunchAgent template with the running binary, data dir and config
+path filled in, then `install-mcp`, `install-hooks` and global
+`install-skills` for each agent named with `--agent` or detected from its
+session store or MCP config (the stores `doctor` scans). It finishes with a
+read-only self-check: `/healthz`, a `memory_status` call over MCP, and
+`doctor`. The service manager is reached through an injectable runner, so the
+unit rendering and the `systemctl`/`launchctl` calls are tested without a real
+session. Windows has no service step. A second run changes no file. Each
+rendered unit carries an identity line with the SHA-256 of the rest of the
+file; `uninstall` stops and removes only a unit whose digest still matches.
+`install.sh`, a release asset with its own `.sha256`, installs the release
+tarball under `~/.local` after checking it against the published checksum.
 
 `auth enable` turns on the root bearer for an install created before
 new installs got one; see [`[auth]` root bearer](#auth-root-bearer).
@@ -1351,7 +1406,9 @@ the server URL is loopback and no `default` server profile is registered.
 * **Richer read surfaces for the web UI.** The multi-workspace read-only
   wiki browser shipped in `ai-memory-web` (`/web`: project list, page
   tree, page view, page history with a server-side unified diff, a paged
-  session timeline, search, and the root-only `/web/pending` triage page,
+  session timeline, project search through `memory_query`'s hybrid ranker
+  with a recall trace, the root-only `/web/health` panel, and the root-only
+  `/web/pending` triage page,
   whose approve and reject buttons post to the existing
   `/admin/pending-writes/*` routes). It stays read-only by design: the wiki is a
   machine-authored record, and a browser edit surface would break the
@@ -1363,11 +1420,16 @@ the server URL is loopback and no `default` server profile is registered.
   applies: an expired version is neither listed nor readable by id, and a page
   whose live version expired shows no history, since the forget sweep deletes
   every row at its path. Better *reading*
-  (graph exploration, recall traces) is open. See
+  (graph exploration) is open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
-* **Real LongMemEval-S harness.** The recall-eval framework exists
-  ([`crates/ai-memory-consolidate/tests/suite/recall_eval.rs`](../crates/ai-memory-consolidate/tests/suite/recall_eval.rs));
-  porting LongMemEval-S itself requires the dataset.
+* **Retrieval measurement gaps.** The LongMemEval-S harness ships in
+  `evals/` (pipeline, component and decomposition modes; results in
+  [`docs/benchmarks/`](benchmarks/README.md)), next to the recall-eval
+  framework
+  ([`crates/ai-memory-consolidate/tests/suite/recall_eval.rs`](../crates/ai-memory-consolidate/tests/suite/recall_eval.rs)).
+  Still unmeasured: a full-set local-embeddings run with the observation
+  stream, and `belief_authority_weight`, which needs an LLM-consolidated
+  corpus because zero-LLM session pages carry no `page_evidence`.
 
 ## Reading order
 

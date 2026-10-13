@@ -525,6 +525,15 @@ jobs:
             sha256sum ai-memory-hooks.tar.gz > ai-memory-hooks.tar.gz.sha256
           )
 
+      - name: Stage checksum-verified install script
+        run: |
+          set -euo pipefail
+          install -m 0755 install.sh artifacts/install.sh
+          (
+            cd artifacts
+            sha256sum install.sh > install.sh.sha256
+          )
+
       - name: Generate release body
         run: |
           echo "## Checksums (SHA256)" > body.md
@@ -534,6 +543,10 @@ jobs:
           echo "" >> body.md
           echo "## Install" >> body.md
           echo '```bash' >> body.md
+          echo "# Linux/macOS, no root: checksum-verified release binary under ~/.local, then one-step setup" >> body.md
+          echo "curl -fsSL https://github.com/akitaonrails/ai-memory/releases/download/${GITHUB_REF_NAME}/install.sh | AI_MEMORY_VERSION=${{ needs.validate-version.outputs.version }} sh" >> body.md
+          echo "ai-memory setup" >> body.md
+          echo "" >> body.md
           echo "# Arch Linux (AUR)" >> body.md
           echo "yay -S ai-memory-bin      # prebuilt Linux x86_64/aarch64 binary" >> body.md
           echo "yay -S ai-memory          # builds from source" >> body.md

@@ -9,6 +9,7 @@ use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
 
 mod api;
+mod health;
 mod history;
 mod index;
 mod login;
@@ -70,6 +71,43 @@ pub(crate) async fn resolve_read_scope(
     .await
 }
 
+/// Refuse a root-only page unless the caller may use `/admin`, with the same
+/// `Capability::Admin` decision `require_root_for_multiuser_admin` makes:
+/// anonymous on a multi-user server is 401, a non-root user 403.
+pub(crate) async fn require_admin(
+    state: &WebState,
+    level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+) -> Result<(), axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::{Html, IntoResponse};
+    let level = level.map_or(
+        ai_memory_core::AuthLevel::Anonymous,
+        |axum::Extension(level)| level,
+    );
+    let distinguishes_operators = state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    match level.authorize(ai_memory_core::Capability::Admin, distinguishes_operators) {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_authentication_required() => Err(StatusCode::UNAUTHORIZED.into_response()),
+        Err(_) => {
+            use askama::Template;
+            let mut response = match (crate::templates::AdminRequiredView {}).render() {
+                Ok(body) => (StatusCode::FORBIDDEN, Html(body)).into_response(),
+                Err(_) => StatusCode::FORBIDDEN.into_response(),
+            };
+            // A 403 here means "not root", not "change your password": keep
+            // the HTML auth redirect from sending the user to that form.
+            response
+                .extensions_mut()
+                .insert(crate::html_auth::AdminRequired);
+            Err(response)
+        }
+    }
+}
+
 /// Build the read-only wiki page router (no static assets — those are public).
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
@@ -83,6 +121,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         )
         .route("/search", get(search::handler))
         .route("/pending", get(pending::handler))
+        .route("/health", get(health::handler))
         .with_state(state)
 }
 

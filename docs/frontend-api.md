@@ -11,7 +11,7 @@
 
 | | What you can do | What you can't do |
 |---|---|---|
-| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; list a page's stored versions and diff two of them; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls, and `crates/ai-memory-web/clippy.toml` forbids the `Wiki` write and destructive methods anywhere in the crate, so adding one fails `cargo clippy -D warnings`. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
+| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; list a page's stored versions and diff two of them; search (global FTS5, or scoped through `memory_query`'s hybrid ranker, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls, and `crates/ai-memory-web/clippy.toml` forbids the `Wiki` write and destructive methods anywhere in the crate, so adding one fails `cargo clippy -D warnings`. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
 | `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy. Use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
@@ -50,7 +50,20 @@ position). Both follow the same per-project read rule as the page view.
 The builtin wiki also serves the root-only `GET {web_slug}/pending` page. It
 lists pending auto-improvement proposals and posts approve and reject to the
 existing `/admin/pending-writes/*` routes. A signed-in non-root user gets a
-403 page, not the change-password redirect. Start
+403 page, not the change-password redirect. The root-only
+`GET {web_slug}/health` page follows the same gate: hook counters (accepted,
+shed, 429), writer queue, the spool and recovery journal under the server's
+data directory, the consolidation queue, embedder and provider state, and the
+failing server-side checks with their fix commands. It is HTML only, answers
+`Cache-Control: private, no-store`, and shows counts, timestamps and configured
+labels, never provider error text or page content.
+`GET {web_slug}/search?q=…&workspace=…&project=…&explain=1` is the project
+search: the same hybrid ranker and per-project read rule as a scoped
+`/api/v1/search` (§4.5), and with `explain=1` a recall trace (per-hit stream
+ranks, raw scores, RRF contributions, fused score, authority, intent boost,
+rerank score, plus per-stream timings). `limit` clamps to `1..=100`, default
+`20`; without a scope it is the cross-project FTS5 search (default `50`), whose
+trace is the FTS time alone. Start
 with:
 
 ```http
@@ -265,7 +278,16 @@ Rules:
   top-level `workspace`/`project`.
 - `snippet` contains FTS5 HTML markers (`<mark>…</mark>`) around the
   matched terms.
-- `rank` is FTS5 rank; **lower is better** (closer to query terms).
+- A **global** search (no scope) is FTS5 over every project the caller may
+  read, like `memory_query(global=true)`; `rank` is the FTS5 rank.
+- A **scoped** search (`workspace`+`project`, or `scopes`) runs the hybrid
+  ranker `memory_query` uses for a project: FTS5, entity, vector (when the
+  server has an embedder), graph and observation streams fused by RRF, the
+  bounded authority adjustment, and the optional reranker. The same query
+  returns the same order as `memory_query`; `rank` is the negated,
+  authority-adjusted fused score. Several `scopes` merge by best rank per
+  page.
+- `rank`: **lower is better** in both modes.
 
 ### 4.6 Recent
 
@@ -773,7 +795,7 @@ The trailing-slash redirect at `{base_path}{web_slug}/` →
 client-side and never reach the server.
 
 When `--web-ui-dir` is **absent**, the built-in server-side `/web`
-browser is the default (read-only HTML rendering, FTS5 search,
+browser is the default (read-only HTML rendering, search,
 project tree), unchanged from before.
 
 ## 7. Worked example: minimal SPA fetch
@@ -865,6 +887,8 @@ Read these:
 | Response structs (`PageHit`, `WorkspaceSummary`, `BriefingSnapshot`, `HealthPage`, `SessionSummary`, `ObservationRecord`, …) | `crates/ai-memory-store/src/reader.rs` |
 | Session listing + per-session observation readers (`sessions_for_scope`, `session_summary_scoped`, `session_observations_scoped`) | `crates/ai-memory-store/src/reader.rs` |
 | Page-history readers (`page_versions`, `page_version_body`) and the bounded diff | `crates/ai-memory-store/src/reader.rs`, `crates/ai-memory-web/src/diff.rs` |
+| Scoped search ranker shared with `memory_query` (`hybrid_search_scopes`) | `crates/ai-memory-web/src/recall.rs`, `crates/ai-memory-store/src/reader.rs` |
+| Health panel checks and fix lines | `crates/ai-memory-web/src/health.rs`, `crates/ai-memory-core/src/fix_lines.rs` |
 | 27 integration tests covering every endpoint (auth, 400s, 404s, multi-scope correctness, SPA fallback) | `crates/ai-memory-web/tests/routes.rs` |
 | Auth + middleware layering | `crates/ai-memory-cli/src/commands/serve.rs` (`mount_web_router`, `apply_http_layers`) |
 | Custom-UI dir validation | `crates/ai-memory-cli/src/commands/serve.rs` (`validate_web_ui_args`) |

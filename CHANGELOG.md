@@ -8,6 +8,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a recall trace to web search. A project page has its own search box,
+  and a search with `workspace` and `project`
+  (`/web/search?q=…&workspace=…&project=…`) now ranks with the same hybrid
+  ranker as `memory_query` for that project: FTS5, entity, vector, graph and
+  observation streams, the authority adjustment, and the reranker when one is
+  configured. The server now hands its configured embedder and reranker to the
+  web UI, and the reranker's four-call concurrency limit is shared with
+  `memory_query`. With "Explain ranking" (`explain=1`) each hit shows its rank,
+  raw score and RRF contribution in every stream, the fused score, the
+  authority multiplier, and the intent boost and rerank score when present;
+  the page also lists the streams that ran, the embedder and reranker in use,
+  and each stream's time in milliseconds. A scoped `/api/v1/search` (one
+  project or `scopes`) uses the same ranker, so it returns the same order as
+  `memory_query`, and its `rank` is now the fused rank. A search without a
+  scope is still the cross-project FTS5 search, as `memory_query(global=true)`
+  is. Project search follows the per-project read rule: a viewer without a
+  grant on a restricted project gets a 403 and no trace, and an unknown project
+  is a 404.
+- Added a root-only server health page at `/web/health`, linked from the web UI
+  header. It shows the hook counters since the server started (accepted, shed
+  with 429 by saturation or rate limit, stored, failed, dropped), the writer
+  queue depth, the hook spool and recovery journal in the server's data
+  directory, the consolidation queue (last completion, pending, running,
+  completed and failed jobs), the configured embedder, both providers' status
+  and the stored vector identities. Failing checks are listed with the command
+  that fixes them, the same lines `ai-memory status` prints: `ai-memory
+  recover` for a backed-up spool or journal, `ai-memory compact --confirm` for
+  reclaimable space, `ai-memory embed` for pages without vectors, `ai-memory
+  embed --force` for vectors made under another model, and the LLM provider's
+  retry command. The page is read-only and is gated like `/web/pending`: on a
+  multi-user server anonymous requests get a 401 and database users a 403. It
+  never shows provider error text, page content or project names.
+- Added a two-command native install for Linux and macOS:
+  `curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh`,
+  then `ai-memory setup`. `install.sh` is a new release asset with its own
+  `install.sh.sha256`. It downloads the release tarball for the machine, checks
+  it against the published `.sha256` file and refuses to install when that file
+  is missing, names another asset or does not match, or when the archive holds
+  an absolute or `..` path. It unpacks under `~/.local/lib/ai-memory`, links
+  `~/.local/bin/ai-memory`, needs no root, leaves an existing non-link
+  `ai-memory` (such as the Docker wrapper) alone, and runs nothing when the
+  download is cut short. The new `ai-memory setup [--yes] [--agent <name>]...
+  [--no-service]` runs `init` (a fresh data dir gets the root bearer token),
+  installs and starts a per-user service rendered from the packaged systemd
+  user unit or launchd LaunchAgent with this install's binary, data dir and
+  config, wires MCP, hooks and global Agent Skills for each named or detected
+  agent, and ends with a read-only check of `/healthz`, `memory_status` and
+  `doctor`. It shows the plan and asks first; without a terminal it changes
+  nothing unless given `--yes`. A second run changes nothing. Windows has no
+  service step. `ai-memory uninstall --apply` stops and removes that service,
+  but only a unit `setup` wrote and nobody edited since; any other unit at that
+  path is left alone and reported. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
+  ai-memory for its user, and `scripts/onboarding-acceptance.sh` measures the
+  path from a clean home to the first returned memory.
 - Added page history and session replay to the read-only web UI. Each page
   links to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version,
   newest first, superseded ones included, so a version a concurrent write
@@ -268,11 +322,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `auth: none (loopback)` with the fix, `ai-memory auth enable`.
 
 ### Changed
+- Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
+  `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
+  FTS5 alone, so it returns the same order as `memory_query`, and `rank` is
+  now the fused rank. Cross-project search without a scope is unchanged.
 - Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
   Code, Goose, Qwen Code and OpenHuman in `docs/install.md`, and listed them
   in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
   the client's own documentation at a named version and has not yet been run
   end to end. Aider is not listed because it has no MCP support.
+- Published `docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md`, which
+  splits the LongMemEval-S retrieval number into capture cost, ranking quality
+  and harness artifacts, and records what the observation stream recovered
+  (zero-LLM FTS `hit@5` 0.666 → 0.868 on all 470 questions). The benchmark,
+  evals and comparison docs no longer blame the 2 KB excerpt cap for the gap
+  (pages holding exactly the captured text score 0.968 against 0.972 for whole
+  sessions) and no longer attribute agentmemory's 0.967 to LongMemEval-S: it is
+  the grep baseline on agentmemory's in-house corpus, and its LongMemEval-S
+  figure is 95.2% from a component harness with the reranker disabled, not
+  like-for-like with ai-memory's pipeline numbers. `docs/comparison.md` gains a
+  "From agentmemory" migration note.
 - Changed `memory_query` ranking to include the observation stream by
   default, after it raised hit@5 on the retrieval eval for both zero-LLM and
   local-embedding search while staying inside its latency and context-token
@@ -294,7 +363,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server's credential. The Docker wrapper hands a host command (`install-hooks`,
   `mcp-bridge`, `run`) the token of a server initialized on its volume as an
   owner-only file that `install-hooks` copies from the volume, never on a
-  command line.
+  command line. With no human accounts the built-in web UI answers a browser
+  with a Basic sign-in prompt instead of redirecting to a login form that
+  could not succeed: any username, and the token file's contents as the
+  password. `ai-memory setup` prints that URL and the file to read, never the
+  token. The macOS menu bar app reads the token from its data dir when none is
+  saved in Settings, so an install it initialized turns green without pasting
+  anything.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites

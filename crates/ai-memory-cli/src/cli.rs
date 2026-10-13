@@ -113,6 +113,11 @@ pub struct Cli {
 pub enum Command {
     /// Initialise the data directory layout.
     Init(InitArgs),
+    /// Set up a native install in one step: `init`, a user service
+    /// (systemd `--user` or a launchd LaunchAgent), and hooks, MCP and skills
+    /// for every detected agent, then a read-only self-check. Shows the plan
+    /// and asks first unless `--yes` is given. Re-running changes nothing.
+    Setup(SetupArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
     /// List every workspace/project pair the server knows about (plain,
@@ -1972,6 +1977,26 @@ pub struct InitArgs {
     /// Overwrite an existing `config.toml` if present.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for `setup`.
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Apply the plan without asking. Without it, `setup` shows the plan and
+    /// asks on a terminal, or exits non-zero when there is no terminal to
+    /// ask on.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Wire this agent instead of the detected ones. Repeat for several.
+    /// Detection looks for each harness's session store or MCP config under
+    /// your home; OpenCode 2 and the Kiro CLI v3 engine are only wired when
+    /// named here.
+    #[arg(long = "agent", value_enum)]
+    pub agents: Vec<AgentChoice>,
+    /// Do not install or start a user service; use this when the server
+    /// already runs some other way (Docker, a packaged system unit).
+    #[arg(long)]
+    pub no_service: bool,
 }
 
 /// Arguments for `status`.

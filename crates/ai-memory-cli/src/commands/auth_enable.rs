@@ -518,10 +518,17 @@ mod tests {
                 path.display()
             );
         }
+        // Compare canonical paths: the token path comes from the canonical
+        // data dir, which differs from the walked temp path on macOS
+        // (`/var` -> `/private/var`) and Windows (`\\?\` and 8.3 names).
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let allowed_paths = [
+            canonical(&first.token_path),
+            canonical(&crate::config::hook_auth_token_path_in(&data_dir)),
+            canonical(&crate::config::hook_auth_header_path_in(&data_dir)),
+        ];
         for (path, text) in files_under(&data_dir) {
-            let allowed = path == first.token_path
-                || path == crate::config::hook_auth_token_path_in(&data_dir)
-                || path == crate::config::hook_auth_header_path_in(&data_dir);
+            let allowed = allowed_paths.contains(&canonical(&path));
             assert!(
                 allowed || !text.contains(&token),
                 "token copied to an unexpected file {}",

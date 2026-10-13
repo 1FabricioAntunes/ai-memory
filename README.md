@@ -194,6 +194,26 @@ differs, and the published benchmark, is in [How ai-memory compares](docs/compar
 
 ## Quick start
 
+### Linux and macOS (two commands, no root)
+
+```bash
+curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh
+ai-memory setup
+```
+
+`install.sh` downloads the release for your OS and CPU, checks it against the
+release's published SHA-256 checksum (it refuses to install without a match),
+and links `~/.local/bin/ai-memory`. `ai-memory setup` then creates the data
+directory with a bearer token in an owner-only file, starts a per-user service
+(systemd `--user` or a launchd LaunchAgent), and wires MCP, hooks and Agent
+Skills for every agent it finds, or the ones you name with `--agent`. It shows
+the plan and asks first; `--yes` skips the question, and running it again
+changes nothing. Restart your agents afterwards. Details, the environment
+variables and how to verify the script before running it are in
+[`docs/install.md`](docs/install.md#one-step-native-install-installsh--ai-memory-setup).
+An AI agent installing ai-memory for you can follow
+[`INSTALL_FOR_AGENTS.md`](INSTALL_FOR_AGENTS.md).
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install

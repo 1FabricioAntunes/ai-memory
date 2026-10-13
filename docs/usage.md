@@ -525,7 +525,14 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and FTS5 search. Each page links
+breadcrumbs, rendered markdown, metadata, and search. The search box in the
+header searches every project with FTS5, like `memory_query(global=true)`. The
+search on a project page ranks with the same hybrid ranker as `memory_query`
+for that project, and its "Explain ranking" box shows each hit's stream ranks,
+RRF contributions, authority and rerank score, plus the per-stream timings.
+Root also gets `/web/health`: hook counters (429s included), the writer queue,
+the local spool and recovery journal, the consolidation queue, embedder and
+provider state, and the failing checks with the command that fixes each. Each page links
 to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version, newest
 first, with the author where the write was attributed, and a unified diff
 between any two of them (by default the latest against the version it

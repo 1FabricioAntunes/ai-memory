@@ -671,6 +671,7 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
         "ai-memory-wrapper.cmd",
         "ai-memory-install-hooks",
         "ai-memory-hooks.tar.gz",
+        "install.sh",
     ] {
         assert!(release.contains(asset), "release must publish {asset}");
         assert!(

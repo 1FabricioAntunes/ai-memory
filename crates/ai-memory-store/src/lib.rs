@@ -86,16 +86,16 @@ pub use reader::{
     AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
-    GraphVia, HealthDetail, HealthPage, InboxCount, InboxEntry, ObservationHit, ObservationOrder,
-    ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
+    GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
+    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
     PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta,
     PageSummary, PageVersion, PageVersionBody, PageVersions, ProjectCoordinateCollisionReason,
     ProjectCoordinateDiagnostic, ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH,
     RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
-    RrfContributions, ScopeRow, SearchExplain, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionSummary, SettledPage, StatusCounts, StorageStatus,
-    StoredEmbedding, StoredPageBody, StreamTimings, WorkspaceScopeRow, WorkspaceSummary,
-    f32_vec_to_bytes,
+    RrfContributions, ScopeRow, SearchExplain, SessionConsolidationQueue,
+    SessionConsolidationSummary, SessionDependentRows, SessionEndDisposition, SessionSummary,
+    SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings,
+    VectorQuery, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{

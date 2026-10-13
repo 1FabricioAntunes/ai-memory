@@ -729,6 +729,37 @@ fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
 
+/// A query embedding plus the stored-vector identity it may be compared
+/// against, borrowed for one [`ReaderPool::hybrid_search_scopes`] call.
+#[derive(Debug, Clone, Copy)]
+pub struct VectorQuery<'a> {
+    /// The query embedding.
+    pub vector: &'a [f32],
+    /// Provider of the eligible stored vectors.
+    pub provider: &'a str,
+    /// Model identity of the eligible stored vectors.
+    pub model: &'a str,
+    /// Dimensionality of the eligible stored vectors.
+    pub dim: u32,
+}
+
+/// One [`ReaderPool::hybrid_search_scopes`] request.
+#[derive(Debug, Clone, Copy)]
+pub struct HybridSearch<'a> {
+    /// Free-text query.
+    pub query: &'a str,
+    /// Query embedding; `None` skips the vector stream.
+    pub vector: Option<VectorQuery<'a>>,
+    /// Most hits returned.
+    pub limit: usize,
+    /// See [`ReaderPool::search_pages_for_project`]; `None` means now.
+    pub expiry_cutoff_us: Option<i64>,
+    /// Let superseded page versions into the candidate pool.
+    pub include_superseded: bool,
+    /// Attach per-hit [`SearchExplain`] and per-stream [`StreamTimings`].
+    pub explain: bool,
+}
+
 /// Per-query wall time of each retrieval stream, in milliseconds, for an
 /// `explain=true` query. Measured only on the explained path, so a normal
 /// query takes no clock readings for it. A `None` field is a stream that did
@@ -961,6 +992,25 @@ pub struct SessionConsolidationSummary {
     pub state: String,
     /// Provider attempts spent on this generation.
     pub attempts: u32,
+}
+
+/// Server-wide state of the SessionEnd consolidation queue, for the health
+/// panel. Counts and timestamps only: no session ids, scopes or provider
+/// error text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SessionConsolidationQueue {
+    /// Jobs waiting for a worker (including ones backing off to retry).
+    pub pending: u64,
+    /// Jobs a worker holds right now.
+    pub running: u64,
+    /// Jobs that finished.
+    pub completed: u64,
+    /// Jobs that gave up after their attempts.
+    pub failed: u64,
+    /// Unix microseconds of the newest completed job, if any.
+    pub last_completed_at_us: Option<i64>,
+    /// Unix microseconds the oldest pending job was requested, if any.
+    pub oldest_pending_requested_at_us: Option<i64>,
 }
 
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
@@ -5943,6 +5993,123 @@ impl ReaderPool {
         ))
     }
 
+    /// The hybrid ranker over one or more resolved scopes — the single entry
+    /// point `memory_query` and the web search both rank project/scopes
+    /// results through.
+    ///
+    /// One scope returns [`Self::hybrid_search`]'s order untouched. Several
+    /// scopes are searched one at a time and merged: a page id found in more
+    /// than one keeps its best rank, then the union is sorted by rank, path
+    /// and id and cut to `search.limit`. Per-hit [`SearchExplain`] and the
+    /// summed [`StreamTimings`] are returned only when `search.explain` asks
+    /// for them; the normal path reads no clock for them.
+    ///
+    /// The caller resolves `scopes` (and so decides who may read them); this
+    /// never widens past them.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn hybrid_search_scopes(
+        &self,
+        scopes: &[(WorkspaceId, ProjectId)],
+        search: HybridSearch<'_>,
+    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, Option<StreamTimings>)> {
+        // Provider/model/dim only select which stored vectors are eligible;
+        // with no query vector the vector stream never runs, so the empty
+        // triple is inert rather than a fake identity.
+        let (vector, provider, model, dim) = match search.vector {
+            Some(v) => (
+                Some(v.vector.to_vec()),
+                v.provider.to_owned(),
+                v.model.to_owned(),
+                v.dim,
+            ),
+            None => (None, String::new(), String::new(), 0),
+        };
+        let mut timings: Option<StreamTimings> = None;
+        let mut per_scope = Vec::with_capacity(scopes.len());
+        for &(workspace_id, project_id) in scopes {
+            let (hits, scope_timings) = self
+                .hybrid_search_inner(
+                    workspace_id,
+                    project_id,
+                    search.query.to_owned(),
+                    vector.clone(),
+                    provider.clone(),
+                    model.clone(),
+                    dim,
+                    search.limit,
+                    search.expiry_cutoff_us,
+                    search.explain,
+                    search.include_superseded,
+                )
+                .await?;
+            if search.explain {
+                timings
+                    .get_or_insert_with(Default::default)
+                    .accumulate(&scope_timings);
+            }
+            per_scope.push(hits);
+        }
+        let hits = if per_scope.len() == 1 {
+            per_scope.pop().unwrap_or_default()
+        } else {
+            let mut hits_by_id: std::collections::HashMap<
+                PageId,
+                (PageHit, Option<SearchExplain>),
+            > = std::collections::HashMap::new();
+            for hit in per_scope.into_iter().flatten() {
+                match hits_by_id.entry(hit.0.id) {
+                    std::collections::hash_map::Entry::Occupied(mut existing) => {
+                        if hit.0.rank < existing.get().0.rank {
+                            existing.insert(hit);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(hit);
+                    }
+                }
+            }
+            let mut hits: Vec<(PageHit, Option<SearchExplain>)> =
+                hits_by_id.into_values().collect();
+            hits.sort_by(|a, b| {
+                a.0.rank
+                    .partial_cmp(&b.0.rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
+                    .then_with(|| a.0.id.as_bytes().cmp(b.0.id.as_bytes()))
+            });
+            hits.truncate(search.limit);
+            hits
+        };
+        let hits = if search.explain {
+            hits.into_iter()
+                .map(|(hit, explain)| (hit, Some(explain.unwrap_or_default())))
+                .collect()
+        } else {
+            hits
+        };
+        Ok((hits, timings))
+    }
+
+    /// The streams [`Self::hybrid_search_scopes`] runs for a query, in the
+    /// order `memory_query` reports them as `streams_active`.
+    #[must_use]
+    pub fn active_streams(&self, has_query_vector: bool) -> Vec<&'static str> {
+        let mut streams = vec!["fts", "entity"];
+        if has_query_vector {
+            streams.push("vector");
+            if self.tuning.abstract_vectors {
+                streams.push("abstract");
+            }
+        }
+        streams.push("graph");
+        if self.tuning.observation_stream {
+            streams.push("observation");
+        }
+        streams
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn hybrid_search_inner(
         &self,
@@ -10495,6 +10662,46 @@ impl ReaderPool {
                 observations,
                 evidence_rows,
             })
+        })
+        .await
+    }
+
+    /// Server-wide [`SessionConsolidationQueue`] state.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_consolidation_queue(&self) -> StoreResult<SessionConsolidationQueue> {
+        self.with_conn(|conn| {
+            let mut queue = SessionConsolidationQueue::default();
+            let mut stmt = conn
+                .prepare("SELECT state, COUNT(*) FROM session_consolidation_jobs GROUP BY state")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (state, n) = row?;
+                let n = u64::try_from(n).unwrap_or(0);
+                match state.as_str() {
+                    "pending" => queue.pending = n,
+                    "running" => queue.running = n,
+                    "completed" => queue.completed = n,
+                    "failed" => queue.failed = n,
+                    _ => {}
+                }
+            }
+            queue.last_completed_at_us = conn.query_row(
+                "SELECT MAX(completed_at) FROM session_consolidation_jobs \
+                 WHERE state = 'completed'",
+                [],
+                |row| row.get(0),
+            )?;
+            queue.oldest_pending_requested_at_us = conn.query_row(
+                "SELECT MIN(requested_at) FROM session_consolidation_jobs \
+                 WHERE state = 'pending'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(queue)
         })
         .await
     }

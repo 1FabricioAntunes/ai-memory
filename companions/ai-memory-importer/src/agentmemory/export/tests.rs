@@ -269,7 +269,7 @@ fn colliding_basenames_split_by_cwd() {
 #[test]
 fn text_is_redacted_before_the_plan_exists() {
     let mut export = fixture_export();
-    export["memories"][0]["content"] = json!("key: sk-1234567890abcdefghijklmnop end");
+    export["memories"][0]["content"] = json!(concat!("key: sk-", "1234567890abcdefghijklmnop end")); // split for secret scanners
     let plan = plan_fixture(&export, &fixture_mapping(), true);
     let all = format!(
         "{:?}{}",

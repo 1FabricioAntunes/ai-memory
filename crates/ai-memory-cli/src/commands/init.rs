@@ -80,17 +80,22 @@ bearer_token_file = {}
 ///   another way gets a new token at `auth-tokens/default`.
 /// - Anything else, an existing install above all, records nothing and keeps
 ///   the loopback no-auth behaviour it had (`ai-memory auth enable` opts in).
-fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<String>> {
+fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<RecordedBearer>> {
     if let Some(raw) = config
         .auth
         .bearer_token_file
         .as_ref()
         .filter(|raw| !raw.as_os_str().is_empty())
     {
-        if let Some(path) = config.auth.token_file_path() {
-            crate::local_auth::provision_root_token(path)?;
-        }
-        return Ok(Some(raw.to_string_lossy().into_owned()));
+        let token = config
+            .auth
+            .token_file_path()
+            .map(crate::local_auth::provision_root_token)
+            .transpose()?;
+        return Ok(Some(RecordedBearer {
+            raw: raw.to_string_lossy().into_owned(),
+            token,
+        }));
     }
     if !fresh || config.auth.bearer_token.is_some() {
         return Ok(None);
@@ -104,7 +109,29 @@ fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<Str
          route but /healthz; hooks, the CLI and `ai-memory mcp-bridge` read it from there.",
         minted.path.display()
     );
-    Ok(Some(crate::server_profiles::ROOT_TOKEN_RELATIVE.to_owned()))
+    Ok(Some(RecordedBearer {
+        raw: crate::server_profiles::ROOT_TOKEN_RELATIVE.to_owned(),
+        token: Some(minted),
+    }))
+}
+
+/// The `bearer_token_file` a written config records, and the token read from
+/// (or minted into) that file.
+struct RecordedBearer {
+    raw: String,
+    token: Option<crate::local_auth::RootToken>,
+}
+
+/// What one `init` did, for a caller (`setup`) that keeps going in the same
+/// process after it.
+pub(crate) struct InitOutcome {
+    /// The config file `init` wrote or found.
+    pub(crate) config_path: PathBuf,
+    /// False when a config file already existed and was left untouched.
+    pub(crate) config_written: bool,
+    /// The root bearer the written config names in `bearer_token_file`, so the
+    /// caller can adopt it the way `Config::load` would have.
+    pub(crate) root_token: Option<crate::local_auth::RootToken>,
 }
 
 /// Run the `init` subcommand.
@@ -122,6 +149,18 @@ fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<Str
 /// Returns an error if directories cannot be created or the config file
 /// cannot be written.
 pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Result<()> {
+    initialize(config, &args, config_path).map(|_| ())
+}
+
+/// [`run`], reporting what it did.
+///
+/// # Errors
+/// As [`run`].
+pub(crate) fn initialize(
+    config: &Config,
+    args: &InitArgs,
+    config_path: Option<&Path>,
+) -> Result<InitOutcome> {
     let root = &config.data_dir;
     let cfg_path = init_config_path(root, config_path);
     // Decided before anything is created: a data dir that already has a
@@ -138,6 +177,11 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
         tracing::info!(path = %path.display(), "ensured directory");
     }
 
+    let mut outcome = InitOutcome {
+        config_path: cfg_path.clone(),
+        config_written: false,
+        root_token: None,
+    };
     if cfg_path.exists() && !args.force {
         tracing::info!(
             path = %cfg_path.display(),
@@ -154,9 +198,12 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
         // (anyhow's `with_context` would conflict), so map manually.
         let pepper = generate_token_hex(TOKEN_PEPPER_BYTES)
             .map_err(|e| anyhow::anyhow!("generating auth token_pepper: {e}"))?;
-        let bearer_line = root_bearer_for_new_config(config, fresh)?
-            .map(|raw| render_bearer_token_file_line(&raw))
+        let recorded = root_bearer_for_new_config(config, fresh)?;
+        let bearer_line = recorded
+            .as_ref()
+            .map(|bearer| render_bearer_token_file_line(&bearer.raw))
             .unwrap_or_default();
+        outcome.root_token = recorded.and_then(|bearer| bearer.token);
         let body = format!(
             "{}{}{}",
             DEFAULT_CONFIG_TOML,
@@ -168,10 +215,11 @@ pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Resul
         f.write_all(body.as_bytes())
             .with_context(|| format!("writing {}", cfg_path.display()))?;
         tracing::info!(path = %cfg_path.display(), "wrote default config");
+        outcome.config_written = true;
     }
 
     tracing::info!("init complete");
-    Ok(())
+    Ok(outcome)
 }
 
 /// Create missing directory components with owner-only access without changing

@@ -14,6 +14,7 @@ use crate::commands::apply_shared::{PrivateBackup, apply_atomic_with_backup};
 use crate::commands::path_util::{
     agent_config_home, claude_config_dir, claude_config_paths, home_dir,
 };
+use crate::commands::user_service::{self, ServiceManager};
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
@@ -721,6 +722,15 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     let plan = build_plan(&args, &config.data_dir)?;
     print_plan(&plan);
+    let service = if args.only.is_none() {
+        setup_service(config)
+    } else {
+        None
+    };
+    if let Some((_, removal)) = &service {
+        print_service_plan(removal);
+    }
+    let remove_service = matches!(&service, Some((_, user_service::Removal::Removed(_))));
     let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
     if hooks_removed {
         // Only the current checkout's project file is reachable from here.
@@ -739,19 +749,8 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         println!("(dry-run; pass --apply to remove)");
         return Ok(());
     }
-    if plan.is_empty() && !args.purge_data {
+    if plan.is_empty() && !args.purge_data && !remove_service {
         return Ok(());
-    }
-
-    // All-or-nothing: when we're going to purge data, refuse before touching
-    // anything if an ai-memory process is alive (matches reset's guard-at-top).
-    // Wiring-only uninstall stays unguarded — it edits agent config files the
-    // server never touches.
-    if args.purge_data {
-        let siblings = crate::process_guard::sibling_processes();
-        if !siblings.is_empty() {
-            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
-        }
     }
 
     if std::io::stdin().is_terminal() && !args.yes {
@@ -763,6 +762,28 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
             println!("aborted.");
             return Ok(());
+        }
+    }
+
+    // The service `setup` installed runs the server this uninstall is taking
+    // away; stop it first, so a purge below does not find it alive.
+    if let Some((manager, user_service::Removal::Removed(path))) = &service {
+        match user_service::remove(*manager, path, &user_service::SystemRunner)? {
+            user_service::Removal::Removed(path) => {
+                println!("✓ stopped and removed the user service {}", path.display());
+            }
+            other => print_service_plan(&other),
+        }
+    }
+
+    // All-or-nothing: when we're going to purge data, refuse before touching
+    // the data if an ai-memory process is alive (matches reset's guard-at-top).
+    // Wiring-only uninstall stays unguarded — it edits agent config files the
+    // server never touches.
+    if args.purge_data {
+        let siblings = crate::process_guard::sibling_processes();
+        if !siblings.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
         }
     }
 
@@ -816,6 +837,35 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     print_docker_hint(args.purge_data);
 
     Ok(())
+}
+
+/// The user service `setup` installs on this platform and what uninstall
+/// would do about it; `None` on a platform without one or with no home.
+fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Removal)> {
+    let manager = ServiceManager::current()?;
+    let home = crate::commands::run::native_home(config)?;
+    let xdg_config_home = config
+        .runtime_env
+        .process_env()
+        .iter()
+        .find(|(key, _)| key == "XDG_CONFIG_HOME")
+        .map(|(_, value)| PathBuf::from(value));
+    let path = user_service::unit_path(manager, &home, xdg_config_home.as_deref());
+    Some((manager, user_service::planned_removal(&path)))
+}
+
+fn print_service_plan(removal: &user_service::Removal) {
+    match removal {
+        user_service::Removal::Absent => {}
+        user_service::Removal::Removed(path) => {
+            println!("would stop and remove the user service {}", path.display());
+        }
+        user_service::Removal::NotOurs(path) => println!(
+            "leaving {}: `ai-memory setup` did not write it, or it was edited since; remove it \
+             yourself if it runs ai-memory",
+            path.display()
+        ),
+    }
 }
 
 /// Print the manual Docker teardown steps (never executed). When the

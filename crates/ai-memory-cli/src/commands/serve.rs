@@ -1766,6 +1766,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_href: &base_href,
                     base_path: &base_path,
                     trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                    // The same embedder and rerank stage `memory_query`
+                    // holds (the stage shares its concurrency gate), so web
+                    // project search ranks like the MCP tool.
+                    recall: ai_memory_web::Recall {
+                        embedder: embedder.clone(),
+                        rerank: server.rerank_stage(),
+                    },
+                    health: Some(Arc::new(ai_memory_web::health::HealthSources {
+                        ingest: ingest_metrics.clone(),
+                        providers: provider_health.clone(),
+                        probe: Arc::new(ServeHealthProbe {
+                            writer: store.writer.clone(),
+                            data_dir: config.data_dir.clone(),
+                        }),
+                    })),
                 },
             )?;
             // HTML navigational 401/403 → builtin login / change-password.
@@ -2863,6 +2878,38 @@ fn configure_consolidator(
         consolidator: Some(consolidator),
         admin_llm: Some(llm),
     })
+}
+
+/// What the web health page reads from this process: the writer queue,
+/// and the hook spool and recovery journal under this server's data
+/// directory (a hook client on another machine spools there, not here).
+struct ServeHealthProbe {
+    writer: ai_memory_store::WriterHandle,
+    data_dir: std::path::PathBuf,
+}
+
+impl ai_memory_web::health::HealthProbe for ServeHealthProbe {
+    fn process_state(&self) -> ai_memory_web::health::ProcessState {
+        use ai_memory_web::health::{JournalState, ProcessState, SpoolState};
+        let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&self.data_dir));
+        let (pending, degraded, finish_failed, error) =
+            super::recovery::journal_summary(&self.data_dir);
+        ProcessState {
+            write_queue: Some(self.writer.queue_depth()),
+            spool: Some(SpoolState {
+                pending: spool.pending,
+                oldest_age_ms: spool.oldest_age_ms,
+                retries_total: spool.retries_total,
+                capacity: spool.capacity,
+            }),
+            journal: Some(JournalState {
+                pending,
+                degraded,
+                finish_failed,
+                unreadable: error.is_some(),
+            }),
+        }
+    }
 }
 
 /// Validate a list of CORS origins before the server binds.
@@ -5847,6 +5894,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -5949,6 +5998,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -6021,6 +6072,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -6058,8 +6111,10 @@ mod tests {
             .unwrap();
         assert_eq!(json_401.status(), StatusCode::UNAUTHORIZED);
 
-        // Browser navigations redirect to the public login page.
-        let html_redir = router
+        // With a bearer and no human accounts there is no login form that
+        // could succeed, so a browser navigation gets the Basic challenge,
+        // not a redirect to the login page.
+        let html_challenge = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -6072,16 +6127,33 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(html_redir.status(), StatusCode::SEE_OTHER);
-        let location = html_redir
+        assert_eq!(html_challenge.status(), StatusCode::UNAUTHORIZED);
+        assert!(html_challenge.headers().get(header::LOCATION).is_none());
+        let challenge = html_challenge
             .headers()
-            .get(header::LOCATION)
+            .get(header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        assert!(
-            location.starts_with("/web/login?next="),
-            "expected login redirect, got {location}"
-        );
+        assert!(challenge.starts_with("Basic "), "challenge: {challenge}");
+
+        // The token as the Basic password opens the wiki.
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode("root:secret");
+        let signed_in = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .header("Authorization", format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status(), StatusCode::OK);
 
         // Login HTML is public (no auth).
         let login = router
@@ -6167,6 +6239,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -6229,6 +6303,8 @@ mod tests {
                 base_href: "/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
