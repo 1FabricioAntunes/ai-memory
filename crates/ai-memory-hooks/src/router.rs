@@ -36,8 +36,8 @@ use tracing::{debug, info, warn};
 
 use crate::capture_policy::{
     CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource,
-    ExtractionState, PolicyState, ToolFamily, metadata_only_body, tool_observation_outcome,
-    valid_call_id,
+    ExtractionState, PolicyState, ToolFamily, inspection_sentinel, metadata_only_body,
+    tool_observation_outcome, valid_call_id,
 };
 use crate::log;
 use crate::payload::{
@@ -1267,13 +1267,14 @@ fn protocol_matches_inspection(protocol: &CaptureProtocol, inspected: &CapturePr
 /// Build a policy solely to use the shared, fixture-backed direct schema
 /// inspection API. The active sentinel cannot match a normalized real path;
 /// active extracted file calls can therefore be either Keep or Drop during
-/// protocol validation.
+/// protocol validation. Its spelling follows the cwd's path flavor so a
+/// Windows session compiles Active instead of Invalid (GHSA-gcpc-88hm-3xqr,
+/// #1250).
 fn capture_inspector(state: PolicyState, cwd: &str) -> CapturePolicy {
-    const ACTIVE_SENTINEL: &str = "/__ai_memory_capture_server_inspection_never_match__";
     match state {
         PolicyState::Active => CapturePolicy::resolve(
             CaptureSource::Parsed(&CaptureConfig {
-                ignore_paths: vec![ACTIVE_SENTINEL.into()],
+                ignore_paths: vec![inspection_sentinel(cwd).into()],
             }),
             cwd,
             None,
@@ -17955,6 +17956,71 @@ mod tests {
         assert!(
             inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), stripped))
                 .is_some()
+        );
+    }
+
+    /// A Windows cwd used to compile the POSIX never-match sentinel as
+    /// Invalid (GHSA-gcpc-88hm-3xqr), so server re-inspection stripped every
+    /// kept file and shell body. Provable Keep events stay Keep; an
+    /// unevaluated brace still becomes metadata-only.
+    #[test]
+    fn capture_protocol_active_keep_on_a_windows_cwd_keeps_provable_bodies() {
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let kept = |cwd: &str, tool: &str, input: serde_json::Value, family: &str, paths: u16| {
+            serde_json::json!({
+                "session_id": "win-keep", "cwd": cwd,
+                "tool_name": tool, "tool_input": input,
+                "tool_response": "KEEP_BODY",
+                "_ai_memory_capture": capture_protocol("keep", "active", family, paths, "extracted"),
+            })
+        };
+        for raw in [
+            kept(
+                r"C:\repo",
+                "Bash",
+                serde_json::json!({"command": "echo KEEP_BODY"}),
+                "non-file",
+                0,
+            ),
+            kept(
+                r"C:\repo",
+                "Read",
+                serde_json::json!({"file_path": r"C:\repo\notes.md"}),
+                "file",
+                1,
+            ),
+            kept(
+                r"\\server\share\repo",
+                "Bash",
+                serde_json::json!({"command": "echo KEEP_BODY"}),
+                "non-file",
+                0,
+            ),
+        ] {
+            let env = HookEnvelope::from_query_and_body(query(), raw.clone());
+            assert_eq!(inspect_capture_envelope(env).unwrap().raw, raw, "{raw}");
+        }
+        let brace = kept(
+            r"C:\repo",
+            "Bash",
+            serde_json::json!({"command": "cat docs/{adr,x}/1.md"}),
+            "non-file",
+            0,
+        );
+        let env =
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), brace)).unwrap();
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        let stored = serde_json::to_string(&env).unwrap();
+        assert!(
+            !stored.contains("SENTINEL") && !stored.contains("KEEP_BODY"),
+            "{stored}"
         );
     }
 
