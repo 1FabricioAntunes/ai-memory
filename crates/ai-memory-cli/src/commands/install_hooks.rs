@@ -181,16 +181,32 @@ pub(crate) fn settings_file_carries_ai_memory_hooks(path: &Path) -> bool {
         .is_some_and(|content| settings_carry_ai_memory_hooks(&content))
 }
 
-/// Read bound for [`settings_file_carries_ai_memory_hook_for_event`]: it runs on the hook hot path, so a runaway
-/// settings file costs at most this much.
+/// Read bound for [`hooks_file_delivers_ai_memory_event`]: it runs on the hook
+/// hot path, so a runaway settings file costs at most this much.
 const MAX_PLUGIN_DEDUP_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Whether the Claude-shaped settings file at `path` registers an ai-memory
-/// hook for `event` (`SessionStart`, ...). The Claude Code plugin's copy of
-/// an event is dropped only when a settings hook delivers that same event, so
-/// an older install that wires fewer events still gets the rest from the
-/// plugin. A missing, unreadable or malformed file registers nothing.
-pub(crate) fn settings_file_carries_ai_memory_hook_for_event(path: &Path, event: &str) -> bool {
+/// Where the event map sits in a hooks file a plugin event is checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HooksFileShape {
+    /// Claude-shaped: `{"hooks": {"SessionStart": [...]}}` (Claude Code
+    /// `settings.json`, Droid `settings.json`).
+    HooksKey,
+    /// The event map itself with no wrapper (Droid `hooks.json`).
+    EventMap,
+}
+
+/// Whether the hooks file at `path` registers an ai-memory hook that fires on
+/// every occurrence of `event` (`SessionStart`, ...). A plugin's copy of an
+/// event is dropped only when such a hook delivers that same event, so an
+/// older install that wires fewer events still gets the rest from the plugin,
+/// and a hook narrowed by a `matcher` does not suppress the plugin for what
+/// it would not match. A missing, unreadable or malformed file registers
+/// nothing.
+pub(crate) fn hooks_file_delivers_ai_memory_event(
+    path: &Path,
+    shape: HooksFileShape,
+    event: &str,
+) -> bool {
     use std::io::Read as _;
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -203,13 +219,32 @@ pub(crate) fn settings_file_carries_ai_memory_hook_for_event(path: &Path, event:
     {
         return false;
     }
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .as_ref()
-        .and_then(ai_memory_claude_hooks)
-        .and_then(|hooks| hooks.get(event))
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let event_map = match shape {
+        HooksFileShape::HooksKey => document.get("hooks"),
+        HooksFileShape::EventMap => Some(&document),
+    };
+    event_map
+        .and_then(|map| map.get(event))
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry))
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| is_ai_memory_hook_entry(entry) && matcher_catches_all(entry))
+        })
+}
+
+/// A hook entry with no `matcher`, an empty one or `*` fires on every
+/// occurrence of its event; any other matcher (one tool, one session source)
+/// selects a subset, and the plugin must still deliver the rest.
+fn matcher_catches_all(entry: &serde_json::Value) -> bool {
+    match entry.get("matcher") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(matcher)) => matches!(matcher.trim(), "" | "*"),
+        Some(_) => false,
+    }
 }
 
 /// Re-copy the Claude Code hook scripts into the stable staging dir the
@@ -237,8 +272,10 @@ pub(crate) fn restage_claude_code_scripts(
 /// honors the variable when it resolves that Codex's transcripts
 /// (`ManagedHarness::Codex` in `ai-memory-workstream`), so ignoring it here left
 /// one half of the same install pointing somewhere the other half did not.
-pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    codex_hooks_path_in(std::env::var_os("CODEX_HOME"))
+pub(crate) fn codex_hooks_path(
+    env: &crate::config::RuntimeEnv,
+) -> anyhow::Result<std::path::PathBuf> {
+    codex_hooks_path_in(env.var_os("CODEX_HOME"))
 }
 
 /// The env value comes in as a parameter so tests can exercise both branches
@@ -273,7 +310,7 @@ pub(crate) fn copilot_cli_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 /// [`copilot_cli_hooks_path`] with the `COPILOT_HOME` value passed in. Resolves
 /// through the same config dir as `install-mcp --client copilot-cli`
 /// ([`install_mcp::copilot_home_in`]), so the two halves of one install agree.
-fn copilot_cli_hooks_path_in(
+pub(crate) fn copilot_cli_hooks_path_in(
     env_override: Option<std::ffi::OsString>,
 ) -> anyhow::Result<std::path::PathBuf> {
     Ok(install_mcp::copilot_home_in(env_override)?
@@ -757,6 +794,12 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     // `--capture-assistant` still forces it on; this only fills in the unset case
     // from what is already installed. Gated to the agents where assistant capture
     // is allowed (Claude Code, Codex), whose configs share the nested-hooks shape.
+    // Codex's default hooks file depends on CODEX_HOME. Resolve it from the
+    // captured environment once, into `args` like the project strategy below,
+    // so every reader of the existing install and the writer agree on it.
+    if args.apply && args.agent == AgentChoice::Codex && args.config_file.is_none() {
+        args.config_file = Some(codex_hooks_path(&config.runtime_env)?);
+    }
     if args.apply
         && !args.capture_assistant
         && capture_assistant_allowed(args.agent)
@@ -1237,7 +1280,8 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
     } else {
         match args.agent {
             AgentChoice::ClaudeCode => claude_settings_target(args).ok()?,
-            AgentChoice::Codex => codex_hooks_path().ok()?,
+            // `run` resolves it into `args.config_file` before any caller.
+            AgentChoice::Codex => return None,
             AgentChoice::CommandCode => command_code_settings_path().ok()?,
             AgentChoice::Cursor => cursor_hooks_path().ok()?,
             AgentChoice::GeminiCli => gemini_settings_path().ok()?,
@@ -2623,10 +2667,10 @@ fn apply_to_codex_settings_with_payload(
     payload: serde_json::Value,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let path = match &args.config_file {
-        Some(p) => p.clone(),
-        None => codex_hooks_path()?,
-    };
+    let path = args
+        .config_file
+        .clone()
+        .context("internal: the Codex hooks path is resolved before apply")?;
     let outcome = merge_codex_payload(payload, &path)?;
     println!(
         "✓ {} {} ({})",
@@ -9837,6 +9881,35 @@ model = "gpt-5"
     /// `--auth-token <token>` for native hooks — so it sat in the agent's
     /// config file *and* in `/proc/<pid>/cmdline` for the lifetime of every
     /// hook, on every tool call.
+    /// `install-hooks --agent codex --apply` writes to the CODEX_HOME that
+    /// `Config::load` captured, not one re-read from the live process
+    /// (invariant #1): an injected value decides the file.
+    #[test]
+    fn codex_apply_writes_under_the_captured_codex_home() {
+        let home = TempDir::new().unwrap();
+        let codex_home = TempDir::new().unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.runtime_env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "CODEX_HOME",
+            codex_home.path().to_str().unwrap(),
+        )]);
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Codex,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        run(&config, args).expect("apply should succeed");
+
+        let written = std::fs::read_to_string(codex_home.path().join("hooks.json")).unwrap();
+        assert!(written.contains("ai-memory"), "{written}");
+    }
+
     #[test]
     fn apply_persists_the_bearer_and_keeps_it_out_of_the_agent_config() {
         let home = TempDir::new().unwrap();

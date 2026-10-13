@@ -491,6 +491,122 @@ mod launcher {
         );
     }
 
+    /// Front door 4 for Droid (adversarial): Droid runs the Claude Code
+    /// plugin with `DROID_PLUGIN_ROOT`, and the launcher re-attributes it.
+    /// With the `install-hooks --agent droid` hook for the same event in
+    /// `~/.factory/hooks.json` the plugin copy is dropped. Controls: no Droid
+    /// hooks keeps it, and so does a Claude settings hook, which Droid never
+    /// runs. A folderless Droid session is not captured either.
+    #[test]
+    fn a_droid_hook_for_the_same_event_drops_the_droid_plugin_copy() {
+        let sb = Sandbox::new();
+        let root = sb.home.to_string_lossy().into_owned();
+        let droid = [
+            ("CLAUDE_PLUGIN_ROOT", ""),
+            ("DROID_PLUGIN_ROOT", root.as_str()),
+        ];
+
+        sb.settings_hook(
+            &sb.claude.join("settings.json"),
+            "UserPromptSubmit",
+            "user-prompt-submit",
+        );
+        sb.launch("user-prompt-submit", &sb.prompt(), &droid);
+        assert_eq!(sb.spooled().len(), 1, "control: no Droid hook");
+        assert!(
+            sb.spooled()[0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("agent=droid")
+        );
+
+        let factory = sb.home.join(".factory");
+        std::fs::create_dir_all(&factory).unwrap();
+        let command = format!(
+            "{BIN} hook --event user-prompt-submit --agent droid --server-url {}",
+            sb.server
+        );
+        std::fs::write(
+            factory.join("hooks.json"),
+            json!({"UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": command}]}]})
+                .to_string(),
+        )
+        .unwrap();
+        sb.launch("user-prompt-submit", &sb.prompt(), &droid);
+        assert_eq!(
+            sb.spooled().len(),
+            1,
+            "Droid hooks.json: plugin copy dropped"
+        );
+
+        sb.launch("post-tool-use", &sb.read_tool("README.md"), &droid);
+        assert_eq!(
+            sb.spooled().len(),
+            2,
+            "an unwired event stays with the plugin"
+        );
+
+        sb.launch(
+            "user-prompt-submit",
+            &json!({"session_id": "s", "prompt": "no cwd"}),
+            &droid,
+        );
+        assert_eq!(sb.spooled().len(), 2, "folderless Droid session");
+    }
+
+    /// The committed hooks.json command still works when the launcher lost
+    /// its exec bit (a desktop zip upload, a Windows checkout): Claude Code
+    /// runs the command line through a shell, and it starts the launcher
+    /// with `sh` instead of executing it.
+    #[test]
+    fn the_hook_command_runs_a_launcher_without_the_exec_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let sb = Sandbox::new();
+        let source = repo_root().join("plugins").join("claude-code");
+        let plugin = sb.home.join("unzipped-plugin");
+        std::fs::create_dir_all(plugin.join("scripts")).unwrap();
+        let launcher = plugin.join("scripts/ai-memory-hook");
+        std::fs::copy(source.join("scripts/ai-memory-hook"), &launcher).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let hooks: Value = serde_json::from_str(
+            &std::fs::read_to_string(source.join("hooks/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        let command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+
+        let mut cmd = hermetic("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(&sb.repo)
+            .env("HOME", &sb.home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("CLAUDE_CONFIG_DIR", &sb.claude)
+            .env("CLAUDE_PLUGIN_ROOT", &plugin)
+            .env("CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN", BIN)
+            .env("CLAUDE_PLUGIN_OPTION_DATA_DIR", &sb.data)
+            .env("CLAUDE_PLUGIN_OPTION_SERVER_URL", &sb.server)
+            .env_remove("CLAUDE_PROJECT_DIR")
+            .env_remove("PLUGIN_ROOT")
+            .env_remove("DROID_PLUGIN_ROOT")
+            .env("RUST_LOG", "off")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(sb.prompt().to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(sb.spooled().len(), 1, "{output:?}");
+    }
+
     /// A session with no project folder is not captured through the plugin.
     #[test]
     fn folderless_sessions_are_not_captured_through_the_plugin() {

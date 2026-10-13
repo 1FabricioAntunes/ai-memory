@@ -624,7 +624,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     });
 
     let native_memory = native_memory_reports(&home, &cwd);
-    let codex_hooks = codex_hook_trust(&cwd).await;
+    let codex_hooks = codex_hook_trust(&config.runtime_env, &cwd).await;
     let repo_root =
         ai_memory_consolidate::discover_main_repo_root(&cwd).unwrap_or_else(|_| cwd.clone());
     let agentmemory_residue = super::agentmemory_residue::scan(
@@ -680,8 +680,11 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
 /// The trust state of the installed ai-memory Codex hooks, when there are
 /// any: asking Codex starts it, so a machine without ai-memory's Codex hooks
 /// is left alone.
-async fn codex_hook_trust(cwd: &Path) -> Option<super::codex_hook_trust::CodexHookTrust> {
-    let hooks_file = super::install_hooks::codex_hooks_path().ok()?;
+async fn codex_hook_trust(
+    env: &crate::config::RuntimeEnv,
+    cwd: &Path,
+) -> Option<super::codex_hook_trust::CodexHookTrust> {
+    let hooks_file = super::install_hooks::codex_hooks_path(env).ok()?;
     let installed = std::fs::read_to_string(&hooks_file).ok()?;
     if !installed.contains("ai-memory") {
         return None;

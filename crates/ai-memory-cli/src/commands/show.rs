@@ -214,7 +214,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
 
     let (target, workspace, project) = if let Some(name) = new_project {
         let workspace = args.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE);
-        let target = create_project(&root, &name, workspace, harness)?;
+        let target = create_project(&root, &name, workspace, harness, &config.runtime_env)?;
         (target, workspace.to_owned(), name)
     } else {
         let candidate = &candidates[project_index - 1];
@@ -565,9 +565,10 @@ fn create_project(
     name: &str,
     workspace: &str,
     harness: RunHarnessChoice,
+    env: &crate::config::RuntimeEnv,
 ) -> Result<PathBuf> {
     create_project_with_initializer(parent, name, workspace, |staging| {
-        install_context_files(harness, staging)
+        install_context_files(harness, staging, env)
     })
 }
 
@@ -611,7 +612,11 @@ fn create_project_with_initializer(
     Ok(target)
 }
 
-fn install_context_files(harness: RunHarnessChoice, path: &Path) -> Result<()> {
+fn install_context_files(
+    harness: RunHarnessChoice,
+    path: &Path,
+    env: &crate::config::RuntimeEnv,
+) -> Result<()> {
     let (instruction, agent, skill_root) = match harness {
         RunHarnessChoice::Claude => (
             "CLAUDE.md",
@@ -624,16 +629,19 @@ fn install_context_files(harness: RunHarnessChoice, path: &Path) -> Result<()> {
             path.join(".agents/skills"),
         ),
     };
-    install_instructions::run_quiet(InstallInstructionsArgs {
-        target: Some(path.join(instruction)),
-        print: false,
-        no_skills: false,
-        compact: false,
-        skills_scope: None,
-        skills_agent: Some(agent),
-        skills_target_dir: Some(skill_root),
-        skills_force: false,
-    })
+    install_instructions::run_quiet(
+        InstallInstructionsArgs {
+            target: Some(path.join(instruction)),
+            print: false,
+            no_skills: false,
+            compact: false,
+            skills_scope: None,
+            skills_agent: Some(agent),
+            skills_target_dir: Some(skill_root),
+            skills_force: false,
+        },
+        env,
+    )
 }
 
 fn humanize_age(timestamp: Option<&str>) -> String {

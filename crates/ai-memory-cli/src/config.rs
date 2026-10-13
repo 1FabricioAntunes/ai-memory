@@ -810,6 +810,19 @@ impl RuntimeEnv {
         &self.process_env.0
     }
 
+    /// One variable of the captured process environment. Third-party harness
+    /// homes (`CODEX_HOME`, `COPILOT_HOME`, ...) are read through here so a
+    /// command never re-reads the live environment (invariant #1) and tests
+    /// can inject them.
+    #[must_use]
+    pub(crate) fn var_os(&self, name: &str) -> Option<OsString> {
+        self.process_env
+            .0
+            .iter()
+            .find(|(key, _)| key.as_os_str() == name)
+            .map(|(_, value)| value.clone())
+    }
+
     /// Whether this invocation delegates native capture to an external producer.
     #[must_use]
     pub fn capture_owner_active(&self) -> bool {
@@ -851,6 +864,19 @@ impl RuntimeEnv {
         Self {
             host_cwd: Some(host_cwd.into()),
             home_dir: Some(home_dir.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_process_env_for_tests(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            process_env: CapturedProcessEnv(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+                    .collect(),
+            ),
             ..Self::default()
         }
     }

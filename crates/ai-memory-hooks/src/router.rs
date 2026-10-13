@@ -8479,10 +8479,7 @@ mod tests {
         assert_eq!(snap.accepted, 0);
     }
 
-    /// Both accept-but-drop branches, in one batch: a client-protocol Drop and
-    /// the subagent tail-drop. They are separate call sites in
-    /// `handle_hook_batch`, so a single-branch case would leave the other
-    /// silently uncounted — the exact failure this change exists to fix.
+    /// Install a #1241 drop list naming one tool-use id prefix and one tool.
     fn with_drop_list(state: &mut HookState) {
         state.ingest_drop_list = crate::drop_list::IngestDropList::new(
             vec!["toolu_plugin_".into()],
@@ -8585,6 +8582,10 @@ mod tests {
         assert_eq!(snap.accepted, 1, "control: the unlisted item is ingested");
     }
 
+    /// Both accept-but-drop branches, in one batch: a client-protocol Drop and
+    /// the subagent tail-drop. They are separate call sites in
+    /// `handle_hook_batch`, so a single-branch case would leave the other
+    /// silently uncounted — the exact failure this change exists to fix.
     #[tokio::test]
     async fn handle_hook_batch_records_dropped_by_policy() {
         let tmp = TempDir::new().unwrap();

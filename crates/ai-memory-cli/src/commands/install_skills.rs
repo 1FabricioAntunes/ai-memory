@@ -48,22 +48,25 @@ pub(super) struct PreparedInstall {
 /// Returns an error when target roots cannot be resolved, an unmanaged
 /// same-name skill would be overwritten without `--force`, or a skill
 /// file cannot be written.
-pub fn run(_config: &Config, args: InstallSkillsArgs) -> Result<()> {
-    let roots = resolve_target_roots_from_env(&args)?;
+pub fn run(config: &Config, args: InstallSkillsArgs) -> Result<()> {
+    let roots = resolve_target_roots_from_env(&args, &config.runtime_env)?;
 
     if args.print {
         print_install_plan(&roots, grok_handoff_rule_path_for(&args)?);
         return Ok(());
     }
 
-    let prepared = prepare_install(&args)?;
+    let prepared = prepare_install(&args, &config.runtime_env)?;
     print_reports(apply_prepared_install(prepared)?);
 
     Ok(())
 }
 
-pub(super) fn prepare_install(args: &InstallSkillsArgs) -> Result<PreparedInstall> {
-    let roots = resolve_target_roots_from_env(args)?;
+pub(super) fn prepare_install(
+    args: &InstallSkillsArgs,
+    env: &crate::config::RuntimeEnv,
+) -> Result<PreparedInstall> {
+    let roots = resolve_target_roots_from_env(args, env)?;
     let plans = skill_file_plans(&roots);
     let grok_handoff_rule = grok_handoff_rule_path_for(args)?;
     validate_overwrite_safety(&plans, args.force)?;
@@ -178,20 +181,27 @@ fn print_reports(reports: Vec<InstallReport>) {
     }
 }
 
-fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetRoot>> {
+/// The harness homes come from the environment `Config::load` captured, not
+/// the live process (invariant #1).
+fn resolve_target_roots_from_env(
+    args: &InstallSkillsArgs,
+    env: &crate::config::RuntimeEnv,
+) -> Result<Vec<TargetRoot>> {
     let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
     let home = home_dir();
-    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let appdata = env.var_os("APPDATA").map(PathBuf::from);
     // Grok and Copilot CLI relocate their whole config home, global skills
     // included, through GROK_HOME / COPILOT_HOME.
     let agent_home = match (args.scope, args.agent) {
-        (InstallSkillsScope::Global, InstallSkillsAgent::Grok) => Some(install_mcp::grok_home()?),
-        (InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli) => Some(
-            install_mcp::copilot_home_in(std::env::var_os("COPILOT_HOME"))?,
-        ),
+        (InstallSkillsScope::Global, InstallSkillsAgent::Grok) => {
+            Some(install_mcp::grok_home_in(env.var_os("GROK_HOME"))?)
+        }
+        (InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli) => {
+            Some(install_mcp::copilot_home_in(env.var_os("COPILOT_HOME"))?)
+        }
         _ => None,
     };
-    let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
     resolve_target_roots_for_platform(
         args,
         &cwd,
@@ -706,6 +716,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(root_names(&roots), ["/custom/grok/skills"]);
+    }
+
+    /// COPILOT_HOME and GROK_HOME come from the captured environment, never
+    /// the live process: an injected value decides the global root.
+    #[test]
+    fn global_harness_homes_come_from_the_captured_environment() {
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[
+            ("COPILOT_HOME", "/injected/copilot"),
+            ("GROK_HOME", "/injected/grok"),
+        ]);
+        let copilot = resolve_target_roots_from_env(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            copilot[0].path,
+            Path::new("/injected/copilot").join(SKILLS_DIR)
+        );
+        let grok = resolve_target_roots_from_env(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Grok),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(grok[0].path, Path::new("/injected/grok").join(SKILLS_DIR));
     }
 
     #[test]

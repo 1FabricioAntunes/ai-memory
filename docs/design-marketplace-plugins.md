@@ -394,7 +394,11 @@ our repository would install the Claude plugin and send events tagged
   the matching ai-memory agent when one exists, and otherwise prints `{}` and
   exits. *Shipped:* `DROID_PLUGIN_ROOT` → `droid`; `PLUGIN_ROOT` without
   `CLAUDE_PLUGIN_ROOT` → `codex`; neither `CLAUDE_PLUGIN_ROOT` nor
-  `PLUGIN_ROOT` → `{}`. Cursor is not remapped: when Cursor runs Claude
+  `PLUGIN_ROOT` → `{}`. A Droid-launched event carries
+  `AI_MEMORY_HOOK_ORIGIN=droid-plugin` and gets the same folderless skip and
+  de-duplication as the Claude Code plugin, against the one file Droid reads
+  hooks from (`~/.factory/hooks.json`, else the `hooks` key of
+  `~/.factory/settings.json`). Cursor is not remapped: when Cursor runs Claude
   hooks the event already reaches the existing #721 path as `claude-code`
   with `cursor_version`, and whether Cursor runs *plugin* hooks at all is
   one of the Cursor unknowns;
@@ -554,15 +558,15 @@ matchers `install-hooks` writes today:
 {
   "description": "ai-memory lifecycle capture through the installed ai-memory binary",
   "hooks": {
-    "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code session-start" }] }],
-    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code user-prompt-submit" }] }],
-    "PreToolUse":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code pre-tool-use" }] }],
-    "PostToolUse":      [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code post-tool-use" }] }],
-    "PreCompact":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code pre-compact" }] }],
-    "Stop":             [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code stop" }] }],
-    "SessionEnd":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code session-end" }] }],
-    "SubagentStart":    [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code subagent-start" }] }],
-    "SubagentStop":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code subagent-stop" }] }]
+    "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code session-start" }] }],
+    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code user-prompt-submit" }] }],
+    "PreToolUse":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code pre-tool-use" }] }],
+    "PostToolUse":      [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code post-tool-use" }] }],
+    "PreCompact":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code pre-compact" }] }],
+    "Stop":             [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code stop" }] }],
+    "SessionEnd":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code session-end" }] }],
+    "SubagentStart":    [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code subagent-start" }] }],
+    "SubagentStop":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code subagent-stop" }] }]
   }
 }
 ```

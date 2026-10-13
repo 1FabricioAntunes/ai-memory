@@ -179,13 +179,21 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
 /// Build the full removal plan by reading each existing config file and
 /// running the matching pure stripper. Missing files / no-matches
 /// produce no entry. `name`/`url` identify the MCP server.
-fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<PlannedChange>> {
+///
+/// Harness homes (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`,
+/// `GROK_HOME`, `APPDATA`) come
+/// from `env`, the environment `Config::load` captured (invariant #1).
+fn build_plan(
+    args: &UninstallArgs,
+    data_dir: &Path,
+    env: &crate::config::RuntimeEnv,
+) -> anyhow::Result<Vec<PlannedChange>> {
     let mut plan = Vec::new();
     let want = |k: crate::cli::UninstallOnly| args.only.is_none() || args.only == Some(k);
     let name = args.mcp_name.as_deref();
     let url = args.mcp_url.as_str();
     let home = home_dir();
-    let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
     let omp_dirs = if want(crate::cli::UninstallOnly::Hooks) || want(crate::cli::UninstallOnly::Mcp)
     {
         omp_agent_dirs(home.as_deref(), args.profile.as_deref())
@@ -216,11 +224,11 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             // Copilot CLI's standalone file keeps flat entries under the usual
             // `hooks` key next to its `version: 1`, like Cursor's.
             (
-                install_hooks::copilot_cli_hooks_path()?,
+                install_hooks::copilot_cli_hooks_path_in(env.var_os("COPILOT_HOME"))?,
                 HookConfigShape::NestedHooksKey,
             ),
             (
-                install_hooks::codex_hooks_path()?,
+                install_hooks::codex_hooks_path(env)?,
                 HookConfigShape::NestedHooksKey,
             ),
             (
@@ -438,7 +446,7 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
                 // even with CODEX_HOME set, so sweep that file too.
                 claude_config_paths(
                     home.as_deref(),
-                    agent_config_home(std::env::var_os("CODEX_HOME")).as_deref(),
+                    agent_config_home(env.var_os("CODEX_HOME")).as_deref(),
                     Path::new(".codex/config.toml"),
                     Path::new("config.toml"),
                 )
@@ -496,9 +504,9 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
     // ---- Managed Agent Skills (project + global roots) ----
     if want(crate::cli::UninstallOnly::Skills) {
         let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
-        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-        let grok_home = install_mcp::grok_home().ok();
-        let copilot_home = install_mcp::copilot_home_in(std::env::var_os("COPILOT_HOME")).ok();
+        let appdata = env.var_os("APPDATA").map(PathBuf::from);
+        let grok_home = install_mcp::grok_home_in(env.var_os("GROK_HOME")).ok();
+        let copilot_home = install_mcp::copilot_home_in(env.var_os("COPILOT_HOME")).ok();
         for root in skill_roots(
             &cwd,
             home.as_deref(),
@@ -727,7 +735,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     let name = args.mcp_name.clone();
     let url = args.mcp_url.clone();
 
-    let plan = build_plan(&args, &config.data_dir)?;
+    let plan = build_plan(&args, &config.data_dir, &config.runtime_env)?;
     print_plan(&plan);
     // The marketplace plugins carry hooks, MCP and skills together, so only a
     // full uninstall removes them; the harness's own CLI does the removal.
@@ -783,27 +791,12 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         }
     }
 
-    // The service `setup` installed runs the server this uninstall is taking
-    // away; stop it first, so a purge below does not find it alive.
-    if let Some((manager, user_service::Removal::Removed(path))) = &service {
-        match user_service::remove(*manager, path, &user_service::SystemRunner)? {
-            user_service::Removal::Removed(path) => {
-                println!("✓ stopped and removed the user service {}", path.display());
-            }
-            other => print_service_plan(&other),
-        }
-    }
-
-    // All-or-nothing: when we're going to purge data, refuse before touching
-    // the data if an ai-memory process is alive (matches reset's guard-at-top).
-    // Wiring-only uninstall stays unguarded — it edits agent config files the
-    // server never touches.
-    if args.purge_data {
-        let siblings = crate::process_guard::sibling_processes();
-        if !siblings.is_empty() {
-            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
-        }
-    }
+    stop_service_guarding_purge(
+        service.as_ref(),
+        args.purge_data,
+        &user_service::SystemRunner,
+        crate::process_guard::sibling_processes,
+    )?;
 
     // The current checkout's `.claude/settings.local.json` keeps its backup
     // under the data dir, as `install-hooks --scope project` does: a sibling
@@ -909,6 +902,97 @@ fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Remov
         .map(|(_, value)| PathBuf::from(value));
     let path = user_service::unit_path(manager, &home, xdg_config_home.as_deref());
     Some((manager, user_service::planned_removal(&path)))
+}
+
+/// Stop the user service `setup` installed, refusing a data purge while any
+/// other ai-memory process is alive.
+///
+/// All-or-nothing: the live-process check runs first, with the service's own
+/// process left out because this uninstall is about to stop it, so a sibling
+/// (a `run` session, a second server) refuses the purge before the service
+/// is stopped or anything else is touched (matches reset's guard-at-top).
+/// After the stop the check runs again without that exception: a service that
+/// did not exit still holds the data. Wiring-only uninstall stays unguarded;
+/// it edits agent config files the server never touches.
+fn stop_service_guarding_purge(
+    service: Option<&(ServiceManager, user_service::Removal)>,
+    purge_data: bool,
+    runner: &dyn user_service::CommandRunner,
+    siblings: impl Fn() -> Vec<sysinfo::Pid>,
+) -> Result<()> {
+    let to_stop = match service {
+        Some((manager, user_service::Removal::Removed(path))) => Some((*manager, path)),
+        _ => None,
+    };
+    if purge_data {
+        let service_pid = to_stop.and_then(|(manager, _)| service_main_pid(manager, runner));
+        let others: Vec<sysinfo::Pid> = siblings()
+            .into_iter()
+            .filter(|pid| Some(pid.as_u32()) != service_pid)
+            .collect();
+        if !others.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &others));
+        }
+    }
+    if let Some((manager, path)) = to_stop {
+        match user_service::remove(manager, path, runner)? {
+            user_service::Removal::Removed(path) => {
+                println!("✓ stopped and removed the user service {}", path.display());
+            }
+            other => print_service_plan(&other),
+        }
+    }
+    if purge_data && to_stop.is_some() {
+        let alive = siblings();
+        if !alive.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &alive));
+        }
+    }
+    Ok(())
+}
+
+/// The running service's main process, as its manager reports it; `None`
+/// when it is not running or the manager cannot say.
+fn service_main_pid(
+    manager: ServiceManager,
+    runner: &dyn user_service::CommandRunner,
+) -> Option<u32> {
+    let pid = match manager {
+        ServiceManager::SystemdUser => {
+            let out = runner
+                .run(
+                    "systemctl",
+                    &[
+                        "--user",
+                        "show",
+                        "--property=MainPID",
+                        "--value",
+                        user_service::SYSTEMD_UNIT_NAME,
+                    ],
+                )
+                .ok()
+                .filter(|out| out.success)?;
+            out.stdout.trim().parse::<u32>().ok()?
+        }
+        ServiceManager::Launchd => {
+            // `launchctl list <label>` prints a dictionary with a
+            // `"PID" = 123;` line while the job runs.
+            let out = runner
+                .run("launchctl", &["list", user_service::LAUNCHD_LABEL])
+                .ok()
+                .filter(|out| out.success)?;
+            out.stdout.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("\"PID\" =")?
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+            })?
+        }
+    };
+    (pid != 0).then_some(pid)
 }
 
 fn print_service_plan(removal: &user_service::Removal) {
@@ -1633,6 +1717,173 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers `systemctl`/`launchctl` from a script and records each call.
+    struct ServiceRunner {
+        calls: std::cell::RefCell<Vec<String>>,
+        main_pid: &'static str,
+    }
+
+    impl user_service::CommandRunner for ServiceRunner {
+        fn run(&self, program: &str, args: &[&str]) -> Result<user_service::CommandOutcome> {
+            let line = format!("{program} {}", args.join(" "));
+            self.calls.borrow_mut().push(line.clone());
+            let stdout = if line.contains("MainPID") {
+                self.main_pid.to_owned()
+            } else if line.starts_with("launchctl list") {
+                format!(
+                    "{{\n\t\"Label\" = \"x\";\n\t\"PID\" = {};\n}};\n",
+                    self.main_pid
+                )
+            } else {
+                String::new()
+            };
+            Ok(user_service::CommandOutcome {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// A unit `setup` rendered, written where `uninstall` finds it.
+    fn setup_unit(root: &Path) -> (ServiceManager, user_service::Removal) {
+        let manager = ServiceManager::SystemdUser;
+        let unit = user_service::render(
+            manager,
+            &user_service::ServiceSpec {
+                exe: root.join("bin").join("ai-memory"),
+                data_dir: root.join("data"),
+                config_path: root.join("config.toml"),
+                home: root.to_path_buf(),
+                xdg_config_home: None,
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(unit.path.parent().unwrap()).unwrap();
+        std::fs::write(&unit.path, &unit.contents).unwrap();
+        (manager, user_service::planned_removal(&unit.path))
+    }
+
+    /// Adversarial: a live sibling (pid 777) refuses `--purge-data` BEFORE
+    /// the service is stopped; the old order stopped it first and only then
+    /// refused, leaving the user without a server and with nothing purged.
+    /// Controls: the service's own process is not a sibling, and a purge
+    /// with only that process alive stops the service and proceeds.
+    #[cfg(unix)]
+    #[test]
+    fn purge_guard_refuses_a_live_sibling_before_stopping_the_service() {
+        let root = tempfile::tempdir().unwrap();
+        let service = setup_unit(root.path());
+        assert!(matches!(service.1, user_service::Removal::Removed(_)));
+        let runner = ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid: "4242",
+        };
+        let pids = |raw: &[u32]| {
+            raw.iter()
+                .copied()
+                .map(sysinfo::Pid::from_u32)
+                .collect::<Vec<_>>()
+        };
+
+        let error =
+            stop_service_guarding_purge(Some(&service), true, &runner, || pids(&[4242, 777]))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("777") && !error.contains("4242"), "{error}");
+        assert!(
+            !runner.calls.borrow().iter().any(|c| c.contains("disable")),
+            "the service must still run: {:?}",
+            runner.calls.borrow()
+        );
+
+        let alive = std::cell::RefCell::new(pids(&[4242]));
+        stop_service_guarding_purge(Some(&service), true, &runner, || alive.replace(Vec::new()))
+            .unwrap();
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c == "systemctl --user disable --now ai-memory.service")
+        );
+    }
+
+    /// A service that did not exit after the stop still blocks the purge.
+    #[cfg(unix)]
+    #[test]
+    fn purge_guard_rechecks_after_stopping_the_service() {
+        let root = tempfile::tempdir().unwrap();
+        let service = setup_unit(root.path());
+        let runner = ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid: "4242",
+        };
+        let error = stop_service_guarding_purge(Some(&service), true, &runner, || {
+            vec![sysinfo::Pid::from_u32(4242)]
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("4242"), "{error}");
+    }
+
+    #[test]
+    fn service_main_pid_reads_systemd_and_launchd() {
+        let runner = |main_pid| ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid,
+        };
+        assert_eq!(
+            service_main_pid(ServiceManager::SystemdUser, &runner("4242\n")),
+            Some(4242)
+        );
+        assert_eq!(
+            service_main_pid(ServiceManager::SystemdUser, &runner("0\n")),
+            None,
+            "MainPID=0 means not running"
+        );
+        assert_eq!(
+            service_main_pid(ServiceManager::Launchd, &runner("515")),
+            Some(515)
+        );
+    }
+
+    /// The skill sweep finds a global Copilot CLI skill under the COPILOT_HOME
+    /// `Config::load` captured (invariant #1), not one re-read from the live
+    /// process.
+    #[test]
+    fn skill_sweep_uses_the_captured_copilot_home() {
+        let copilot_home = tempfile::tempdir().unwrap();
+        let skill = copilot_home
+            .path()
+            .join(SKILLS_DIR)
+            .join(MANAGED_SKILLS[0].relative_path);
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, MANAGED_SKILLS[0].content).unwrap();
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "COPILOT_HOME",
+            copilot_home.path().to_str().unwrap(),
+        )]);
+        let args = UninstallArgs {
+            apply: false,
+            purge_data: false,
+            only: Some(crate::cli::UninstallOnly::Skills),
+            mcp_name: None,
+            mcp_url: String::new(),
+            yes: false,
+            profile: None,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let plan = build_plan(&args, data.path(), &env).unwrap();
+        assert!(
+            plan.iter().any(|change| matches!(
+                change,
+                PlannedChange::DeleteFile { path, .. } if *path == skill
+            )),
+            "{plan:?}"
+        );
+    }
 
     /// Each installed plugin is removed through its own harness CLI, and one
     /// failure does not stop the next.

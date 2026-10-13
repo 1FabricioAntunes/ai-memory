@@ -70,7 +70,10 @@ const RECOVERY_DIR: &str = ".recovery";
 const RECOVERY_MATCH_FILE: &str = ".active";
 const RECOVERY_COMPLETED_FILE: &str = ".completed";
 const SPOOL_CAPACITY_LOCK_FILE: &str = ".capacity.lock";
-const SPOOL_COORD_LOCK_WAIT: Duration = Duration::from_millis(5);
+/// How long an enqueue waits for another enqueuer's capacity check. Bounded
+/// well inside the hook's ~200 ms budget; past it the event is spooled anyway
+/// (the cap is a soft bound), never discarded.
+const SPOOL_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(50);
 const MAX_SPOOL_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 const RECOVERY_TOMBSTONE_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_TOMBSTONES: usize = 512;
@@ -291,6 +294,10 @@ pub fn enqueue_with_config(
     let final_path = spool.join(&name);
     let bytes = serde_json::to_vec(entry)?;
     write_private(&tmp, &bytes)?;
+    // The capacity lock only serializes concurrent count-then-rename checks
+    // so a burst cannot overshoot the cap. If another enqueuer holds it past
+    // the wait, count without it: the worst case is a few entries over a soft
+    // cap, where giving up here silently lost a captured event.
     let capacity_lock = open_spool_capacity_lock(spool)?;
     let started = Instant::now();
     loop {
@@ -298,14 +305,11 @@ pub fn enqueue_with_config(
             Ok(()) => break,
             Err(error)
                 if is_drain_lock_busy_error(&error)
-                    && started.elapsed() < SPOOL_COORD_LOCK_WAIT =>
+                    && started.elapsed() < SPOOL_CAPACITY_LOCK_WAIT =>
             {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Err(error) if is_drain_lock_busy_error(&error) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Ok(());
-            }
+            Err(error) if is_drain_lock_busy_error(&error) => break,
             Err(error) => return Err(error),
         }
     }
@@ -574,20 +578,7 @@ impl QuarantinedSpool {
                     outcomes,
                     failed_index: None,
                 } if outcomes.len() == 1 => {
-                    let outcome = outcomes[0].as_str();
-                    let durable = matches!(outcome, "stored" | "replayed")
-                        || outcome == "ignored_end"
-                            && entry_event(&entry).as_deref() == Some("session-end");
-                    if durable {
-                        let _ = std::fs::remove_file(path);
-                        result.sent += 1;
-                        result.durable += 1;
-                    } else if outcome.starts_with("dropped_") {
-                        let _ = std::fs::remove_file(path);
-                        result.dropped += 1;
-                    } else {
-                        bump_or_drop(&path, &entry, max_attempts.0, &mut result);
-                    }
+                    settle_item(&path, &entry, &outcomes[0], max_attempts.0, &mut result);
                 }
                 _ => bump_or_drop(&path, &entry, max_attempts.0, &mut result),
             }
@@ -1495,23 +1486,8 @@ pub async fn drain_with_live_token(
                             chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                         break;
                     }
-                    for (position, outcome) in outcomes.iter().enumerate() {
-                        let terminal = matches!(outcome.as_str(), "stored" | "replayed")
-                            || outcome == "ignored_end"
-                                && entry_event(&chunk[position].1).as_deref()
-                                    == Some("session-end");
-                        if terminal {
-                            let _ = std::fs::remove_file(&chunk[position].0);
-                            result.sent += 1;
-                            result.durable += 1;
-                        } else {
-                            bump_or_drop(
-                                &chunk[position].0,
-                                &chunk[position].1,
-                                max_attempts,
-                                &mut result,
-                            );
-                        }
+                    for ((path, entry), outcome) in chunk.iter().zip(&outcomes) {
+                        settle_item(path, entry, outcome, max_attempts, &mut result);
                     }
                     if let Some(failed_index) = failed_index {
                         bump_or_drop(
@@ -1711,21 +1687,7 @@ pub async fn drain_with_live_token(
                         .await
                         {
                             BatchOutcome::Detailed { outcomes, .. } => {
-                                let durable = outcomes
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(position, outcome)| {
-                                        matches!(outcome.as_str(), "stored" | "replayed")
-                                            || outcome.as_str() == "ignored_end"
-                                                && entry_event(&chunk[*position].1).as_deref()
-                                                    == Some("session-end")
-                                    })
-                                    .map(|(position, _)| position)
-                                    .collect::<Vec<_>>();
-                                let sent = delete_accepted_indices(&chunk, &durable);
-                                result.sent += sent;
-                                result.durable += sent;
-                                result.remaining += chunk.len().saturating_sub(sent);
+                                settle_retried_detailed(&chunk, &outcomes, &mut result);
                                 continue;
                             }
                             BatchOutcome::Accepted(k) => {
@@ -1798,21 +1760,7 @@ pub async fn drain_with_live_token(
                             .await
                         {
                             BatchOutcome::Detailed { outcomes, .. } => {
-                                let durable = outcomes
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(position, outcome)| {
-                                        matches!(outcome.as_str(), "stored" | "replayed")
-                                            || outcome.as_str() == "ignored_end"
-                                                && entry_event(&chunk[*position].1).as_deref()
-                                                    == Some("session-end")
-                                    })
-                                    .map(|(position, _)| position)
-                                    .collect::<Vec<_>>();
-                                let sent = delete_accepted_indices(&chunk, &durable);
-                                result.sent += sent;
-                                result.durable += sent;
-                                result.remaining += chunk.len().saturating_sub(sent);
+                                settle_retried_detailed(&chunk, &outcomes, &mut result);
                                 continue;
                             }
                             BatchOutcome::Accepted(k) => {
@@ -1927,6 +1875,91 @@ pub async fn drain_with_live_token(
         }
     }
     result
+}
+
+/// What a drain does with one spooled entry once a modern server has answered
+/// it with a per-item batch outcome. Every drain path (correlated, batched,
+/// rerooted and token-retried) routes through this one table so they cannot
+/// disagree about which outcomes end an entry's life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemDisposition {
+    /// The server holds the event: delete it and count it durable.
+    Durable,
+    /// The server has decided never to store this event (capture policy,
+    /// disabled subagent capture, no write access, identity collision,
+    /// unstorable payload). Re-sending gets the same verdict forever, so
+    /// delete it and count it dropped.
+    Dropped,
+    /// Unknown outcome (a newer server): keep it and charge an attempt.
+    Retry,
+}
+
+fn item_disposition(outcome: &str, entry: &SpoolEntry) -> ItemDisposition {
+    match outcome {
+        // `resumed` is only returned after the server completed the keyed
+        // ingest of an observation an earlier delivery already stored, so a
+        // redelivery would come back `replayed`: the event is durable.
+        "stored" | "replayed" | "resumed" => ItemDisposition::Durable,
+        "ignored_end" if entry_event(entry).as_deref() == Some("session-end") => {
+            ItemDisposition::Durable
+        }
+        // The server only emits `ignored_end` for SessionEnd; any other
+        // carrier is a verdict that will not change on redelivery.
+        "ignored_end" => ItemDisposition::Dropped,
+        dropped if dropped.starts_with("dropped_") => ItemDisposition::Dropped,
+        _ => ItemDisposition::Retry,
+    }
+}
+
+/// Apply [`item_disposition`] to one entry of a first-attempt batch reply.
+fn settle_item(
+    path: &Path,
+    entry: &SpoolEntry,
+    outcome: &str,
+    max_attempts: u32,
+    result: &mut DrainResult,
+) {
+    match item_disposition(outcome, entry) {
+        ItemDisposition::Durable => {
+            let _ = std::fs::remove_file(path);
+            result.sent += 1;
+            result.durable += 1;
+        }
+        ItemDisposition::Dropped => {
+            let _ = std::fs::remove_file(path);
+            result.dropped += 1;
+        }
+        ItemDisposition::Retry => bump_or_drop(path, entry, max_attempts, result),
+    }
+}
+
+/// Settle a detailed reply to a retried request (rerooted address or live
+/// token). Durable and dropped entries leave the spool; anything else stays
+/// queued uncharged, because the first request already charged nothing for
+/// these entries and the retry path never charges.
+fn settle_retried_detailed(
+    chunk: &[(PathBuf, SpoolEntry)],
+    outcomes: &[String],
+    result: &mut DrainResult,
+) {
+    let mut settled = 0usize;
+    for ((path, entry), outcome) in chunk.iter().zip(outcomes) {
+        match item_disposition(outcome, entry) {
+            ItemDisposition::Durable => {
+                let _ = std::fs::remove_file(path);
+                result.sent += 1;
+                result.durable += 1;
+                settled += 1;
+            }
+            ItemDisposition::Dropped => {
+                let _ = std::fs::remove_file(path);
+                result.dropped += 1;
+                settled += 1;
+            }
+            ItemDisposition::Retry => {}
+        }
+    }
+    result.remaining += chunk.len().saturating_sub(settled);
 }
 
 fn delete_accepted_indices(chunk: &[(PathBuf, SpoolEntry)], indices: &[usize]) -> usize {
@@ -2588,6 +2621,42 @@ mod tests {
         enqueue(&spool, &entry).unwrap();
         assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(spool_len(&spool), 1, "content is retained for recovery");
+    }
+
+    #[test]
+    fn enqueue_keeps_the_event_when_the_capacity_lock_stays_held() {
+        // Another enqueuer stuck holding the capacity lock past the wait used
+        // to make this one delete its temp file and return Ok: a silent loss.
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let lock = open_spool_capacity_lock(&spool).unwrap();
+        lock.lock_exclusive().unwrap();
+        let entry = entry_for(
+            "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code".into(),
+            r#"{"session_id":"native-1","prompt":"contended"}"#.into(),
+            None,
+            false,
+        );
+        let started = Instant::now();
+        enqueue(&spool, &entry).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= SPOOL_CAPACITY_LOCK_WAIT,
+            "waits for the holder first"
+        );
+        // Generous for loaded CI and Windows sleep granularity; the point is
+        // that the wait is bounded, not an exact figure.
+        assert!(elapsed < Duration::from_secs(1), "the wait is bounded");
+        assert_eq!(spool_len(&spool), 1, "the contended event is spooled");
+
+        // A holder that lets go inside the wait is simply waited out.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(lock);
+        });
+        enqueue(&spool, &entry).unwrap();
+        releaser.join().unwrap();
+        assert_eq!(spool_len(&spool), 2);
     }
 
     #[test]
@@ -4081,6 +4150,106 @@ mod tests {
             sorted_attempts(&spool),
             vec![0, 0],
             "saturation must not bump retry attempts for the first unaccepted item"
+        );
+    }
+
+    /// Serve every request with one fixed `200 OK` JSON body.
+    async fn serve_fixed_batch_reply(body: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let _ = s.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn batch_drain_deletes_server_dropped_items_instead_of_retrying() {
+        // A dropped_* verdict is final: re-POSTing it gets the same answer
+        // until max_attempts (forever with 0), as the correlated path knew.
+        let addr = serve_fixed_batch_reply(
+            r#"{"accepted":3,"results":[{"index":0,"outcome":"stored"},{"index":1,"outcome":"dropped_policy"},{"index":2,"outcome":"stored"}]}"#,
+        )
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{addr}/hook?event=e{i}"),
+            );
+        }
+
+        let r = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            MaxAttempts::new(0),
+        )
+        .await;
+
+        assert_eq!(r.sent, 2);
+        assert_eq!(r.durable, 2);
+        assert_eq!(r.dropped, 1);
+        assert_eq!(r.remaining, 0);
+        assert!(
+            list_entries(&spool).unwrap().0.is_empty(),
+            "a dropped_policy item must leave the spool after one drain"
+        );
+    }
+
+    #[test]
+    fn every_drain_path_shares_one_outcome_table() {
+        let entry = |event: &str| {
+            entry_for(
+                format!("http://127.0.0.1:1/hook?event={event}&agent=claude-code"),
+                "{}".into(),
+                None,
+                false,
+            )
+        };
+        let observation = entry("post-tool-use");
+        for outcome in ["stored", "replayed", "resumed"] {
+            assert_eq!(
+                item_disposition(outcome, &observation),
+                ItemDisposition::Durable,
+                "{outcome}"
+            );
+        }
+        for outcome in [
+            "dropped_policy",
+            "dropped_subagent",
+            "dropped_unauthorized",
+            "dropped_collision",
+            "dropped_invalid",
+        ] {
+            assert_eq!(
+                item_disposition(outcome, &observation),
+                ItemDisposition::Dropped,
+                "{outcome}"
+            );
+        }
+        assert_eq!(
+            item_disposition("ignored_end", &entry("session-end")),
+            ItemDisposition::Durable
+        );
+        assert_eq!(
+            item_disposition("some_future_outcome", &observation),
+            ItemDisposition::Retry
         );
     }
 

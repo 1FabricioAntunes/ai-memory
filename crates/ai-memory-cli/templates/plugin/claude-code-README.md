@@ -17,6 +17,10 @@ wrapper or the macOS app; see the
 the binary the plugin captures nothing: it says so once at session start and
 never blocks Claude.
 
+The plugin needs ai-memory 3.0 or later. With an older binary the hooks
+fall back to `http://127.0.0.1:49374` and print an upgrade hint, and the
+memory tools do not connect while `server_url` is empty.
+
 ## Install
 
 ```text
@@ -64,7 +68,7 @@ with `/plugin configure ai-memory@ai-memory`.
 | Option | Default | Use |
 | --- | --- | --- |
 | `server_url` | empty | Empty uses the `server_url` from your ai-memory config. Set it only to point this plugin elsewhere. |
-| `ai_memory_bin` | `ai-memory` | Path to the binary when it is not on `PATH`. |
+| `ai_memory_bin` | `ai-memory` | Absolute path to the binary when it is not on `PATH`. A relative path is ignored: it would resolve inside the checkout. |
 | `data_dir` | empty | Only for an install with a non-default data directory. |
 
 There is no token option. Hooks and the MCP bridge use the credentials the

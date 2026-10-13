@@ -189,6 +189,10 @@ agents) either way.
 
 The plugin does not contain ai-memory. Install the binary first (above, or
 Homebrew, AUR, RPM, the Docker wrapper, the macOS app), then add the plugin.
+The plugins need ai-memory 3.0 or later: an older binary requires
+`--server-url` on every hook, so the launcher retries it against
+`http://127.0.0.1:49374` with a one-line upgrade hint on stderr, and the MCP
+entry does not connect until the binary is upgraded.
 Every hook runs `scripts/ai-memory-hook`, a short POSIX script that finds
 the binary and hands it the event with `ai-memory hook`, the same native
 command `install-hooks` wires. Capture policy (`ignore_paths`, allowlist
@@ -216,8 +220,8 @@ configure ai-memory@ai-memory`:
 
 | Option | Default | Use |
 | --- | --- | --- |
-| `server_url` | empty | Empty uses the `server_url` from your ai-memory config, so the plugin and the CLI never disagree. Set it only to point this plugin elsewhere. |
-| `ai_memory_bin` | `ai-memory` | Path to the binary when it is not on the `PATH` the app sees. The launcher also tries `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`. |
+| `server_url` | empty | Empty uses the `server_url` from your ai-memory config, so the plugin and the CLI never disagree (the launcher omits `--server-url`). Set it only to point this plugin elsewhere. |
+| `ai_memory_bin` | `ai-memory` | Absolute path to the binary when it is not on the `PATH` the app sees; a relative path is ignored, since it would resolve inside the checkout. The launcher also tries `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`. |
 | `data_dir` | empty | Only for an install with a non-default data directory. |
 
 - Claude Code does not auto-update a third-party marketplace
@@ -228,13 +232,19 @@ configure ai-memory@ai-memory`:
 - If `install-hooks` already put ai-memory hooks in
   `~/.claude/settings.json` or a checkout's `.claude/settings.local.json`,
   those win: the plugin skips every event they deliver, so nothing is
-  captured twice. `ai-memory doctor` reports the double install and which
+  captured twice. Only a hook with an empty or `*` matcher counts; one you
+  narrowed to some tools leaves the plugin capturing the others. `ai-memory doctor` reports the double install and which
   copy to remove. While the plugin is enabled, `ai-memory setup` and
   `ai-memory run` stop writing Claude's settings hooks, MCP entry and
   skills; run `ai-memory install-hooks --agent claude-code --apply` (or
   `install-mcp`, `install-skills`) to add them anyway.
 - Folderless sessions (a desktop scratch workspace with no project folder)
   are not captured through the plugin.
+- Factory Droid can install this plugin through its Claude marketplace
+  fallback. Its events are recorded as `droid`, and when `install-hooks
+  --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
+  the `hooks` key of `~/.factory/settings.json` while `hooks.json` does not
+  exist) the plugin skips it, as it does for Claude's settings hooks.
 - On Windows, Claude Code runs plugin hooks through Git Bash, which it
   already requires, so the launcher needs nothing else.
 - With the Docker wrapper, plugin hooks need a `bin/ai-memory` wrapper that runs
@@ -265,7 +275,12 @@ changelog. `ai-memory doctor` and the `status` skill report hooks Codex
 skips. The Codex plugin has no options: the server URL and credentials come
 from your ai-memory config, and the MCP entry runs `ai-memory mcp-bridge
 --no-session-id` from `PATH`. On Windows the hooks call `ai-memory hook`
-directly (`commandWindows`), so `ai-memory` must be on `PATH`.
+directly (`commandWindows`), so `ai-memory` must be on `PATH`. That direct
+call is a known limitation: it skips the launcher, so a Windows event is not
+marked as plugin-launched (folderless sessions are captured, as with a
+settings hook), and without the binary Codex reports a failed hook instead
+of the launcher's silent no-op. Changing it would also change the command
+Codex keys hook trust on.
 
 Codex runs plugin hooks and `~/.codex/hooks.json` hooks side by side, and an
 untrusted settings hook is skipped silently, so the plugin cannot safely drop

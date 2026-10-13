@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code session-start"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code session-start"
           }
         ]
       }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code user-prompt-submit"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code user-prompt-submit"
           }
         ]
       }
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code pre-tool-use"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code pre-tool-use"
           }
         ]
       }
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code post-tool-use"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code post-tool-use"
           }
         ]
       }
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code pre-compact"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code pre-compact"
           }
         ]
       }
@@ -62,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code stop"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code stop"
           }
         ]
       }
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code session-end"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code session-end"
           }
         ]
       }
@@ -84,7 +84,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code subagent-start"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code subagent-start"
           }
         ]
       }
@@ -95,7 +95,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ai-memory-hook claude-code subagent-stop"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code subagent-stop"
           }
         ]
       }

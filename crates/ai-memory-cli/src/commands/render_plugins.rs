@@ -43,10 +43,12 @@ const LAUNCHER_PATH: &str = "scripts/ai-memory-hook";
 const CLAUDE_DESCRIPTION: &str = "Long-term memory across sessions and harnesses. Hands each \
     lifecycle event to the installed ai-memory binary, which applies your capture exclusions and \
     sends a sanitized record only to your ai-memory server (default http://127.0.0.1:49374). Adds \
-    the ai-memory MCP tools. No telemetry. Requires the ai-memory binary. In Cowork, capture runs \
-    on your computer and needs ai-memory installed there; the memory tools still work.";
+    the ai-memory MCP tools. No telemetry. Requires the ai-memory binary, 3.0 or later. In \
+    Cowork, capture runs on your computer and needs ai-memory installed there; the memory tools \
+    still work.";
 const CODEX_DESCRIPTION: &str = "Long-term memory across sessions and harnesses, backed by the \
-    installed ai-memory binary and your ai-memory server. No telemetry. Codex runs the hooks only \
+    installed ai-memory binary (3.0 or later) and your ai-memory server. No telemetry. Codex runs \
+    the hooks only \
     after you trust them in /hooks.";
 
 /// One generated file, relative to the repository root.
@@ -61,11 +63,21 @@ pub struct PluginFile {
 }
 
 impl PluginFile {
+    /// Every constructor goes through here. The templates and LICENSE are
+    /// `include_str!`ed, so a CRLF checkout (Windows `core.autocrlf`) would
+    /// otherwise ship `/bin/sh^M` launchers and break the drift test.
     fn text(path: impl Into<String>, contents: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            contents: contents.into(),
+            contents: contents.into().replace("\r\n", "\n"),
             executable: false,
+        }
+    }
+
+    fn script(path: impl Into<String>, contents: impl Into<String>) -> Self {
+        Self {
+            executable: true,
+            ..Self::text(path, contents)
         }
     }
 
@@ -134,11 +146,7 @@ fn codex_catalog(version: &str) -> Value {
 /// status skill and the license.
 fn common_files(dir: &str) -> Vec<PluginFile> {
     let mut files = vec![
-        PluginFile {
-            path: format!("{dir}/{LAUNCHER_PATH}"),
-            contents: LAUNCHER.to_owned(),
-            executable: true,
-        },
+        PluginFile::script(format!("{dir}/{LAUNCHER_PATH}"), LAUNCHER),
         PluginFile::text(format!("{dir}/LICENSE"), LICENSE),
         PluginFile::text(format!("{dir}/skills/status/SKILL.md"), STATUS_SKILL),
     ];
@@ -173,7 +181,8 @@ fn claude_code_plugin(version: &str) -> Vec<PluginFile> {
             ),
             "ai_memory_bin": option(
                 "ai-memory executable",
-                "Path to the ai-memory binary, only needed when it is not on PATH.",
+                "Absolute path to the ai-memory binary, only needed when it is not on PATH. A \
+                 relative path is ignored.",
                 "ai-memory",
             ),
             "data_dir": option(
@@ -183,6 +192,9 @@ fn claude_code_plugin(version: &str) -> Vec<PluginFile> {
             ),
         },
     });
+    // Run through `sh`, as the Codex plugin does, rather than executing the
+    // launcher: a plugin uploaded as a desktop zip can lose the exec bit, and
+    // Windows Git Bash does not honour it at all.
     let mut hooks = serde_json::Map::new();
     for (name, script) in CLAUDE_CODE_EVENTS {
         let event = script.trim_end_matches(".sh");
@@ -190,7 +202,7 @@ fn claude_code_plugin(version: &str) -> Vec<PluginFile> {
             name.to_owned(),
             json!([{ "matcher": "", "hooks": [{
                 "type": "command",
-                "command": format!("\"${{CLAUDE_PLUGIN_ROOT}}\"/{LAUNCHER_PATH} claude-code {event}"),
+                "command": format!("sh \"${{CLAUDE_PLUGIN_ROOT}}/{LAUNCHER_PATH}\" claude-code {event}"),
             }]}]),
         );
     }
@@ -345,7 +357,7 @@ mod tests {
             assert_eq!(
                 command,
                 format!(
-                    "\"${{CLAUDE_PLUGIN_ROOT}}\"/scripts/ai-memory-hook claude-code {}",
+                    "sh \"${{CLAUDE_PLUGIN_ROOT}}/scripts/ai-memory-hook\" claude-code {}",
                     script.trim_end_matches(".sh")
                 )
             );
@@ -413,6 +425,17 @@ mod tests {
                     .contains("ai-memory doctor")
             );
             assert!(file(&files, &format!("{dir}/scripts/ai-memory-hook")).executable);
+        }
+    }
+
+    #[test]
+    fn rendered_files_are_lf_even_from_a_crlf_checkout() {
+        let launcher = PluginFile::script("x", "#!/bin/sh\r\nexec \"$bin\"\r\n");
+        assert_eq!(launcher.contents, "#!/bin/sh\nexec \"$bin\"\n");
+        assert!(launcher.executable);
+        assert_eq!(PluginFile::text("y", "a\r\nb").contents, "a\nb");
+        for file in render("1.0.0") {
+            assert!(!file.contents.contains('\r'), "{}", file.path);
         }
     }
 

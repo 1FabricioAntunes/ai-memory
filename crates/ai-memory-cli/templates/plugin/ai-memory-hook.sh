@@ -53,7 +53,14 @@ fi
 url="${CLAUDE_PLUGIN_OPTION_SERVER_URL:-}"
 data_dir="${CLAUDE_PLUGIN_OPTION_DATA_DIR:-}"
 bin="${CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN:-}"
-if [ -z "$bin" ] || [ "$bin" = "ai-memory" ]; then
+# Only an absolute path is honoured. A relative one would resolve against the
+# hook's working directory, the checkout, so a repository could ship the
+# "binary" every event is handed to.
+case "$bin" in
+    /* | [A-Za-z]:[\\/]*) ;;
+    *) bin="" ;;
+esac
+if [ -z "$bin" ]; then
     bin=""
     if command -v ai-memory >/dev/null 2>&1; then
         bin=$(command -v ai-memory)
@@ -74,10 +81,25 @@ fi
 
 # `hook` comes first so the Docker host wrapper can route it to its native
 # client; --data-dir is a global flag and may follow it.
-set -- hook --event "$event" --agent "$agent" --server-url "$url"
+set -- hook --event "$event" --agent "$agent"
 if [ -n "$data_dir" ]; then
     set -- "$@" --data-dir "$data_dir"
 fi
 AI_MEMORY_HOOK_ORIGIN="$agent-plugin"
 export AI_MEMORY_HOOK_ORIGIN
-exec "$bin" "$@"
+if [ -n "$url" ]; then
+    exec "$bin" "$@" --server-url "$url"
+fi
+
+# No URL option: ai-memory 3.0 and later read server_url from their own
+# config when --server-url is omitted. An older binary requires the flag
+# (and would post an empty one to a bare /hook), so it rejects the call with
+# a usage error, exit 2, before reading stdin. Retry it once against the
+# default local server, which still has the whole payload, and say why.
+status=0
+"$bin" "$@" || status=$?
+if [ "$status" -ne 2 ]; then
+    exit "$status"
+fi
+printf '%s\n' "ai-memory: this ai-memory binary predates the plugin (it needs 3.0 or later); sending to http://127.0.0.1:49374. Upgrade ai-memory, or set the plugin's server_url option." >&2
+exec "$bin" "$@" --server-url "http://127.0.0.1:49374"

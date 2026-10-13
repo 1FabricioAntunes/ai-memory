@@ -1537,7 +1537,10 @@ mod tests {
                 AgentChoice::ClaudeCode,
                 install_hooks::claude_settings_path(),
             ),
-            (AgentChoice::Codex, install_hooks::codex_hooks_path()),
+            (
+                AgentChoice::Codex,
+                install_hooks::codex_hooks_path(&crate::config::RuntimeEnv::from_process()),
+            ),
             (AgentChoice::OpenCode, install_hooks::opencode_plugin_path()),
             (
                 AgentChoice::OpenCode2,
