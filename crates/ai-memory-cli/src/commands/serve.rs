@@ -11,7 +11,7 @@ use ai_memory_consolidate::{
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
     run_lint,
 };
-use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
+use ai_memory_core::{ActiveProject, IdentityKey, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
     CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
     WorkstreamState, hook_router, workstream_router,
@@ -862,8 +862,35 @@ async fn run_profile_worker(
     }
 }
 
+async fn session_consolidation_actor(
+    reader: &ReaderPool,
+    session_id: ai_memory_core::SessionId,
+) -> ai_memory_core::ActorContext {
+    match reader.session_actor_user(session_id).await {
+        Ok(Some(owner)) => IdentityKey::from_storage_key(&owner)
+            .map(|key| key.to_actor_context())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    session = %session_id,
+                    "session owner is not a valid identity key; consolidating as anonymous"
+                );
+                ai_memory_core::ActorContext::anonymous()
+            }),
+        Ok(None) => ai_memory_core::ActorContext::anonymous(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session = %session_id,
+                "could not read session owner; consolidating as anonymous"
+            );
+            ai_memory_core::ActorContext::anonymous()
+        }
+    }
+}
+
 async fn run_session_consolidation_worker(
     writer: WriterHandle,
+    reader: ReaderPool,
     consolidator: Arc<Consolidator>,
     notify: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -933,13 +960,8 @@ async fn run_session_consolidation_worker(
                 "could not read the session page before SessionEnd consolidation; consolidating",
             ),
         }
-        let consolidation = consolidator.consolidate_session(
-            session_id,
-            false,
-            ai_memory_core::ActorContext::anonymous(),
-            None,
-            None,
-        );
+        let actor = session_consolidation_actor(&reader, session_id).await;
+        let consolidation = consolidator.consolidate_session(session_id, false, actor, None, None);
         tokio::pin!(consolidation);
         let result = tokio::select! {
             () = cancel.cancelled() => {
@@ -959,7 +981,7 @@ async fn run_session_consolidation_worker(
                         generation,
                         attempts,
                         path = %outcome.path,
-                        "SessionEnd: queued LLM consolidation written (opt-in)",
+                        "queued LLM consolidation written",
                     );
                     #[cfg(test)]
                     completed.notify_one();
@@ -1406,25 +1428,22 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 cancel.child_token(),
             ));
             let (session_consolidation_notify, session_consolidation_task) =
-                if config.consolidate_on_session_end {
-                    if let Some(consolidator) = consolidator.clone() {
-                        let notify = Arc::new(tokio::sync::Notify::new());
-                        let task = tokio::spawn(run_session_consolidation_worker(
-                            store.writer.clone(),
-                            consolidator,
-                            notify.clone(),
-                            cancel.child_token(),
-                            #[cfg(test)]
-                            Arc::new(tokio::sync::Notify::new()),
-                        ));
-                        info!(
-                            max_attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
-                            "durable SessionEnd consolidation worker started"
-                        );
-                        (Some(notify), Some(task))
-                    } else {
-                        (None, None)
-                    }
+                if let Some(consolidator) = consolidator.clone() {
+                    let notify = Arc::new(tokio::sync::Notify::new());
+                    let task = tokio::spawn(run_session_consolidation_worker(
+                        store.writer.clone(),
+                        store.reader.clone(),
+                        consolidator,
+                        notify.clone(),
+                        cancel.child_token(),
+                        #[cfg(test)]
+                        Arc::new(tokio::sync::Notify::new()),
+                    ));
+                    info!(
+                        max_attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+                        "durable session consolidation worker started"
+                    );
+                    (Some(notify), Some(task))
                 } else {
                     (None, None)
                 };
@@ -4426,6 +4445,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
+            store.reader.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),
@@ -4459,6 +4479,209 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "completed work must not be claimed again"
+        );
+    }
+
+    /// A PreCompact checkpoint job is an open session. The same worker must
+    /// consume it without `end_session` and without the SessionEnd opt-in.
+    #[tokio::test]
+    async fn session_consolidation_worker_consumes_an_open_session_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "checkpoint".into(),
+                    body: "open session still running".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should complete the open-session checkpoint");
+
+        let path = format!("sessions/{session_id}.md");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(workspace_id, project_id, &path)
+                .await
+                .unwrap()
+                .is_some_and(|page| page.body.contains("Durable worker completed")),
+            "checkpoint completion must follow the durable wiki write"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "completed checkpoint must not be claimed again"
+        );
+    }
+
+    /// The worker attributes the rewrite to the session owner, not anonymous.
+    #[tokio::test]
+    async fn session_consolidation_worker_attributes_checkpoint_to_session_owner() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: Some("user:alice".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "checkpoint".into(),
+                    body: "owned session still running".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should complete the owned checkpoint");
+        cancel.cancel();
+        task.await.unwrap();
+
+        let path = format!("sessions/{session_id}.md");
+        let page = store
+            .reader
+            .page_body_by_ids(workspace_id, project_id, &path)
+            .await
+            .unwrap()
+            .expect("checkpoint page must exist");
+        let frontmatter: serde_json::Value = serde_json::from_str(&page.frontmatter_json).unwrap();
+        assert_eq!(
+            frontmatter["last_modified_by"]["username"].as_str(),
+            Some("alice"),
+            "checkpoint rewrite must be attributed to the session owner: {frontmatter}"
         );
     }
 
@@ -4533,6 +4756,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
+            store.reader.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),
@@ -4695,6 +4919,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
+            store.reader.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),

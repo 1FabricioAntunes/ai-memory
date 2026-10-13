@@ -268,6 +268,12 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    EnqueueSessionCheckpoint {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     ClaimSessionConsolidation {
         now: i64,
         stale_before: i64,
@@ -1658,6 +1664,26 @@ impl WriterHandle {
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EnqueueSessionConsolidation {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Persist one open-session checkpoint job (PreCompact / PostCompaction)
+    /// for the current observation generation. Duplicate generations are
+    /// idempotent. An already-ended session is refused.
+    pub async fn enqueue_session_checkpoint(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EnqueueSessionCheckpoint {
             workspace_id,
             project_id,
             session_id,
@@ -3897,6 +3923,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     session_id,
                 );
                 send_or_warn(reply, result, "enqueue_session_consolidation");
+            }
+            WriteCmd::EnqueueSessionCheckpoint {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result = crate::session_consolidation::enqueue_checkpoint(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                );
+                send_or_warn(reply, result, "enqueue_session_checkpoint");
             }
             WriteCmd::ClaimSessionConsolidation {
                 now,

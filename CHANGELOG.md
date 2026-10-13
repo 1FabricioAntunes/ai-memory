@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- PreCompact and PostCompaction write the heuristic `sessions/<id>.md`
+  checkpoint on the `/hook` and `/hook/batch` request and complete the
+  ingest key there. When a provider is configured, the LLM rewrite is
+  queued on `session_consolidation_jobs` and handled by the same bounded
+  worker SessionEnd already uses. The previous inline wait sat behind
+  the client drain (3 s, or 250 ms incremental) for a 12-135 s provider
+  call, left the ingest key incomplete, and restarted the LLM on every
+  redelivery. SessionEnd enqueue stays opt-in via
+  `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`; the worker now starts whenever
+  a consolidator exists so checkpoint jobs still run when that flag is
+  off. The rewrite is attributed to the session owner recorded at session
+  start. (#1229)
 - Replaced the unmaintained YAML library (`serde_yaml` and its
   `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
   reads existing page frontmatter to exactly the same values as before. One

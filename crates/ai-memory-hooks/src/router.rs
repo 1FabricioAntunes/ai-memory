@@ -456,10 +456,10 @@ pub struct HookState {
     pub reader: ai_memory_store::ReaderPool,
     /// Wiki handle — used to write the session-summary page.
     pub wiki: Wiki,
-    /// Optional LLM-driven consolidator. When set, PreCompact uses it
-    /// to refresh `sessions/<id>.md` before the agent loses its
-    /// working context. When `None`, falls back to the deterministic
-    /// rule-based synth (still useful, just lower-signal).
+    /// Optional LLM-driven consolidator. When set, PreCompact /
+    /// PostCompaction write a rule-based `sessions/<id>.md` on the
+    /// request and enqueue the provider rewrite on the durable worker.
+    /// When `None`, only the rule-based synth runs.
     pub consolidator: Option<Arc<Consolidator>>,
     /// Privacy strip applied to every observation before it lands in
     /// the store. Same handle is also held by the wiki and consolidator
@@ -489,12 +489,13 @@ pub struct HookState {
     /// tokens. Disabled (pass-through) unless configured by the CLI.
     pub ingest_rate: Arc<tokio::sync::Mutex<IngestRateLimiter>>,
     /// Opt-in (`AI_MEMORY_CONSOLIDATE_ON_SESSION_END`): when true and a
-    /// `consolidator` is present, SessionEnd also runs LLM consolidation on
-    /// top of the always-written heuristic session page. Off by default so
-    /// session close stays cheap; the LLM checkpoint otherwise happens on
-    /// PreCompact and via manual `memory_consolidate`.
+    /// `consolidator` is present, SessionEnd also enqueues LLM consolidation
+    /// on top of the always-written heuristic session page. Off by default so
+    /// session close stays cheap. PreCompact / PostCompaction enqueue
+    /// whenever a consolidator is present, independent of this flag.
     pub consolidate_on_session_end: bool,
-    /// Coalescing wake-up for the durable SessionEnd consolidation worker.
+    /// Coalescing wake-up for the durable session-consolidation worker
+    /// (opt-in SessionEnd jobs and PreCompact / PostCompaction checkpoints).
     /// The database is the queue; notifications only reduce pickup latency.
     pub session_consolidation_notify: Option<Arc<tokio::sync::Notify>>,
     /// Coalescing wake-up for the cross-project profile pass: a session that
@@ -3321,6 +3322,45 @@ async fn enqueue_session_end_consolidation(
     Ok(inserted)
 }
 
+async fn enqueue_session_checkpoint_consolidation(
+    state: &HookState,
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> anyhow::Result<bool> {
+    if state.consolidator.is_none() {
+        return Ok(false);
+    }
+    let Some(notify) = state.session_consolidation_notify.as_ref() else {
+        warn!(
+            session = %session_id,
+            "PreCompact/PostCompaction LLM consolidation has no queue worker"
+        );
+        return Ok(false);
+    };
+    let path = PagePath::new(format!("sessions/{session_id}.md"))?;
+    if agent_session_page_id(state, workspace_id, project_id, session_id, &path)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let inserted = state
+        .writer
+        .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+        .await?;
+    if inserted {
+        state.ingest_metrics.record_persisted(now_unix_ms());
+    }
+    notify.notify_one();
+    debug!(
+        session = %session_id,
+        inserted,
+        "PreCompact/PostCompaction LLM consolidation queued"
+    );
+    Ok(inserted)
+}
+
 /// Only events that begin or actively advance work may move the legacy
 /// process-wide and identity-only fallbacks. Completion events can arrive
 /// after the operator has moved to another project, especially when a native
@@ -3843,8 +3883,8 @@ async fn process_authorized(
         .as_ref()
         .map(IdentityKey::to_actor_context)
         .unwrap_or_default();
-    if let Some(checkpoint_label) = checkpoint_label
-        && let Err(e) = consolidate_or_synth(
+    if let Some(checkpoint_label) = checkpoint_label {
+        match consolidate_or_synth(
             state,
             session_id,
             ws,
@@ -3853,12 +3893,27 @@ async fn process_authorized(
             HookCheckpoint {
                 label: checkpoint_label,
                 track_page_write: outcome == HookProcessingOutcome::Resumed,
+                defer_llm: true,
             },
             session_actor.clone(),
         )
         .await
-    {
-        warn!(error = %e, "PreCompact/PostCompaction consolidation failed; continuing");
+        {
+            Ok(checkpoint) => {
+                if checkpoint.should_enqueue_llm
+                    && let Err(e) =
+                        enqueue_session_checkpoint_consolidation(state, session_id, ws, proj).await
+                {
+                    warn!(
+                        error = %e,
+                        "PreCompact/PostCompaction consolidation enqueue failed; continuing"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "PreCompact/PostCompaction consolidation failed; continuing");
+            }
+        }
     }
 
     // On SessionEnd, close boundary-only sessions without generated artifacts.
@@ -4520,6 +4575,7 @@ fn checkpoint_fallback_warning(
 struct HookCheckpoint {
     label: &'static str,
     track_page_write: bool,
+    defer_llm: bool,
 }
 
 /// What one checkpoint run did. `fallback_reason` is set exactly when the
@@ -4531,10 +4587,11 @@ struct HookCheckpoint {
 #[derive(Debug)]
 struct CheckpointOutcome {
     // Read by the checkpoint tests (compiled only under `cfg(test)`); the
-    // production caller deliberately ignores a successful checkpoint's
-    // outcome, so the lint must be allowed explicitly.
+    // production caller uses `should_enqueue_llm` and ignores
+    // `fallback_reason`.
     #[allow(dead_code)]
     fallback_reason: Option<String>,
+    should_enqueue_llm: bool,
 }
 
 /// Write a fresh `sessions/<id>.md` for the current session without
@@ -4551,6 +4608,7 @@ async fn consolidate_or_synth(
 ) -> anyhow::Result<CheckpointOutcome> {
     let checkpoint_label = checkpoint.label;
     let mut fallback_reason = None;
+    let should_enqueue_llm = checkpoint.defer_llm && state.consolidator.is_some();
     // First deliveries already stamped their observation write. Only a retry
     // needs to distinguish a recovered page write from an unchanged checkpoint.
     let previous_page_id = if checkpoint.track_page_write {
@@ -4573,10 +4631,15 @@ async fn consolidate_or_synth(
         .await?
         .is_some()
     {
-        return Ok(CheckpointOutcome { fallback_reason });
+        return Ok(CheckpointOutcome {
+            fallback_reason,
+            should_enqueue_llm: false,
+        });
     }
-    let fallback_from_llm = state.consolidator.is_some();
-    if let Some(c) = state.consolidator.as_ref() {
+    let fallback_from_llm = state.consolidator.is_some() && !checkpoint.defer_llm;
+    if !checkpoint.defer_llm
+        && let Some(c) = state.consolidator.as_ref()
+    {
         let result = c
             // The hook path has no per-call override, so `None` lets the
             // project's standing `_prompts/consolidation.md` preferences
@@ -4615,12 +4678,18 @@ async fn consolidate_or_synth(
                         );
                         e
                     });
-                return Ok(CheckpointOutcome { fallback_reason });
+                return Ok(CheckpointOutcome {
+                    fallback_reason,
+                    should_enqueue_llm: false,
+                });
             }
             // Nothing to checkpoint. The rule-based path below no-ops on the
             // same condition, so this is success, not a failure worth logging.
             Err(ConsolidatorError::EmptySession(_)) => {
-                return Ok(CheckpointOutcome { fallback_reason });
+                return Ok(CheckpointOutcome {
+                    fallback_reason,
+                    should_enqueue_llm: false,
+                });
             }
             Err(e) if checkpoint_degrades_to_synth(&e) => {
                 let (warning, error_summary) = checkpoint_fallback_warning(checkpoint_label, &e);
@@ -4636,7 +4705,10 @@ async fn consolidate_or_synth(
     }
     let observations = state.reader.observations_for_session(session_id).await?;
     if is_ephemeral_session(&observations) {
-        return Ok(CheckpointOutcome { fallback_reason });
+        return Ok(CheckpointOutcome {
+            fallback_reason,
+            should_enqueue_llm: false,
+        });
     }
     let new_page = synthesize_session_page(
         workspace_id,
@@ -4682,7 +4754,10 @@ async fn consolidate_or_synth(
             e
         });
     debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
-    Ok(CheckpointOutcome { fallback_reason })
+    Ok(CheckpointOutcome {
+        fallback_reason,
+        should_enqueue_llm,
+    })
 }
 
 /// The id of `sessions/<id>.md` when the agent wrote it itself through
@@ -5079,6 +5154,36 @@ mod tests {
                        (8192 tokens), try increasing it"
                     .into(),
             }
+        }
+    }
+
+    /// Stalls, then panics if the compaction hook path still calls the provider.
+    struct SlowHookLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SlowHookLlm {
+        fn name(&self) -> &'static str {
+            "slow-hook"
+        }
+        fn model(&self) -> &str {
+            "slow-hook"
+        }
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            self.stall().await
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            self.stall().await
+        }
+    }
+
+    impl SlowHookLlm {
+        async fn stall<T>(&self) -> LlmResult<T> {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            panic!("compaction hook path must not call the provider");
         }
     }
 
@@ -6145,6 +6250,7 @@ mod tests {
             HookCheckpoint {
                 label: "pre-compact",
                 track_page_write: true,
+                defer_llm: false,
             },
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -6238,6 +6344,7 @@ mod tests {
                 HookCheckpoint {
                     label: checkpoint_label,
                     track_page_write: true,
+                    defer_llm: false,
                 },
                 ai_memory_core::ActorContext::anonymous(),
             )
@@ -6335,6 +6442,7 @@ mod tests {
             HookCheckpoint {
                 label: "pre-compact",
                 track_page_write: true,
+                defer_llm: false,
             },
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -6375,6 +6483,7 @@ mod tests {
             HookCheckpoint {
                 label: "pre-compact",
                 track_page_write: true,
+                defer_llm: false,
             },
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -7580,6 +7689,7 @@ mod tests {
             HookCheckpoint {
                 label: "test",
                 track_page_write: true,
+                defer_llm: false,
             },
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -7597,6 +7707,7 @@ mod tests {
             HookCheckpoint {
                 label: "test",
                 track_page_write: true,
+                defer_llm: false,
             },
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -11779,6 +11890,144 @@ mod tests {
         );
     }
 
+    /// Compaction checkpoints write the heuristic page, enqueue the durable
+    /// job, and return without calling the provider (#1229). Independent of
+    /// the SessionEnd opt-in.
+    #[tokio::test]
+    async fn compaction_checkpoint_queues_llm_work_without_waiting_for_the_provider() {
+        for event in ["pre-compact", "post-compaction"] {
+            let tmp = TempDir::new().unwrap();
+            let mut state = make_state(&tmp).await;
+            state.consolidator = Some(Arc::new(Consolidator::new(
+                state.reader.clone(),
+                state.writer.clone(),
+                state.wiki.clone(),
+                Arc::new(SlowHookLlm),
+                state.workspace_id,
+                state.project_id,
+            )));
+            state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+            let sid = if event == "pre-compact" {
+                "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c001"
+            } else {
+                "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c002"
+            };
+            let fire = |name: &str| {
+                HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: name.into(),
+                        agent: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    serde_json::json!({
+                        "session_id": sid,
+                        "prompt": "keep this working state"
+                    }),
+                )
+            };
+            process(&state, fire("user-prompt-submit"), None, Vec::new())
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            process(&state, fire(event), None, Vec::new())
+                .await
+                .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "{event} must not wait for the provider on the hook path"
+            );
+
+            let session_id: SessionId = sid.parse().unwrap();
+            let path = format!("sessions/{session_id}.md");
+            let page = state
+                .reader
+                .page_body_by_ids(state.workspace_id, state.project_id, &path)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{event} must write a rule-based checkpoint"));
+            assert!(
+                page.body.contains("keep this working state"),
+                "{event} heuristic page must carry the session: {}",
+                page.body
+            );
+
+            let now = Timestamp::now().as_microsecond();
+            let job = state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{event} must enqueue a durable checkpoint job"));
+            assert_eq!(job.session_id(), session_id);
+            assert!(
+                state
+                    .reader
+                    .latest_open_handoff(
+                        state.workspace_id,
+                        state.project_id,
+                        None,
+                        ai_memory_core::OwnerFilter::Any
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{event} must not create a handoff"
+            );
+        }
+    }
+
+    /// Zero-LLM PreCompact still writes the synth page and must not insert a
+    /// consolidation job.
+    #[tokio::test]
+    async fn compaction_checkpoint_writes_synth_without_a_job_when_no_provider() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c010";
+        let fire = |name: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "prompt": "keep this working state"
+                }),
+            )
+        };
+        process(&state, fire("user-prompt-submit"), None, Vec::new())
+            .await
+            .unwrap();
+        process(&state, fire("pre-compact"), None, Vec::new())
+            .await
+            .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let path = format!("sessions/{session_id}.md");
+        let page = state
+            .reader
+            .page_body_by_ids(state.workspace_id, state.project_id, &path)
+            .await
+            .unwrap()
+            .expect("zero-LLM PreCompact must still write the synth page");
+        assert!(
+            page.body.contains("keep this working state"),
+            "synth page must carry the session: {}",
+            page.body
+        );
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "zero-LLM PreCompact must not insert a consolidation job"
+        );
+    }
+
     /// A compaction checkpoint keeps the agent's page as SessionEnd does,
     /// and still replaces a page no agent wrote (control).
     #[tokio::test]
@@ -11800,6 +12049,86 @@ mod tests {
                 "{closing}: {replaced}"
             );
         }
+    }
+
+    /// An agent-written session page is left alone and must not enqueue a
+    /// checkpoint job: the worker would otherwise still claim it.
+    #[tokio::test]
+    async fn compaction_checkpoint_skips_enqueue_when_the_agent_wrote_the_page() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            Arc::new(SlowHookLlm),
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c020";
+        let deliver = |event: &'static str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "consolidate this session" }),
+            )
+        };
+        for event in ["session-start", "user-prompt-submit"] {
+            process(&state, deliver(event), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        let path = format!("sessions/{sid}.md");
+        state
+            .wiki
+            .write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                path: ai_memory_core::PagePath::new(path.clone()).unwrap(),
+                frontmatter: serde_json::json!({
+                    "consolidated": true,
+                    "consolidated_by": "agent"
+                }),
+                body: "# Agent page\n\nCompiled by the agent's own model.".into(),
+                tier: ai_memory_core::Tier::Episodic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        process(&state, deliver("pre-compact"), None, Vec::new())
+            .await
+            .unwrap();
+
+        let body = state
+            .reader
+            .page_body_by_ids(state.workspace_id, state.project_id, &path)
+            .await
+            .unwrap()
+            .expect("the agent page must still exist")
+            .body;
+        assert!(
+            body.contains("Compiled by the agent's own model"),
+            "PreCompact must keep the agent page: {body}"
+        );
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "an agent-written page must not enqueue a checkpoint job"
+        );
     }
 
     /// A substantive SessionEnd must write the heuristic `sessions/<id>.md`
