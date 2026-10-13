@@ -715,10 +715,6 @@ async fn memory_status(config: &Config) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A versioned Homebrew binary is recorded through the `opt/<formula>`
-    /// link that survives `brew upgrade` and `brew cleanup`, falling back to
-    /// the `<prefix>/bin` link; a link to some other binary never wins.
-    #[cfg(unix)]
     /// Muse is detected by its config or data directory under the home or
     /// the absolute XDG roots, and not otherwise.
     #[test]
@@ -743,6 +739,10 @@ mod tests {
         assert_eq!(AgentPlan::new(AgentChoice::Muse).mcp, Some(McpClient::Muse));
     }
 
+    /// A versioned Homebrew binary is recorded through the `opt/<formula>`
+    /// link that survives `brew upgrade` and `brew cleanup`, falling back to
+    /// the `<prefix>/bin` link; a link to some other binary never wins.
+    #[cfg(unix)]
     #[test]
     fn a_cellar_binary_is_recorded_through_its_stable_homebrew_link() {
         use std::os::unix::fs::symlink;
