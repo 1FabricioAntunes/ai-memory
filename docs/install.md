@@ -3256,10 +3256,18 @@ ai-memory install-hooks --agent  claude-code --apply
 ```
 
 The installed Docker wrapper runs CLI commands inside a short-lived
-helper container for server/store operations, but runs `install-hooks` through
-the stable checksum-verified native client under
+helper container for server/store operations, but runs `install-hooks`,
+`mcp-bridge`, and lifecycle `hook` commands through the stable
+checksum-verified native client under
 `~/.local/share/ai-memory/native-runner/`. This keeps hook command paths valid
-on the host and enforces capture exclusions before spooling. For local loopback
+on the host and enforces capture exclusions before spooling. A hook command
+that calls the wrapper (`ai-memory hook --event …`) therefore runs natively in
+a few milliseconds and posts to the host's `127.0.0.1:49374`; it never starts a
+container. A hook only reuses the installed client: `install-hooks` and
+`mcp-bridge` install and refresh it, while the hook path never checks for an
+update or downloads. If no client is installed yet, the wrapper says to run
+`ai-memory install-hooks` once, drops that one event, and exits 0 so the agent
+is not blocked. For local loopback
 servers, the wrapper automatically bridges
 that helper back to the host's `127.0.0.1:49374`, so `ai-memory status`,
 `ai-memory search`, and `ai-memory bootstrap` work with the same default
@@ -3302,7 +3310,7 @@ inoperable. Docker documents `label=disable` in the
 [`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
 
 `ai-memory run`, `ai-memory show`, `ai-memory continue`, `ai-memory resume`,
-`ai-memory workstreams`, and `ai-memory rename-workstream` are the exceptions:
+`ai-memory workstreams`, and `ai-memory rename-workstream` are exceptions too:
 the current wrapper intercepts them and starts a cached checksum-verified native
 client on the host, where local checkouts, harness executables, and session
 stores exist. It preserves an explicit remote `AI_MEMORY_SERVER_URL`. If one of

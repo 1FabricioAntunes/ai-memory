@@ -532,6 +532,16 @@ and [0.x](docs/changelog/0.x.md).
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed `ai-memory hook` running inside a helper container on Docker-wrapper
+  installs (Linux/macOS). A hook config or plugin that called the wrapper paid
+  about 280 ms per event, over the 200 ms hook budget, and its default
+  `127.0.0.1` server URL pointed at the container instead of the host server.
+  The wrapper now runs `hook` and `hook-drain` through the same
+  checksum-verified native host client as `mcp-bridge` and `install-hooks`.
+  A hook only reuses the installed client, with no update check or download
+  on the hook path. When no client is installed yet, the wrapper says to run
+  `ai-memory install-hooks` once, skips the event and exits 0, so the agent
+  is never blocked.
 
 ## [2.6.6] - 2026-10-13
 
