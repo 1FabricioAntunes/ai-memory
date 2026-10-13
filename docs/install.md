@@ -69,7 +69,11 @@ ai-memory setup
 `install.sh.sha256`. It picks `ai-memory-<os>-<arch>.tar.gz` for the machine,
 downloads it with its `.sha256` file, and stops before unpacking anything when
 the checksum file is missing, names another asset, or does not match. It also
-refuses an archive holding an absolute or `..` path. The release goes to
+refuses an archive holding an absolute or `..` path, or any member that is not
+a plain file or directory (a symlink or hard link), and unpacks with
+`--no-same-owner`. Without curl it falls back to wget, and for the default
+GitHub URL only to a wget that supports `--https-only` (so a redirect cannot
+drop to plain http); BusyBox wget is refused there. The release goes to
 `~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
 binary, so the bundled `hooks/` directory sits beside it and
 `ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
