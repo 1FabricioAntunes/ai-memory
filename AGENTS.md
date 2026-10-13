@@ -373,6 +373,17 @@ covers the same tests, slower, no tiers.
 - Typed boundaries are load-bearing: IDs, `PagePath`, `AgentKind`,
   sanitization, workspace/project resolution, auth capability, and
   provider dialects are parsed/normalized once and reused.
+- **The core stays Rust-only.** The root workspace and everything the server
+  ships (the binary, its built-in `/web` UI, Docker, native packages) build
+  with Cargo alone: no Node, npm, bundler or JavaScript framework, and no
+  build step outside Cargo (the vendored Tailwind CLI is the one pinned
+  exception, run only to regenerate `static/tailwind.css`). The web UI is
+  server-rendered from askama templates; a page may carry a small inline
+  vanilla script for progressive enhancement, never a framework. A UI or
+  console that needs a JavaScript toolchain belongs in a companion, and
+  another language appears only where its target ecosystem requires it
+  (a TypeScript client SDK, the Swift macOS app, the TS plugins generated for
+  JS-based harnesses), always under `companions/` or as generated output.
 - Keep CLI commands thin: parse args, resolve config once, call typed
   library functions, render output. Provider-specific behavior belongs in
   `ai-memory-llm`, not in CLI/admin handlers.
@@ -559,6 +570,10 @@ Additional boundary rules:
   test-only churn are exempt. CI rejects a duplicated heading
   (`scripts/check-changelog-sections.sh`) and any edit to an already
   released section (`scripts/check-changelog-frozen.sh`).
+  `CHANGELOG.md` holds the current major line; when a new major ships,
+  `bin/release` moves the previous major's sections and compare links to
+  `docs/changelog/<major>.x.md` (`scripts/changelog_sections.py archive`).
+  Archived sections stay frozen, and the frozen check reads both places.
 - **Run the humanizer on new or heavily edited prose.** New documentation,
   and any large rewrite of existing text (a new doc section, a rewritten guide,
   a long CHANGELOG entry, an RFC or design note), goes through the `humanizer`

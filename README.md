@@ -178,8 +178,8 @@ access-weighted retention) works with no API key at all.
 **Built on the shoulders of:** the
 [Karpathy LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
 (compile-not-retrieve),
-[agentmemory](https://github.com/rohitg00/agentmemory) (this project is its Rust
-successor), [basic-memory](https://github.com/basicmachines-co/basic-memory)
+[agentmemory](https://github.com/rohitg00/agentmemory) (hook capture for coding
+agents), [basic-memory](https://github.com/basicmachines-co/basic-memory)
 (markdown-on-disk truth),
 [cognee](https://github.com/topoteretes/cognee) (pipeline composition and
 triplet embeddings),
