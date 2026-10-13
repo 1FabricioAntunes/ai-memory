@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists projects the same way instead of falling back to local scan results.
   If both calls fail, the error names both routes and the likely causes.
   (#1236)
+- Fixed consolidation sending the model a prompt with no evidence when
+  `consolidation.max_input_tokens` sat at the validated floor. The floor was
+  checked against the raw token count, but the prompt builders work on a
+  smaller character budget (tokens × a chars-per-token estimate ×
+  `input_token_safety_margin`, default 0.8). At the old 6,500 floor the batch
+  prompt's fixed part alone overflowed that budget, so every observation became
+  an omission marker. The floor is now 8,350 tokens at the default margin, and
+  a lower margin needs a proportionally larger budget. A project's existing
+  page titles are now optional prompt context, listed only as far as they fit,
+  so a project with many pages no longer crowds observations out at a small
+  budget. An install configured between 6,500 and 8,350 tokens now fails at
+  startup with a message naming both numbers. (#1234, #1242)
 - Replaced the unmaintained YAML library (`serde_yaml` and its
   `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
   reads existing page frontmatter to exactly the same values as before. One

@@ -903,7 +903,7 @@ llm = true                        # use the configured provider when there is on
                                   # env: AI_MEMORY_PROFILE__<KEY>, e.g. AI_MEMORY_PROFILE__SHARE=workspace
 
 [consolidation]                    # LLM consolidation prompt sizing
-max_input_tokens = 100000          # approximate whole-input target; min 6000
+max_input_tokens = 100000          # approximate whole-input target; min 8350 at the default margin (scales with it)
                                    # a flat chars-per-token heuristic, so it
                                    # UNDER-budgets denser corpora: pt-BR prose
                                    # and source code tokenize at fewer chars per
