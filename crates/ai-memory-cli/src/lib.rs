@@ -24,6 +24,7 @@ mod commands;
 mod config;
 mod http_client;
 mod install_layout;
+mod local_auth;
 mod logging;
 mod marker;
 mod process_guard;
@@ -84,6 +85,7 @@ pub async fn run() -> Result<()> {
 
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
+        Command::Setup(args) => commands::setup::run(&config, args, config_path.as_deref()).await,
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::ListProjects(args) => commands::list_projects::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,
@@ -160,6 +162,13 @@ pub async fn run() -> Result<()> {
         Command::AutoImproveReport(args) => commands::auto_improve_report::run(&config, args).await,
         Command::AutoImprove(args) => commands::auto_improve::run(&config, args).await,
         Command::FinalizeSession(args) => commands::finalize_session::run(&config, args).await,
+        Command::Recover(args) => {
+            let exit_code = commands::recovery::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::PendingWrites(args) => commands::pending_writes::run(&config, args).await,
         Command::Embed(args) => commands::embed::run(&config, args).await,
         Command::GenerateAuthToken(args) => commands::generate_auth_token::run(&config, args),
@@ -175,7 +184,7 @@ pub async fn run() -> Result<()> {
         Command::MoveSession(args) => commands::move_session::run(&config, args).await,
         Command::Uninstall(args) => commands::uninstall::run(&config, args),
         Command::Upgrade(args) => commands::upgrade::run(&config, args).await,
-        Command::Auth(args) => commands::auth::run(&config, args).await,
+        Command::Auth(args) => commands::auth::run(&config, args, config_path.as_deref()).await,
         Command::User(args) => commands::user::run(&config, args).await,
         Command::ApiKey(args) => commands::api_key::run(&config, args).await,
         Command::Project(args) => commands::project::run(&config, args).await,

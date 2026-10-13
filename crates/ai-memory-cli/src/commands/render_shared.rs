@@ -1093,7 +1093,7 @@ fn build_pool_settings_yaml_for_platform(
 /// Emit a YAML single-quoted scalar: wrap in `'…'`, doubling any embedded
 /// `'`. Single-quote style is the only YAML form in which the POSIX shell
 /// quoting inside the hook command survives byte-for-byte.
-fn yaml_single_quote(s: &str) -> String {
+pub(crate) fn yaml_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -3132,10 +3132,8 @@ check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-cap
         let Some(()) = node_strip_types_available() else {
             return;
         };
-        // `keep()` cancels delete-on-drop: the emitted modules are the
-        // evidence, so they stay on disk for inspection after the run.
-        let temp = tempfile::tempdir().unwrap().keep();
-        eprintln!("capture-owner gate modules retained at {}", temp.display());
+        let guard = tempfile::tempdir().unwrap();
+        let temp = guard.path().to_path_buf();
         const HARNESS: &str = r#"import { closeSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";

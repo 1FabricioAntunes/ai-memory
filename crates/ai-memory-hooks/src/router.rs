@@ -638,6 +638,8 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// `POST /hook`: [`admit_hook`] timed into the `/admin/metrics` histogram.
+/// The timer covers the response, not the spawned processing.
 async fn handle_hook(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HookQuery>,
@@ -645,8 +647,25 @@ async fn handle_hook(
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: HeaderMap,
-    Json(mut body): Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let metrics = state.ingest_metrics.clone();
+    let _timer = metrics.hook_latency().start();
+    admit_hook(
+        state, query, actor_ext, level_ext, viewer_ext, headers, body,
+    )
+    .await
+}
+
+async fn admit_hook(
+    state: Arc<HookState>,
+    query: HookQuery,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    headers: HeaderMap,
+    mut body: serde_json::Value,
+) -> (StatusCode, &'static str) {
     // Unconditional backstop (#196): drop any raw assistant-message field on the
     // `Value` before it becomes a `HookEnvelope`, so the field can never reach
     // `body_excerpt`, tracing, or the store — regardless of client version.
@@ -8341,6 +8360,45 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Every `/hook` answer, queued or shed, lands in the latency histogram
+    /// that `/admin/metrics` exposes, and nothing else does.
+    #[tokio::test]
+    async fn handle_hook_times_every_answer_into_the_latency_histogram() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let call = |state: Arc<HookState>| async move {
+            handle_hook(
+                State(state),
+                Query(HookQuery {
+                    event: "session-start".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                Json(serde_json::json!({ "session_id": "latency-s1" })),
+            )
+            .await
+            .into_response()
+            .status()
+        };
+        assert_eq!(state.ingest_metrics.hook_latency().snapshot().count(), 0);
+        assert_eq!(call(state.clone()).await, StatusCode::ACCEPTED);
+        assert_eq!(state.ingest_metrics.hook_latency().snapshot().count(), 1);
+
+        let tmp2 = TempDir::new().unwrap();
+        let mut saturated = make_state(&tmp2).await;
+        saturated.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        saturated.ingest_metrics = state.ingest_metrics.clone();
+        assert_eq!(
+            call(Arc::new(saturated)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(state.ingest_metrics.hook_latency().snapshot().count(), 2);
     }
 
     #[tokio::test]

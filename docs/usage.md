@@ -154,7 +154,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
 | "Search expired notes for X" | `memory_query` with `include_expired: true` | Opts an explicit project, sibling-scope, or global search into expired historical pages; ordinary searches exclude them. |
-| "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits. A global query reports only its distinct FTS stream. |
+| "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits, plus a top-level `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`; streams that did not run are left out). A global query reports only its distinct FTS stream and `fts_ms`. |
 | Improve top project/scopes search relevance | Set `AI_MEMORY_RERANKER=llm` on a server with an LLM provider | Sends the bounded query plus up to 30 bounded titles/snippets to the provider for at most one final relevance pass. Invalid, partial, failed, timed-out, or concurrency-saturated requests preserve the normal order; `global=true` and supplemental global-preference hits are unchanged. |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "That recalled page helped" / "this page is stale" | `memory_feedback` | Records `helpful`, `not_helpful`, `stale`, or `wrong` for the exact path. Retention weight affects sweep-eligible episodic pages; stale/wrong also flag any current page for lint review. Retrieved content never authorizes feedback by itself. |
@@ -335,7 +335,10 @@ exists, both when both exist, or creates `CLAUDE.md` when neither exists. Use
 instruction target unless you override it: `CLAUDE.md` implies
 `.claude/skills`, `AGENTS.md` implies `.agents/skills`, and both files imply
 both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
-install under its `.grok/skills` root; for Hermes Agent, `--skills-agent hermes`
+install under its `.grok/skills` root; for GitHub Copilot CLI, select
+`--skills-agent copilot-cli` so skills install under `.github/skills` (project)
+or `$COPILOT_HOME/skills` (global, default `~/.copilot/skills`); for Hermes
+Agent, `--skills-agent hermes`
 installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
@@ -354,6 +357,7 @@ ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
+ai-memory install-skills --scope global --agent copilot-cli
 ai-memory install-skills --scope global --agent hermes
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
@@ -363,13 +367,20 @@ For Devin, project-local skills are installed under `.devin/skills`. Global
 Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
 on non-Windows systems. For Grok Build CLI, project-local skills go under
 `.grok/skills` and global under `$GROK_HOME/skills` (default
-`~/.grok/skills`).
+`~/.grok/skills`). For GitHub Copilot CLI, project-local skills go under the
+repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
+`~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
+`AGENTS.md` instruction target.
 
 Project-local skill roots are `.claude/skills` for Claude-compatible installs,
 `.agents/skills` for cross-client installs, `.devin/skills` for Devin, and
-`.grok/skills` for Grok. Global Claude/Agents roots are `~/.claude/skills` and
-`~/.agents/skills`; global Devin roots are platform-specific as described
-above; global Grok is `$GROK_HOME/skills` (default `~/.grok/skills`).
+`.grok/skills` for Grok, and `.github/skills` for GitHub Copilot CLI. Global
+Claude/Agents roots are `~/.claude/skills` and `~/.agents/skills`; global Devin
+roots are platform-specific as described above; global Grok is
+`$GROK_HOME/skills` (default `~/.grok/skills`); global Copilot CLI is
+`$COPILOT_HOME/skills` (default `~/.copilot/skills`). `uninstall` sweeps both
+Copilot CLI roots and removes only files carrying the ai-memory managed marker,
+so team-authored skills in `.github/skills` are never touched.
 `--target-dir` points at an explicit skill root and bypasses scope/agent
 inference. `--print` previews target paths and `SKILL.md` contents. `--force`
 allows replacement of unmanaged same-name skills; without it, user-authored
@@ -502,7 +513,24 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and FTS5 search. In rendered
+breadcrumbs, rendered markdown, metadata, and search. The search box in the
+header searches every project with FTS5, like `memory_query(global=true)`. The
+search on a project page ranks with the same hybrid ranker as `memory_query`
+for that project, and its "Explain ranking" box shows each hit's stream ranks,
+RRF contributions, authority and rerank score, plus the per-stream timings.
+Root also gets `/web/health`: hook counters (429s included), the writer queue,
+the local spool and recovery journal, the consolidation queue, embedder and
+provider state, and the failing checks with the command that fixes each. Each page links
+to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version, newest
+first, with the author where the write was attributed, and a unified diff
+between any two of them (by default the latest against the version it
+replaced). A version another write replaced stays listed; an expired one does
+not, and a page whose TTL has passed has no history. The project page
+lists recent sessions, and each opens a timeline
+(`/web/w/<ws>/<proj>/s/<session-id>`) that pages through the session's
+captured observations in order, with first/prev/next/last links, a jump field
+and, when JavaScript runs, a slider and `j`/`k` keys to step one observation
+at a time. Observations are shown as plain text. In rendered
 pages, `[[wiki links]]` become clickable links to the target page.
 `[[path]]`, `[[path|label]]`, `[[project:path]]`,
 `[[workspace/project:path]]`, and `[[_global:path]]` are all supported

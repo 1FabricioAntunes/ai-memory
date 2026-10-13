@@ -14,6 +14,11 @@ pub const AGENTS_SKILL_DIR: &str = ".agents";
 pub const DEVIN_SKILL_DIR: &str = ".devin";
 /// Grok Build CLI Agent Skill directory below a project or home root.
 pub const GROK_SKILL_DIR: &str = ".grok";
+/// GitHub Copilot CLI project Agent Skill directory below a repository root.
+pub const GITHUB_SKILL_DIR: &str = ".github";
+/// GitHub Copilot CLI personal Agent Skill directory below the home root, used
+/// when `COPILOT_HOME` does not relocate it.
+pub const COPILOT_SKILL_DIR: &str = ".copilot";
 /// Hermes Agent Skill directory below a project or home root.
 pub const HERMES_SKILL_DIR: &str = ".hermes";
 /// Leaf directory that contains individual Agent Skill directories.
@@ -277,7 +282,7 @@ mod tests {
         let Some((frontmatter, _body)) = rest.split_once("\n---\n") else {
             panic!("{} must close frontmatter", skill.name);
         };
-        serde_yaml::from_str(frontmatter)
+        serde_saphyr::from_str(frontmatter)
             .unwrap_or_else(|e| panic!("{} frontmatter must be valid YAML: {e}", skill.name))
     }
 

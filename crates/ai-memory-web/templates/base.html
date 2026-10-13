@@ -25,6 +25,7 @@
         >
       </form>
       <a href="pending" class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400">Pending</a>
+      <a href="health" class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400">Health</a>
       <button
         type="button"
         id="ai-memory-logout"
@@ -64,8 +65,9 @@
   </main>
 
   <footer class="border-t border-slate-200 dark:border-slate-800 mt-16 py-4">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-xs text-slate-400 dark:text-slate-600">
-      ai-memory · read-only
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4 text-xs text-slate-400 dark:text-slate-600">
+      <span>ai-memory · read-only</span>
+      {% block footer_version %}<span>v{{ crate::templates::VERSION }}</span>{% endblock %}
     </div>
   </footer>
 </body>

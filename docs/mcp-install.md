@@ -3,10 +3,28 @@
 For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
 It shows direct MCP writes, queries and handoffs without a native hook adapter.
 
+Factory Droid, Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
+`install-mcp` client; their hand-written recipes are in
+[`install.md`](install.md#clients-without-an-install-mcp-writer).
+
 > All snippets below default to `http://127.0.0.1:49374` (local server). For a
 > remote server (homelab, LAN box) substitute the appropriate URL AND add an
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
 > is enabled. The MCP wire protocol expects the `/mcp` path suffix on the URL.
+
+> **Token kept in the data dir.** When this install's bearer comes from
+> `[auth].bearer_token_file` (every fresh `ai-memory init`, and
+> `ai-memory auth enable`), `install-mcp` never writes it into a client's
+> config. Claude Code gets the session-aware `ai-memory mcp-bridge` stdio
+> entry; Codex (`bearer_token_env_var`) and Prime Agent (`bearerTokenEnvVar`)
+> name `AI_MEMORY_AUTH_TOKEN`, which you export where you start them. Every
+> other client gets a local stdio entry, in its own format, that runs
+> `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
+> the token file at launch and forwards no session id, so the client passes
+> `workspace` and `project` like any static client. The client must find
+> `ai-memory` on its `PATH` (GUI apps may need the full path). ZCode keeps
+> HTTP entries only and is refused. Passing `--auth-token` explicitly (or
+> `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
 
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
@@ -152,7 +170,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh / prime-agent
 > ```
 
 ---
@@ -237,9 +255,10 @@ native HTTP or generated bridge paths.
 
 ## GitHub Copilot CLI
 
-**Status:** MCP and lifecycle hooks are supported. Handoffs are not injected
-at `SessionStart` yet (see below), and there is no managed workstream
-(`ai-memory run copilot`).
+**Status:** MCP and lifecycle hooks are supported, the `SessionStart` hook
+injects the pending handoff (see below), and `ai-memory run copilot` launches
+Copilot CLI as a managed workstream harness (see
+[managed workstreams](managed-workstreams.md)).
 
 **Config files:** `$COPILOT_HOME/mcp-config.json` for MCP and
 `$COPILOT_HOME/hooks/ai-memory.json` for lifecycle hooks (`COPILOT_HOME`
@@ -492,6 +511,108 @@ resuming when you need continuity.
 
 Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 <https://dev.meta.ai/docs/muse-code/extending>.
+
+---
+
+## DeepSeek Harness (DSH)
+
+**Status:** MCP supported (print-only). No lifecycle hooks or managed workstream claimed.
+
+DSH has no fixed JSON/TOML MCP config: the MCP client is a Cordis plugin entry
+(`@deepseek-ai/dsh-mcp-client`) inside a profile's `cordis.patch.yml`.
+`install-mcp` therefore prints a ready-to-merge patch fragment and refuses
+`--apply`:
+
+```bash
+ai-memory install-mcp --client dsh
+```
+
+Merge the printed `- insert:` item into
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` (the `web` profile
+reloads its patch live), then reload or restart the profile. The fragment registers
+the default stateless HTTP endpoint and carries `Authorization: Bearer <token>`
+when `--auth-token` (or a configured server token) is present.
+
+DSH ships a bridge that runs an existing Claude Code `hooks.json` or settings
+file (`@deepseek-ai/dsh-hooks-claude-code`). Pointing it at ai-memory's Claude
+Code hooks is not a supported capture path: those hooks report every event as
+`agent=claude-code`, so DSH sessions would be stored as Claude Code sessions.
+ai-memory does not install or manage the bridge, and it delivers only seven Claude Code events
+(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`Stop`, `SubagentStart`, `SubagentStop`). `PreCompact` and
+`SessionEnd` are not delivered, and its `SessionStart` injection runs
+detached. Treat DSH as MCP-only here and recover handoffs explicitly with
+`memory_handoff_list` then `memory_handoff_accept` when continuity matters.
+
+---
+
+## Prime Agent
+
+**Status:** MCP supported. No lifecycle hooks or managed workstream claimed.
+
+[Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) reads user MCP
+servers from the `mcpServers` map of its agent dir's `settings.json`:
+`$PRIME_AGENT_CODING_AGENT_DIR/settings.json`, default
+`~/.prime/agent/settings.json`. A project's `.prime/agent/settings.json`
+overrides it; pass that path with `--config-file`.
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"
+    }
+  }
+}
+```
+
+```bash
+ai-memory install-mcp --client prime-agent --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+export AI_MEMORY_AUTH_TOKEN="$TOKEN"   # in the shell you launch prime-agent from
+```
+
+How Prime Agent 0.10 treats the entry shapes the generated one:
+
+- **The token is referenced, not written.** Prime Agent counts a user HTTP
+  server as connected, and names it in the model's prompt
+  (`Enabled generic MCP servers: ai-memory`), only when the variable in
+  `bearerTokenEnvVar` is set or an OAuth grant exists. A literal
+  `headers.Authorization` still reaches the server but leaves it unlisted, so
+  `install-mcp` writes `"bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"` and the
+  token stays out of `settings.json`. If the variable is unset, Prime Agent
+  shows the server as disconnected and calls fail.
+- **Without a token** the entry is just `type` + `url`. Calls through
+  `mcp.call_tool("ai-memory", ...)` still work, but the server is not listed in
+  the prompt or shown as connected in `/mcp`. Run the server with
+  `AI_MEMORY_AUTH_TOKEN` and pass `--auth-token` to get it listed.
+- **Use the camelCase key.** Prime Agent 0.10.0's own
+  `prime-agent mcp add --bearer-token-env-var` writes `bearer_token_env_var`,
+  which its settings loader ignores. Use `install-mcp` or edit the file.
+
+Prime Agent does not expose MCP tools as native tools. The model calls them
+from its persistent Python REPL:
+`await mcp.list_tools("ai-memory")`, then
+`await mcp.call_tool("ai-memory", "memory_query", {...})`. Requests carry no
+session id or working directory, so Prime Agent is a static client: pass
+`workspace` and `project` on project-scoped calls (the routing snippet from
+`ai-memory install-instructions --target AGENTS.md` says so, and Prime Agent
+loads `AGENTS.md`).
+
+Prime Agent 0.10 is a Rust rewrite: the TypeScript extensions of its 0.9
+releases, which were built on Pi, are gone, and it has no lifecycle hook
+surface. Automatic capture and handoff
+injection are therefore not claimed, and `install-hooks --agent pi` does not
+apply. Ask the agent to call `memory_handoff_begin` before leaving and
+`memory_handoff_accept` when resuming.
+
+Verified against Prime Agent 0.10.0. Sources:
+<https://github.com/PrimeIntellect-ai/prime-agent> (`crates/pa-core/src/mcp/mod.rs`,
+`crates/pa-cli/src/mcp_command.rs`, `prime-agent-runtime/src/rlm/mcp.py`,
+`skills/mcp/SKILL.md`).
 
 ---
 
@@ -1485,8 +1606,9 @@ managed routing package. The `memory_install_self_routing` tool is read-only:
 it returns the slim markered instruction block, marker strings, agent filename
 hints, managed skill payloads (`name`, `description`, `relative_path`,
 `content`), and authoritative project/global target hints for `.claude/skills`,
-`.agents/skills`, `.grok/skills`, and `$GROK_HOME/skills` (default
-`~/.grok/skills`), plus overwrite guidance. Agents should use their own file
+`.agents/skills`, `.grok/skills`, `$GROK_HOME/skills` (default
+`~/.grok/skills`), GitHub Copilot CLI's `.github/skills` and
+`$COPILOT_HOME/skills` (default `~/.copilot/skills`), plus overwrite guidance. Agents should use their own file
 editing tools to write those artifacts while preserving unrelated user content.
 
 If the model doesn't see any of those tools, the MCP registration

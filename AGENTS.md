@@ -78,7 +78,7 @@ install or refresh work.
 If you're about to write a durable project rule ("always X", "never
 Y", "all PRs must ..."), write it in the project's canonical agent instruction file.
 Many projects use CLAUDE.md for Claude Code and
-AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
+AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI,
 but if the project says one file is canonical, use that file.
 
 Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
@@ -100,7 +100,7 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
+  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code / Copilot CLI -> `AGENTS.md`),
   uses its Write / Edit tool to replace or append the returned
   `markered_block` while preserving
   non-ai-memory user content, then writes or updates each returned
@@ -148,8 +148,8 @@ Core design:
 - **LLM is opt-in.** Zero-LLM mode still captures, searches (FTS5), and
   writes rule-based summaries. Providers (Anthropic, Anthropic OAuth,
   OpenAI, OpenAI/Codex OAuth, GitHub Copilot, Gemini, OpenCode,
-  OpenAI-compatible endpoints) enable
-  consolidation, lint, and the auto-improvement loop.
+  OpenAI-compatible endpoints, Cursor Agent CLI) enable consolidation, lint,
+  and the auto-improvement loop.
 - **Per-project isolation by construction**: every row and page is keyed
   by `(workspace_id, project_id, path)`, resolved from the caller's cwd,
   a `.ai-memory.toml` marker file, or explicit scope arguments.
@@ -519,8 +519,10 @@ Additional boundary rules:
 
 ## Security considerations
 
-- **Default posture:** loopback-only bind (`127.0.0.1:49374`), no auth —
-  safe for a single-user machine. Any non-loopback bind should set a
+- **Default posture:** loopback-only bind (`127.0.0.1:49374`). A fresh
+  `ai-memory init` mints a root bearer into `<data_dir>/auth-tokens/default`
+  (`[auth].bearer_token_file`); an install created before that keeps no
+  auth until `ai-memory auth enable`. Any non-loopback bind should set a
   bearer token (`AI_MEMORY_AUTH_TOKEN`) and `AI_MEMORY_ALLOWED_HOSTS`
   (DNS-rebinding guard). TLS is deliberately delegated to a reverse
   proxy (see `docs/https-via-proxy.md`).

@@ -47,6 +47,7 @@ pub(crate) fn agent_choice_for_harness(harness: ManagedHarness) -> Option<AgentC
         ManagedHarness::KiroV3 => AgentChoice::KiroCliV3,
         ManagedHarness::Grok => AgentChoice::Grok,
         ManagedHarness::Antigravity => AgentChoice::AntigravityCli,
+        ManagedHarness::Copilot => AgentChoice::CopilotCli,
         // No AgentChoice / installer support.
         ManagedHarness::Crush => return None,
     })
@@ -311,7 +312,11 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
     } = targets;
     let infer_opencode_transition = opencode_dialect.is_some() && !config.server_url_configured();
     let server_url = (!infer_opencode_transition).then(|| config.server_url.clone());
-    let auth_token = config.auth.bearer_token.clone();
+    // Only an inline token is handed to the installers as an explicit value.
+    // One read from `[auth].bearer_token_file` stays out of rendered configs:
+    // hook install persists it to the hook credential files, and MCP install
+    // routes it through the bridge or an env-var reference (#552).
+    let auth_token = config.auth.renderable_bearer_token().map(str::to_owned);
     let hook_install = |config_file: Option<PathBuf>| InstallHooksArgs {
         agent,
         hooks_dir: overrides.hooks_dir.clone(),
@@ -404,6 +409,8 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             config_file: mcp_file,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
+            stdio_bridge: false,
         });
     WireInstalls {
         opencode_dialect,
@@ -637,6 +644,7 @@ mod tests {
             ManagedHarness::KiroV3,
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
+            ManagedHarness::Copilot,
         ] {
             assert!(
                 agent_choice_for_harness(harness).is_some(),
@@ -992,6 +1000,12 @@ mod tests {
                 "hooks/ai-memory.json",
                 Some("config.toml"),
             ),
+            (
+                ManagedHarness::Copilot,
+                "COPILOT_HOME",
+                "hooks/ai-memory.json",
+                Some("mcp-config.json"),
+            ),
         ] {
             let installs = planned_installs(&config, harness, &env_pair(var, &root));
             assert_eq!(installs.hooks.len(), 1, "{harness:?}");
@@ -1134,6 +1148,7 @@ mod tests {
             (ManagedHarness::Kimi, &["KIMI_CODE_HOME"][..]),
             (ManagedHarness::KiroV3, &["KIRO_HOME"][..]),
             (ManagedHarness::Grok, &["GROK_HOME"][..]),
+            (ManagedHarness::Copilot, &["COPILOT_HOME"][..]),
         ] {
             let run_env: Vec<_> = vars
                 .iter()
@@ -1523,6 +1538,10 @@ mod tests {
                 AgentChoice::AntigravityCli,
                 install_hooks::antigravity_hooks_path(),
             ),
+            (
+                AgentChoice::CopilotCli,
+                install_hooks::copilot_cli_hooks_path(),
+            ),
         ] {
             assert_eq!(
                 install_hooks::hook_config_target_with(agent, &process_env).ok(),
@@ -1543,6 +1562,7 @@ mod tests {
             ManagedHarness::KiroV3,
             ManagedHarness::Grok,
             ManagedHarness::Antigravity,
+            ManagedHarness::Copilot,
         ] {
             let agent = agent_choice_for_harness(harness).unwrap();
             assert!(

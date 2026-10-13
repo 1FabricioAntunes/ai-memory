@@ -14,11 +14,12 @@ use crate::commands::apply_shared::{PrivateBackup, apply_atomic_with_backup};
 use crate::commands::path_util::{
     agent_config_home, claude_config_dir, claude_config_paths, home_dir,
 };
+use crate::commands::user_service::{self, ServiceManager};
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, MANAGED_MARKER,
-    MANAGED_SKILLS, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
+    GROK_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
 use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
 use anyhow::{Context, Result};
@@ -413,6 +414,7 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             CopilotCli,
             Swival,
             Muse,
+            PrimeAgent,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -486,11 +488,13 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
         let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
         let grok_home = install_mcp::grok_home().ok();
+        let copilot_home = install_mcp::copilot_home_in(std::env::var_os("COPILOT_HOME")).ok();
         for root in skill_roots(
             &cwd,
             home.as_deref(),
             appdata.as_deref(),
             grok_home.as_deref(),
+            copilot_home.as_deref(),
             claude_config_dir.as_deref(),
         ) {
             for skill in MANAGED_SKILLS {
@@ -529,13 +533,15 @@ fn skill_roots(
     home: Option<&Path>,
     appdata: Option<&Path>,
     grok_home: Option<&Path>,
+    copilot_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(10);
+    let mut roots = Vec::with_capacity(12);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
@@ -544,6 +550,10 @@ fn skill_roots(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(GROK_SKILL_DIR));
         push_unique_skill_root(&mut roots, grok_root.join(SKILLS_DIR));
+        let copilot_root = copilot_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
+        push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
     }
     // Windows global Devin installs live under %APPDATA%\devin\skills, not
     // $HOME/.devin/skills — sweep it too or uninstall orphans those skills.
@@ -689,6 +699,15 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     let plan = build_plan(&args, &config.data_dir)?;
     print_plan(&plan);
+    let service = if args.only.is_none() {
+        setup_service(config)
+    } else {
+        None
+    };
+    if let Some((_, removal)) = &service {
+        print_service_plan(removal);
+    }
+    let remove_service = matches!(&service, Some((_, user_service::Removal::Removed(_))));
     let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
     if hooks_removed {
         // Only the current checkout's project file is reachable from here.
@@ -707,19 +726,8 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         println!("(dry-run; pass --apply to remove)");
         return Ok(());
     }
-    if plan.is_empty() && !args.purge_data {
+    if plan.is_empty() && !args.purge_data && !remove_service {
         return Ok(());
-    }
-
-    // All-or-nothing: when we're going to purge data, refuse before touching
-    // anything if an ai-memory process is alive (matches reset's guard-at-top).
-    // Wiring-only uninstall stays unguarded — it edits agent config files the
-    // server never touches.
-    if args.purge_data {
-        let siblings = crate::process_guard::sibling_processes();
-        if !siblings.is_empty() {
-            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
-        }
     }
 
     if std::io::stdin().is_terminal() && !args.yes {
@@ -731,6 +739,28 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
             println!("aborted.");
             return Ok(());
+        }
+    }
+
+    // The service `setup` installed runs the server this uninstall is taking
+    // away; stop it first, so a purge below does not find it alive.
+    if let Some((manager, user_service::Removal::Removed(path))) = &service {
+        match user_service::remove(*manager, path, &user_service::SystemRunner)? {
+            user_service::Removal::Removed(path) => {
+                println!("✓ stopped and removed the user service {}", path.display());
+            }
+            other => print_service_plan(&other),
+        }
+    }
+
+    // All-or-nothing: when we're going to purge data, refuse before touching
+    // the data if an ai-memory process is alive (matches reset's guard-at-top).
+    // Wiring-only uninstall stays unguarded — it edits agent config files the
+    // server never touches.
+    if args.purge_data {
+        let siblings = crate::process_guard::sibling_processes();
+        if !siblings.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
         }
     }
 
@@ -763,8 +793,12 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
-    // reasoning applies; the registry of URLs stays.
-    if let Err(error) = crate::server_profiles::clear_tokens(&config.data_dir) {
+    // reasoning applies; the registry of URLs stays. The root bearer the
+    // server itself reads (`[auth].bearer_token_file`) is not a hook's and
+    // stays with the server's config.
+    if let Err(error) =
+        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+    {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
             config.data_dir.display()
@@ -780,6 +814,35 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     print_docker_hint(args.purge_data);
 
     Ok(())
+}
+
+/// The user service `setup` installs on this platform and what uninstall
+/// would do about it; `None` on a platform without one or with no home.
+fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Removal)> {
+    let manager = ServiceManager::current()?;
+    let home = crate::commands::run::native_home(config)?;
+    let xdg_config_home = config
+        .runtime_env
+        .process_env()
+        .iter()
+        .find(|(key, _)| key == "XDG_CONFIG_HOME")
+        .map(|(_, value)| PathBuf::from(value));
+    let path = user_service::unit_path(manager, &home, xdg_config_home.as_deref());
+    Some((manager, user_service::planned_removal(&path)))
+}
+
+fn print_service_plan(removal: &user_service::Removal) {
+    match removal {
+        user_service::Removal::Absent => {}
+        user_service::Removal::Removed(path) => {
+            println!("would stop and remove the user service {}", path.display());
+        }
+        user_service::Removal::NotOurs(path) => println!(
+            "leaving {}: `ai-memory setup` did not write it, or it was edited since; remove it \
+             yourself if it runs ai-memory",
+            path.display()
+        ),
+    }
 }
 
 /// Print the manual Docker teardown steps (never executed). When the
@@ -1249,7 +1312,8 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::CommandCode
         | McpClient::CopilotCli
         | McpClient::Swival
-        | McpClient::Devin => Some(&["mcpServers"]),
+        | McpClient::Devin
+        | McpClient::PrimeAgent => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::OpenCode2 => Some(&["mcp", "servers"]),
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
@@ -1258,7 +1322,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         // Muse Code spells the key snake_case; the camelCase spelling the
         // clients above use would leave the entry behind.
         McpClient::Muse => Some(&["mcp_servers"]),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
     }
 }
 
@@ -1276,16 +1340,35 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
             return true;
         }
     }
+    // Our stdio bridge, in any client's shape (`command` + `args`, or
+    // OpenCode's single `command` array), aimed at this server.
+    if install_mcp::bridge_entry_url(entry) == Some(url) {
+        return true;
+    }
     if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
         let has_remote = args.iter().any(|a| a.as_str() == Some("mcp-remote"));
-        let has_session_bridge = entry.get("command").and_then(|v| v.as_str()) == Some("ai-memory")
-            && args.iter().any(|a| a.as_str() == Some("mcp-bridge"));
         let has_url = args.iter().any(|a| a.as_str() == Some(url));
-        if (has_remote || has_session_bridge) && has_url {
+        if has_remote && has_url {
             return true;
         }
     }
     false
+}
+
+/// A TOML `[mcp_servers.<name>]` table (Codex, Grok) aimed at `url`: an HTTP
+/// entry by its `url`, or our stdio bridge by `command` + `args`.
+fn toml_mcp_entry_targets(table: &dyn toml_edit::TableLike, url: &str) -> bool {
+    if table.get("url").and_then(|u| u.as_str()) == Some(url) {
+        return true;
+    }
+    let as_json = serde_json::json!({
+        "command": table.get("command").and_then(|c| c.as_str()),
+        "args": table
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+    });
+    install_mcp::bridge_entry_url(&as_json) == Some(url)
 }
 
 /// URL forms uninstall matches for `client`: the endpoint as given, plus
@@ -1431,10 +1514,8 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                 for k in keys {
                     let matches_url = servers
                         .get(&k)
-                        .and_then(|item| item.as_table())
-                        .and_then(|t| t.get("url"))
-                        .and_then(|u| u.as_str())
-                        == Some(url);
+                        .and_then(|item| item.as_table_like())
+                        .is_some_and(|t| toml_mcp_entry_targets(t, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -1447,9 +1528,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                     let matches_url = servers
                         .get(&k)
                         .and_then(|value| value.as_inline_table())
-                        .and_then(|table| table.get("url"))
-                        .and_then(|value| value.as_str())
-                        == Some(url);
+                        .is_some_and(|table| toml_mcp_entry_targets(table, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -1482,17 +1561,17 @@ mod tests {
         let home = Path::new("/home/alice");
         let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
 
-        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None);
+        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None, None);
         assert!(
             roots.contains(&appdata.join("devin").join(SKILLS_DIR)),
             "{roots:?}"
         );
 
-        let without = skill_roots(cwd, Some(home), None, None, None);
+        let without = skill_roots(cwd, Some(home), None, None, None, None);
         assert_eq!(
             without.len(),
-            8,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok × project+global)"
+            10,
+            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × project+global)"
         );
         assert!(
             without.contains(&cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
@@ -1512,6 +1591,7 @@ mod tests {
         let roots = skill_roots(
             Path::new("/repo"),
             Some(Path::new("/home/alice")),
+            None,
             None,
             None,
             Some(Path::new("/stores/claude")),
@@ -1534,12 +1614,78 @@ mod tests {
             None,
             Some(Path::new("/custom/grok")),
             None,
+            None,
         );
         assert!(
             roots.contains(&PathBuf::from("/custom/grok/skills")),
             "{roots:?}"
         );
         assert!(!roots.contains(&PathBuf::from("/home/alice/.grok/skills")));
+    }
+
+    /// `.github/skills` is usually committed team content, so sweeping it must
+    /// only ever plan the deletion of ai-memory's own marker-bearing files.
+    #[test]
+    fn github_skill_root_sweep_spares_unmanaged_same_name_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = MANAGED_SKILLS[0];
+        let user = tmp
+            .path()
+            .join("user/.github/skills")
+            .join(skill.relative_path);
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, "---\nname: team-skill\n---\nteam-authored\n").unwrap();
+        let mut plan = Vec::new();
+        push_generated_delete(&mut plan, user.clone(), DeleteKind::ManagedSkill);
+        assert!(
+            plan.is_empty(),
+            "an unmanaged skill must never be planned: {plan:?}"
+        );
+
+        let managed = tmp
+            .path()
+            .join("ours/.github/skills")
+            .join(skill.relative_path);
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, skill.content).unwrap();
+        push_generated_delete(&mut plan, managed.clone(), DeleteKind::ManagedSkill);
+        assert_eq!(plan.len(), 1, "the managed control must be planned");
+    }
+
+    /// `install-skills --agent copilot-cli` writes `.github/skills` in the
+    /// project and `$COPILOT_HOME/skills` globally; uninstall must sweep both.
+    #[test]
+    fn skill_roots_sweep_copilot_cli_project_and_relocated_home() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            Some(Path::new("/custom/copilot")),
+            None,
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/repo/.github/skills")),
+            "{roots:?}"
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/custom/copilot/skills")),
+            "{roots:?}"
+        );
+        assert!(!roots.contains(&PathBuf::from("/home/alice/.copilot/skills")));
+
+        let default_home = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            default_home.contains(&PathBuf::from("/home/alice/.copilot/skills")),
+            "{default_home:?}"
+        );
     }
 
     #[test]
@@ -2173,6 +2319,26 @@ mod tests {
         assert!(v["mcpServers"].get("github").is_some());
     }
 
+    /// Prime Agent's settings.json carries every other Prime Agent setting
+    /// beside `mcpServers`; the strip removes only ai-memory's entry.
+    #[test]
+    fn strip_mcp_prime_agent_keeps_other_settings_and_servers() {
+        let content = r#"{"defaultModel":"glm","mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp","bearerTokenEnvVar":"AI_MEMORY_AUTH_TOKEN"},"search":{"type":"http","url":"https://search.example/mcp"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::PrimeAgent,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_none());
+        assert!(v["mcpServers"].get("search").is_some());
+        assert_eq!(v["defaultModel"], "glm");
+    }
+
     #[test]
     fn strip_mcp_zed_context_servers_preserves_other_settings() {
         let content = r#"{
@@ -2215,6 +2381,62 @@ mod tests {
         )
         .unwrap();
         assert!(removed.is_empty());
+    }
+
+    /// The stdio bridge entries `install-mcp` writes on a token-file install
+    /// are ours when they target this server, in every client shape, and a
+    /// bridge aimed at another server is not.
+    #[test]
+    fn bridge_entries_are_recognised_by_their_upstream_url() {
+        let url = "http://127.0.0.1:49374/mcp";
+        let bridge = |target: &str| {
+            serde_json::json!({
+                "type": "stdio",
+                "command": "ai-memory",
+                "args": ["mcp-bridge", "--no-session-id", "--server-url", target],
+            })
+        };
+        let opencode = serde_json::json!({
+            "type": "local",
+            "command": ["ai-memory", "mcp-bridge", "--no-session-id", "--server-url", url],
+            "enabled": true,
+        });
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &bridge(url),
+            Some("ai-memory"),
+            url
+        ));
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &opencode,
+            Some("ai-memory"),
+            url
+        ));
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &bridge("https://team.example/mcp"),
+            Some("ai-memory"),
+            url
+        ));
+        let foreign =
+            serde_json::json!({"command": "other", "args": ["mcp-bridge", "--server-url", url]});
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &foreign,
+            Some("ai-memory"),
+            url
+        ));
+
+        let toml = format!(
+            "[mcp_servers.ai-memory]\ncommand = \"ai-memory\"\nargs = [\"mcp-bridge\", \"--no-session-id\", \"--server-url\", \"{url}\"]\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+        );
+        let (out, removed) = strip_mcp_toml(&toml, Some("ai-memory"), url).unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        assert!(out.contains("[mcp_servers.other]"), "{out}");
+        let (_, kept) =
+            strip_mcp_toml(&toml, Some("ai-memory"), "https://team.example/mcp").unwrap();
+        assert!(kept.is_empty());
     }
 
     #[test]

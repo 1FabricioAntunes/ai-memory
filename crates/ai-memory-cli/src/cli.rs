@@ -113,6 +113,11 @@ pub struct Cli {
 pub enum Command {
     /// Initialise the data directory layout.
     Init(InitArgs),
+    /// Set up a native install in one step: `init`, a user service
+    /// (systemd `--user` or a launchd LaunchAgent), and hooks, MCP and skills
+    /// for every detected agent, then a read-only self-check. Shows the plan
+    /// and asks first unless `--yes` is given. Re-running changes nothing.
+    Setup(SetupArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
     /// List every workspace/project pair the server knows about (plain,
@@ -123,6 +128,8 @@ pub enum Command {
     /// Check capture coverage: compare local harness session stores for this
     /// project against what the server captured, and warn when a harness ran
     /// here recently but has no captured sessions (its hook is likely missing).
+    /// Also reports agentmemory MCP entries and rules-file guideline blocks
+    /// left after a migration; it only reads and prints the fix.
     Doctor(DoctorArgs),
     /// One-time import of this project's existing local harness session history
     /// into a brand-new (empty) ai-memory store, so installing hooks
@@ -235,7 +242,8 @@ pub enum Command {
     /// Current values are listed under `--client`; see docs/mcp-install.md
     /// for the full guide.
     InstallMcp(InstallMcpArgs),
-    /// Internal stdio-to-HTTP MCP bridge for session-aware Claude Code installs.
+    /// Internal stdio-to-HTTP MCP bridge: session-aware for Claude Code, or
+    /// session-less (`--no-session-id`) for every other stdio MCP client.
     #[command(hide = true)]
     McpBridge(McpBridgeArgs),
     /// Stage + commit the wiki tree under git.
@@ -258,6 +266,10 @@ pub enum Command {
     AutoImprove(AutoImproveArgs),
     /// Manually finalize the latest open session for one agent in this project.
     FinalizeSession(FinalizeSessionArgs),
+    /// Recover history a server outage missed: drain the local hook spool,
+    /// replay degraded-run transcripts through the hook backfill path, and
+    /// finish managed runs whose transcript import failed. Safe to re-run.
+    Recover(RecoverArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
     PendingWrites(PendingWritesArgs),
     /// Compute + store embeddings for every latest page (M9).
@@ -516,6 +528,11 @@ pub enum RunHarnessChoice {
     /// Google Antigravity CLI (`agy`).
     #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+    /// GitHub Copilot CLI (`copilot`). `run`'s positional names only
+    /// command-line harnesses, so the bare name cannot mean VS Code Copilot
+    /// here the way `install-mcp --client copilot` does.
+    #[value(name = "copilot", alias = "copilot-cli")]
+    Copilot,
 }
 
 /// Parses the `run` harness positional, additionally wildcarding every
@@ -1349,6 +1366,13 @@ pub enum AuthCommand {
     Logout(AuthLogoutArgs),
     /// Show stored provider auth state without printing secrets.
     Status(AuthStatusArgs),
+    /// Require a bearer token on this install's server. Idempotent: mints
+    /// `<data_dir>/auth-tokens/default` (owner-only) if missing, records
+    /// `[auth].bearer_token_file`, gives the hooks the token through their
+    /// credential files, and re-registers Claude Code's MCP entry as the
+    /// `ai-memory mcp-bridge` stdio bridge. The token is never printed or
+    /// written into a harness config. Restart the server afterwards.
+    Enable(AuthEnableArgs),
 }
 
 /// Provider choices for `auth`.
@@ -1398,6 +1422,15 @@ pub struct AuthLogoutArgs {
 /// Arguments for `auth status`.
 #[derive(Debug, Args)]
 pub struct AuthStatusArgs {}
+
+/// Arguments for `auth enable`.
+#[derive(Debug, Args)]
+pub struct AuthEnableArgs {
+    /// Leave harness MCP registrations alone; only provision the token,
+    /// the config key and the hook credential files.
+    #[arg(long)]
+    pub no_mcp: bool,
+}
 
 /// Which concern `uninstall` should touch. Omitted = all four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1762,6 +1795,9 @@ pub enum InstallSkillsAgent {
     Devin,
     /// Grok Build CLI's `.grok/skills` directory.
     Grok,
+    /// GitHub Copilot CLI's `.github/skills` (project) or
+    /// `$COPILOT_HOME/skills` (global, default `~/.copilot/skills`) directory.
+    CopilotCli,
     /// Hermes Agent's `.hermes/skills` directory.
     Hermes,
     /// Install into both Claude Code and `.agents` skill directories.
@@ -1947,6 +1983,26 @@ pub struct InitArgs {
     /// Overwrite an existing `config.toml` if present.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for `setup`.
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Apply the plan without asking. Without it, `setup` shows the plan and
+    /// asks on a terminal, or exits non-zero when there is no terminal to
+    /// ask on.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Wire this agent instead of the detected ones. Repeat for several.
+    /// Detection looks for each harness's session store or MCP config under
+    /// your home; OpenCode 2 and the Kiro CLI v3 engine are only wired when
+    /// named here.
+    #[arg(long = "agent", value_enum)]
+    pub agents: Vec<AgentChoice>,
+    /// Do not install or start a user service; use this when the server
+    /// already runs some other way (Docker, a packaged system unit).
+    #[arg(long)]
+    pub no_service: bool,
 }
 
 /// Arguments for `status`.
@@ -2460,6 +2516,14 @@ fn parse_finalizable_agent(s: &str) -> Result<ai_memory_core::AgentKind, String>
     Ok(kind)
 }
 
+/// Arguments for `recover`.
+#[derive(Debug, Args)]
+pub struct RecoverArgs {
+    /// Print the machine-readable report as JSON on stdout.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
@@ -2662,6 +2726,22 @@ pub enum McpClient {
     /// `SessionStart` output contract is not, so lifecycle capture and
     /// managed workstreams are not claimed. See `install-mcp --client muse`.
     Muse,
+    /// DeepSeek Harness (DSH) - MCP-only. DSH has no fixed JSON/TOML MCP
+    /// config: the client is a Cordis plugin entry
+    /// (@deepseek-ai/dsh-mcp-client) inside a profile's cordis.patch.yml.
+    /// This integration is print-only (--apply is refused); merge the
+    /// rendered insert list into the profile patch. No lifecycle capture is
+    /// claimed.
+    #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
+    Dsh,
+    /// Prime Agent (PrimeIntellect-ai/prime-agent) - the `mcpServers` map of
+    /// `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default
+    /// `~/.prime/agent/settings.json`) with `type: "http"` + `url`. A token is
+    /// referenced through `bearerTokenEnvVar: "AI_MEMORY_AUTH_TOKEN"`, never
+    /// written literally: that is the only non-OAuth credential Prime Agent
+    /// counts as connected and names to the model. MCP-only: Prime Agent 0.10
+    /// has no lifecycle hooks (its earlier TypeScript extensions were removed).
+    PrimeAgent,
 }
 
 /// Arguments for `commit`.
@@ -2693,6 +2773,8 @@ pub enum LlmProviderChoice {
     Copilot,
     /// OpenCode cloud API (Go by default; AI_MEMORY_LLM_BASE_URL selects Zen).
     Opencode,
+    /// Cursor subscription via the logged-in `agent` CLI (`--print --mode ask`).
+    Cursor,
 }
 
 /// Arguments for `embed`.
@@ -3162,14 +3244,32 @@ pub struct InstallMcpArgs {
     /// wants `gemini`. Kimi Code and Kiro already get theirs; this overrides.
     #[arg(long, value_enum)]
     pub flavor: Option<SchemaFlavor>,
+    /// Reference the token by the `AI_MEMORY_AUTH_TOKEN` variable name
+    /// instead of embedding it (Codex `bearer_token_env_var`, Prime Agent
+    /// `bearerTokenEnvVar`). Set by the installer, never a flag: it is how an
+    /// install whose token lives in `[auth].bearer_token_file` keeps the token
+    /// out of the harness config.
+    #[arg(skip)]
+    pub token_env_var: bool,
+    /// Write a stdio entry that runs the session-less `ai-memory mcp-bridge`
+    /// instead of an HTTP entry. Set by the installer, never a flag: it is how
+    /// a client without env-var indirection reaches a server whose token lives
+    /// in `[auth].bearer_token_file`.
+    #[arg(skip)]
+    pub stdio_bridge: bool,
 }
 
-/// Arguments for the internal Claude Code session-aware MCP bridge.
+/// Arguments for the internal stdio-to-HTTP MCP bridge.
 #[derive(Debug, Clone, Args)]
 pub struct McpBridgeArgs {
     /// Remote ai-memory base URL or full `/mcp` endpoint.
     #[arg(long)]
     pub server_url: Option<String>,
+    /// Run as a plain stdio-to-HTTP bridge that forwards no session identity,
+    /// for MCP clients other than Claude Code. Without it the bridge forwards
+    /// `CLAUDE_CODE_SESSION_ID` and refuses to start when it is missing.
+    #[arg(long)]
+    pub no_session_id: bool,
 }
 
 /// Transport for the MCP server.
@@ -3296,6 +3396,15 @@ pub struct WritePageArgs {
     /// Pin the page so the future decay sweep skips it.
     #[arg(long)]
     pub pinned: bool,
+    /// Profile entries only (`profile/...` paths): repeatable stack tag
+    /// (`rust`, `typescript`, ...) limiting the entry to projects on that
+    /// stack.
+    #[arg(long = "applies-to")]
+    pub applies_to: Vec<String>,
+    /// Profile entries only: what already enforces the entry (e.g.
+    /// `pre-push hook`), which keeps it out of the session-start digest.
+    #[arg(long = "enforced-by")]
+    pub enforced_by: Option<String>,
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
@@ -3310,6 +3419,30 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn write_page_takes_the_profile_entry_fields() {
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "write-page",
+            "--path",
+            "profile/style/types.md",
+            "--body",
+            "Never cast.",
+            "--applies-to",
+            "rust",
+            "--applies-to",
+            "typescript",
+            "--enforced-by",
+            "pre-push hook",
+        ])
+        .expect("write-page profile args parse");
+        let Command::WritePage(args) = parsed.command else {
+            panic!("expected write-page command");
+        };
+        assert_eq!(args.applies_to, ["rust", "typescript"]);
+        assert_eq!(args.enforced_by.as_deref(), Some("pre-push hook"));
+    }
 
     #[test]
     fn serve_api_only_flag_does_not_enable_the_web_ui() {
@@ -4411,6 +4544,16 @@ mod tests {
             panic!("expected install-mcp for swival");
         };
         assert_eq!(args.client, McpClient::Swival);
+    }
+
+    #[test]
+    fn prime_agent_mcp_client_parses() {
+        let cli = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", "prime-agent"])
+            .unwrap_or_else(|error| panic!("failed to parse MCP client prime-agent: {error}"));
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp for prime-agent");
+        };
+        assert_eq!(args.client, McpClient::PrimeAgent);
     }
 
     #[test]

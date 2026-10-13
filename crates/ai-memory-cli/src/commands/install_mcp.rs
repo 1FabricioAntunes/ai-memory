@@ -26,10 +26,14 @@ use serde_json::json;
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
-use crate::commands::render_shared::bearer_header_value;
+use crate::commands::render_shared::{bearer_header_value, yaml_single_quote};
 use crate::config::{Config, DEFAULT_MCP_URL};
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
+
+/// The variable a Prime Agent entry names in `bearerTokenEnvVar`: the same one
+/// ai-memory's own hooks and CLI read the server token from.
+const PRIME_AGENT_TOKEN_ENV: &str = "AI_MEMORY_AUTH_TOKEN";
 
 #[derive(Clone, Copy)]
 enum JsonMcpLocation {
@@ -99,14 +103,29 @@ pub(crate) fn run_with_opencode_dialect(
             |entry| entry.mcp_url.clone(),
         )
     };
-    let args = InstallMcpArgs {
+    // A token read from `[auth].bearer_token_file` is never copied into a
+    // harness config: that file exists to keep it out of them (#552). An
+    // inferred literal from an old entry is ignored then too, since it would
+    // re-embed a stale credential.
+    let token_file = config.auth.token_file_path();
+    let auth_token = args
+        .auth_token
+        .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned))
+        .or_else(|| {
+            inferred
+                .filter(|_| token_file.is_none())
+                .and_then(|entry| entry.auth_token)
+        });
+    let mut args = InstallMcpArgs {
         server_url: Some(server_url),
-        auth_token: args
-            .auth_token
-            .or_else(|| config.auth.bearer_token.clone())
-            .or_else(|| inferred.and_then(|entry| entry.auth_token)),
+        auth_token,
         ..args
     };
+    if args.auth_token.is_none()
+        && let Some(token_file) = token_file
+    {
+        route_file_token(&mut args, token_file)?;
+    }
     validate_args(&args)?;
     if args.apply {
         return apply_to_config_file(&args);
@@ -135,9 +154,227 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
         McpClient::Muse => render_muse(&args)?,
+        McpClient::Dsh => render_dsh(&args)?,
+        McpClient::PrimeAgent => render_prime_agent(&args)?,
     };
     println!("{snippet}");
     Ok(())
+}
+
+/// Wire a client to a server whose bearer lives in `[auth].bearer_token_file`
+/// without writing the token into the client's config.
+///
+/// - Claude Code gets the session-aware `ai-memory mcp-bridge` entry.
+/// - Codex and Prime Agent reference `AI_MEMORY_AUTH_TOKEN` by name, the
+///   form their writers already use and both clients document.
+/// - Pi is unchanged: its generated extension reads the hook credential file.
+/// - Every other client that runs local commands gets a stdio entry for the
+///   session-less bridge (`mcp-bridge --no-session-id`), in that client's own
+///   documented stdio shape. The bridge is our own process, loads config like
+///   any subcommand, and so reads the token from the file at launch.
+/// - ZCode is refused: its entry schema keeps only `type`/`url`/`headers`/
+///   `enabled`/`timeoutMs` and silently drops `command`/`args` (#511), so it
+///   can only take a literal header.
+fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> {
+    match args.client {
+        McpClient::ClaudeCode => args.session_aware = true,
+        McpClient::Codex | McpClient::PrimeAgent => args.token_env_var = true,
+        McpClient::Pi => {}
+        McpClient::Zcode => bail!(
+            "this server's bearer token lives in {path} and ai-memory does not copy it into \
+             another program's config. ZCode keeps only HTTP entries (`type`/`url`/`headers`), \
+             so it can only take the token as a literal header and is not registered \
+             automatically. Add the entry by hand with the header read from that file, or pass \
+             the token explicitly with `{env}=... ai-memory install-mcp --client zcode ...` if \
+             you accept it being stored in ZCode's config.",
+            path = token_file.display(),
+            env = PRIME_AGENT_TOKEN_ENV,
+        ),
+        _ => args.stdio_bridge = true,
+    }
+    Ok(())
+}
+
+/// The command a stdio bridge entry runs. Resolved through `PATH` like the
+/// Claude Code entry, so the Docker wrapper (which intercepts `mcp-bridge`)
+/// and a native install both answer to it.
+const BRIDGE_COMMAND: &str = "ai-memory";
+
+/// Arguments of the session-less bridge for `args`: the URL carries the
+/// client's schema-flavor marker, because the bridge forwards `tools/list`
+/// to it verbatim and the client is the one that needs the dialect.
+fn session_less_bridge_args(args: &InstallMcpArgs) -> Vec<String> {
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    vec![
+        "mcp-bridge".to_owned(),
+        "--no-session-id".to_owned(),
+        "--server-url".to_owned(),
+        flavored_url_for(args, base_url),
+    ]
+}
+
+/// The upstream URL of an ai-memory bridge entry: `command: "ai-memory"` with
+/// `args`, or OpenCode's single `command` array, running `mcp-bridge` with a
+/// `--server-url`. `None` for any other entry.
+pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
+    let argv: Vec<&str> = match entry.get("command")? {
+        serde_json::Value::String(command) if command == BRIDGE_COMMAND => entry
+            .get("args")?
+            .as_array()?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect(),
+        serde_json::Value::Array(command) => {
+            let mut words = command.iter().filter_map(serde_json::Value::as_str);
+            if words.next() != Some(BRIDGE_COMMAND) {
+                return None;
+            }
+            words.collect()
+        }
+        _ => return None,
+    };
+    if argv.first() != Some(&"mcp-bridge") {
+        return None;
+    }
+    argv.iter()
+        .position(|arg| *arg == "--server-url")
+        .and_then(|i| argv.get(i + 1))
+        .copied()
+}
+
+/// What the entry `name` in `client`'s config file at `path` targets: an
+/// HTTP entry's URL (`url`, `httpUrl`, `serverUrl`), a bridge entry's
+/// upstream, or the URL a Claude Desktop `mcp-remote` shim forwards to.
+/// `Ok(None)` when the file or the entry is absent, or the entry targets no
+/// URL this installer could have written.
+///
+/// # Errors
+/// The file exists but cannot be read or parsed.
+pub(crate) fn existing_entry_endpoint(
+    client: McpClient,
+    path: &Path,
+    name: &str,
+) -> Result<Option<String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if matches!(client, McpClient::Codex | McpClient::Grok) {
+        let doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let Some(table) = doc
+            .get("mcp_servers")
+            .and_then(|servers| servers.get(name))
+            .and_then(toml_edit::Item::as_table_like)
+        else {
+            return Ok(None);
+        };
+        let as_json = json!({
+            "url": table.get("url").and_then(toml_edit::Item::as_str),
+            "command": table.get("command").and_then(toml_edit::Item::as_str),
+            "args": table.get("args").and_then(toml_edit::Item::as_array).map(|args| {
+                args.iter().filter_map(toml_edit::Value::as_str).collect::<Vec<_>>()
+            }),
+        });
+        return Ok(entry_endpoint(&as_json).map(str::to_owned));
+    }
+    let Some(location) = json_mcp_location(client) else {
+        return Ok(None);
+    };
+    let root: serde_json::Value = jsonc_parser::parse_to_ast(
+        &text,
+        &jsonc_parser::CollectOptions::default(),
+        &ParseOptions::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
+    .value
+    .map_or(serde_json::Value::Null, Into::into);
+    let pointer = match location {
+        JsonMcpLocation::RootMcpServers => "/mcpServers",
+        JsonMcpLocation::RootMcp => "/mcp",
+        JsonMcpLocation::NestedMcpServers => "/mcp/servers",
+        JsonMcpLocation::RootServers => "/servers",
+        JsonMcpLocation::RootContextServers => "/context_servers",
+        JsonMcpLocation::RootMcpServersSnake => "/mcp_servers",
+    };
+    let Some(entry) = root.pointer(pointer).and_then(|servers| servers.get(name)) else {
+        return Ok(None);
+    };
+    if let Some(url) = ["url", "httpUrl", "serverUrl"]
+        .iter()
+        .find_map(|key| entry.get(*key).and_then(serde_json::Value::as_str))
+        .or_else(|| bridge_entry_url(entry))
+    {
+        return Ok(Some(url.to_owned()));
+    }
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| args.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    Ok(args
+        .iter()
+        .position(|arg| *arg == "mcp-remote")
+        .and_then(|i| args.get(i + 1))
+        .map(|url| (*url).to_owned()))
+}
+
+/// The stdio entry, in the client's documented shape, that runs the
+/// session-less bridge. `None` for clients whose entry is not JSON or that
+/// take no stdio entry here.
+fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
+    let bridge = session_less_bridge_args(args);
+    let plain = || json!({"command": BRIDGE_COMMAND, "args": bridge.clone()});
+    let typed =
+        |kind: &str| json!({"type": kind, "command": BRIDGE_COMMAND, "args": bridge.clone()});
+    let mut opencode_argv = vec![BRIDGE_COMMAND.to_owned()];
+    opencode_argv.extend(bridge.iter().cloned());
+    Some(match args.client {
+        McpClient::ClaudeDesktop
+        | McpClient::Zed
+        | McpClient::Devin
+        | McpClient::KimiCode
+        | McpClient::KiroCli
+        | McpClient::Openclaw => plain(),
+        McpClient::GeminiCli | McpClient::AntigravityCli => json!({
+            "command": BRIDGE_COMMAND,
+            "args": bridge,
+            "timeout": GEMINI_MCP_TIMEOUT_MS,
+        }),
+        McpClient::Cursor | McpClient::VsCodeCopilot | McpClient::Swival | McpClient::Zero => {
+            typed("stdio")
+        }
+        McpClient::Omp => json!({
+            "type": "stdio",
+            "command": BRIDGE_COMMAND,
+            "args": bridge,
+            "enabled": true,
+        }),
+        McpClient::CopilotCli => json!({
+            "type": "local",
+            "command": BRIDGE_COMMAND,
+            "args": bridge,
+            "tools": ["*"],
+        }),
+        McpClient::CommandCode => json!({
+            "transport": "stdio",
+            "enabled": true,
+            "command": BRIDGE_COMMAND,
+            "args": bridge,
+        }),
+        McpClient::Muse => json!({
+            "transport": "stdio",
+            "command": BRIDGE_COMMAND,
+            "args": bridge,
+            "enabled": true,
+            "mode": "optional",
+        }),
+        McpClient::OpenCode => json!({"type": "local", "command": opencode_argv, "enabled": true}),
+        McpClient::OpenCode2 => json!({"type": "local", "command": opencode_argv}),
+        _ => return None,
+    })
 }
 
 fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
@@ -157,11 +394,21 @@ fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
 }
 
 pub(crate) fn mcp_server_url_from_base(server_url: &str) -> String {
-    let trimmed = server_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/mcp") {
-        trimmed.to_string()
+    let trimmed = server_url.trim();
+    // A query (a schema `?flavor=` marker on a bridge's upstream URL) stays
+    // after the path, which is what gains the `/mcp` suffix.
+    let (path, query) = trimmed
+        .split_once('?')
+        .map_or((trimmed, None), |(path, query)| (path, Some(query)));
+    let path = path.trim_end_matches('/');
+    let path = if path.ends_with("/mcp") {
+        path.to_string()
     } else {
-        format!("{trimmed}/mcp")
+        format!("{path}/mcp")
+    };
+    match query {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
     }
 }
 
@@ -171,6 +418,47 @@ fn validate_args(args: &InstallMcpArgs) -> Result<()> {
     }
     if matches!(args.client, McpClient::KiroCli) {
         validate_kiro_remote_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL))?;
+    }
+    if matches!(args.client, McpClient::Dsh) {
+        validate_dsh_server_name(&args.name)?;
+    }
+    if matches!(args.client, McpClient::PrimeAgent) {
+        validate_prime_agent_server_name(&args.name)?;
+    }
+    Ok(())
+}
+
+/// DSH's `serverName` must match `[A-Za-z0-9_-]{1,32}`, and the
+/// rendered entry reuses the entry name for it, so reject an unusable
+/// `--name` before printing a snippet DSH would refuse.
+fn validate_dsh_server_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !valid {
+        bail!("DSH serverName must be 1-32 characters of [A-Za-z0-9_-]; got {name:?}");
+    }
+    Ok(())
+}
+
+/// Prime Agent resolves a user MCP server only when its name is 1-64
+/// characters of `[A-Za-z0-9_-]` starting with a letter or digit; any other
+/// name is never connected, so refuse it before writing the entry.
+fn validate_prime_agent_server_name(name: &str) -> Result<()> {
+    let valid = name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !valid {
+        bail!(
+            "Prime Agent MCP server names must be 1-64 characters of [A-Za-z0-9_-] starting with a letter or digit; got {name:?}"
+        );
     }
     Ok(())
 }
@@ -211,7 +499,8 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
 }
 
 /// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
-/// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`, and OMP's
+/// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`,
+/// `PRIME_AGENT_CODING_AGENT_DIR`, and OMP's
 /// `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR`) read
 /// through `env`,
 /// so `ai-memory run --env` can point auto-wire at the same config home
@@ -282,6 +571,9 @@ pub(crate) fn mcp_config_path_with(
         McpClient::Pi => bail!(
             "Pi has no native mcp.json; use `ai-memory install-hooks --agent pi --apply` to install the generated MCP bridge extension."
         ),
+        McpClient::Dsh => bail!(
+            "DeepSeek Harness has no fixed MCP config file; merge the printed snippet into $DSH_HOME/profiles/<profile>/cordis.patch.yml."
+        ),
         // OMP reads mcp.json from its agent dir, the one its extensions live
         // in, so a profile, PI_CODING_AGENT_DIR or PI_CONFIG_DIR moves it too.
         McpClient::Omp => {
@@ -339,6 +631,13 @@ pub(crate) fn mcp_config_path_with(
         // $XDG_CONFIG_HOME for its skill roots, so --config-file covers
         // non-default XDG setups (same policy as Zero above).
         McpClient::Muse => home()?.join(".config").join("muse").join("settings.json"),
+        // Prime Agent's agent dir is $PRIME_AGENT_CODING_AGENT_DIR when set,
+        // else ~/.prime/agent; user MCP servers live in its settings.json
+        // (a project's `.prime/agent/settings.json` overrides it: pass that
+        // path via --config-file).
+        McpClient::PrimeAgent => {
+            prime_agent_dir_in(env("PRIME_AGENT_CODING_AGENT_DIR"))?.join("settings.json")
+        }
     })
 }
 
@@ -526,6 +825,19 @@ pub(crate) fn copilot_home_in(env_override: Option<std::ffi::OsString>) -> Resul
         .join(".copilot"))
 }
 
+/// Prime Agent's agent directory: `$PRIME_AGENT_CODING_AGENT_DIR` when set and
+/// not blank, otherwise `~/.prime/agent`. The override is injected to keep
+/// path tests process-local.
+fn prime_agent_dir_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for Prime Agent configuration")?
+        .join(".prime")
+        .join("agent"))
+}
+
 /// Resolve Grok Build CLI's user configuration root. Grok honours
 /// `GROK_HOME`; otherwise it uses `~/.grok`.
 pub(crate) fn grok_home() -> Result<PathBuf> {
@@ -600,6 +912,9 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
     if matches!(args.client, McpClient::Pi) {
         bail!(pi_mcp_apply_guidance(args));
     }
+    if matches!(args.client, McpClient::Dsh) {
+        bail!(dsh_mcp_apply_guidance(args));
+    }
     let path = resolve_config_file(args)?;
     let outcome = match args.client {
         McpClient::Codex => apply_atomic(&path, |existing| {
@@ -623,6 +938,18 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    if matches!(args.client, McpClient::PrimeAgent)
+        && (args.auth_token.is_some() || args.token_env_var)
+    {
+        println!(
+            "  Prime Agent reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch prime-agent."
+        );
+    }
+    if matches!(args.client, McpClient::Codex) && args.token_env_var {
+        println!(
+            "  Codex reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex."
+        );
+    }
     Ok(())
 }
 
@@ -677,7 +1004,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KiroCli
         | McpClient::CommandCode
         | McpClient::CopilotCli
-        | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::Swival
+        | McpClient::PrimeAgent => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
         // Zero, and ZCode use.
@@ -690,12 +1018,17 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
         McpClient::Muse => Some(JsonMcpLocation::RootMcpServersSnake),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
     }
 }
 
 fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     validate_args(args)?;
+    if args.stdio_bridge
+        && let Some(entry) = stdio_bridge_entry(args)
+    {
+        return Ok(entry);
+    }
     match args.client {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
         McpClient::OpenCode2 => build_mcp_entry_opencode2(args),
@@ -705,6 +1038,9 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::Muse => build_mcp_entry_muse(args),
         McpClient::Codex | McpClient::Grok => {
             bail!("internal: Codex/Grok MCP config is TOML, not JSON")
+        }
+        McpClient::Dsh => {
+            bail!("internal: DeepSeek Harness MCP config is a Cordis YAML patch, not JSON")
         }
         _ => build_mcp_entry(args),
     }
@@ -851,10 +1187,7 @@ fn inferred_owned_opencode_entry(
     }
     let object = entry.as_object()?;
     Some(InferredOpenCodeMcpConfig {
-        mcp_url: object
-            .get("url")
-            .and_then(serde_json::Value::as_str)?
-            .to_string(),
+        mcp_url: entry_endpoint(entry)?.to_string(),
         auth_token: object
             .get("headers")
             .and_then(|headers| headers.get("Authorization"))
@@ -894,6 +1227,9 @@ fn opencode_generated_headers(headers: Option<&serde_json::Value>) -> bool {
 }
 
 fn opencode_mcp_entry_has_generated_shape(entry: &serde_json::Value, location: McpClient) -> bool {
+    if bridge_entry_url(entry).is_some() {
+        return opencode_bridge_entry_has_generated_shape(entry, location);
+    }
     let Some(entry) = entry.as_object() else {
         return false;
     };
@@ -924,9 +1260,45 @@ fn opencode_mcp_entry_has_generated_shape(entry: &serde_json::Value, location: M
     }
 }
 
+/// The stdio bridge entry `install-mcp` writes for OpenCode on a token-file
+/// install: `type: "local"` and the `command` array, plus `enabled: true` in
+/// the V1 location only.
+fn opencode_bridge_entry_has_generated_shape(
+    entry: &serde_json::Value,
+    location: McpClient,
+) -> bool {
+    let Some(object) = entry.as_object() else {
+        return false;
+    };
+    let allowed = ["type", "command", "enabled"];
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("local")
+        || !object
+            .get("command")
+            .is_some_and(serde_json::Value::is_array)
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+    {
+        return false;
+    }
+    match location {
+        McpClient::OpenCode => {
+            object.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+        }
+        McpClient::OpenCode2 => !object.contains_key("enabled"),
+        _ => false,
+    }
+}
+
+/// The endpoint an entry targets: its `url`, or a bridge entry's upstream.
+fn entry_endpoint(entry: &serde_json::Value) -> Option<&str> {
+    entry
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| bridge_entry_url(entry))
+}
+
 fn opencode_mcp_entry_is_owned(entry: &serde_json::Value, args: &InstallMcpArgs) -> bool {
     let expected_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
-    entry.get("url").and_then(serde_json::Value::as_str) == Some(expected_url)
+    entry_endpoint(entry) == Some(expected_url)
         && opencode_mcp_entry_has_generated_shape(
             entry,
             match args.client {
@@ -1234,6 +1606,21 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             }
             entry.insert("tools".into(), json!(["*"]));
         }
+        McpClient::PrimeAgent => {
+            // Prime Agent 0.10 counts a user HTTP server as connected, and
+            // names it to the model, only with an OAuth grant or a
+            // `bearerTokenEnvVar` whose variable is set; a literal
+            // `headers.Authorization` still dispatches but stays unlisted.
+            // So the token is referenced by variable, which also keeps it
+            // out of settings.json. The camelCase key is the one Prime
+            // Agent's loader reads (its own `mcp add` writes snake_case,
+            // which is ignored).
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(server_url));
+            if args.auth_token.is_some() || args.token_env_var {
+                entry.insert("bearerTokenEnvVar".into(), json!(PRIME_AGENT_TOKEN_ENV));
+            }
+        }
         _ => bail!("internal: build_mcp_entry called for unsupported client"),
     }
     Ok(serde_json::Value::Object(entry))
@@ -1399,7 +1786,9 @@ fn codex_upsert_mcp_server(
     // override per-tool — see Codex's `[mcp_servers.X.tools]`
     // map.
     server["default_tools_approval_mode"] = value("approve");
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
+    if args.token_env_var {
+        server["bearer_token_env_var"] = value(PRIME_AGENT_TOKEN_ENV);
+    } else if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
         let mut headers = Table::new();
         headers["Authorization"] = value(b);
         server["http_headers"] = Item::Table(headers);
@@ -1426,6 +1815,19 @@ fn grok_upsert_mcp_server(
     use toml_edit::{Item, Table, value};
 
     let mut server = Table::new();
+    if args.stdio_bridge {
+        // Grok picks stdio from `command` (and HTTP from `url`).
+        server["command"] = value(BRIDGE_COMMAND);
+        server["args"] = value(
+            session_less_bridge_args(args)
+                .iter()
+                .map(String::as_str)
+                .collect::<toml_edit::Array>(),
+        );
+        server["enabled"] = value(true);
+        upsert_toml_mcp_server(doc, &args.name, server);
+        return Ok(());
+    }
     server["url"] = value(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
     server["enabled"] = value(true);
     if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
@@ -1530,7 +1932,12 @@ fn render_codex(args: &InstallMcpArgs) -> String {
         name = args.name,
         url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
     );
-    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
+    if args.token_env_var {
+        out.push_str(&format!(
+            "bearer_token_env_var = \"{PRIME_AGENT_TOKEN_ENV}\"\n\
+             # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
+        ));
+    } else if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
         out.push_str(&format!(
             "\n[mcp_servers.{name}.http_headers]\n\
              Authorization = \"{b}\"\n\
@@ -1700,6 +2107,108 @@ fn render_muse(args: &InstallMcpArgs) -> Result<String> {
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
+}
+
+fn render_prime_agent(args: &InstallMcpArgs) -> Result<String> {
+    let auth = if args.auth_token.is_some() || args.token_env_var {
+        format!(
+            "# The token is not written: the entry names ${PRIME_AGENT_TOKEN_ENV}\n\
+             # (bearerTokenEnvVar), so export it where you launch prime-agent.\n\
+             # Without it the server is disconnected and calls fail.\n"
+        )
+    } else {
+        format!(
+            "# Without a token Prime Agent 0.10 lists the server as not connected\n\
+             # and leaves it out of the model's MCP prompt, though\n\
+             # mcp.call_tool(\"{name}\", ...) still reaches it. Run the server\n\
+             # with {PRIME_AGENT_TOKEN_ENV} and pass --auth-token to list it.\n",
+            name = args.name,
+        )
+    };
+    Ok(format!(
+        "# Prime Agent - merge into $PRIME_AGENT_CODING_AGENT_DIR/settings.json\n\
+         # (default ~/.prime/agent/settings.json), or re-run with --apply to\n\
+         # merge it in place preserving other settings. A project's\n\
+         # .prime/agent/settings.json also works: pass it via --config-file.\n\
+         #\n\
+         {auth}\
+         #\n\
+         # The model calls tools from its Python REPL:\n\
+         #   await mcp.call_tool(\"{name}\", \"memory_query\", {{...}})\n\
+         # MCP-only: Prime Agent has no lifecycle hooks to capture sessions.\n\
+         {snippet}\n",
+        name = args.name,
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+/// DeepSeek Harness (DSH) has no fixed JSON/TOML MCP config: the client is a
+/// Cordis plugin entry inside a profile's cordis.patch.yml. Render the
+/// patch-list fragment the operator merges by hand; --apply is refused.
+fn render_dsh(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# DeepSeek Harness (DSH) - merge the entry below into the DSH\n\
+         # profile patch at $DSH_HOME/profiles/<profile>/cordis.patch.yml,\n\
+         # then reload the profile (the web profile reloads live).\n\
+         #\n\
+         # DSH has no fixed MCP config file: the client is a Cordis plugin\n\
+         # entry, so this integration is print-only. A new top-level\n\
+         # - insert: item is fine - patch row order carries no load\n\
+         # semantics. This wires MCP only; no lifecycle capture.\n\
+         {snippet}\n",
+        snippet = render_dsh_snippet(args),
+    ))
+}
+
+fn render_dsh_snippet(args: &InstallMcpArgs) -> String {
+    // Single-quote every interpolated scalar: a plain YAML scalar would turn
+    // a valid `--name 123` into an integer `serverName`, and a URL or token
+    // carrying `"`, `\` or ` #` would no longer parse as one string.
+    let name = yaml_single_quote(&args.name);
+    let url = yaml_single_quote(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
+    let mut out = String::new();
+    out.push_str("- insert:\n");
+    out.push_str(&format!("    - id: {name}\n"));
+    out.push_str("      name: '@deepseek-ai/dsh-mcp-client'\n");
+    out.push_str("      config:\n");
+    out.push_str(&format!("        serverName: {name}\n"));
+    if args.stdio_bridge {
+        out.push_str("        transport: stdio\n");
+        out.push_str(&format!(
+            "        command: {}\n",
+            yaml_single_quote(BRIDGE_COMMAND)
+        ));
+        out.push_str("        args:\n");
+        for arg in session_less_bridge_args(args) {
+            out.push_str(&format!("          - {}\n", yaml_single_quote(&arg)));
+        }
+        out.push_str("        toolCallTimeoutMs: 120000");
+        return out;
+    }
+    out.push_str("        transport: streamable-http\n");
+    out.push_str(&format!("        url: {url}\n"));
+    if let Some(value) = bearer_header_value(args.auth_token.as_deref()) {
+        out.push_str("        headers:\n");
+        out.push_str(&format!(
+            "          Authorization: {}\n",
+            yaml_single_quote(&value)
+        ));
+    }
+    // Fixed at the value validated against DSH. Pending: candidate for a CLI
+    // parameter (e.g. --tool-call-timeout-ms) if demand appears.
+    out.push_str("        toolCallTimeoutMs: 120000");
+    out
+}
+
+fn dsh_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
+    format!(
+        "DeepSeek Harness has no fixed MCP config file; refusing to write MCP config. Re-run without --apply to print the Cordis patch fragment, then merge it into $DSH_HOME/profiles/<profile>/cordis.patch.yml{}",
+        if args.auth_token.is_some() {
+            " (the printed entry carries the auth header)."
+        } else {
+            "."
+        }
+    )
 }
 
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
@@ -1904,6 +2413,8 @@ mod tests {
             config_file: None,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
+            stdio_bridge: false,
         }
     }
 
@@ -1917,6 +2428,8 @@ mod tests {
             config_file: None,
             session_aware: false,
             flavor: None,
+            token_env_var: false,
+            stdio_bridge: false,
         }
     }
 
@@ -2313,6 +2826,69 @@ mod tests {
     }
 
     #[test]
+    fn dsh_render_uses_cordis_patch_insert_shape() {
+        let rendered = render_dsh(&args_for(McpClient::Dsh)).expect("render");
+        assert!(rendered.contains("- insert:"));
+        assert!(rendered.contains("name: '@deepseek-ai/dsh-mcp-client'"));
+        assert!(rendered.contains("transport: streamable-http"));
+        assert!(rendered.contains("url: 'http://127.0.0.1:49374/mcp'"));
+        assert!(rendered.contains("toolCallTimeoutMs: 120000"));
+    }
+
+    #[test]
+    fn dsh_render_carries_the_bearer_header_when_a_token_is_present() {
+        let rendered = render_dsh(&args_with_token(McpClient::Dsh)).expect("render");
+        assert!(rendered.contains("Authorization: 'Bearer test-token-deadbeef'"));
+    }
+
+    #[test]
+    fn dsh_render_quotes_every_interpolated_scalar_as_a_yaml_string() {
+        // `123` passes the serverName check but is a YAML integer unquoted;
+        // the URL and token carry characters that end a plain scalar.
+        let mut args = args_with_token(McpClient::Dsh);
+        args.name = "123".into();
+        args.server_url = Some("http://h:1/mcp?a=\"b\" #c".into());
+        args.auth_token = Some("it's #x".into());
+        let rendered = render_dsh(&args).expect("render");
+        assert!(rendered.contains("    - id: '123'\n"), "{rendered}");
+        assert!(
+            rendered.contains("        serverName: '123'\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("        url: 'http://h:1/mcp?a=\"b\" #c'\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("          Authorization: 'Bearer it''s #x'\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn dsh_rejects_an_unusable_server_name() {
+        let mut args = args_for(McpClient::Dsh);
+        args.name = "not a name".into();
+        let error = validate_args(&args).expect_err("name must be rejected");
+        assert!(format!("{error}").contains("serverName"));
+    }
+
+    #[test]
+    fn dsh_accepts_a_valid_server_name() {
+        let mut args = args_for(McpClient::Dsh);
+        args.name = "ai-memory_2".into();
+        validate_args(&args).expect("valid name");
+    }
+
+    #[test]
+    fn dsh_apply_is_refused_with_the_patch_pointer() {
+        let mut args = args_for(McpClient::Dsh);
+        args.apply = true;
+        let error = apply_to_config_file(&args).expect_err("apply must be refused");
+        assert!(format!("{error}").contains("cordis.patch.yml"));
+    }
+
+    #[test]
     fn claude_desktop_render_lists_packaged_and_unpacked_windows_paths() {
         let rendered = render_claude_desktop(&args_for(McpClient::ClaudeDesktop)).unwrap();
         assert!(rendered.contains(r"%APPDATA%\Claude\claude_desktop_config.json"));
@@ -2387,6 +2963,11 @@ mod tests {
             (McpClient::KimiCode, "KIMI_CODE_HOME", "mcp.json"),
             (McpClient::KiroCli, "KIRO_HOME", "settings/mcp.json"),
             (McpClient::Omp, "PI_CODING_AGENT_DIR", "mcp.json"),
+            (
+                McpClient::PrimeAgent,
+                "PRIME_AGENT_CODING_AGENT_DIR",
+                "settings.json",
+            ),
         ] {
             let env = |name: &str| (name == var).then(|| root.as_os_str().to_owned());
             assert_eq!(
@@ -2880,6 +3461,8 @@ mod tests {
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
+            McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
         }
     }
 
@@ -2909,6 +3492,7 @@ mod tests {
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
+            McpClient::Dsh,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -2953,6 +3537,8 @@ mod tests {
             McpClient::VsCodeCopilot,
             McpClient::Zed,
             McpClient::Muse,
+            McpClient::Dsh,
+            McpClient::PrimeAgent,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -2990,7 +3576,178 @@ mod tests {
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
+            McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
         }
+    }
+
+    const FILE_TOKEN: &str = "file-token-0123456789abcdef";
+
+    /// A config whose bearer came from `[auth].bearer_token_file`, as
+    /// `Config::load` leaves it on a new install.
+    fn file_token_config(dir: &Path) -> Config {
+        let mut config = Config::default();
+        config
+            .auth
+            .adopt_token_file(dir.join("auth-tokens").join("default"), FILE_TOKEN.into());
+        config
+    }
+
+    fn apply_with(config: &Config, client: McpClient, file: &Path) -> Result<()> {
+        let mut args = args_for(client);
+        args.apply = true;
+        args.config_file = Some(file.to_path_buf());
+        let dialect = match client {
+            McpClient::OpenCode => Some(ai_memory_workstream::OpenCodeDialect::V1),
+            McpClient::OpenCode2 => Some(ai_memory_workstream::OpenCodeDialect::V2),
+            _ => None,
+        };
+        run_with_opencode_dialect(config, args, dialect)
+    }
+
+    /// New-install default: a token read from the token file is never written
+    /// into a harness config, and every client `install-mcp --apply` writes
+    /// still gets an entry that reaches the server: Claude Code the
+    /// session-aware bridge, Codex and Prime Agent a reference to
+    /// `$AI_MEMORY_AUTH_TOKEN`, every other client the session-less bridge in
+    /// its own stdio shape. ZCode, which keeps only HTTP entries, is the one
+    /// refusal, and writes nothing.
+    #[test]
+    fn a_file_sourced_token_wires_every_client_without_entering_its_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = file_token_config(tmp.path());
+        let url = DEFAULT_MCP_URL;
+        for &client in <McpClient as clap::ValueEnum>::value_variants() {
+            if matches!(client, McpClient::Pi | McpClient::Dsh) {
+                continue; // no config file: an extension, and print-only
+            }
+            let ext = if matches!(client, McpClient::Codex | McpClient::Grok) {
+                "toml"
+            } else {
+                "json"
+            };
+            let file = tmp.path().join(format!("{client:?}.{ext}"));
+            let result = apply_with(&config, client, &file);
+            if client == McpClient::Zcode {
+                let err = result.unwrap_err();
+                assert!(format!("{err:#}").contains("ZCode"), "{err:#}");
+                assert!(!file.exists(), "ZCode must not be written");
+                continue;
+            }
+            result.unwrap_or_else(|e| panic!("{client:?}: {e:#}"));
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains(FILE_TOKEN),
+                "token leaked into {client:?}: {text}"
+            );
+            assert!(
+                !text.contains("Authorization"),
+                "{client:?} got a header: {text}"
+            );
+            match client {
+                McpClient::Codex => assert!(
+                    text.contains("bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\""),
+                    "{text}"
+                ),
+                McpClient::PrimeAgent => {
+                    assert!(text.contains("\"bearerTokenEnvVar\""), "{text}");
+                }
+                _ => {
+                    let endpoint = existing_entry_endpoint(client, &file, "ai-memory")
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("{client:?} entry has no endpoint: {text}"));
+                    assert_eq!(endpoint.split('?').next(), Some(url), "{client:?}: {text}");
+                    assert!(text.contains("mcp-bridge"), "{client:?}: {text}");
+                    assert_eq!(
+                        text.contains("--no-session-id"),
+                        client != McpClient::ClaudeCode,
+                        "only Claude Code forwards a session id: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The documented stdio shape of a few clients whose keys differ.
+    #[test]
+    fn stdio_bridge_entries_follow_each_clients_documented_shape() {
+        let entry = |client| {
+            let mut args = args_for(client);
+            args.stdio_bridge = true;
+            build_json_mcp_entry(&args).unwrap()
+        };
+        let opencode = entry(McpClient::OpenCode);
+        assert_eq!(opencode["type"], "local");
+        assert_eq!(opencode["command"][0], "ai-memory");
+        assert_eq!(opencode["command"][1], "mcp-bridge");
+        assert_eq!(opencode["enabled"], true);
+        assert!(entry(McpClient::OpenCode2).get("enabled").is_none());
+        assert_eq!(entry(McpClient::CopilotCli)["type"], "local");
+        assert_eq!(entry(McpClient::CopilotCli)["tools"][0], "*");
+        assert_eq!(entry(McpClient::CommandCode)["transport"], "stdio");
+        assert_eq!(entry(McpClient::Muse)["mode"], "optional");
+        assert_eq!(entry(McpClient::VsCodeCopilot)["type"], "stdio");
+        assert!(entry(McpClient::Zed).get("type").is_none());
+        // Kimi Code's schema dialect rides the bridge's upstream URL.
+        assert_eq!(
+            entry(McpClient::KimiCode)["args"][3],
+            "http://127.0.0.1:49374/mcp?flavor=moonshot"
+        );
+
+        let mut grok = args_for(McpClient::Grok);
+        grok.stdio_bridge = true;
+        let mut doc = toml_edit::DocumentMut::new();
+        grok_upsert_mcp_server(&mut doc, &grok).unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("command = \"ai-memory\""), "{text}");
+        assert!(!text.contains("url ="), "{text}");
+
+        let mut dsh = args_for(McpClient::Dsh);
+        dsh.stdio_bridge = true;
+        let yaml = render_dsh_snippet(&dsh);
+        assert!(yaml.contains("transport: stdio"), "{yaml}");
+        assert!(yaml.contains("- '--no-session-id'"), "{yaml}");
+    }
+
+    /// A flavored upstream URL keeps its query when the bridge normalises it.
+    #[test]
+    fn mcp_server_url_from_base_keeps_a_query_after_the_path() {
+        assert_eq!(
+            mcp_server_url_from_base("http://h:1/mcp?flavor=moonshot"),
+            "http://h:1/mcp?flavor=moonshot"
+        );
+        assert_eq!(
+            mcp_server_url_from_base("http://h:1/?flavor=gemini"),
+            "http://h:1/mcp?flavor=gemini"
+        );
+        assert_eq!(mcp_server_url_from_base("http://h:1/"), "http://h:1/mcp");
+    }
+
+    /// Controls: an inline token (pre-default install, `AI_MEMORY_AUTH_TOKEN`) and
+    /// an explicit `--auth-token` keep embedding exactly as before.
+    #[test]
+    fn inline_and_explicit_tokens_still_embed_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inline = Config::default();
+        inline.auth.bearer_token = Some("inline-token".into());
+        let cursor = tmp.path().join("cursor.json");
+        apply_with(&inline, McpClient::Cursor, &cursor).unwrap();
+        assert!(
+            std::fs::read_to_string(&cursor)
+                .unwrap()
+                .contains("Bearer inline-token")
+        );
+
+        let config = file_token_config(tmp.path());
+        let explicit = tmp.path().join("explicit.json");
+        let mut args = args_for(McpClient::Cursor);
+        args.apply = true;
+        args.config_file = Some(explicit.clone());
+        args.auth_token = Some("explicit-token".into());
+        run_with_opencode_dialect(&config, args, None).unwrap();
+        let text = std::fs::read_to_string(&explicit).unwrap();
+        assert!(text.contains("Bearer explicit-token"), "{text}");
+        assert!(!text.contains(FILE_TOKEN), "{text}");
     }
 
     #[test]
@@ -3497,6 +4254,141 @@ mod tests {
             "Bearer test-token-deadbeef"
         );
         assert_eq!(ours["tools"], json!(["*"]));
+    }
+
+    /// Prime Agent 0.10 lists a user HTTP server to the model only when its
+    /// `bearerTokenEnvVar` is set, so a token is referenced by variable and
+    /// never written into settings.json.
+    #[test]
+    fn prime_agent_entry_names_the_token_variable_never_the_token() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::PrimeAgent)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"
+                    }
+                }
+            })
+        );
+
+        let rendered = render_prime_agent(&args_with_token(McpClient::PrimeAgent)).unwrap();
+        assert!(!rendered.contains("test-token-deadbeef"), "{rendered}");
+        assert!(rendered.contains("export it where you launch prime-agent"));
+        assert!(rendered.contains("~/.prime/agent/settings.json"));
+        assert!(rendered.contains(r#"await mcp.call_tool("ai-memory", "memory_query""#));
+    }
+
+    #[test]
+    fn prime_agent_entry_without_a_token_is_bare_http_and_says_it_is_unlisted() {
+        let entry = build_json_mcp_entry(&args_for(McpClient::PrimeAgent)).unwrap();
+        assert_eq!(
+            entry,
+            json!({"type": "http", "url": "http://127.0.0.1:49374/mcp"})
+        );
+        let rendered = render_prime_agent(&args_for(McpClient::PrimeAgent)).unwrap();
+        assert!(rendered.contains("not connected"), "{rendered}");
+        assert!(
+            !rendered.contains("export it where you launch"),
+            "{rendered}"
+        );
+    }
+
+    /// Prime Agent fronts several model vendors, so it has no default schema
+    /// flavor, but an explicit `--flavor` reaches the URL it lists tools from.
+    #[test]
+    fn prime_agent_entry_carries_an_explicit_flavor_only() {
+        let mut args = args_for(McpClient::PrimeAgent);
+        assert_eq!(
+            build_json_mcp_entry(&args).unwrap()["url"],
+            "http://127.0.0.1:49374/mcp"
+        );
+        args.flavor = Some(SchemaFlavor::Gemini);
+        assert_eq!(
+            build_json_mcp_entry(&args).unwrap()["url"],
+            "http://127.0.0.1:49374/mcp?flavor=gemini"
+        );
+    }
+
+    #[test]
+    fn prime_agent_apply_preserves_settings_and_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        fs::write(
+            &config_path,
+            r#"{"defaultModel":"glm","mcpServers":{"search":{"type":"http","url":"https://search.example/mcp","bearerTokenEnvVar":"SEARCH_TOKEN"}}}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::PrimeAgent);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        assert!(!second.contains("test-token-deadbeef"), "{second}");
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["defaultModel"], "glm");
+        assert_eq!(
+            value["mcpServers"]["search"]["bearerTokenEnvVar"],
+            "SEARCH_TOKEN"
+        );
+        assert_eq!(
+            value["mcpServers"]["ai-memory"],
+            json!({
+                "type": "http",
+                "url": "https://memory.example/mcp",
+                "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"
+            })
+        );
+    }
+
+    /// A name Prime Agent would never connect is refused before any write.
+    #[test]
+    fn prime_agent_rejects_server_names_it_cannot_resolve() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        for name in [
+            "",
+            "-memory",
+            "_memory",
+            "ai memory",
+            "ai.memory",
+            &"m".repeat(65),
+        ] {
+            let mut args = args_for(McpClient::PrimeAgent);
+            args.name = name.to_string();
+            args.config_file = Some(config_path.clone());
+            let error = apply_to_config_file(&args).unwrap_err();
+            assert!(
+                error.to_string().contains("Prime Agent MCP server names"),
+                "{name:?}: {error:#}"
+            );
+            assert!(!config_path.exists(), "{name:?} must not write the file");
+        }
+        for name in ["ai-memory", "memory_2", "M", &"m".repeat(64)] {
+            let mut args = args_for(McpClient::PrimeAgent);
+            args.name = name.to_string();
+            validate_args(&args).unwrap_or_else(|error| panic!("{name:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn prime_agent_dir_honours_env_override() {
+        assert_eq!(
+            prime_agent_dir_in(Some("/tmp/custom-prime-agent".into())).unwrap(),
+            PathBuf::from("/tmp/custom-prime-agent")
+        );
+        let default = home_dir().unwrap().join(".prime").join("agent");
+        assert_eq!(prime_agent_dir_in(Some("".into())).unwrap(), default);
+        assert_eq!(prime_agent_dir_in(None).unwrap(), default);
     }
 
     #[test]

@@ -7,6 +7,400 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added a recall trace to web search. A project page has its own search box,
+  and a search with `workspace` and `project`
+  (`/web/search?q=…&workspace=…&project=…`) now ranks with the same hybrid
+  ranker as `memory_query` for that project: FTS5, entity, vector, graph and
+  observation streams, the authority adjustment, and the reranker when one is
+  configured. The server now hands its configured embedder and reranker to the
+  web UI, and the reranker's four-call concurrency limit is shared with
+  `memory_query`. With "Explain ranking" (`explain=1`) each hit shows its rank,
+  raw score and RRF contribution in every stream, the fused score, the
+  authority multiplier, and the intent boost and rerank score when present;
+  the page also lists the streams that ran, the embedder and reranker in use,
+  and each stream's time in milliseconds. A scoped `/api/v1/search` (one
+  project or `scopes`) uses the same ranker, so it returns the same order as
+  `memory_query`, and its `rank` is now the fused rank. A search without a
+  scope is still the cross-project FTS5 search, as `memory_query(global=true)`
+  is. Project search follows the per-project read rule: a viewer without a
+  grant on a restricted project gets a 403 and no trace, and an unknown project
+  is a 404.
+- Added a root-only server health page at `/web/health`, linked from the web UI
+  header. It shows the hook counters since the server started (accepted, shed
+  with 429 by saturation or rate limit, stored, failed, dropped), the writer
+  queue depth, the hook spool and recovery journal in the server's data
+  directory, the consolidation queue (last completion, pending, running,
+  completed and failed jobs), the configured embedder, both providers' status
+  and the stored vector identities. Failing checks are listed with the command
+  that fixes them, the same lines `ai-memory status` prints: `ai-memory
+  recover` for a backed-up spool or journal, `ai-memory compact --confirm` for
+  reclaimable space, `ai-memory embed` for pages without vectors, `ai-memory
+  embed --force` for vectors made under another model, and the LLM provider's
+  retry command. The page is read-only and is gated like `/web/pending`: on a
+  multi-user server anonymous requests get a 401 and database users a 403. It
+  never shows provider error text, page content or project names.
+- Added a two-command native install for Linux and macOS:
+  `curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh`,
+  then `ai-memory setup`. `install.sh` is a new release asset with its own
+  `install.sh.sha256`. It downloads the release tarball for the machine, checks
+  it against the published `.sha256` file and refuses to install when that file
+  is missing, names another asset or does not match, or when the archive holds
+  an absolute or `..` path. It unpacks under `~/.local/lib/ai-memory`, links
+  `~/.local/bin/ai-memory`, needs no root, leaves an existing non-link
+  `ai-memory` (such as the Docker wrapper) alone, and runs nothing when the
+  download is cut short. The new `ai-memory setup [--yes] [--agent <name>]...
+  [--no-service]` runs `init` (a fresh data dir gets the root bearer token),
+  installs and starts a per-user service rendered from the packaged systemd
+  user unit or launchd LaunchAgent with this install's binary, data dir and
+  config, wires MCP, hooks and global Agent Skills for each named or detected
+  agent, and ends with a read-only check of `/healthz`, `memory_status` and
+  `doctor`. It shows the plan and asks first; without a terminal it changes
+  nothing unless given `--yes`. A second run changes nothing. Windows has no
+  service step. `ai-memory uninstall --apply` stops and removes that service,
+  but only a unit `setup` wrote and nobody edited since; any other unit at that
+  path is left alone and reported. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
+  ai-memory for its user, and `scripts/onboarding-acceptance.sh` measures the
+  path from a clean home to the first returned memory.
+- Added page history and session replay to the read-only web UI. Each page
+  links to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version,
+  newest first, superseded ones included, so a version a concurrent write
+  replaced stays visible, with timestamps and the author of attributed writes,
+  plus a server-side unified diff between any two versions (by default the
+  latest against the version it replaced). Expired versions are hidden, and a
+  page whose TTL has passed shows no history. The same data is available as JSON
+  at `GET /api/v1/workspaces/{ws}/projects/{proj}/history/{*path}`. The version
+  list is capped at 200 per request, and the diff refuses inputs over 512 KiB,
+  10,000 lines or 1,000 changed lines and stops at 2,000 output lines. The
+  project page lists recent sessions, and each opens a timeline
+  (`/web/w/<ws>/<proj>/s/<session-id>`) that pages through its observations in
+  capture order with first/prev/next/last links and a jump field; with
+  JavaScript, a slider and `j`/`k` keys step one observation at a time. It uses
+  the same readers, owner filter and caps as the `/api/v1` session routes, and
+  observations render as escaped text. Both views follow the per-project read
+  rule: a non-grantee of a restricted project gets a 403, and a version id or
+  session id from another project or workspace reads as not found. The
+  `ai-memory-web` crate now has a `clippy.toml` that forbids the `Wiki` write
+  and destructive methods, so a write path in the web UI or `/api/v1` fails
+  `cargo clippy -D warnings`.
+- Added an observation stream to `memory_query` ranking:
+  `[retrieval] observation_stream` (env
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM`, on by default). A zero-LLM
+  session page keeps only a short excerpt of each turn, so the detail a
+  question asks about often lives only in the session's observations. With the
+  flag on, project and `scopes` searches also run full-text search over
+  observations in the same project, and each matching session votes once,
+  through its best-matching observation, for its own latest
+  `sessions/<id>.md` page as one more RRF stream. When page search did not
+  match the page itself, the matching excerpt becomes the hit's snippet, and
+  `explain=true` reports an `observation` stream with the matched observation
+  ids. Hits are still pages and nothing is written; sessions without a page
+  keep the `raw_hits` fallback, and `global=true` search is unchanged.
+- Added a root-only `GET /admin/metrics` endpoint in Prometheus text format.
+  It exposes the hook admission and delivery counters, MCP tool calls split
+  into reads and writes, and fixed-bucket latency histograms for `POST /hook`
+  and `memory_query`. Every label comes from a fixed set: no query text, page
+  body, prompt, client or project name, scope or token appears in the output.
+  On a multi-user server only root can read it, like every `/admin/*` route.
+- Added a `timings` object to `memory_query` responses with `explain=true`:
+  each retrieval stream's wall time in milliseconds (`fts_ms`, `entity_ms`,
+  `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`), summed over `scopes`.
+  Streams that did not run are left out, and a query without `explain` reads
+  no clock for them.
+- Added the end reason to session-end observations. When a harness's
+  `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
+  `logout`, `prompt_input_exit` or `other`), its first line is stored,
+  sanitized, as the observation body, so consolidation can tell a normal
+  quit from anything else, and the zero-LLM session page closes its summary
+  with `ended (<reason>)`. Payloads without a reason are stored as before.
+  (#1225)
+- The web UI shows pending cross-project mail. Project cards carry an amber
+  `N inbox` badge when messages are waiting for an agent in that project, the
+  home page summarises the total and links the projects holding mail, and the
+  project page gains a read-only Mailbox section listing up to five of them
+  (subject, sender, a snippet, age; "5 of N" when more are waiting), with an
+  empty state when there are none. A sender the viewer may not read is shown as
+  "a project you cannot read", and the page never pops or cancels a message.
+  (#1202)
+- `install-mcp --client prime-agent` registers ai-memory with Prime Agent
+  (PrimeIntellect-ai/prime-agent), merging an HTTP entry into the `mcpServers`
+  map of `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default
+  `~/.prime/agent/settings.json`) and preserving other settings and servers.
+  With a token the entry names `"bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"`
+  and the token is not written; Prime Agent 0.10 counts a user HTTP server as
+  connected, and lists it to the model, only with that variable set (or an
+  OAuth grant), so export it where you launch `prime-agent`. Without a token
+  the server is still callable through `mcp.call_tool("ai-memory", ...)` but is
+  not listed. MCP-only: Prime Agent 0.10 has no lifecycle hooks. (#1163)
+- `memory_write_page` accepts `expected_page_id` (write only if that is still
+  the page's latest version) or `create_only` (write only if the page does not
+  exist), and `memory_delete_page` accepts `expected_page_id`. A precondition
+  that no longer holds fails with `reason: "precondition_failed"` and the
+  current version, and changes nothing. `memory_read_page` returns the version
+  as `page_id` and `/api/v1` pages as `id`. This is the compare-and-write the
+  team-wiki sync needed (#986).
+- The `ai-memory-wikisync` companion gained CI and post-merge integration
+  (#986, slice 5): `sync --check` writes nothing and exits 0 in sync, 3 on
+  drift and 4 on conflicts or refusals (a clone without sync state compares
+  the repository with the server directly), and `install-hook` /
+  `uninstall-hook` manage a marked git `post-merge` block that runs `sync`
+  after each merge: a dry-run report unless `--on-merge apply`, never with
+  `--prefer`, and never with a stored token. The cookbook has a GitHub
+  Actions recipe. (#986)
+- The `ai-memory-wikisync` companion now propagates deletes with
+  `sync --propagate-deletes` (#986, slice 4): a file deleted in the repository
+  deletes its server page through `memory_delete_page`, and a page deleted on
+  the server deletes its file, when the other side is unchanged since the last
+  sync. A delete against an edit is a conflict that `--prefer` resolves, more
+  than `--max-deletes` (default 10) refuses the run, and a pinned page is
+  deleted only with `--prefer repo`. Every sync write and delete now carries
+  the page version it was planned against, so a page changed during the run is
+  reported and left alone while the rest apply, and `sync --apply` refuses a
+  server older than 2.7. Without the flag deletes are still only reported.
+  (#986)
+- `ai-memory doctor` now reports three silent capture failures: an unreachable
+  server (reported instead of aborting the check), a hook spool that is full and
+  evicting undelivered events, and installed ai-memory Codex hooks that Codex
+  skips because they are untrusted or changed since they were trusted (asked
+  of Codex itself through `codex app-server`). `ai-memory status` no longer says
+  queued events will be delivered once the spool has started evicting them.
+- Added two-way sync to the `ai-memory-wikisync` companion (#986, slice 3):
+  `sync` imports repository edits and new pages through the public
+  `memory_write_page` MCP tool and exports server edits, comparing each
+  page with the last sync. A page changed on both sides is a conflict until
+  `--prefer repo` or `--prefer server`; deletes are reported, not synced.
+  It is a dry-run without `--apply`, refuses files without frontmatter,
+  refuses to overwrite server pages whose metadata a write would clear, and
+  re-reads each page right before writing it. (#1164)
+- `finalize-session --agent antigravity-cli` now replays the session's typed
+  prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
+  live Antigravity sessions, whose hooks carry no prompt event, get a summary
+  page titled by the first prompt, a handoff with "Started/Last", and prompts
+  that `memory_query` and `memory_recent` can find. Only lines whose
+  conversation and workspace match the session are read; each prompt carries
+  the key `backfill` mints for it, so a repeated `--reopen` stores it once and a
+  prompt typed after the first finalize arrives with the next one. A checkout
+  the capture allowlist does not admit and `--all-owners` runs replay nothing,
+  and a missing `history.jsonl` only warns. (#1160)
+- `ai-memory run` accepts `copilot` (alias `copilot-cli`) and manages GitHub
+  Copilot CLI as a workstream harness: a fresh session gets a generated
+  `--session-id`, a returning one is resumed with `--resume=<id>`, user
+  selectors (`--resume`, `--continue`, `--session-id`, `--connect`) win,
+  utility subcommands pass through, and `--yolo` maps to Copilot's native
+  `--yolo`. Visible messages, tool calls and results, and compaction summaries
+  are imported read-only from `$COPILOT_HOME/session-state/<uuid>/events.jsonl`
+  (system prompts, hidden reasoning, hook output, and telemetry are excluded),
+  and the existing SessionStart hook delivers the workstream context. The
+  first managed launch auto-wires Copilot's hooks and MCP, and `doctor` now
+  counts its local sessions. Verified against Copilot CLI 1.0.92. (#1040)
+- GitHub Copilot CLI is now a first-class routing target:
+  `install-skills --agent copilot-cli` (and `install-instructions
+  --skills-agent copilot-cli`) writes the managed Agent Skills to the
+  repository's `.github/skills` or, globally, to `$COPILOT_HOME/skills`
+  (default `~/.copilot/skills`); `memory_install_self_routing` returns
+  `copilot_cli` filename and skill-root hints; the routing snippet, the
+  routing-install skill, and the MCP instructions name Copilot CLI with
+  `AGENTS.md`; and `uninstall` sweeps both Copilot roots, removing only
+  marker-bearing ai-memory skills. (#1040)
+- Added `ai-memory recover` and a bounded local recovery journal for server
+  outages. Offline managed launches now record only uniquely correlated native
+  session locators; recovery quarantines overlapping spool entries before exact
+  `/hook/batch` transcript replay, journals harnesses without transcript export
+  as spool-only without calling their exporter, retains bounded recovery dedup
+  keys with their sessions,
+  fails closed on terminal drops, and lets only the original owner finish an
+  expired unsuperseded managed run through exact idempotent replay. Backfill
+  and recovery replay now use reserved `recovery_*` idempotency keys, so
+  re-running `backfill --force` over sessions imported by ai-memory ≤2.6.0 (or
+  plain-backfilling a recovery-replayed session) can duplicate those older
+  observations. (#1125)
+- Added `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` for the `openai-compat`
+  provider (opt-in, off by default, ignored by every other provider): when
+  set, every chat request carries
+  `chat_template_kwargs: {"enable_thinking": false}`, so thinking-capable
+  local engines (vLLM / SGLang serving Qwen3-class models) spend the output
+  budget on the structured payload instead of a reasoning pass. (#1130)
+- Added the `cursor` LLM provider. Consolidation calls the logged-in Cursor
+  Agent CLI (`agent --print --mode ask`) so a Cursor subscription can drive
+  summaries without an API key. The default model is `cursor-grok-4.6-high`
+  ("Grok 4.6"). `AI_MEMORY_CURSOR_AGENT` overrides the binary. The provider never passes
+  `--yolo` or `--force`, because the prompt is captured session text. (#1127)
+- Added `applies_to` and `enforced_by` arguments to `memory_write_page`, and
+  `--applies-to` / `--enforced-by` to `ai-memory write-page`, for profile
+  entries. Both fields were documented as profile-entry frontmatter, but no
+  tool could set them, so scoping an entry to a stack or keeping it out of the
+  digest meant editing the wiki file by hand, and the next tool rewrite of the
+  entry dropped the value. A tag the profile cannot detect in any project
+  (`typscript`) is refused instead of silently hiding the entry, and both
+  arguments are refused on any page the digest does not read: one outside
+  `profile/`, or a `profile/` path in an ordinary project. (#1178)
+- Added the server version to the footer of every signed-in `/web` page (the
+  public login and change-password pages leave it out), on the right
+  side opposite "ai-memory · read-only", so you can tell which build a browser
+  tab is talking to without running `ai-memory status`. (#1171)
+- Added `install-mcp --client dsh` for the DeepSeek Harness (aliases
+  `deepseek-harness` and `deepseek_harness`). DSH keeps its MCP client in
+  a Cordis profile patch rather than a fixed config file, so the command prints a
+  ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
+  refuses `--apply`. (#1193)
+- The `ai-memory-importer` companion imports agentmemory data. `agentmemory-vault`
+  reads its Obsidian vault export; `agentmemory-export` reads its `ExportData`
+  JSON file, from disk only, and needs a mapping file from agentmemory's
+  project names (or exact session working directories) to ai-memory
+  workspaces and projects. `--apply` refuses to run while any record is
+  unmapped. Pages land under `imported/agentmemory/` (`--dest-prefix`), never
+  under `sessions/` or another reserved family, and links to pages that were
+  not imported become plain text. Every write goes through `memory_write_page`
+  with `create_only` or `expected_page_id`, and the importer refuses servers
+  older than 2.7. A memory's versions are written oldest first so ai-memory
+  keeps the supersession chain, and `forgetAfter` becomes `expires_at`. Each
+  page carries a stable UUIDv5 ingest key, so an interrupted import resumes
+  without duplicates and a rerun writes nothing. Text is redacted before
+  anything is planned or sent. Observations are dropped unless
+  `--replay-observations` replays them as `external-import` sessions through
+  `/hook/batch`, and records with no ai-memory counterpart are counted in the
+  manifest. The cookbook has a "Coming from agentmemory" section.
+- `ai-memory doctor` reports agentmemory configuration left behind after a
+  migration: an MCP server entry in any harness config `install-mcp` knows (or
+  in a project's `.mcp.json`, `.cursor/mcp.json`, `.gemini/settings.json` or
+  `.vscode/mcp.json`), and agentmemory guideline blocks in rules files such as
+  `AGENTS.md`, `GEMINI.md`, `.cursor/rules/` and `.kiro/steering/`. It names
+  each file and the key or lines, prints the fix, and warns when a block names
+  `memory_consolidate`, which ai-memory also has with different arguments. The
+  check only reads; it never edits or deletes another tool's files. `doctor
+  --json` carries the findings as `agentmemory_residue`.
+- Added `ai-memory auth enable`, which turns on bearer auth for an install
+  created without it. It reuses or creates an owner-only token at
+  `<data_dir>/auth-tokens/default`, records it in `config.toml`, gives the
+  installed hooks the token when they hold no other credential, and
+  re-registers every MCP client whose `ai-memory` entry points at this server
+  the way `install-mcp` now wires a token-file install. It lists each client
+  it changed, each entry for another server it left alone, and anything that
+  needs a manual change. Running it again changes nothing, and the token is
+  never printed or written into a harness config. Restart the server
+  afterwards.
+- Added `ai-memory mcp-bridge --no-session-id`, a plain stdio-to-HTTP MCP
+  bridge for any client that runs local commands. It authenticates with the
+  token from config (`AI_MEMORY_AUTH_TOKEN`, `[auth] bearer_token`, or the
+  file `[auth] bearer_token_file` names), forwards no session identity (the
+  client passes `workspace` and `project` like any static MCP client, and an
+  inherited `CLAUDE_CODE_SESSION_ID` is ignored), and exits at once with
+  `401 Unauthorized` when the server refuses it. Without the flag the bridge
+  keeps Claude Code's session forwarding and still refuses to start without
+  `CLAUDE_CODE_SESSION_ID`.
+- Added the `[auth] bearer_token_file` config key (env
+  `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`): a file holding the root bearer token,
+  read once at startup. A relative path resolves against the data dir.
+  `AI_MEMORY_AUTH_TOKEN` still takes precedence; setting the key together with
+  `[auth] bearer_token` is a startup error, and a server whose configured file
+  is missing or empty refuses to start. A token read from the file is never
+  written into a harness config: `install-mcp` registers Claude Code through
+  the session-aware `ai-memory mcp-bridge`, gives Codex and Prime Agent a
+  reference to `$AI_MEMORY_AUTH_TOKEN`, and writes every other client a stdio
+  entry for `ai-memory mcp-bridge --no-session-id` in that client's own config
+  format (OpenCode, OpenCode 2, Cursor, Claude Desktop, Gemini CLI, OpenClaw,
+  OMP, Antigravity CLI, Zero, Devin, Grok, Kimi Code, Kiro CLI, Command Code,
+  Copilot CLI, Swival, VS Code, Zed, Muse Code; DeepSeek Harness's printed
+  patch too). Only ZCode, whose config keeps HTTP entries only, is refused with
+  the manual option. `uninstall` recognises these entries.
+  `install-hooks --apply` stores the token in the hook credential files only.
+- `ai-memory status` and `ai-memory doctor` now show the server's auth
+  posture, and for an unauthenticated loopback server print
+  `auth: none (loopback)` with the fix, `ai-memory auth enable`.
+
+### Changed
+- Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
+  `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
+  FTS5 alone, so it returns the same order as `memory_query`, and `rank` is
+  now the fused rank. Cross-project search without a scope is unchanged.
+- Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
+  Code, Goose, Qwen Code and OpenHuman in `docs/install.md`, and listed them
+  in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
+  the client's own documentation at a named version and has not yet been run
+  end to end. Aider is not listed because it has no MCP support.
+- Published `docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md`, which
+  splits the LongMemEval-S retrieval number into capture cost, ranking quality
+  and harness artifacts, and records what the observation stream recovered
+  (zero-LLM FTS `hit@5` 0.666 → 0.868 on all 470 questions). The benchmark,
+  evals and comparison docs no longer blame the 2 KB excerpt cap for the gap
+  (pages holding exactly the captured text score 0.968 against 0.972 for whole
+  sessions) and no longer attribute agentmemory's 0.967 to LongMemEval-S: it is
+  the grep baseline on agentmemory's in-house corpus, and its LongMemEval-S
+  figure is 95.2% from a component harness with the reranker disabled, not
+  like-for-like with ai-memory's pipeline numbers. `docs/comparison.md` gains a
+  "From agentmemory" migration note.
+- Changed `memory_query` ranking to include the observation stream by
+  default, after it raised hit@5 on the retrieval eval for both zero-LLM and
+  local-embedding search while staying inside its latency and context-token
+  budgets. `explain=true` lists `observation` in
+  `streams_active` whenever it runs. To keep the previous ranking, set
+  `[retrieval] observation_stream = false` (or
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`); ranking is then identical
+  to before.
+- Changed `ai-memory init` on a fresh data dir (no config file and no
+  database yet) to create a root bearer token at
+  `<data_dir>/auth-tokens/default` and record `[auth] bearer_token_file`, so
+  a new install's server requires the token on every route except `/healthz`.
+  The hooks, the CLI and `ai-memory mcp-bridge` read it from the data dir;
+  client commands of a packaged install, whose config lives outside the data
+  dir, find it there too when they read no config file and target a loopback
+  server. Existing installs are unchanged and keep running without auth until
+  `ai-memory auth enable`; so is an `init` that finds a database or a bearer
+  supplied another way. `uninstall` keeps this token, since it is the
+  server's credential. The Docker wrapper hands a host command (`install-hooks`,
+  `mcp-bridge`, `run`) the token of a server initialized on its volume as an
+  owner-only file that `install-hooks` copies from the volume, never on a
+  command line. With no human accounts the built-in web UI answers a browser
+  with a Basic sign-in prompt instead of redirecting to a login form that
+  could not succeed: any username, and the token file's contents as the
+  password. `ai-memory setup` prints that URL and the file to read, never the
+  token. The macOS menu bar app reads the token from its data dir when none is
+  saved in Settings, so an install it initialized turns green without pasting
+  anything.
+- Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
+  plus `tags`, `pinned` and a non-default `tier` when set) above the body,
+  so metadata survives a round trip. The first run after upgrading rewrites
+  unedited files of an earlier export in place. (#1164)
+
+### Fixed
+- Fixed SessionEnd consolidation repeating the same expensive prompt on the
+  durable queue when the structured LLM response fails deterministically: a
+  truncated or empty response, malformed JSON, or an unexpected response
+  shape now ends the queue on the first attempt, keeping the heuristic page
+  the hook already wrote; pre-send connection and capacity (`503`) failures
+  retain the bounded backoff. (#1131)
+- Fixed structured LLM responses stopped at the output budget
+  (`finish_reason = "length"`) or returned without usable content: they now
+  fail with redacted terminal errors, without copying the response. (#1130)
+- Replaced the unmaintained YAML library (`serde_yaml` and its
+  `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
+  reads existing page frontmatter to exactly the same values as before. One
+  formatting change: when a page is next saved, a frontmatter value that needs
+  quoting (a title containing `: `, for example) is written in double quotes
+  instead of single quotes. `ai-memory-importer` reads three rare
+  hand-written forms differently: a numeric-looking `title` or tag such as
+  `007` is no longer used, a `!!timestamp`-tagged title fails that page's
+  import, and a custom-tagged title (`!foo x`) imports as its plain text.
+
+## [2.6.5] - 2026-10-12
+
+### Fixed
+- Fixed the detached hook drainer recreating a deleted data directory. A
+  drainer started just before `ai-memory uninstall --purge-data` (or one
+  whose data directory was removed some other way) brought back an empty
+  `hook-spool/` with its lock file. The drainer now exits when the data
+  directory is gone. A spool directory the drainer creates is also private
+  (`0700`) now, as one created by a queued event always was; before, it
+  took the default permissions.
+- Fixed the profile harvest writing a fresh copy of a stack preference on
+  every pass. A statement classified `stack` (for example "Use Rust by default
+  for everything else.") lives in `profile/stack/` beside the per-language
+  stack entries, and the step that finds an entry's existing page skipped that
+  whole directory, so each harvest saw no page and wrote another `-2`, `-3`,
+  … copy, each one shown in the session-start profile digest. Only the
+  per-language pages (`profile/stack/rust.md` and the like) are skipped now.
+  Copies already written stay until they are deleted.
+
 ## [2.6.4] - 2026-10-12
 
 ### Fixed
@@ -9008,7 +9402,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...HEAD
+[2.6.5]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/akitaonrails/ai-memory/compare/v2.6.1...v2.6.2
