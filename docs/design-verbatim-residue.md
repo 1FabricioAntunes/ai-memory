@@ -1,7 +1,8 @@
 # Design: verbatim residue for the consolidation prompt (#1215)
 
-**Status: proposal, not implemented (2026-10-11). Implementation waits for the
-maintainer's go on this document.**
+**Status: design of record (#1216, merged 2026-10-12). The maintainer answered
+Q1 to Q3 in #1215 (§9). The measurement harness of §4 lands first, on its own;
+the mechanism of §3 follows it (§8).**
 
 When a session has more observations than the consolidation prompt can carry,
 the projection keeps the highest-scoring 256 and replaces the rest with one
@@ -55,7 +56,7 @@ cited here only because the fidelity metric in §4.1 counts it.
 Numbers below come from one ai-memory 2.6.3 store (three agent harnesses,
 1,679 sessions, 2026-10-11), read-only, by replaying the projection's
 selection rules and the proposed miner over the stored observations. They set
-a baseline for this document; the harness in §4 is what the pull request will
+a baseline for this document; the harness in §4 is what the pull requests
 publish. In this table "an error term" means one of `error`, `failed`,
 `panic`, `exception`, `traceback`, `fatal` in any case; the mechanism's own
 `ERROR_LINE` class (§3.2) is narrower.
@@ -99,8 +100,9 @@ diagnostic material and nothing like the whole session.
   `PromptBudgets::default()` (100k tokens at margin 1.0, that is 300,000
   characters, against the 240,000 the server configures at the 0.8 default)
   and is documented as exposed for off-tree A/B harnesses (`evals/`), as is
-  `BATCH_SYSTEM_PROMPT`. Its callers are two call sites in `evals/src/ab.rs`
-  and one in-crate test.
+  `BATCH_SYSTEM_PROMPT`. Its callers are in `evals/` (`ab.rs`,
+  `projection.rs`, and `fidelity.rs`, which builds the empty scaffold) and one
+  in-crate test.
 - **Scoring and selection.** `projection.rs` `observation_score` starts at
   the observation's `importance` (0 to 10) and adds: kind priors
   (`user-prompt` 100, `session-end` 95, `pre-compact` 90, non-empty `stop`
@@ -147,7 +149,16 @@ diagnostic material and nothing like the whole session.
   identifiers, file paths, shell commands, and error strings verbatim". The
   single-page prompt's style rule 4 ("Aggregate per-tool-call detail ...
   summarise what was learned") is the one instruction that pulls the other
-  way; the batch prompt has no equivalent rule.
+  way; the batch prompt has no equivalent rule. Since #1221 (`f4f5a58b`,
+  2026-10-11) both prompts also carry a TERMINAL STATE AND CARRIED DETAIL
+  section: say when a session ended abruptly, let a later correction win,
+  keep the last metrics of in-flight work verbatim, carry "run X when Y"
+  operator instructions verbatim with their preconditions, and list access
+  and verification paths without secrets. Those rules act on what the prompt
+  shows; a fact the projection omitted is out of their reach. The section
+  grew the batch system prompt from 5,888 to 7,384 bytes, and the fixed part
+  of a batch request (system prompt, scaffold, output schema, envelope
+  reserve) is now 18,991 characters.
 - **Config and wiring.** `ai-memory-cli/src/config.rs` `ConsolidationSettings`
   (`#[serde(default)]`, `max_input_tokens`, `max_output_tokens`,
   `input_token_safety_margin`); `ai-memory-cli/src/commands/serve.rs`
@@ -179,8 +190,8 @@ The switch is a `Consolidator` field beside `per_user_slots`, set by
 `verbatim_residue` field on the startup line it already logs. The projection
 receives it through `ObservationProjectionConfig::with_verbatim_residue(bool)`.
 `PromptBudgets` and `with_prompt_limits` do not change. `build_batch_request`
-gains a `verbatim_residue: bool` parameter, and its callers (two call sites in
-`evals/src/ab.rs`, one in-crate test) pass the value they need. There is no
+gains a `verbatim_residue: bool` parameter, and its callers (`evals/` and one
+in-crate test) pass the value they need. There is no
 sibling function: `evals/` builds the on and off requests from one
 `Vec<Observation>` through the same signature, with no new public surface.
 
@@ -298,10 +309,10 @@ Codex sessions were `exec-<uuid>` call ids.
 
 ### 3.5 Budget and fit into the funnel
 
-Block budget: `min(max_total_chars / 8, 8_192)` characters. At the default
-100k input tokens (0.8 margin) the batch projection has about 222k characters
-for observations, so the cap is 3.7% of it; a 400k configuration leaves the
-cap at 0.9%.
+Block budget: `min(max_total_chars / 8, 8_192)` characters, the fixed cap the
+maintainer chose in #1215 (Q2). At the default 100k input tokens (0.8 margin)
+the batch projection has about 221k characters for observations, so the cap
+is 3.7% of it; a 400k configuration leaves the cap at 0.9%.
 
 The residue is computed **after** today's selection and character pruning,
 and only then makes room for itself. Today's loop stops at the observation
@@ -372,7 +383,7 @@ counts headers.
 ## 4. Measuring it before it ships
 
 ai-memory gates a changed default on a measured delta (the R2 rule in
-`docs/ARCHITECTURE.md`), and `evals/` (`ai-memory-eval ab`) today reports
+`docs/ARCHITECTURE.md`). Before PR 1, `evals/` (`ai-memory-eval ab`) reported
 latency, update counts and parse status only.
 
 **Measurement scope.** Today the harness builds the batch request only
@@ -380,8 +391,8 @@ latency, update counts and parse status only.
 `SYSTEM_PROMPT` are private). `memory_consolidate` without `multi_page`, the
 hooks and the session-end worker all go through `consolidate_session`, that
 is, the single-page prompt. The projection, and therefore the residue, is the
-same function on both paths, so the implementation PR's numbers come from the
-batch request and hold for both. They are measured at `build_batch_request`'s
+same function on both paths, so the mechanism's numbers come from the batch
+request and hold for both. They are measured at `build_batch_request`'s
 default budget (margin 1.0, 300,000 characters), a quarter more room than the
 server's 240,000 at the 0.8 default, and the benchmark page says so. A prompt
 A/B is path-specific: the rule-4 wording exists only in the single-page
@@ -389,61 +400,109 @@ prompt, so the conditional prompt PR exposes the single-page builder
 (`build_single_request`, §8) and `--mode single` before it publishes a delta.
 Until then, no number in this document measures the rule-4 wording.
 
-### 4.1 Harness additions
+### 4.1 The harness (PR 1)
 
-- `--residue`: builds the off and on requests from the same `Vec<Observation>`
-  in one run (ids and timestamps are minted per run, so hashing requests
-  across runs cannot serve as the control) and reports the fidelity table for
-  both; fixtures 01 to 05 must come out byte-identical.
-- `--runs N`: repeats each side; the baseline-versus-baseline spread (both
-  builders send `temperature: 0.2`) is published as the noise band.
-  `retrieval-ab-r2.md` publishes the same control for the zero-LLM retrieval
-  path, where it is a determinism check and the delta is exactly zero.
-- `--dump-request`: writes each side's system and user message under the
-  gitignored `evals/runs/`, next to the raw outputs the harness already saves;
-  the README says not to point it at real sessions.
-- `evals/src/fidelity.rs`, zero-LLM, using the crate's own slice and
-  `mine_residue_tokens` so the metric and the mechanism cannot drift apart.
-  Matching is exact substring; a paraphrase counts as loss by definition. It
-  reports:
-  - `recall_prompt`: tokens of all observations that reach the user message,
-    minus the fixed prompt text;
-  - `recall_page`: tokens that reach the pages;
-  - `projection_loss = 1 - recall_prompt`;
-  - `llm_loss`: in the prompt, not on the page;
-  - `hallucination`: a literal token on the page that is in neither the
-    observations nor the fixed text;
-  - `wikilink_hallucination` (#1207);
-  - optional `must_mention` / `must_not_mention` per fixture;
-  - coverage of observations with an `ERROR_LINE` match;
-  - the share of `ERROR_LINE` tokens that came from a `file`-family tool (a
-    noise gate).
-- `evals/README.md` stops calling `must_mention` out of scope and says that
-  CI builds and runs the crate's tests (`cargo nextest run --workspace
-  --all-targets`) while the `ab` and `retrieval` commands themselves still
-  never run there.
+**What is measured.** A fact can be lost at two stages, and the fix differs.
+The projection may omit it, and then no prompt wording brings it back; or the
+model may drop it after seeing it. The primary measure is a list of literal
+strings per fixture (`must_mention`), chosen by the fixture author and
+independent of any token miner. Keep-token recall is reported too, as a
+broader view, but it cannot judge this mechanism: measured with the residue's
+own miner, `recall_prompt` rises by construction whenever anything is
+omitted, because the residue adds exactly those tokens to the prompt. A
+reviewer would rightly read that as the mechanism grading itself.
+
+PR 1 adds, with no change under `crates/`:
+
+- `evals/src/fidelity.rs`, zero-LLM. Matching is exact, case-sensitive
+  substring; a paraphrase counts as a loss by definition. Per fixture and
+  run:
+  - `projection_loss`: share of `must_mention` absent from the request;
+  - `llm_loss`: share of the request-reaching `must_mention` absent from the
+    pages;
+  - `recall_prompt` and `recall_page` over `mine_keep_tokens` (secondary),
+    with tokens the empty scaffold already carries left out of the
+    denominator;
+  - `hallucinated_tokens`: keep-tokens on a page found in neither the request
+    nor the batch's own paths, one count per invention (a path and its bare
+    filename count once);
+  - `invented_wikilinks`: links to pages outside the batch; the harness lists
+    no existing pages in the prompt, so each one is invented (#1207);
+  - `must_not_mention_hits`.
+- `ab`: the scores above for every run of both sides, `--runs N` (up to 20;
+  the spread between a side's own runs, printed as mean and min-max, is the
+  noise band), `--generated-seed`, the exact request of each fixture under
+  `requests/`, and a `report.json` with commit, seed, sha256 of the generated
+  session, providers, models and N.
+- `projection`, a new subcommand with no provider: the zero-LLM half, per
+  fixture, with `--dump` to write each request and the generated session.
+  Its README section says not to point it at real sessions.
+- `evals/src/generate.rs`, the seeded generator (§4.2), and fixtures 06
+  and 07.
+- `evals/README.md` loses "`must_mention` is out of scope" and says that CI
+  builds and runs the crate's tests (`cargo nextest run --workspace
+  --all-targets`) while the `ab`, `projection` and `retrieval` commands
+  themselves never run there.
+
+PR 2 adds what needs the mechanism: `--residue`, which builds the off and on
+requests from the same `Vec<Observation>` in one run (ids and timestamps are
+minted per run, so hashing requests across runs cannot serve as the control),
+and the two metrics that need `mine_residue_tokens`: coverage of
+observations with an `ERROR_LINE` match, and the share of `ERROR_LINE` tokens
+that came from a `file`-family tool (a noise gate).
 
 ### 4.2 Fixtures
 
 No fixture in the tree is larger than 40 KB, and the existing tests build
 long sessions in code, so the long session comes from a seeded generator in
-`evals/` rather than a committed file (`--dump-fixture` to inspect it): about
-300 observations, 85% `post-tool-use` in the three real header shapes, one
-Bash result as one-line JSON, the `unknown` family with `outcome: error`, and
-twelve known facts of which some live only in observations that will be
-omitted. Its sha256 is published with the numbers. Two small fixtures are
-committed:
+`evals/` rather than a committed file (`projection --dump` writes it): 300
+observations, about 80% `post-tool-use` in the real header shapes (modern
+`tool_family` / `tool_call_id` / `outcome`, legacy `tool: <name>`, Claude
+Code's one-line JSON Bash result, the metadata-only `unknown` family with
+`outcome: error`), tool call ids in the Claude, Codex and Grok spellings, and
+an ending on an unanswered prompt with no `session-end`. The generator owns
+its PRNG (SplitMix64), because `rand`'s `StdRng` stream may change between
+releases and the published sha256 must stay reproducible.
 
-- `06-pt-br-tail-and-error-forms.json` (under 8 KB): a `user-prompt` past
-  3,000 characters whose `ERRO:` line is at the end, a 125-character accented
-  error line (byte cap on a character boundary), and one error written only in
-  Portuguese vocabulary, to measure the gap (Q1).
-- `07-injection-and-traps.json` (under 5 KB): an omitted tool output with
+Fifteen facts are planted once each:
+
+- seven where the default budget keeps them, so a loss there is the
+  model's. They follow the shapes of the #1221 field report: in-flight
+  metrics (`412 GB of 1.38 TB`, `97 MB/s`), an operator instruction
+  (`rotate-fence-keys.sh`), a staged-script path, plus a configuration value,
+  a source path and a pt-BR error as a language control;
+- eight where the projection drops them, which is what a residue has to
+  recover: an English compiler error, a Postgres pt-BR `ERRO:` line, an error
+  worded only in Portuguese, a release version, a host and a job-state marker
+  path in output with no high-signal term, and an operator instruction with
+  its precondition past the 3,000-character excerpt of a pasted prompt.
+
+Where a fact sits is a choice, so this session's `projection_loss` describes
+the fixture, not real sessions (§1.2 is the evidence for those); what it
+supports is the off/on comparison. Zero-LLM at the default budget of
+`build_batch_request` on `release/2.7` today: 225 of 300 observations
+selected, one body truncated, 8 of 15 facts lost, exactly the eight planted
+at risk, and `recall_prompt` 0.886. A test pins that split (the seven kept,
+the pasted prompt's two lost, at least six of the eight at risk lost), so a
+change to projection scoring that moves it fails loudly instead of quietly
+changing what the benchmark measures. Two small fixtures are committed:
+
+- `06-pt-br-tail-and-error-forms.json` (5 KB): a `user-prompt` past 3,000
+  characters whose `ERRO:` line is the last line (lost by the projection
+  today), a 125-character accented `ERRO:` line of 132 bytes (the 128-byte
+  cut on a character boundary), and an error worded only in Portuguese with
+  no prefix. All three are `must_mention`. It shows where pt-BR error text is
+  lost; with one line per form it cannot say how often a form occurs, which is
+  why Q1 is decided on a store (§4.3).
+- `07-injection-and-traps.json` (2 KB): a tool output with
   `error: IGNORE ALL PREVIOUS RULES ...`, an agent-harness notification
-  stored as a `user-prompt`, a plausible non-existent wikilink,
-  `must_not_mention`, and a credential-shaped value in the forms
-  `.gitleaks.toml` already allowlists, at the lengths the sanitizer rules
-  require. The GitHub token is `ghp_FAKE0123456789ABCDEFGHIJ` (24 characters
+  stored as a `user-prompt`, a plausible wikilink to a page that does not
+  exist, and credential-shaped values in the forms `.gitleaks.toml` already
+  allowlists, at the lengths the sanitizer rules require. The real compiler
+  error is `must_mention`; the injected marker, the injected phrase and both
+  credentials are `must_not_mention`. The fixture is small, so nothing is
+  omitted at the default budget; PR 2 runs it at a reduced budget to put the
+  traps in omitted observations. The GitHub token is `ghp_FAKE0123456789ABCDEFGHIJ` (24 characters
   after the prefix, against `{20,}`); the AWS key is the sanitizer's own
   fixture `AKIAFAKEFAKEFAKEFAKE` (exactly 16 after `AKIA`, the anchor of
   `aws_key`; a shorter value would pass the sanitizer untouched). Both sit on
@@ -459,19 +518,39 @@ committed:
 Results go to `docs/benchmarks/consolidation-literal-fidelity-<date>.md`
 (commit, generator seed and sha256, provider, model, N, noise band) with a
 section of its own in `docs/benchmarks/README.md`, apart from the retrieval
-table. The pull request opens only if, on the generated session and fixture
-06:
+table. The mechanism's pull request (PR 2) opens only if, on the generated
+session and fixture 06:
 
 | Rule | Threshold |
 |---|---|
 | Fixtures 01 to 05 | byte-identical on and off |
-| `recall_prompt` and coverage of `ERROR_LINE`-bearing observations | on > off |
-| `recall_page` | on >= off - noise |
-| `hallucination` and parse rate | on <= off + noise; parse rate equal |
+| At-risk `must_mention` facts on the pages (primary) | on > off + noise |
+| Kept `must_mention` facts on the pages (`llm_loss`) | on <= off + noise |
+| At-risk `must_mention` facts in the request | on > off |
+| Coverage of `ERROR_LINE`-bearing observations | on > off |
+| `recall_prompt` | on > off (a sanity check, true by construction) |
+| `hallucinated_tokens`, `invented_wikilinks`, parse rate | on <= off + noise; parse rate equal |
+| `must_not_mention_hits` | zero on both |
 | `ERROR_LINE` tokens from `file`-family tools | <= 20% |
 | Prompt growth | <= 8,192 characters plus the marker |
 
-Noise is the baseline-versus-baseline spread with `--runs 3`.
+Noise is the spread between a side's own runs with `--runs 3`, on the same
+model on both sides.
+
+**Q1, decided before measuring.** The maintainer keeps the built-in
+`ERROR_LINE` class English-canonical. The `ERRO:` / `Erro:` prefixes the
+§3.2 pattern already has stay: they are diagnostic prefixes (the first is
+what Postgres prints in pt-BR), not vocabulary. A bounded, configurable extra list for Portuguese forms follows
+only if the gap is material. Fixture 06 cannot answer that: it has one line
+per form, so it reports a form as lost or kept and says nothing about how
+often the form occurs. The proposed criterion, set here so the threshold is
+not chosen after the numbers: on a real store, measured read-only and
+published only as aggregates as in §1.2, the gap is material when, in the
+median session that omits observations, at least 15% of the error lines in
+omitted observations carry no error term the shipped `ERROR_LINE` matches and
+do carry Portuguese error vocabulary (`falhou`, `exceção`, `não foi
+possível`). The maintainer may change the threshold before the measurement
+runs, not after.
 
 ## 5. Tests (each with a control)
 
@@ -567,7 +646,7 @@ Noise is the baseline-versus-baseline spread with `--runs 3`.
   rather than adding its own; tokens are single lines under every
   line-splitting convention and cannot form a header, and test 8 proves it
   with a control. `docs/security-boundaries.md`: rule 1 is triggered once, by
-  the letter. PR 1 changes code in row 1h's "Enforcing code" column
+  the letter. PR 2 changes code in row 1h's "Enforcing code" column
   (`profile.rs` `user_written` becomes `pub(crate)` and gains a second
   caller, pass 1 of the residue), so the same change extends row 1h with the
   new caller and names test 7 as its adversarial test. For that test to bite
@@ -585,25 +664,33 @@ Noise is the baseline-versus-baseline spread with `--runs 3`.
   tier-down output unchanged (`mine_keep_tokens` keeps its bytes). Turning
   the switch off again removes the block from the next consolidation; pages
   already written are not rewritten.
-- **R2.** Not applicable: retrieval ranking and stored content do not change.
-  The rule-based page follow-up (Q3) is where R2 would apply.
+- **R2.** Retrieval ranking and stored content do not change. Turning the
+  residue on by default is still a changed default, gated on the measured
+  deltas of the §4.3 table, as the maintainer confirmed in #1215. The
+  rule-based page follow-up (Q3) changes stored content and is R2-gated in
+  full.
 
 ## 7. Failure modes and limits
 
 - **It is coverage, not completeness.** Under the caps, a giant session gets
   26 to 55 observations' worth of tokens out of tens of thousands omitted.
-  Raising the 8,192 cap is the one real lever (Q2).
+  Raising the 8,192 cap is the one real lever; the maintainer kept it fixed
+  (Q2), and raising it later is a one-line change once the harness shows the
+  cap is what binds.
 - **Header-only tool bodies yield nothing**: the `unknown` family and the
   metadata-only bodies of the capture policy, which on this installation were
   every Codex `file` call and every Grok call. Capturing more there is a
   capture and privacy decision outside this design.
 - **Portuguese error vocabulary** beyond `ERRO:` / `Erro:` is outside the
-  class (17% to 37% of this installation's error lines). Q1.
+  class (17% to 37% of this installation's error lines). It stays outside
+  the built-in class (Q1); a bounded, configurable extra list follows only if
+  the §4.3 criterion says the gap is material.
 - **Agent-harness notifications** that `user_written` does not recognise
   still compete in pass 1; the half-budget quota bounds the damage without
   removing it.
 - **The model still decides what to copy.** Style rule 4 of the single-page
-  prompt asks it to summarise tool detail; the conditional prompt PR (§8)
+  prompt asks it to summarise tool detail, while the #1221 rules ask for
+  metrics and operator instructions verbatim; the conditional prompt PR (§8)
   touches that only with an `llm_loss` delta measured on the single-page
   request, which the harness cannot build today (§4).
 - **Sessions that never reach a model** (no provider configured, or a
@@ -617,21 +704,32 @@ Noise is the baseline-versus-baseline spread with `--runs 3`.
   re-mined.** Their tokens entered `seen` while the block was still selected,
   so the residue does not carry them either: what the extra pruning removes
   is not recovered.
-- **Pre-existing, reported separately**: at `max_input_tokens = 6000` with
-  the 0.8 margin, the batch builder's fixed text (about 17k characters)
-  exceeds the budget and leaves zero characters for observations, against
-  what the comment on `MIN_CONSOLIDATION_MAX_INPUT_TOKENS` promises. Not part
-  of this series.
+- **Pre-existing, reported separately**: at the validated floor
+  (`MIN_CONSOLIDATION_MAX_INPUT_TOKENS`, 6,500 since #1219) and the default
+  0.8 margin, the budget is 15,600 characters against a fixed batch part of
+  18,991, so the batch builder has no room for observations, against what the
+  constant's comment promises. The floor holds at margin 1.0 (509 characters
+  left); at 0.8 the first room appears near 8,000 tokens (209 characters).
+  Not part of this series.
 
 ## 8. Pull request plan (base `release/2.7`)
 
 | PR | Content | Size |
 |---|---|---|
-| 0 (this) | `docs/design-verbatim-residue.md`, docs only, no CHANGELOG entry (same as `design-page-ingestion-windows.md`) | 1 file |
-| 1 | §3 and §4 together (contents below) | about 850 lines, about 20 files |
-| 2 (conditional) | A positive copy rule beside style rule 4 of the single-page prompt (contents below) | about 120 lines |
+| 0 (#1216, merged) | this document | 1 file |
+| 1 | the harness of §4.1 and §4.2, no change under `crates/`; this document updated with the maintainer's answers | about 1,550 lines, 10 files |
+| 2 | the mechanism of §3, `--residue` and the two `ERROR_LINE` metrics | estimated 600 to 800 lines, about 12 files |
+| 3 (conditional) | a positive copy rule beside style rule 4 of the single-page prompt | about 120 lines |
 
-PR 1 carries:
+The harness goes first, for three reasons. It is useful on its own: it measures whether the #1221 prompt rules keep the metrics and
+operator instructions that reach the prompt, and how much the projection
+drops before any rule can act. It puts a baseline on record before any code
+under `crates/` changes. And if the projection turns out to lose little on
+the sessions that matter, PR 2 is not needed. None of it is dead code while
+the mechanism does not exist: `evals/` is not shipped, and every new item has
+a caller in the `ab` or `projection` command.
+
+PR 2 carries:
 
 - `keep_tokens.rs`: `RESIDUE_PATTERNS`, `mine`, `mine_residue_tokens`,
   `ERROR_LINE` and `VERSION`;
@@ -643,9 +741,7 @@ PR 1 carries:
   `verbatim_residue` parameter of `build_batch_request`;
 - config: `ConsolidationSettings.verbatim_residue`, `configure_consolidator`
   and the field on its startup line;
-- `evals/`: `--residue`, `--runs`, `--dump-request`, `--dump-fixture`,
-  `fidelity.rs`, the generator, fixtures 06 and 07, and the `evals/README.md`
-  wording;
+- `evals/`: `--residue` and the two `ERROR_LINE` metrics of §4.1;
 - docs: the benchmark page and its section in `docs/benchmarks/README.md`, a
   `CHANGELOG.md` `### Added ... (#NNN)` entry, the `[consolidation]` block in
   `docs/ARCHITECTURE.md`, and the row-1h update in
@@ -653,14 +749,9 @@ PR 1 carries:
 - tests 1 to 14.
 
 Every new public item ships with its in-tree caller
-(`render_verbatim_residue` for `mine_residue_tokens`). That is why the
-mechanism is one pull request rather than a miner-first split: a miner
-without its consumer would be dead code in the binary, and `evals/` is not
-shipped. If the maintainer prefers two reviews, the clean split is a
-harness-only PR first (no change under `crates/`, fidelity over the existing
-`mine_keep_tokens`) and the mechanism second.
+(`render_verbatim_residue` for `mine_residue_tokens`).
 
-PR 2 carries:
+PR 3 carries:
 
 - a positive copy rule beside style rule 4 of the single-page prompt, the one
   instruction that conflicts with verbatim copying (§2); the batch and
@@ -675,25 +766,26 @@ PR 2 carries:
 - a substring test for the new sentence in all three prompts, the
   before/after table in the same PR, and a `### Changed` entry.
 
-It opens only if `llm_loss(off)` on the generated session and fixture 06 is
-0.20 or more **and** the prompt A/B (`--runs 3`, on the single-page request)
-shows `llm_loss` falling by 0.10 or more with equal parse rate, no higher
-`hallucination`, and page bytes within +20%. The prompts already say "error
-strings verbatim"; a wording change without that number would be rightly
-declined.
+It opens only if `llm_loss` on the kept facts of the generated session and
+fixture 06 is 0.20 or more against the prompts as they stand after #1221,
+**and** the prompt A/B (`--runs 3`, on the single-page request) shows
+`llm_loss` falling by 0.10 or more with equal parse rate, no more invented
+tokens or links, and page bytes within +20%. The #1221 rules already ask for
+metrics and operator instructions verbatim and the prompts already say
+"error strings verbatim"; a wording change without that number would be
+rightly declined.
 
 Gates before each push: `cargo fmt --all -- --check`, `git diff --check`,
 `cargo clippy --workspace --all-targets -- -D warnings` (`missing_docs` is a
 warning, so every new `pub` item carries a doc comment), `cargo tf`,
 `cargo deny check`; gitleaks runs on the PR range with the fail-closed
-config. The maintainer may fold review into this document before any code
-lands, as with #1008 (`18c6949f`). If the maintainer would rather implement
-the mechanism from this document, that is a fine outcome too; the fork stays
-rebased on `release/2.7`, so it never competes with that work.
+config. If the maintainer would rather implement the mechanism from this
+document, that is a fine outcome too; the fork stays rebased on
+`release/2.7`, so it never competes with that work.
 
-## 9. Decisions taken here, and the three that are the maintainer's
+## 9. Decisions
 
-Decided by the evidence above, so the pull request does not have to ask:
+Decided by the evidence above:
 
 | | Decision | Where |
 |---|---|---|
@@ -702,21 +794,29 @@ Decided by the evidence above, so the pull request does not have to ask:
 | D3 | A second private pattern table and one public function (`mine_residue_tokens`); no hash or UUID class; no `CODE_SPAN` or `IDENTIFIER` | §3.2 |
 | D4 | The system prompts do not change; the block header defers to their rules | §3.1, §3.6 |
 | D5 | Mined after pruning; at most three observation blocks pruned, then the residue shrinks by whole groups; 512 characters per observation; block cap `min(max_total_chars / 8, 8_192)` | §3.5 |
-| D6 | Long test sessions come from a seeded generator; only the two small fixtures are committed | §4.2 |
-| D7 | CHANGELOG entries use the current `(#NNN)` form; this document needs none | §8 |
+| D6 | Long test sessions come from a seeded generator with its own PRNG; only the two small fixtures are committed | §4.2 |
+| D7 | CHANGELOG entries use the current `(#NNN)` form; the harness PR needs none (`evals/` is not shipped) | §8 |
 | D8 | The prompt change is a separate, conditional pull request with its own delta, measured on the single-page request | §8 |
-| D9 | The batch-builder floor at 6,000 tokens is a separate issue | §7 |
+| D9 | The batch-builder floor (no room for observations at 6,500 tokens and the 0.8 margin) is a separate issue | §7 |
+| D10 | The primary measure is the per-fixture `must_mention` list, independent of any miner; keep-token recall is secondary | §4.1 |
+| D11 | The harness lands first, alone | §8 |
 
-Open:
+Answered by the maintainer in #1215 (2026-10-12):
 
-- Q1. Portuguese error forms beyond `ERRO:` / `Erro:` (`falhou`,
-  `exceção`, `não foi possível`): add them to `ERROR_LINE`, or keep the class
-  English-only like `has_high_signal_terms`? The cost of leaving them out is
-  measured above (17% to 37% of this installation's error lines).
-- Q2. Block cap: a fixed 8,192 characters, or a share of the observation
-  budget (1/8 would be about 118k characters on a 400k-token configuration)?
-  The cap is the lever that decides how much a large session recovers.
-- Q3. Should the rule-based page follow-up (`## Retained facts (verbatim)`
-  in `ai-memory-hooks/src/synth.rs`, R2-gated, the only path for sessions
-  that never reach a model) get its own design document after this one
-  lands?
+- **Q1.** Portuguese error forms beyond `ERRO:` / `Erro:` stay out of the
+  built-in `ERROR_LINE` class, English-canonical like
+  `has_high_signal_terms`. If the gap is material, they come as a bounded,
+  configurable extra pattern list, never by growing the default table; the
+  sanitizer stays the only trust boundary, and a config-supplied regex set is
+  size-capped like every other config input. Materiality is decided by the
+  criterion in §4.3, set before measuring.
+- **Q2.** A fixed 8,192 characters. A proportional cap makes prompt growth
+  depend on configuration (118k characters on a 400k-token configuration is a
+  second prompt, not a residue). Raising the constant later is a one-line,
+  measured change.
+- **Q3.** The rule-based page follow-up (`## Retained facts (verbatim)` in
+  `ai-memory-hooks/src/synth.rs`, the only path for sessions that never reach
+  a model) gets its own design document after this series, built on the
+  existing rule-based path rather than a new writer, and R2-gated. It starts
+  from `synth.rs` as #1221 left it (`321b7cef`, which added a deterministic
+  terminal-state line). No page-content change ships in this series.

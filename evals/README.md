@@ -1,10 +1,14 @@
 # `evals/` — evaluation harnesses
 
-One Rust binary (`ai-memory-eval`) with two subcommands:
+One Rust binary (`ai-memory-eval`) with three subcommands:
 
 - **`ab`** — runs the EXACT consolidation prompt ai-memory uses in
-  production against two LLM providers side by side, and saves both
-  outputs to disk for human comparison.
+  production against two LLM providers side by side, saves both
+  outputs to disk for human comparison, and scores literal fidelity
+  (see [Literal fidelity](#literal-fidelity)).
+- **`projection`** — the zero-LLM half of that scoring: which fixture
+  facts the observation projection lets into the prompt at all. No
+  provider, no network.
 - **`retrieval`** — the LongMemEval retrieval benchmark, driven end to
   end through a real `ai-memory serve` subprocess. Published baselines
   live in `docs/benchmarks/`.
@@ -12,7 +16,9 @@ One Rust binary (`ai-memory-eval`) with two subcommands:
 **This is not part of the shipped binary.** It's a workspace member
 purely so it shares deps + builds with the rest. `cargo build` from
 the repo root will compile it, but it's never bundled into the
-docker image and never run by CI.
+docker image. CI builds it and runs its unit tests
+(`cargo nextest run --workspace --all-targets`); the `ab`,
+`projection` and `retrieval` commands themselves never run there.
 
 ## When to reach for this
 
@@ -43,11 +49,13 @@ For each `*.json` under `evals/fixtures/`:
    validation the live system applies. Schema-parse failure is
    recorded (not fatal).
 4. Persists to `evals/runs/<timestamp>/{baseline,candidate}/<fixture>.{json,md,meta.json}`.
+5. Scores each output against the fixture's `must_mention` and
+   `must_not_mention` lists and writes `report.json`.
 
-The runner prints latency + parse status per fixture and a tail
-summary. **Quality is for you to read** — open the markdown files
-in `runs/<timestamp>/baseline/` and `…/candidate/` side by side and
-judge faithfulness, scoping, hallucination, etc.
+The runner prints latency, parse status and the fidelity numbers per
+fixture and run, and a tail summary. Structure and judgement are
+still **for you to read**: open the markdown files in
+`runs/<timestamp>/baseline/` and `…/candidate/` side by side.
 
 ## Running it
 
@@ -122,13 +130,84 @@ evals/runs/2026-05-22T18-30-00Z/
 ├── baseline/
 │   ├── 01-rust-bug-fix.json        ← raw structured output
 │   ├── 01-rust-bug-fix.md          ← flat markdown rendering, easy to read
-│   └── 01-rust-bug-fix.meta.json   ← {elapsed_ms, parsed_ok, update_count}
-└── candidate/
-    └── …
+│   └── 01-rust-bug-fix.meta.json   ← {elapsed_ms, parsed_ok, update_count, fidelity}
+├── candidate/
+│   └── …
+├── requests/01-rust-bug-fix.txt    ← the exact system prompt + user message sent
+├── generated-session.json          ← with --generated-seed
+└── report.json                     ← provenance + every run of both sides
 ```
 
-Eyeball the `.md` files in pairs. The runner also prints a
+With `--runs N` the per-case files carry a `.rN` suffix. Eyeball the
+`.md` files in pairs. The runner also prints a
 `diff -ru baseline candidate` command you can run.
+
+## Literal fidelity
+
+Consolidation can lose a fact at two stages, and the fix differs:
+
+- **projection**: the observation projection omits whole observations
+  and cuts bodies at 3,000 characters to fit the budget. A fact it
+  drops never reaches the model, so no prompt wording can bring it
+  back.
+- **model**: the fact was in the prompt and the page does not carry it.
+
+Each fixture may list `must_mention` (literal strings the pages should
+carry) and `must_not_mention` (strings no page may carry: injected
+instructions, credential-shaped values). Matching is exact,
+case-sensitive substring, so a paraphrase counts as a loss; that is
+what "verbatim" means in the prompts. The scores, per fixture and run:
+
+| Metric | Meaning |
+|---|---|
+| `projection_loss` | share of `must_mention` absent from the prompt (zero-LLM) |
+| `llm_loss` | share of the prompt-reaching `must_mention` absent from the pages |
+| `recall_prompt` / `recall_page` | keep-token recall (`mine_keep_tokens`) of the prompt and the pages; a broad secondary view |
+| `hallucinated_tokens` | keep-tokens on a page found in neither the request nor the batch's own paths |
+| `invented_wikilinks` | `[[links]]` to pages outside the batch; the prompt lists no existing pages, so each one is invented (#1207) |
+| `must_not_mention_hits` | forbidden strings found on a page |
+
+The `must_mention` lists are the primary measure because they do not
+depend on any token miner. A change that adds miner tokens to the
+prompt raises `recall_prompt` by construction, so it cannot be judged
+by that number.
+
+`--runs N` (up to 20) repeats every side. The spread between a side's
+own runs, printed as `mean (min-max)`, is the noise band, and a delta
+inside it is noise. Run the same model on both sides to measure
+the band on its own.
+
+`--generated-seed 1215` adds the seeded long session from
+`src/generate.rs`: 300 observations in production capture shapes with
+fifteen planted facts. Seven sit where the default budget keeps them;
+eight sit where the projection drops them (early in the session, in
+output with no high-signal term, or past the excerpt cap of a pasted
+prompt). Where a fact sits is a choice, so this session's
+`projection_loss` describes the fixture, not real sessions; what it
+supports is a before/after comparison. `report.json` records the seed
+and the sha256 of the generated JSON next to the numbers; a test pins the
+sha256 of seed 1215, so a generator change that alters it has to update the
+pin and say so beside any republished number.
+
+Two differences from a live server: fixtures and the generated session reach
+the projection without passing through the capture sanitizer (they are
+synthetic, and the injection fixture keeps its planted strings on purpose),
+and they are projected at the harness's 300,000-character default budget,
+not the server's 240,000-character one (100,000 tokens × 3 characters ×
+the 0.8 safety margin). Compare runs against each other, not against a
+server's prompts.
+
+Zero-LLM, no provider:
+
+```bash
+cargo run -p ai-memory-eval -- projection --generated-seed 1215
+# also write every request and the generated session to a directory:
+cargo run -p ai-memory-eval -- projection --generated-seed 1215 --dump evals/runs/projection
+```
+
+Point `--dump` and the fixtures at synthetic sessions only. A request
+holds every observation verbatim, and real sessions do not belong in
+files you may share.
 
 ## Adding fixtures
 
@@ -143,9 +222,13 @@ Each fixture is a JSON file:
     {"kind": "user-prompt",   "title": "user prompt", "body": "..."},
     {"kind": "pre-tool-use",  "title": "Edit", "body": "..."},
     ...
-  ]
+  ],
+  "must_mention": ["error[E0382]: borrow of moved value"],
+  "must_not_mention": ["IGNORE ALL PREVIOUS RULES"]
 }
 ```
+
+Both lists are optional.
 
 `kind` values: `session-start`, `user-prompt`, `pre-tool-use`,
 `post-tool-use`, `pre-compact`, `notification`, `stop`,
@@ -156,10 +239,10 @@ for the next human who opens the file.
 
 ## What this harness does NOT do
 
-- **Score quality automatically.** Pure side-by-side. If you want
-  metrics, the next layer up would be keyword recall (`must_mention`
-  per fixture) or an LLM-as-judge pass — both deliberately out of
-  scope here.
+- **Judge quality.** The literal checks above say whether a string
+  survived, not whether the page is any good. Structure, scoping and
+  judgement are still read by a human; an LLM-as-judge pass is
+  deliberately out of scope.
 - **Test the embedding pipeline.** This only exercises the
   consolidation LLM. Embedding A/B would be a parallel harness
   (probe queries + expected target pages, measure recall@5/MRR).
