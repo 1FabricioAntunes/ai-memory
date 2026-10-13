@@ -271,6 +271,43 @@ mod tests {
         ));
     }
 
+    /// Adversarial: a settings hook narrowed by a matcher (one tool) must not
+    /// suppress the plugin copy for every other tool. Controls: an empty,
+    /// `*` or absent matcher catches everything and drops the plugin copy.
+    #[test]
+    fn only_a_catch_all_matcher_suppresses_the_plugin_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = temp.path().join("settings.json");
+        let files = vec![(settings.clone(), HooksFileShape::HooksKey)];
+        let hook = |matcher: Option<serde_json::Value>| {
+            let mut entry = serde_json::json!({"hooks": [{"type": "command", "command": "/usr/bin/ai-memory hook --event post-tool-use --agent claude-code --server-url http://h"}]});
+            if let Some(matcher) = matcher {
+                entry["matcher"] = matcher;
+            }
+            serde_json::json!({"hooks": {"PostToolUse": [entry]}}).to_string()
+        };
+        let drops = || {
+            drops_plugin_event(
+                PluginOrigin::ClaudeCode,
+                "post-tool-use",
+                Some("/work/repo"),
+                &files,
+            )
+        };
+        for narrowed in ["Bash", "Edit|Write", "mcp__.*"] {
+            std::fs::write(&settings, hook(Some(serde_json::json!(narrowed)))).unwrap();
+            assert!(!drops(), "{narrowed}");
+        }
+        for catch_all in [
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("*")),
+            None,
+        ] {
+            std::fs::write(&settings, hook(catch_all.clone())).unwrap();
+            assert!(drops(), "{catch_all:?}");
+        }
+    }
+
     /// Codex settings hooks never suppress the plugin: an untrusted one would
     /// be skipped by Codex and the event lost.
     #[test]

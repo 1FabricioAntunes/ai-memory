@@ -195,11 +195,13 @@ pub(crate) enum HooksFileShape {
     EventMap,
 }
 
-/// Whether the hooks file at `path` registers an ai-memory hook for `event`
-/// (`SessionStart`, ...). A plugin's copy of an event is dropped only when
-/// such a hook delivers that same event, so an older install that wires fewer
-/// events still gets the rest from the plugin. A missing, unreadable or
-/// malformed file registers nothing.
+/// Whether the hooks file at `path` registers an ai-memory hook that fires on
+/// every occurrence of `event` (`SessionStart`, ...). A plugin's copy of an
+/// event is dropped only when such a hook delivers that same event, so an
+/// older install that wires fewer events still gets the rest from the plugin,
+/// and a hook narrowed by a `matcher` does not suppress the plugin for what
+/// it would not match. A missing, unreadable or malformed file registers
+/// nothing.
 pub(crate) fn hooks_file_delivers_ai_memory_event(
     path: &Path,
     shape: HooksFileShape,
@@ -227,7 +229,22 @@ pub(crate) fn hooks_file_delivers_ai_memory_event(
     event_map
         .and_then(|map| map.get(event))
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry))
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| is_ai_memory_hook_entry(entry) && matcher_catches_all(entry))
+        })
+}
+
+/// A hook entry with no `matcher`, an empty one or `*` fires on every
+/// occurrence of its event; any other matcher (one tool, one session source)
+/// selects a subset, and the plugin must still deliver the rest.
+fn matcher_catches_all(entry: &serde_json::Value) -> bool {
+    match entry.get("matcher") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(matcher)) => matches!(matcher.trim(), "" | "*"),
+        Some(_) => false,
+    }
 }
 
 /// Re-copy the Claude Code hook scripts into the stable staging dir the

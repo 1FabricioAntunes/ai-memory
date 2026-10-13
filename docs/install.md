@@ -218,7 +218,8 @@ configure ai-memory@ai-memory`:
 - If `install-hooks` already put ai-memory hooks in
   `~/.claude/settings.json` or a checkout's `.claude/settings.local.json`,
   those win: the plugin skips every event they deliver, so nothing is
-  captured twice. `ai-memory doctor` reports the double install and which
+  captured twice. Only a hook with an empty or `*` matcher counts; one you
+  narrowed to some tools leaves the plugin capturing the others. `ai-memory doctor` reports the double install and which
   copy to remove. While the plugin is enabled, `ai-memory setup` and
   `ai-memory run` stop writing Claude's settings hooks, MCP entry and
   skills; run `ai-memory install-hooks --agent claude-code --apply` (or
