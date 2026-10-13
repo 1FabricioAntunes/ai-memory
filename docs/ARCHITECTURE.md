@@ -1429,9 +1429,9 @@ the server URL is loopback and no `default` server profile is registered.
   [`docs/benchmarks/`](benchmarks/README.md)), next to the recall-eval
   framework
   ([`crates/ai-memory-consolidate/tests/suite/recall_eval.rs`](../crates/ai-memory-consolidate/tests/suite/recall_eval.rs)).
-  Still unmeasured: a full-set local-embeddings run with the observation
-  stream, and `belief_authority_weight`, which needs an LLM-consolidated
-  corpus because zero-LLM session pages carry no `page_evidence`.
+  Still unmeasured: `belief_authority_weight`, which needs an
+  LLM-consolidated corpus because zero-LLM session pages carry no
+  `page_evidence`.
 
 ## Reading order
 

@@ -42,9 +42,10 @@ What sets it apart:
 It also publishes numbers, produced by the in-repo harness with full
 provenance and measured end to end through the shipped capture pipeline:
 **LongMemEval-S hit@5 about 0.82** with the default local embeddings (0.823 and
-0.815 in the two published full-set runs) and 0.666 zero-LLM. The observation stream in 2.7
-(unreleased, on by default) raises zero-LLM from 0.662 to **0.855** on all 470
-questions, measured on one build with the stream off and on.
+0.815 in the two published full-set runs) and 0.666 zero-LLM in 2.6. The
+observation stream in 2.7 (unreleased, on by default) raises zero-LLM to
+**0.951** and local embeddings to **0.936** on all 470 questions, measured on
+one build with the stream off and on.
 With capture skipped and each raw session indexed whole (component mode,
 ranking only), zero-LLM FTS scores 0.972; the
 [decomposition report](benchmarks/longmemeval-s-decomposition-2026-10-12.md)
@@ -296,7 +297,7 @@ operator turns it on.
 
 - **Retrieval through capture, and no local reranker.** Through the shipped
   pipeline, LongMemEval-S hit@5 is about 0.82 with local embeddings and 0.666
-  zero-LLM (2.6); the 2.7 observation stream raises zero-LLM to 0.855. Ranking
+  zero-LLM (2.6); the 2.7 observation stream raises them to 0.936 and 0.951. Ranking
   the same raw sessions whole scores 0.972 zero-LLM. The
   [decomposition](benchmarks/longmemeval-s-decomposition-2026-10-12.md) traced
   the gap to capture, and within capture not to the 2 KB privacy cap (pages holding exactly the captured text

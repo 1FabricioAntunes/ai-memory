@@ -44,11 +44,13 @@ pipeline-vs-whole-session A/B, on `release/2.7` at `85eb1723` with
 `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` on every arm (see "Harness
 correction").
 
-Observation-stream runs (R1, re-run 2026-10-13 on the corrected harness):
+Observation-stream runs (2026-10-13, corrected harness):
 
-- build: `release/2.7` at `85eb1723`, where the stream is on by default; the
-  baseline side sets `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` and the
-  candidate side `=true`
+- build: the shipped ranking, `228d72f0` on top of `e124b123`, for the
+  full-set FTS and local A/Bs; `release/2.7` at `85eb1723` for the first
+  version. The stream is on by default in both, so the baseline side sets
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` and the candidate side
+  `=true`
 - harness: `85eb1723`, which replays each question's sessions under their own
   session ids (see "Harness correction")
 - dataset, hardware and model as above (original `longmemeval_s` file)
@@ -188,13 +190,53 @@ The fix keeps the session page as it is and adds the observation bodies to
 ranking instead. With `[retrieval] observation_stream` on, project and
 `scopes` searches also run full-text search over the project's observations,
 and each matching session votes once, through its best observation, for its
-own `sessions/<id>.md` page as one more RRF stream. Hits are still pages, and
-nothing new is written to the wiki. It is on by default in 2.7; setting it to
-`false` restores the previous ranking exactly.
+own `sessions/<id>.md` page as one more RRF stream. A page the stream voted
+for takes its lexical evidence from the stream alone: page FTS over its
+title-only body still reports a rank but adds nothing, so a session that only
+shares topic words in its titles cannot outvote the session holding the
+answer. Hits are still pages, and nothing new is written to the wiki. It is on
+by default in 2.7; setting it to `false` restores the previous ranking
+exactly.
 
-Baseline is the stream off, candidate is the stream on, same build, same
-questions. These are the corrected-harness runs (see "Harness correction"
-below):
+Stream off → on, same build (`release/2.7` at `228d72f0` on top of
+`e124b123`, the shipped ranking), same questions, all 470, corrected harness:
+
+| run | hit@5 | hit@1 | hit@10 | recall@5 | p95 ms | flips |
+|---|---|---|---|---|---|---|
+| FTS | 0.662 → **0.951** | 0.511 → 0.857 | 0.687 → 0.972 | 0.533 → 0.893 | 90 → 112 | +139/−3 |
+| Local embeddings | 0.796 → **0.936** | 0.536 → 0.757 | 0.881 → 0.970 | 0.657 → 0.871 | 264 → 234 | +72/−6 |
+
+FTS `hit@5` per slice, off → on: knowledge-update 0.764 → 1.000,
+multi-session 0.562 → 0.967, single-session-assistant 0.804 → 1.000,
+single-session-preference 0.533 → 0.700, single-session-user 0.688 → 1.000,
+temporal-reasoning 0.654 → 0.921. The FTS and local runs ran at the same time
+on one host, so their latencies are only indicative.
+
+Context tokens rise because the candidate returns more hits: with the stream
+off, FTS returned fewer than five hits for 219 of 470 questions (5.6 on
+average), and with it on, 9.9. The cost of the top five hits rises much less:
+
+| run | mean context tokens, all hits | top five hits only |
+|---|---|---|
+| FTS | 366.7 → 528.1 | 256.3 → 266.1 (+3.8%) |
+| Local embeddings | 451.4 → 528.3 | 225.7 → 264.1 (+17.0%) |
+
+"Top five hits only" scales each question's estimate by `min(returned, 5) /
+returned`.
+
+The pipeline now ranks an evidence session into the top five for 95.1% of
+questions with FTS alone, against 96.8% for pages holding exactly the captured
+text and 97.2% for whole raw sessions. With the stream on, local embeddings
+score slightly below FTS alone (0.936 against 0.951), mostly on
+single-session-assistant questions (0.875 against 1.000): the session page's
+vector, like its FTS row, sees only the title-only body.
+
+### First version
+
+In its first version the stream's vote was added on top of page FTS, so a
+session page whose title list shared topic words with the question still
+collected both. That version, stream off → on, corrected harness, on
+`release/2.7` at `85eb1723`:
 
 | run | questions | hit@5 | hit@1 | hit@10 | recall@5 | p95 ms | flips |
 |---|---|---|---|---|---|---|---|
@@ -206,28 +248,14 @@ FTS `hit@5` per slice on the full set, off → on: knowledge-update 0.764 →
 0.944, multi-session 0.562 → 0.868, single-session-assistant 0.804 → 0.839,
 single-session-preference 0.533 → 0.667, single-session-user 0.688 → 0.875,
 temporal-reasoning 0.654 → 0.835. No slice dropped, and no question lost its
-top-5 hit. The three runs shared the host one after another, never with each
-other. An earlier build whose observation scan was not yet bounded to the
+top-5 hit. The three runs ran one after another on one host. An earlier build whose observation scan was not yet bounded to the
 project measured a candidate p95 of 1,373 ms; the bounded scan is what
 shipped.
 
-Context tokens rise. The candidate returns more hits: with the stream off,
-FTS returned fewer than five hits for 219 of 470 questions (5.6 hits on
-average), and with it on, 9.9. So the raw mean rises more than the cost of the
-top five hits does:
-
-| run | mean context tokens, all hits | top five hits only |
-|---|---|---|
-| FTS, 470 questions | 366.7 → 548.8 | 256.3 → 276.4 (+7.9%) |
-| FTS, 180 questions | 414.9 → 565.7 | 266.7 → 285.4 (+7.0%) |
-| Local, 90 questions | 476.6 → 563.2 | 238.3 → 281.6 (+18.2%) |
-
-"Top five hits only" scales each question's estimate by `min(returned, 5) /
-returned`.
-
-The stream recovered about two thirds of the FTS headroom the decomposition
-found (0.662 → 0.855, against 0.968 for captured-text pages). A full-set
-local run with the stream on has not been done yet.
+Its top-five context cost rose 7.9% (FTS, 470), 7.0% (FTS, 180) and 18.2%
+(local, 90). Letting the stream alone rank a page it voted for, the shipped
+version above, took FTS `hit@5` from 0.855 to 0.951 and lowered the top-five
+token cost.
 
 ## Harness correction (2026-10-13)
 
@@ -254,8 +282,8 @@ stream, which had partly been scoring sessions whose page was missing:
 | Local pipeline, strat-230 | 0.809 / 0.804 | 0.787 |
 | FTS date-prefix ablation, strat-120 | 0.658 → 0.792 | 0.658 → 0.792 |
 | Local date-prefix ablation, strat-120 | 0.800 → 0.900 | 0.800 → 0.892 |
-| FTS stream off → on, 470 | 0.666 → 0.868 | 0.662 → 0.855 |
-| Local stream off → on, 90 | 0.800 → 0.867 | 0.800 → 0.867 |
+| FTS stream off → on, 470 (first version) | 0.666 → 0.868 | 0.662 → 0.855 |
+| Local stream off → on, 90 (first version) | 0.800 → 0.867 | 0.800 → 0.867 |
 
 Component, grep and captured-session runs write pages directly or read the
 dataset, never replaying session ids through hooks, so they are unchanged.
@@ -336,16 +364,16 @@ $E retrieval --stratify 20 --embeddings local --date-prefix turn --candidate-dat
 $E retrieval --stratify 20 --embeddings local --candidate-server-env AI_MEMORY_RETRIEVAL__BELIEF_AUTHORITY_WEIGHT=0.3
 ```
 
-Observation stream (corrected harness, stream on by default):
+Observation stream, shipped ranking (corrected harness, stream on by
+default): the full-set FTS and local A/Bs. The first version's runs used the
+same commands on `85eb1723`, plus `--stratify 30` (FTS) and `--embeddings
+local --stratify 15`:
 
 ```bash
 B=target/release
 AB="--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false
     --candidate-server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true"
-# full set, then FTS on 180 and local on 90
 $B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 900 $AB
 $B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 900 \
-    --stratify 30 $AB
-$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 900 \
-    --embeddings local --stratify 15 $AB
+    --embeddings local $AB
 ```

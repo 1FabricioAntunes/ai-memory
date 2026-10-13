@@ -102,9 +102,9 @@ cargo run --release -p ai-memory-eval -- retrieval --candidate
 The full-set A/B for the 2.7 observation stream (stream off → on, zero-LLM
 FTS, 470 scored) is published with its provenance in
 [`longmemeval-s-decomposition-2026-10-12.md`](longmemeval-s-decomposition-2026-10-12.md#what-the-observation-stream-recovered):
-`hit@5` 0.662 → 0.855, hit@1 0.511 → 0.611, hit@10 0.687 → 0.934, 91 questions
-gained and none lost (corrected harness, 2026-10-13). The local-embeddings A/B ran on a 90-question stratified
-sample (0.800 → 0.867). The stream is on by default in 2.7, so a baseline run
+`hit@5` 0.662 → 0.951, hit@1 0.511 → 0.857, hit@10 0.687 → 0.972, 139
+questions gained and 3 lost; local embeddings 0.796 → 0.936 on the full set
+(corrected harness, 2026-10-13). The stream is on by default in 2.7, so a baseline run
 of the 2.4 configuration on a 2.7 build needs
 `--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
 
