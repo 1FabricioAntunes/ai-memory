@@ -61,11 +61,21 @@ pub struct PluginFile {
 }
 
 impl PluginFile {
+    /// Every constructor goes through here. The templates and LICENSE are
+    /// `include_str!`ed, so a CRLF checkout (Windows `core.autocrlf`) would
+    /// otherwise ship `/bin/sh^M` launchers and break the drift test.
     fn text(path: impl Into<String>, contents: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            contents: contents.into(),
+            contents: contents.into().replace("\r\n", "\n"),
             executable: false,
+        }
+    }
+
+    fn script(path: impl Into<String>, contents: impl Into<String>) -> Self {
+        Self {
+            executable: true,
+            ..Self::text(path, contents)
         }
     }
 
@@ -134,11 +144,7 @@ fn codex_catalog(version: &str) -> Value {
 /// status skill and the license.
 fn common_files(dir: &str) -> Vec<PluginFile> {
     let mut files = vec![
-        PluginFile {
-            path: format!("{dir}/{LAUNCHER_PATH}"),
-            contents: LAUNCHER.to_owned(),
-            executable: true,
-        },
+        PluginFile::script(format!("{dir}/{LAUNCHER_PATH}"), LAUNCHER),
         PluginFile::text(format!("{dir}/LICENSE"), LICENSE),
         PluginFile::text(format!("{dir}/skills/status/SKILL.md"), STATUS_SKILL),
     ];
@@ -413,6 +419,17 @@ mod tests {
                     .contains("ai-memory doctor")
             );
             assert!(file(&files, &format!("{dir}/scripts/ai-memory-hook")).executable);
+        }
+    }
+
+    #[test]
+    fn rendered_files_are_lf_even_from_a_crlf_checkout() {
+        let launcher = PluginFile::script("x", "#!/bin/sh\r\nexec \"$bin\"\r\n");
+        assert_eq!(launcher.contents, "#!/bin/sh\nexec \"$bin\"\n");
+        assert!(launcher.executable);
+        assert_eq!(PluginFile::text("y", "a\r\nb").contents, "a\nb");
+        for file in render("1.0.0") {
+            assert!(!file.contents.contains('\r'), "{}", file.path);
         }
     }
 
