@@ -129,6 +129,15 @@ case "$(cat "$TMP/stderr")" in
     *"needs 3.0 or later"*) PASS=$((PASS+1)); printf '  ok  %s\n' "an old binary gets a version-skew hint" ;;
     *) FAIL=$((FAIL+1)); printf '  FAIL version-skew hint: %s\n' "$(cat "$TMP/stderr")" ;;
 esac
+# The retry honours AI_MEMORY_SERVER_URL, so an old binary pointed at a
+# remote server never sends to whatever listens on local loopback.
+printf '{"prompt":"remote"}' | run_launcher CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
+    CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$OLD_DIR/ai-memory" \
+    AI_MEMORY_SERVER_URL="https://memory.example:8443" \
+    sh "$LAUNCHER" claude-code user-prompt-submit 2>/dev/null >/dev/null || true
+assert_eq "an old binary's retry uses AI_MEMORY_SERVER_URL" \
+    "hook|--event|user-prompt-submit|--agent|claude-code|--server-url|https://memory.example:8443" \
+    "$(paste -sd '|' "$TMP/argv")"
 
 printf '{}' | TEST_PATH="$STUB_DIR:/usr/bin:/bin" run_launcher CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
     CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="ai-memory" sh "$LAUNCHER" claude-code stop >/dev/null

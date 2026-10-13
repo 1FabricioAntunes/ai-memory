@@ -95,11 +95,13 @@ fi
 # config when --server-url is omitted. An older binary requires the flag
 # (and would post an empty one to a bare /hook), so it rejects the call with
 # a usage error, exit 2, before reading stdin. Retry it once against the
-# default local server, which still has the whole payload, and say why.
+# server AI_MEMORY_SERVER_URL names, else the default local server; stdin
+# still has the whole payload. Say why.
 status=0
 "$bin" "$@" || status=$?
 if [ "$status" -ne 2 ]; then
     exit "$status"
 fi
-printf '%s\n' "ai-memory: this ai-memory binary predates the plugin (it needs 3.0 or later); sending to http://127.0.0.1:49374. Upgrade ai-memory, or set the plugin's server_url option." >&2
-exec "$bin" "$@" --server-url "http://127.0.0.1:49374"
+fallback="${AI_MEMORY_SERVER_URL:-http://127.0.0.1:49374}"
+printf '%s\n' "ai-memory: this ai-memory binary predates the plugin (it needs 3.0 or later); sending to $fallback. Upgrade ai-memory, or set the plugin's server_url option." >&2
+exec "$bin" "$@" --server-url "$fallback"
