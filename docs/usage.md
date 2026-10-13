@@ -180,6 +180,13 @@ The rest of the prompt runs as usual with the recap in context. Serving the
 recap writes nothing: no handoff is claimed and no page or extra observation
 is added (the prompt itself is captured like any other).
 
+Fetching the recap holds the prompt until it arrives. On a healthy local
+server that takes milliseconds. When the server is slow or unreachable, the
+hook first spends up to 3 seconds sending queued events and then waits up to
+3 seconds for the recap, so the prompt can take about 6 seconds to reach the
+agent, which then runs it without a recap. Prompts that do not start with
+`reload context` never wait for this.
+
 | Harness | When the agent sees the recap |
 |---|---|
 | Claude Code | With that prompt (`UserPromptSubmit` `additionalContext`, up to 8,000 chars) |
