@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and "Cites", the pages it links to. Each group lists ten pages and then "and
   N more", and a page in another project carries its `workspace/project`. A
   link from a project the viewer cannot read is left out, as in the
-  `/api/v1` page response. (#NNN)
+  `/api/v1` page response. (#1246)
 - Added a recall trace to web search. A project page has its own search box,
   and a search with `workspace` and `project`
   (`/web/search?q=…&workspace=…&project=…`) now ranks with the same hybrid
