@@ -89,7 +89,14 @@ baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.00
   different index and document construction. Our grep engine reproduces
   agentmemory's grep adapter on all 470 questions, so the question set and
   metric match, but no ranking between the two systems is claimed. The decomposition report has the
-  details.
+  details. agentmemory's 2026-10-09 baseline adds 84.68% strict
+  recall-all@5 and 452/470 any-hit, which its authors say supports no
+  competitive claim. MemPalace publishes 96.6% R@5 raw and 98.4% on 450
+  held-out questions, also retrieval-only and from a different harness.
+  Mem0, Zep, Hindsight and EverOS publish end-to-end QA accuracy, where an
+  LLM answers from retrieved context and an LLM judges the answer; those are
+  a different metric from `hit@5`. [comparison.md](../comparison.md) lists
+  each setup.
 - **Regression gate.** Roadmap items 2-6 re-run this benchmark; a change
   that lowers a slice materially is a regression to fix, not a note to
   publish.
