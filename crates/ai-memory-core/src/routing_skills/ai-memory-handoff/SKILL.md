@@ -1,6 +1,6 @@
 ---
 name: ai-memory-handoff
-description: "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. On Grok, the first turn with no visible handoff should call memory_handoff_list before answering. Trigger by semantic intent rather than exact wording."
+description: "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording."
 ---
 <!-- ai-memory-managed: routing-skill -->
 
@@ -20,8 +20,6 @@ Use this skill for single-use cross-session handoffs. Handoffs are for the next 
 The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use: after SessionStart consumed it the tool returns no handoff, with `status` `consumed_by_hook` when the client forwards its session id and `none_pending` otherwise.
 
 If no pending handoff block is visible, inspect with `memory_handoff_list` first. Listing does not claim or expire anything. When the user asks where we left off, claim one listed row with `memory_handoff_accept` and that `handoff_id`, using the client-aware project scope below. Do not treat list as a second accept path.
-
-On Grok Build CLI, SessionStart and UserPromptSubmit never inject a handoff (Grok discards that stdout). The first PostToolUse claims the pending row through GET `/handoff` and injects `additionalContext`. On the first turn, when no handoff block or additionalContext is visible, call `memory_handoff_list` as the first tool, before reading any file, so that PostToolUse can claim the baton on that call; do not call `memory_handoff_accept` first (that races the hook). Grok reaches MCP tools only through its `use_tool` meta-tool, so invoke it with `tool_name` set to the qualified catalog key `ai-memory__memory_handoff_list` (or `<server>__memory_handoff_list` when the server was registered under another name) instead of spending the turn on `search_tool`. Grok is a static MCP client, so that call carries `workspace` and `project` together, as in Project scope below; for this first call fill them from what the session context already shows — `workspace` `default` and the current directory's basename — rather than spending a tool call on scope. Only when the list comes back empty, resolve the names properly as in Project scope and list once more. Recap from the list payload plus any additionalContext that arrives with the tool result. An empty corrected list means nothing is pending; continue with the user's request.
 
 ## Creating a handoff
 

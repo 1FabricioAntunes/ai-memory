@@ -77,20 +77,44 @@ pub(super) fn prepare_install(args: &InstallSkillsArgs) -> Result<PreparedInstal
 }
 
 /// After `install-hooks --agent grok --apply` writes the hook file, also
-/// install the always-on first-turn rule and, best-effort, the global Grok
-/// routing skills. Unmanaged same-name files are skipped with a warning so a
-/// user-authored skill or rule cannot fail the hook install.
-pub(super) fn install_grok_companions_after_hooks() -> Result<()> {
-    match install_mcp::grok_home() {
-        Ok(home) => install_grok_companions_in(&home, false),
-        Err(err) => {
-            eprintln!("[ai-memory] warning: skipped Grok first-turn companions: {err}");
+/// install the always-on first-turn rule, which the hook's first turn relies
+/// on. An unmanaged same-name file is skipped with a warning so a
+/// user-authored rule cannot fail the hook install. The global Grok skills are
+/// `install-skills --scope global --agent grok`'s job, so `uninstall --only
+/// hooks` removes everything this writes.
+///
+/// The companions go into the Grok home the hook file was written to, never
+/// the process `GROK_HOME`: a relocated home (`ai-memory run grok --env
+/// GROK_HOME=...`, or `--config-file`) must receive them, and a confined
+/// install must not write outside it. A hook file outside the
+/// `<grok home>/hooks/ai-memory.json` layout names no home, so the companions
+/// are skipped with a note.
+pub(super) fn install_grok_companions_after_hooks(hook_file: &Path) -> Result<()> {
+    match grok_home_of_hook_file(hook_file) {
+        Some(home) => {
+            install_grok_rule_in(home, false);
+            Ok(())
+        }
+        None => {
+            eprintln!(
+                "[ai-memory] note: skipped the Grok first-turn rule: {} is not \
+                 <grok home>/hooks/ai-memory.json, so it names no Grok home",
+                hook_file.display()
+            );
             Ok(())
         }
     }
 }
 
-pub(super) fn install_grok_companions_in(grok_home: &Path, force: bool) -> Result<()> {
+/// The Grok home a hook file at `<home>/hooks/ai-memory.json` belongs to.
+fn grok_home_of_hook_file(hook_file: &Path) -> Option<&Path> {
+    let hooks_dir = hook_file.parent()?;
+    (hook_file.file_name()? == "ai-memory.json" && hooks_dir.file_name()? == "hooks")
+        .then(|| hooks_dir.parent())
+        .flatten()
+}
+
+fn install_grok_rule_in(grok_home: &Path, force: bool) {
     let rule_path = grok_handoff_rule_destination(grok_home);
     match write_grok_handoff_rule(&rule_path, force) {
         Ok(outcome) => {
@@ -105,15 +129,6 @@ pub(super) fn install_grok_companions_in(grok_home: &Path, force: bool) -> Resul
             eprintln!("[ai-memory] warning: skipped Grok first-turn handoff rule: {err}");
         }
     }
-
-    let roots = vec![TargetRoot::new(grok_home.join(SKILLS_DIR))];
-    match install_managed_skills(&roots, force) {
-        Ok(reports) => print_reports(reports),
-        Err(err) => {
-            eprintln!("[ai-memory] warning: skipped global Grok skills: {err}");
-        }
-    }
-    Ok(())
 }
 
 fn grok_handoff_rule_destination(grok_home: &Path) -> PathBuf {
@@ -395,6 +410,7 @@ fn agent_root(
     Ok(base.join(agent_dir).join(SKILLS_DIR))
 }
 
+#[cfg(test)]
 fn install_managed_skills(roots: &[TargetRoot], force: bool) -> Result<Vec<InstallReport>> {
     let plans = skill_file_plans(roots);
     validate_overwrite_safety(&plans, force)?;
@@ -473,29 +489,36 @@ fn validate_rule_overwrite(path: &Path, force: bool) -> Result<()> {
 }
 
 fn print_install_plan(roots: &[TargetRoot], grok_handoff_rule: Option<PathBuf>) {
+    print!("{}", render_install_plan(roots, grok_handoff_rule));
+}
+
+fn render_install_plan(roots: &[TargetRoot], grok_handoff_rule: Option<PathBuf>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let push_file = |out: &mut String, content: &str| {
+        out.push_str(content);
+        if !content.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    };
     for root in roots {
-        println!("# Skill root: {}\n", root.path.display());
+        let _ = writeln!(out, "# Skill root: {}\n", root.path.display());
         for skill in MANAGED_SKILLS {
             let path = root.path.join(skill.relative_path);
-            println!("# Would write: {}\n", path.display());
-            print!("{}", skill.content);
-            if !skill.content.ends_with('\n') {
-                println!();
-            }
-            println!();
+            let _ = writeln!(out, "# Would write: {}\n", path.display());
+            push_file(&mut out, skill.content);
         }
     }
     if let Some(path) = grok_handoff_rule {
-        println!(
+        let _ = writeln!(
+            out,
             "# Would write Grok first-turn handoff rule: {}\n",
             path.display()
         );
-        print!("{GROK_HANDOFF_RULE_CONTENT}");
-        if !GROK_HANDOFF_RULE_CONTENT.ends_with('\n') {
-            println!();
-        }
-        println!();
+        push_file(&mut out, GROK_HANDOFF_RULE_CONTENT);
     }
+    out
 }
 
 fn outcome_detail(outcome: ApplyOutcome) -> &'static str {
@@ -973,32 +996,37 @@ mod tests {
         );
     }
 
+    /// The hook install writes the first-turn rule into the Grok home its
+    /// hook file belongs to, and nothing else: no global skills, so
+    /// `uninstall --only hooks` takes back all of it.
     #[test]
-    fn grok_companions_keep_hooks_when_unmanaged_skills_exist() {
+    fn grok_hook_install_writes_only_the_rule_beside_its_hook_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let grok_home = tmp.path();
-        let unmanaged = grok_home.join("skills/ai-memory-retrieval/SKILL.md");
-        fs::create_dir_all(unmanaged.parent().unwrap()).unwrap();
-        fs::write(
-            &unmanaged,
-            "---\nname: ai-memory-retrieval\n---\nuser skill\n",
-        )
-        .unwrap();
+        let grok_home = tmp.path().join("relocated-grok");
+        let hook_file = grok_home.join("hooks").join("ai-memory.json");
 
-        install_grok_companions_in(grok_home, false).unwrap();
+        install_grok_companions_after_hooks(&hook_file).unwrap();
 
-        let rule_path = grok_handoff_rule_destination(grok_home);
         assert!(
-            fs::read_to_string(&rule_path)
+            fs::read_to_string(grok_handoff_rule_destination(&grok_home))
                 .unwrap()
-                .contains(GROK_HANDOFF_RULE_MARKER),
-            "the first-turn rule is the primary companion and must still land"
+                .contains(GROK_HANDOFF_RULE_MARKER)
         );
-        assert_eq!(
-            fs::read_to_string(&unmanaged).unwrap(),
-            "---\nname: ai-memory-retrieval\n---\nuser skill\n"
-        );
-        assert!(!grok_home.join("skills/ai-memory-handoff/SKILL.md").exists());
+        assert!(!grok_home.join(SKILLS_DIR).exists(), "no global skills");
+    }
+
+    /// A hook file outside `<home>/hooks/ai-memory.json` names no Grok home,
+    /// so nothing is written beside it or anywhere else.
+    #[test]
+    fn grok_hook_file_outside_the_layout_installs_no_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_file = tmp.path().join("custom").join("grok-hooks.json");
+
+        install_grok_companions_after_hooks(&hook_file).unwrap();
+
+        assert_eq!(grok_home_of_hook_file(&hook_file), None);
+        assert!(!tmp.path().join("rules").exists());
+        assert!(!tmp.path().join("custom").join("rules").exists());
     }
 
     #[test]
@@ -1006,19 +1034,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roots = vec![TargetRoot::new(tmp.path().join("skills"))];
         let rule = grok_handoff_rule_destination(tmp.path());
-        print_install_plan(&roots, Some(rule.clone()));
-        // Function prints to stdout; the path and payload are what matter for
-        // --print callers. Re-check the bytes it would dump.
-        assert!(GROK_HANDOFF_RULE_CONTENT.contains(GROK_HANDOFF_RULE_MARKER));
-        assert_eq!(
-            rule.file_name().and_then(|name| name.to_str()),
-            Some("ai-memory-handoff.md")
-        );
-        assert_eq!(
-            rule.parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str()),
-            Some("rules")
-        );
+        let plan = render_install_plan(&roots, Some(rule.clone()));
+        assert!(plan.contains(&format!(
+            "# Would write Grok first-turn handoff rule: {}",
+            rule.display()
+        )));
+        assert!(plan.contains(GROK_HANDOFF_RULE_MARKER));
+        // Without a rule path (project scope, --target-dir) the plan names none.
+        assert!(!render_install_plan(&roots, None).contains("first-turn handoff rule:"));
     }
 }

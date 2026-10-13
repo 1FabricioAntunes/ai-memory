@@ -817,7 +817,11 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)?;
-                crate::commands::install_skills::install_grok_companions_after_hooks()
+                let hook_file = match &args.config_file {
+                    Some(path) => path.clone(),
+                    None => grok_hooks_path()?,
+                };
+                crate::commands::install_skills::install_grok_companions_after_hooks(&hook_file)
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),

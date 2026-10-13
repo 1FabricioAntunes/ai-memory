@@ -53,21 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`), summed over `scopes`.
   Streams that did not run are left out, and a query without `explain` reads
   no clock for them.
-- Grok Build CLI first-turn handoff: `install-hooks --agent grok --apply`
-  and `install-skills --scope global --agent grok` write
-  `$GROK_HOME/rules/ai-memory-handoff.md` (default `~/.grok/rules/ai-memory-handoff.md`)
-  so the model calls `memory_handoff_list` on the first turn. Grok discards
-  SessionStart stdout, so that list is the first tool and PostToolUse still
-  claims the baton through GET `/handoff`. The rule names Grok's invocation —
-  `use_tool` with the qualified catalog key `ai-memory__memory_handoff_list` —
-  because Grok reaches MCP tools only through that meta-tool. The rule puts
-  that call ahead of any file read and corrects `workspace`/`project` from
-  `./.ai-memory.toml` only when the list comes back empty, so scope resolution
-  neither consumes the turn nor leaves the current repository.
-  Project-scope Grok skills and `--target-dir` leave the user rule alone.
-  Unmanaged same-name files are refused without `--force`; `install-hooks`
-  warns and keeps the hook file. `uninstall --only skills` and `--only hooks`
-  remove the markered rule. (#1228)
+- Added a Grok Build CLI first-turn handoff rule. `install-hooks --agent grok
+  --apply` and `install-skills --scope global --agent grok` write
+  `$GROK_HOME/rules/ai-memory-handoff.md` (into the Grok home the hook file
+  was written to), which has the model call `memory_handoff_list` as its first
+  tool, through `use_tool` with the qualified key
+  `ai-memory__memory_handoff_list`, before reading any file. Grok discards
+  SessionStart stdout, so that call is what lets the first PostToolUse claim
+  the baton through GET `/handoff`. The rule corrects `workspace` and
+  `project` from the marker or git remote when the first list is empty or
+  answers with a scope error, and treats the handoff PostToolUse claimed as
+  authoritative. A same-name file without the managed marker is kept unless
+  `--force`; `uninstall --only hooks` or `--only skills` removes the managed
+  rule. (#1228)
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,

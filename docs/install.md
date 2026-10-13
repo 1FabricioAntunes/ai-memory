@@ -1768,7 +1768,7 @@ also writes `$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
 meta-tool, so the rule hands the model the qualified catalog key
 `ai-memory__memory_handoff_list` instead of leaving it to `search_tool`. That
 call comes before any file read, and the rule corrects `workspace`/`project`
-from `./.ai-memory.toml` only when the list comes back empty. The
+from `./.ai-memory.toml` only when the list comes back empty or with a scope error. The
 first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
 `[briefing]`). The model sees it after that tool result. A session with no

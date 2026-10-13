@@ -47,7 +47,7 @@ and `install-skills --scope global --agent grok` write
 spells out Grok's invocation — `use_tool` with the qualified catalog key
 `ai-memory__memory_handoff_list` — because Grok reaches MCP tools only through
 that meta-tool, and puts that call ahead of any file read, correcting
-`workspace`/`project` from `./.ai-memory.toml` only when the list is empty.
+`workspace`/`project` from `./.ai-memory.toml` only when the list is empty or a scope error.
 Until that
 tool runs, or if the rule is absent and the session never calls a tool, call
 `memory_handoff_list` then `memory_handoff_accept` with the listed

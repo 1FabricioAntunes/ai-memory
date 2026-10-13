@@ -39,7 +39,7 @@ pub const HERMES_SKILL_DIR: &str = ".hermes";
 pub const SKILLS_DIR: &str = "skills";
 
 const RETRIEVAL_DESCRIPTION: &str = "Use this skill for any request whose goal is read-only retrieval from ai-memory: project history, prior context, decisions, rules, gotchas, recent activity, full wiki pages, or status/briefing. Trigger by semantic intent rather than exact wording, including when ai-memory is not named.";
-const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. On Grok, the first turn with no visible handoff should call memory_handoff_list before answering. Trigger by semantic intent rather than exact wording.";
+const HANDOFF_DESCRIPTION: &str = "Use this skill for any request whose goal is session continuity across agents or time: finding a pending handoff, resuming previous work, saving next-session context, wrapping up, or discarding a mistaken handoff. Trigger by semantic intent rather than exact wording.";
 const MESSAGING_DESCRIPTION: &str = "Use this skill for cross-project agent-to-agent messaging: sending a request to another project's inbox, checking or popping this project's inbox, or retracting a message you sent. Trigger by semantic intent (delegate to another repo, check my inbox, tell the other agent) rather than exact wording.";
 const DURABLE_PAGES_DESCRIPTION: &str = "Use this skill for any explicit wiki mutation in ai-memory: saving durable or time-bounded project knowledge, recording a rule or annotation, updating a note, or deleting a memory page. Trigger by semantic intent rather than exact wording; routine session capture is not a durable-page request.";
 const LEARNING_MAINTENANCE_DESCRIPTION: &str = "Use this skill for any ai-memory knowledge-base maintenance request: consolidating observations, reviewing session lessons, proposing durable learnings, auditing or linting the wiki, finding contradictions, pruning stale memory, or running auto-improvement. Trigger by semantic intent rather than exact wording.";
@@ -338,6 +338,11 @@ mod tests {
                 .contains("Do not call `memory_handoff_accept` as the first tool")
         );
         assert!(GROK_HANDOFF_RULE_CONTENT.contains("empty `handoffs` array"));
+        // A guessed project that does not exist answers with a scope error,
+        // not an empty list; the correction must fire on that too.
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("or a scope error"));
+        // The baton PostToolUse claimed is authoritative over listed rows.
+        assert!(GROK_HANDOFF_RULE_CONTENT.contains("it wins"));
     }
 
     #[test]
