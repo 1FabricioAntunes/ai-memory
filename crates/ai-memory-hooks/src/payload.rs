@@ -832,6 +832,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::CopilotCli
             | AgentKind::Grizzybot
             | AgentKind::Droid
+            | AgentKind::Muse
     )
 }
 
@@ -2494,6 +2495,54 @@ mod tests {
         assert!(body.starts_with("tool_family: file\n"), "{body}");
         assert!(!body.contains("tool_call_id"), "{body}");
         assert!(body.contains("/repo/notes.md"), "{body}");
+    }
+
+    /// Meta Muse Code's PostToolUse and PostToolUseFailure, as captured
+    /// offline from Muse Code 1.4.7 (paths rewritten): a `write_file` is a
+    /// closed `file` family that keeps its `tool_use_id`, the session id is
+    /// the payload's UUIDv7, and a failure aliases to `post-tool-use`.
+    #[test]
+    fn muse_post_tool_use_is_a_closed_file_family_with_call_id() {
+        let raw = serde_json::json!({
+            "cwd": "/repo",
+            "hook_event_name": "PostToolUse",
+            "model": "muse-wonder-1.0",
+            "model_provider": "meta",
+            "permission_mode": "bypassPermissions",
+            "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+            "tool_input": {"content": "alpha\n", "path": "notes.txt"},
+            "tool_name": "write_file",
+            "tool_response": {
+                "filePath": "/repo/notes.txt",
+                "structuredPatch": [{"lines": ["+alpha"], "newLines": 1, "newStart": 1, "oldLines": 0, "oldStart": 1}]
+            },
+            "tool_use_id": "call_30a33793ad9c",
+            "transcript_path": null,
+            "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("muse".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Muse);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("01a13669-dc61-7a72-b5ec-ad2f300ffd26")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("call_30a33793ad9c"), "{body}");
+
+        assert_eq!(
+            HookEvent::parse("PostToolUseFailure"),
+            HookEvent::PostToolUse
+        );
     }
 
     /// Body is well-formed JSON but the expected `session_id` /

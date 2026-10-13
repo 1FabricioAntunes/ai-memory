@@ -288,6 +288,9 @@ pub enum AgentKind {
     /// Factory Droid CLI (`droid`), whose hooks send Claude Code-shaped
     /// payloads (#1240).
     Droid,
+    /// Meta Muse Code (`muse`), whose hooks send Claude Code-shaped payloads
+    /// with Muse's own tool names.
+    Muse,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -298,7 +301,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -322,6 +325,7 @@ impl AgentKind {
         Self::CopilotCli,
         Self::Grizzybot,
         Self::Droid,
+        Self::Muse,
         Self::Other,
     ];
 
@@ -352,6 +356,7 @@ impl AgentKind {
             Self::CopilotCli => "copilot-cli",
             Self::Grizzybot => "grizzybot",
             Self::Droid => "droid",
+            Self::Muse => "muse",
             Self::Other => "other",
         }
     }
@@ -385,6 +390,7 @@ impl AgentKind {
             "copilot-cli" | "copilot_cli" => Self::CopilotCli,
             "grizzybot" | "grizzy-bot" => Self::Grizzybot,
             "droid" | "factory-droid" | "factory_droid" => Self::Droid,
+            "muse" | "muse-code" | "musecode" => Self::Muse,
             _ => Self::Other,
         }
     }
@@ -433,6 +439,10 @@ impl AgentKind {
     /// Factory Droid documents `SessionStart` stdout as session context and
     /// parses a JSON stdout's `hookSpecificOutput.additionalContext`, the
     /// envelope the native hook prints for Claude Code (#1240).
+    ///
+    /// Meta Muse Code injects a `SessionStart` stdout's
+    /// `hookSpecificOutput.additionalContext` as developer context (verified
+    /// offline against Muse Code 1.4.7), so it takes the same envelope.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -703,6 +713,27 @@ mod tests {
         assert!(!AgentKind::Droid.user_prompt_injects_handoff());
         assert!(!AgentKind::Droid.post_tool_injects_handoff());
         assert!(!AgentKind::Droid.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_muse_round_trips() {
+        assert_eq!(AgentKind::Muse.as_str(), "muse");
+        for alias in ["muse", "muse-code", "musecode"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::Muse, "{alias}");
+        }
+        assert_eq!(serde_json::to_string(&AgentKind::Muse).unwrap(), "\"muse\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"muse\"").unwrap(),
+            AgentKind::Muse
+        );
+        assert_eq!(AgentKind::from_wire("meta"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("muse-2"), AgentKind::Other);
+        // Muse injects SessionStart's `hookSpecificOutput.additionalContext`,
+        // so the native hook fetches the handoff there.
+        assert!(AgentKind::Muse.session_start_injects_handoff());
+        assert!(!AgentKind::Muse.user_prompt_injects_handoff());
+        assert!(!AgentKind::Muse.post_tool_injects_handoff());
+        assert!(!AgentKind::Muse.reuses_session_id_after_end());
     }
 
     #[test]

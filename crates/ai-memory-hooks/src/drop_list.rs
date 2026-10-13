@@ -180,6 +180,20 @@ mod tests {
             serde_json::json!({ "session_id": "s", "toolCall": { "name": "noisy_poll", "args": {} } }),
         );
         assert!(list.matches(&antigravity));
+        // Meta Muse Code carries the provider call id in `tool_use_id`, and a
+        // `PostToolUseFailure` is a tool event too.
+        let muse = agent_event(
+            "muse",
+            "PostToolUseFailure",
+            serde_json::json!({ "session_id": "s", "tool_name": "read_file", "tool_input": { "path": "a" }, "tool_use_id": "plugin-3", "error": "x" }),
+        );
+        assert!(list.matches(&muse));
+        let muse_kept = agent_event(
+            "muse",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "read_file", "tool_use_id": "call_3" }),
+        );
+        assert!(!list.matches(&muse_kept));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",
