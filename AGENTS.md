@@ -689,8 +689,9 @@ Additional boundary rules:
   and version milestones.
 - **Branch model.** `main` is the patch line: it takes fixes and docs only
   (`[Unreleased]` holds only `### Fixed`), and patch tags are cut from it.
-  Additive work targets the standing `release/X.Y` branch for the next minor
-  (currently `release/3.0`). Keep `main` an ancestor of it by forward-merging
+  Additive work targets the standing `release/X.Y` branch for the next
+  minor or major (currently `release/3.0`, the next major). Keep `main` an
+  ancestor of it by forward-merging
   `main` into it after every fix lands, never the reverse; when a patch
   release ships, rebuild the branch's `[Unreleased]` as only its own entries
   so released sections stay identical to `main`'s. A fix lands on `main`
