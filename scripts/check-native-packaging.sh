@@ -313,6 +313,18 @@ FAKE
     fail "a failing uninstall must keep its exit status"
   fi
   test -s "${token_copy}" || fail "a failed uninstall must keep the host token copy"
+  # On a terminal without --yes, uninstall asks first, and a declined prompt
+  # still exits 0 with nothing removed, so the copy must stay. `script` gives
+  # the wrapper a pseudo-terminal on stdin (util-linux syntax; skipped where
+  # it is missing).
+  if script -qec true /dev/null >/dev/null 2>&1; then
+    script -qec "env HOME='${token_home}' XDG_DATA_HOME='${token_home}/.local/share' \
+      AI_MEMORY_NO_VERSION_CHECK=1 AI_MEMORY_NO_TTY=1 \
+      AI_MEMORY_DOCKER='${token_docker}' AI_MEMORY_NATIVE_BIN='${token_native}' \
+      AI_MEMORY_DOCKER_TEST_LOG='${token_docker_log}' AI_MEMORY_WRAPPER_TEST_LOG='${token_log}' \
+      bin/ai-memory uninstall --apply" /dev/null </dev/null >/dev/null 2>&1 || true
+    test -s "${token_copy}" || fail "an interactive uninstall without --yes must keep the host token copy"
+  fi
   token_wrapper uninstall --apply --yes
   test ! -e "${token_copy}" || fail "uninstall --apply must remove the host token copy"
 

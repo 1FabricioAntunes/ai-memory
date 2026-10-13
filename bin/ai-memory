@@ -832,18 +832,24 @@ case "${WRAPPER_SUBCOMMAND}" in
 esac
 # A full `uninstall --apply` unwires every hook and MCP entry that reads the
 # host copy of the volume's root bearer, so the copy goes too once the
-# container reports success. A dry run or an `--only` subset keeps it.
+# container reports success. A dry run or an `--only` subset keeps it, and so
+# does an interactive run without `--yes`: uninstall then asks for
+# confirmation, and declining prints "aborted." and still exits 0, with
+# nothing removed.
 DROPS_VOLUME_TOKEN=0
 if [ "${WRAPPER_SUBCOMMAND}" = "uninstall" ]; then
   uninstall_apply=0
   uninstall_only=0
+  uninstall_yes=0
   for arg in ${WRAPPER_ARGS[@]+"${WRAPPER_ARGS[@]:$((idx + 1))}"}; do
     case "${arg}" in
       --apply) uninstall_apply=1 ;;
       --only | --only=*) uninstall_only=1 ;;
+      --yes) uninstall_yes=1 ;;
     esac
   done
-  if [ "${uninstall_apply}" -eq 1 ] && [ "${uninstall_only}" -eq 0 ]; then
+  if [ "${uninstall_apply}" -eq 1 ] && [ "${uninstall_only}" -eq 0 ] \
+    && { [ "${uninstall_yes}" -eq 1 ] || [ ! -t 0 ]; }; then
     DROPS_VOLUME_TOKEN=1
   fi
 fi
