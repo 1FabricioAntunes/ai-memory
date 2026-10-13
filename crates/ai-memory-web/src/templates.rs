@@ -228,7 +228,12 @@ pub(crate) struct MailboxRow {
 pub(crate) struct Folder {
     /// Folder name (first path segment, without trailing slash).
     pub name: String,
-    /// Pages inside this folder.
+    /// Namespace listing for the folder; `None` for the `(root)` bucket,
+    /// which has no namespace URL.
+    pub href: Option<String>,
+    /// Pages in the folder, all of them.
+    pub total: usize,
+    /// The most recently updated pages, capped; every page for `(root)`.
     pub pages: Vec<PageRow>,
 }
 
@@ -288,8 +293,24 @@ pub(crate) struct NamespaceView {
     pub project_href: String,
     /// The namespace path (no trailing slash), e.g. `_lint` or `concepts`.
     pub namespace: String,
-    /// Pages under this namespace.
+    /// The current page of pages under this namespace.
     pub pages: Vec<PageRow>,
+    /// Pages in the whole namespace.
+    pub total: usize,
+    /// 1-based position of the first listed page.
+    pub first: usize,
+    /// 1-based position of the last listed page.
+    pub last: usize,
+    /// Sorting by title instead of recency.
+    pub sort_title: bool,
+    /// Namespace listing sorted by recency.
+    pub sort_updated_href: String,
+    /// Namespace listing sorted by title.
+    pub sort_title_href: String,
+    /// Link to the previous page of results, if any.
+    pub prev_href: Option<String>,
+    /// Link to the next page of results, if any.
+    pub next_href: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use ai_memory_core::PagePath;
+use ai_memory_store::PageSummary;
 use askama::Template;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
@@ -14,11 +15,23 @@ use crate::templates::{
     NamespaceView, NotFoundView, PageRow, PageView, history_href, humanize, page_href, project_href,
 };
 
+/// Pages per namespace listing page.
+const NAMESPACE_PAGE_SIZE: usize = 25;
+
+/// Namespace listing options. Strings, so a bad value falls back to a
+/// default instead of becoming axum's 400.
+#[derive(serde::Deserialize)]
+pub(crate) struct NamespaceQuery {
+    sort: Option<String>,
+    page: Option<String>,
+}
+
 /// Handler for `GET /w/:workspace/:project/p/*path`.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
+    Query(query): Query<NamespaceQuery>,
 ) -> Response {
     if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
         return refusal_response(&refusal);
@@ -28,7 +41,9 @@ pub(crate) async fn handler(
         // Not a page — it may be a namespace (directory) link, e.g. the OKF
         // bundle index's `[_lint/](_lint/)`. Render a listing rather than a
         // bare 404 (#603).
-        Ok(None) => return namespace_or_not_found(&state, &workspace, &project, &path).await,
+        Ok(None) => {
+            return namespace_or_not_found(&state, &workspace, &project, &path, &query).await;
+        }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
@@ -108,6 +123,7 @@ async fn namespace_or_not_found(
     workspace: &str,
     project: &str,
     path: &str,
+    query: &NamespaceQuery,
 ) -> Response {
     let namespace = path.trim_end_matches('/');
     if namespace.is_empty() {
@@ -118,9 +134,43 @@ async fn namespace_or_not_found(
         Ok(p) => p,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let pages: Vec<PageRow> = all
+    let mut under: Vec<_> = all
         .into_iter()
         .filter(|p| p.path.starts_with(&prefix))
+        .collect();
+    if under.is_empty() {
+        return not_found_response();
+    }
+    let sort_title = query.sort.as_deref() == Some("title");
+    // Titles repeat (session pages), so ties fall back to recency, then path.
+    let newest_first = |a: &PageSummary, b: &PageSummary| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.path.cmp(&b.path))
+    };
+    if sort_title {
+        under.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| newest_first(a, b))
+        });
+    } else {
+        under.sort_by(newest_first);
+    }
+    let total = under.len();
+    let last_page = total.div_ceil(NAMESPACE_PAGE_SIZE);
+    let page = query
+        .page
+        .as_deref()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map_or(1, |n| n.min(last_page));
+    let start = (page - 1) * NAMESPACE_PAGE_SIZE;
+    let pages: Vec<PageRow> = under
+        .into_iter()
+        .skip(start)
+        .take(NAMESPACE_PAGE_SIZE)
         .map(|p| PageRow {
             href: page_href(workspace, project, &p.path),
             path: p.path,
@@ -129,15 +179,25 @@ async fn namespace_or_not_found(
             updated_relative: humanize(&p.updated_at),
         })
         .collect();
-    if pages.is_empty() {
-        return not_found_response();
-    }
+    // Resolved against the injected `<base href>`, so a bare `?sort=`
+    // would land on the web root.
+    let href = page_href(workspace, project, &prefix);
+    let sort = if sort_title { "title" } else { "updated" };
+    let page_link = |n: usize| format!("{href}?sort={sort}&page={n}");
     match (NamespaceView {
         workspace: workspace.to_owned(),
         project: project.to_owned(),
         project_href: project_href(workspace, project),
         namespace: namespace.to_owned(),
+        first: start + 1,
+        last: start + pages.len(),
         pages,
+        total,
+        sort_updated_href: format!("{href}?sort=updated"),
+        sort_title_href: format!("{href}?sort=title"),
+        sort_title,
+        prev_href: (page > 1).then(|| page_link(page - 1)),
+        next_href: (page < last_page).then(|| page_link(page + 1)),
     }
     .render())
     {

@@ -350,6 +350,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and never overwrites an existing marker. (#1227)
 
 ### Changed
+- Changed the web UI's project sidebar to link each folder to its namespace
+  listing with a page count, and to show only its five most recently updated
+  pages with a "View all N" link. The namespace listing now sorts by recent
+  update or by title and shows 25 pages at a time with previous and next links
+  (`?sort=title&page=2`). (#NNN)
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
   `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
   FTS5 alone, so it returns the same order as `memory_query`, and `rank` is

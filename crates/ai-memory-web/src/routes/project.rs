@@ -22,6 +22,12 @@ const MAILBOX_LIMIT: usize = 5;
 /// Recent sessions listed on the project page.
 const SESSION_LIMIT: usize = 10;
 
+/// Sidebar bucket for pages directly under the wiki root.
+const ROOT_FOLDER: &str = "(root)";
+
+/// Pages listed per sidebar folder before "View all".
+const FOLDER_PREVIEW: usize = 5;
+
 /// Leading body characters shown per message.
 const SNIPPET_CHARS: usize = 160;
 
@@ -69,8 +75,8 @@ async fn render(
     // bundle indexes) than curated knowledge; listing them as peers
     // buried the concepts/decisions/rules a human actually opens this
     // UI for.
-    let mut knowledge_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
-    let mut system_map: BTreeMap<String, Vec<PageRow>> = BTreeMap::new();
+    let mut knowledge_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
+    let mut system_map: BTreeMap<String, Vec<(String, PageRow)>> = BTreeMap::new();
     for p in &pages {
         let folder = p
             .path
@@ -84,28 +90,25 @@ async fn render(
                     None
                 }
             })
-            .unwrap_or_else(|| "(root)".to_owned());
+            .unwrap_or_else(|| ROOT_FOLDER.to_owned());
         let map = if is_system_page(&p.path) {
             &mut system_map
         } else {
             &mut knowledge_map
         };
-        map.entry(folder).or_default().push(PageRow {
-            path: p.path.clone(),
-            href: page_href(&workspace, &project, &p.path),
-            title: p.title.clone(),
-            kind: p.kind.clone(),
-            updated_relative: humanize(&p.updated_at),
-        });
+        map.entry(folder).or_default().push((
+            p.updated_at.clone(),
+            PageRow {
+                path: p.path.clone(),
+                href: page_href(&workspace, &project, &p.path),
+                title: p.title.clone(),
+                kind: p.kind.clone(),
+                updated_relative: humanize(&p.updated_at),
+            },
+        ));
     }
-    let folders: Vec<Folder> = knowledge_map
-        .into_iter()
-        .map(|(name, pages)| Folder { name, pages })
-        .collect();
-    let system: Vec<Folder> = system_map
-        .into_iter()
-        .map(|(name, pages)| Folder { name, pages })
-        .collect();
+    let folders = to_folders(knowledge_map, &workspace, &project);
+    let system = to_folders(system_map, &workspace, &project);
 
     // Recent pages: knowledge only, sorted by updated_at desc, take 20.
     // Machinery updates constantly (logs append every consolidation,
@@ -144,6 +147,35 @@ async fn render(
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
+}
+
+/// Turn grouped pages into sidebar folders: newest first, capped at
+/// `FOLDER_PREVIEW`, each linked to its namespace listing.
+fn to_folders(
+    map: BTreeMap<String, Vec<(String, PageRow)>>,
+    workspace: &str,
+    project: &str,
+) -> Vec<Folder> {
+    map.into_iter()
+        .map(|(name, mut rows)| {
+            rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
+            let total = rows.len();
+            // `(root)` has no namespace URL to hold the rest, so it lists all.
+            let href =
+                (name != ROOT_FOLDER).then(|| page_href(workspace, project, &format!("{name}/")));
+            let keep = if href.is_some() {
+                FOLDER_PREVIEW
+            } else {
+                total
+            };
+            Folder {
+                href,
+                total,
+                pages: rows.into_iter().take(keep).map(|(_, row)| row).collect(),
+                name,
+            }
+        })
+        .collect()
 }
 
 /// The project's pending inbox, read-only: this page never pops or cancels,
