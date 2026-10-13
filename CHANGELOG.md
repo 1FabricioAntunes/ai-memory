@@ -91,7 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag on, project and `scopes` searches also run full-text search over
   observations in the same project, and each matching session votes once,
   through its best-matching observation, for its own latest
-  `sessions/<id>.md` page as one more RRF stream. When page search did not
+  `sessions/<id>.md` page as one more RRF stream. A page the stream voted for
+  takes its lexical evidence from the stream alone: page FTS over its
+  title-only body still reports a rank but adds nothing, so a session that
+  only shares topic words in its titles cannot outvote the session holding
+  the answer. When page search did not
   match the page itself, the matching excerpt becomes the hit's snippet, and
   `explain=true` reports an `observation` stream with the matched observation
   ids. Hits are still pages and nothing is written; sessions without a page

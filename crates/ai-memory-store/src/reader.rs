@@ -707,7 +707,9 @@ pub struct GraphVia {
 /// Per-stream RRF contributions (`1/(k+rank)`, k=60) for one hit.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RrfContributions {
-    /// FTS5 stream contribution (0.0 when the hit missed that stream).
+    /// FTS5 stream contribution (0.0 when the hit missed that stream, and
+    /// for a session page the observation stream voted for, whose lexical
+    /// evidence comes from that stream instead).
     pub fts: f64,
     /// Vector stream contribution.
     pub vector: f64,
@@ -6332,8 +6334,21 @@ impl ReaderPool {
         }
         let mut fused: std::collections::HashMap<PageId, Fused> = std::collections::HashMap::new();
 
+        // A session page's indexed body is only the titles of its own
+        // observations, and the observation stream already ranks that
+        // session by the full observation text. Counting page FTS as well
+        // would let a session that merely shares topic words in its titles
+        // outvote the session holding the answer, so a page the stream voted
+        // for takes its lexical evidence from the stream alone. Its FTS rank
+        // and snippet are kept; only the RRF contribution is dropped.
+        let observation_voted: std::collections::HashSet<PageId> =
+            observation_votes.iter().map(|vote| vote.page_id).collect();
         for (rank, h) in fts_hits.iter().enumerate() {
-            let contrib = 1.0 / (k + (rank + 1) as f64);
+            let contrib = if observation_voted.contains(&h.id) {
+                0.0
+            } else {
+                1.0 / (k + (rank + 1) as f64)
+            };
             let entry = fused.entry(h.id).or_insert_with(|| Fused {
                 path: h.path.clone(),
                 title: h.title.clone(),

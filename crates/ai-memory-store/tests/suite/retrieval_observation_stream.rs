@@ -458,3 +458,90 @@ async fn a_page_fts_matched_keeps_its_own_snippet() {
     assert!(hit.snippet.contains("colony"), "{}", hit.snippet);
     assert!(!hit.snippet.contains("assistant"), "{}", hit.snippet);
 }
+
+/// A session page's title-only body shares topic words with many sessions;
+/// the answer sits in one session's observation text. Page FTS must not let a
+/// topic-word session outvote the session the observations rank first: a page
+/// the stream voted for takes its lexical evidence from the stream alone.
+#[tokio::test]
+async fn a_topic_word_session_page_does_not_outvote_the_evidence_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let evidence = session(&store, ws, proj).await;
+    let topical = session(&store, ws, proj).await;
+    session_page(
+        &store,
+        ws,
+        proj,
+        evidence,
+        "User asked about weekend plans.",
+    )
+    .await;
+    session_page(&store, ws, proj, topical, "Planning the telescope trip.").await;
+    observe(
+        &store,
+        ws,
+        proj,
+        evidence,
+        "I finally bought the quasar telescope from the camera shop downtown",
+    )
+    .await;
+    observe(
+        &store,
+        ws,
+        proj,
+        topical,
+        "which telescope should I pack for the trip",
+    )
+    .await;
+
+    let hits = search(&store, ws, proj, "quasar telescope").await;
+    let evidence_path = format!("sessions/{evidence}.md");
+    let topical_path = format!("sessions/{topical}.md");
+    assert_eq!(paths(&hits), vec![evidence_path, topical_path.clone()]);
+
+    let (_, topical_details) = hits
+        .iter()
+        .find(|(h, _)| h.path.as_str() == topical_path)
+        .unwrap();
+    // The page FTS match is still reported, but contributes nothing.
+    assert_eq!(topical_details.fts_rank, Some(1));
+    assert_eq!(topical_details.observation_rank, Some(2));
+    assert!(topical_details.rrf.fts.abs() < 1e-12);
+    assert!((topical_details.fused - topical_details.rrf.observation).abs() < 1e-12);
+}
+
+/// Control: a page the stream cannot vote for (anything but a session page)
+/// keeps its page FTS contribution, and still outranks a session page the
+/// stream ranked below it.
+#[tokio::test]
+async fn a_curated_page_keeps_its_page_fts_contribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let sid = session(&store, ws, proj).await;
+    session_page(&store, ws, proj, sid, "User asked about weekend plans.").await;
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj,
+            "decisions/telescope.md",
+            "We chose the quasar telescope for the observatory.",
+        ))
+        .await
+        .unwrap();
+    observe(&store, ws, proj, sid, "the quasar telescope arrived").await;
+
+    let hits = search(&store, ws, proj, "quasar telescope").await;
+    let (_, decision) = hits
+        .iter()
+        .find(|(h, _)| h.path.as_str() == "decisions/telescope.md")
+        .unwrap();
+    assert_eq!(decision.fts_rank, Some(1));
+    assert!((decision.rrf.fts - 1.0 / (K + 1.0)).abs() < 1e-12);
+    assert!(decision.rrf.observation.abs() < 1e-12);
+}
