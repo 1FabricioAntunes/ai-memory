@@ -5,7 +5,7 @@
 ai-memory runs without an LLM: hooks still capture sessions, search uses
 FTS5 + declared entities + graph neighbors, and summaries fall back to
 rule-based output. Add an LLM provider
-when you want LLM consolidation (on PreCompact, on demand via
+when you want LLM consolidation (on PreCompact / PostCompaction, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
 Substantive session ends always write a rule-based summary page + handoff either
@@ -13,10 +13,17 @@ way. A session containing only `SessionStart` / `SessionEnd` boundaries is
 closed without a page, handoff, or provider job. When that empty session had
 accepted startup context, its session-bound handoff is returned to the open
 pool for the next receiver instead of being lost.
-When the session-end opt-in is enabled, provider work is durably queued after
-those deterministic writes and handled by one bounded server worker, so hook
-drain latency does not cancel it. Failed jobs retry with backoff and survive a
-server restart. A resumed native session is ended again only after its
+PreCompact / PostCompaction write a rule-based checkpoint on the hook request.
+Provider work for those checkpoints, and for opt-in SessionEnd, is durably
+queued after those deterministic writes and handled by one bounded server
+worker, so hook drain latency does not cancel it. The worker starts whenever a
+consolidator is configured; SessionEnd enqueue stays behind the opt-in flag.
+A checkpoint rewrite still queued when the session ends runs once anyway, even
+with the flag off. One already running when the session ends finishes after the
+SessionEnd summary and replaces it, so with the flag off the latest page can
+leave out the end of the session; the summary stays reachable as the superseded
+version. Every queued job runs as the session owner recorded at session start,
+not anonymously. Failed jobs retry with backoff and survive a server restart. A resumed native session is ended again only after its
 observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and

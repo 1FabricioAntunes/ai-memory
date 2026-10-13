@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a project with many pages no longer crowds observations out at a small
   budget. An install configured between 6,500 and 8,350 tokens now fails at
   startup with a message naming both numbers. (#1234, #1242)
+- Fixed PreCompact and PostCompaction waiting for the LLM provider inside
+  `/hook` and `/hook/batch`. That 12-135 s call outlived the client's drain
+  timeout, left the ingest key incomplete and restarted on every redelivery.
+  The request now writes the rule-based `sessions/<id>.md` checkpoint and
+  returns; with a provider, the LLM rewrite is queued for the bounded worker
+  SessionEnd already uses, which now starts whenever a provider is configured
+  and runs each job as the session's recorded owner. A resumed session's
+  checkpoint queues its rewrite too, and a retried checkpoint never puts the
+  rule-based page back over a finished rewrite. Two side effects: SessionEnd
+  jobs queued while `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` was on now run even
+  if the flag has since been turned off, and without the flag a session that
+  ends while its checkpoint rewrite runs keeps that rewrite as the latest page,
+  with the SessionEnd summary as the superseded version. (#1229, #1243)
 - Replaced the unmaintained YAML library (`serde_yaml` and its
   `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
   reads existing page frontmatter to exactly the same values as before. One

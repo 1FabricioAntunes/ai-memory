@@ -3725,6 +3725,30 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether LLM consolidation of the session's current observation
+    /// generation is already running or finished. A redelivered checkpoint
+    /// checks this before rewriting the rule-based page, so a retry that
+    /// arrives after the worker finished cannot replace the LLM page it
+    /// wrote.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_generation_consolidating_or_done(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM session_consolidation_jobs \
+                 WHERE session_id = ?1 AND state IN ('running', 'completed') \
+                   AND generation = (SELECT COUNT(*) FROM observations WHERE session_id = ?1))",
+                params![session_id.as_bytes()],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await
+    }
+
     /// The `(workspace_id, project_id, cwd)` a session was created under,
     /// or `None` when no such session exists. The hook router uses this for
     /// session-sticky attribution: mid-session events inherit the session's
