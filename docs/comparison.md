@@ -52,8 +52,8 @@ ranking only), zero-LLM FTS scores 0.972; the
 explains the difference. For context on the same dataset, mcp-memory-service
 reports 0.804 R@5, and agentmemory publishes 95.2% `recall_any@5` from a
 component harness (whole raw sessions, BM25 plus vectors, reranker disabled).
-Pipeline and component numbers are not like-for-like, and a joint evaluation
-with agentmemory is pending, so this page claims no ranking between them. See
+Pipeline and component numbers are not like-for-like, so this page claims no
+ranking between them. See
 [where we're behind](#where-were-behind-or-different-by-choice).
 
 ## By camp
@@ -303,8 +303,7 @@ operator turns it on.
   the gap to capture, and within capture not to the 2 KB privacy cap (pages holding exactly the captured text
   score 0.968) but the zero-LLM session page, which indexed only short turn
   titles. agentmemory's published 95.2% is a component number with its
-  reranker disabled, so it is not like-for-like with ours; a joint evaluation
-  is pending. The only
+  reranker disabled, so it is not like-for-like with ours. The only
   reranker is LLM-as-judge, so the zero-LLM default path has none; the opt-in
   `answer=true` dialectic synthesis (2.4) is likewise LLM-required, off by
   default, and its end-to-end QA-accuracy result is early and small-sample (see

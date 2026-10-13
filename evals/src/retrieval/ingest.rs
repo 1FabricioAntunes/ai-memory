@@ -13,7 +13,7 @@
 //!   own), mirroring what the official LongMemEval harness exposes to
 //!   retrievers as session timestamps.
 //!
-//! Two ablation knobs change that shape for the M1 decomposition (defaults
+//! Two ablation knobs change that shape for the decomposition (defaults
 //! keep every published baseline reproducible):
 //!
 //! - [`DatePrefix`] moves or drops the per-turn date prefix, which takes

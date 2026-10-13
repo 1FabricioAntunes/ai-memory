@@ -88,8 +88,7 @@ baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.00
   a component number, and even our component numbers use a
   different index and document construction. Our grep engine reproduces
   agentmemory's grep adapter on all 470 questions, so the question set and
-  metric match; a joint evaluation of the two systems is pending, and no
-  ranking between them is claimed. The decomposition report has the
+  metric match, but no ranking between the two systems is claimed. The decomposition report has the
   details.
 - **Regression gate.** Roadmap items 2-6 re-run this benchmark; a change
   that lowers a slice materially is a regression to fix, not a note to

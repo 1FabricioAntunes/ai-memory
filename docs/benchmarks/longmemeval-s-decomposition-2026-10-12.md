@@ -20,13 +20,13 @@ Every number below comes from the in-repo harness (`evals/`, see
 
 ## Provenance
 
-Decomposition runs (M1, 2026-10-10 to 2026-10-11):
+Decomposition runs (2026-10-10 to 2026-10-11):
 
 - server: `release/2.7` at `7dd6b2c2` (the binary reports 2.6.3), before the
   observation stream existed
 - harness: `420a8556` (the instruments) and `31f515dc` (adds
   `--http-timeout-secs`); `release/2.7` carries the same `evals/` tree as
-  `014e123b` and `b7ac5a70`
+  `7a2c603d` and `8b797e08`
 - dataset: `longmemeval_s` (sha256 `08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894`);
   where noted, `longmemeval_s_cleaned` (Hugging Face
   `xiaowu0162/longmemeval-cleaned` at `98d7416c24c778c2fee6e6f3006e7a073259d48f`,
@@ -40,18 +40,18 @@ Decomposition runs (M1, 2026-10-10 to 2026-10-11):
 
 Pipeline re-runs (2026-10-13, corrected harness): the FTS full-set pipeline
 with reachability, both date-prefix ablations and the strat-230 local
-pipeline-vs-whole-session A/B, on `release/2.7` at `85eb1723` with
+pipeline-vs-whole-session A/B, on `release/2.7` at `7e08baa7` with
 `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` on every arm (see "Harness
 correction").
 
 Observation-stream runs (2026-10-13, corrected harness):
 
-- build: the shipped ranking, `228d72f0` on top of `e124b123`, for the
-  full-set FTS and local A/Bs; `release/2.7` at `85eb1723` for the first
+- build: the shipped ranking, `41793120` on top of `25594224`, for the
+  full-set FTS and local A/Bs; `release/2.7` at `7e08baa7` for the first
   version. The stream is on by default in both, so the baseline side sets
   `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` and the candidate side
   `=true`
-- harness: `85eb1723`, which replays each question's sessions under their own
+- harness: `7e08baa7`, which replays each question's sessions under their own
   session ids (see "Harness correction")
 - dataset, hardware and model as above (original `longmemeval_s` file)
 
@@ -198,8 +198,8 @@ answer. Hits are still pages, and nothing new is written to the wiki. It is on
 by default in 2.7; setting it to `false` restores the previous ranking
 exactly.
 
-Stream off → on, same build (`release/2.7` at `228d72f0` on top of
-`e124b123`, the shipped ranking), same questions, all 470, corrected harness:
+Stream off → on, same build (`release/2.7` at `41793120` on top of
+`25594224`, the shipped ranking), same questions, all 470, corrected harness:
 
 | run | hit@5 | hit@1 | hit@10 | recall@5 | p95 ms | flips |
 |---|---|---|---|---|---|---|
@@ -236,7 +236,7 @@ vector, like its FTS row, sees only the title-only body.
 In its first version the stream's vote was added on top of page FTS, so a
 session page whose title list shared topic words with the question still
 collected both. That version, stream off → on, corrected harness, on
-`release/2.7` at `85eb1723`:
+`release/2.7` at `7e08baa7`:
 
 | run | questions | hit@5 | hit@1 | hit@10 | recall@5 | p95 ms | flips |
 |---|---|---|---|---|---|---|---|
@@ -269,7 +269,7 @@ got a session page in the later project. This was the "8 of 845 evidence
 sessions had no session page" the first version of this report could not
 explain. A real harness mints a fresh id per session, so the replay now
 namespaces each id by question (`stored_session_uuid` in
-`evals/src/retrieval/ingest.rs`, harness `85eb1723`), and all 845 evidence
+`evals/src/retrieval/ingest.rs`, harness `7e08baa7`), and all 845 evidence
 pages are present.
 
 The pipeline numbers above, and the observation-stream runs, are from the
@@ -307,7 +307,7 @@ Reachability is unchanged too (0.056 / 0.102 on the session page).
   component measurement. ai-memory's pipeline numbers include capture, and
   even its component numbers use a different index, document construction and
   dataset file. **The two are not like-for-like, and no ranking between the
-  tools is claimed here.** A joint evaluation on one harness is pending.
+  tools is claimed here.**
 - The cleaned dataset file changes the haystacks of 454 questions but keeps
   every question and evidence label. Grep and whole-session FTS score the same
   on both files.
@@ -366,7 +366,7 @@ $E retrieval --stratify 20 --embeddings local --candidate-server-env AI_MEMORY_R
 
 Observation stream, shipped ranking (corrected harness, stream on by
 default): the full-set FTS and local A/Bs. The first version's runs used the
-same commands on `85eb1723`, plus `--stratify 30` (FTS) and `--embeddings
+same commands on `7e08baa7`, plus `--stratify 30` (FTS) and `--embeddings
 local --stratify 15`:
 
 ```bash

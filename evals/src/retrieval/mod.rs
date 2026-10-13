@@ -16,7 +16,7 @@
 //! tokens a result would cost the agent (chars/4 over returned snippets).
 //! Without a candidate config the single-config path is unchanged.
 //!
-//! ## M1: decomposing the retrieval gap
+//! ## Decomposing the retrieval gap
 //!
 //! Four opt-in instruments split a hit@k number into capture loss and
 //! ranking loss (defaults reproduce the published baselines):

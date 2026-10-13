@@ -372,7 +372,7 @@ cargo run -p ai-memory-eval -- retrieval --sample 3 \
     --qa --qa-provider gemini --qa-model gemini-2.5-flash
 ```
 
-### `retrieval` decomposition instruments (M1)
+### `retrieval` decomposition instruments
 
 These flags split a hit@k number into evidence the index never saw and
 ranking on evidence it did. All are opt-in; the defaults reproduce the
