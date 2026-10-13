@@ -67,7 +67,14 @@ jobs:
             fi
           done
           for catalog in .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do
-            for ref in $(jq -r '.plugins[].source.ref' "$catalog"); do
+            # A missing catalog or an empty plugin list would leave the loop
+            # below nothing to check, so refuse both before reading refs.
+            if ! jq -e '.plugins | length > 0' "$catalog" >/dev/null; then
+              echo "$catalog is missing or lists no plugins; re-run render-plugins" >&2
+              exit 1
+            fi
+            refs="$(jq -r '.plugins[].source.ref' "$catalog")"
+            for ref in $refs; do
               if [ "$ref" != "v${tag_version}" ]; then
                 echo "$catalog points at ${ref}, expected v${tag_version}; re-run render-plugins" >&2
                 exit 1

@@ -83,7 +83,16 @@ download() {
             curl -fsSL -o "$2" "$1"
         fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1"
+        if [ "$release_base" = "$DEFAULT_RELEASE_BASE" ]; then
+            # The curl path's --proto '=https' for wget: no redirect may drop
+            # to plain http. A wget without the flag (BusyBox) cannot promise
+            # that, so it is refused rather than trusted.
+            wget --help 2>&1 | grep -q -- '--https-only' ||
+                die "this wget cannot refuse a redirect to plain http (no --https-only); install curl or GNU wget"
+            wget -q --https-only -O "$2" "$1"
+        else
+            wget -q -O "$2" "$1"
+        fi
     else
         die "curl or wget is required"
     fi
@@ -116,13 +125,22 @@ verify() {
     [ "$actual" = "$expected" ] || die "checksum mismatch for $3 (expected $expected, got $actual); refusing installation"
 }
 
-# Refuse an archive with an absolute or parent-relative member before tar
-# writes anything.
+# Refuse an archive with an absolute or parent-relative member, or with any
+# member that is not a plain file or directory (a symlink or hard link could
+# point the unpacked tree outside itself), before tar writes anything.
 check_members() {
     tar -tzf "$1" >"$2" || die "cannot read $3"
     while IFS= read -r member; do
         case "$member" in
             /* | ../* | */../* | .. | */..) die "$3 contains an unsafe path ($member); refusing installation" ;;
+        esac
+    done <"$2"
+    # GNU tar and bsdtar both start each verbose line with the member type.
+    tar -tvzf "$1" >"$2" || die "cannot read $3"
+    while IFS= read -r entry; do
+        case "$entry" in
+            -* | d*) ;;
+            *) die "$3 contains a member that is not a plain file or directory ($entry); refusing installation" ;;
         esac
     done <"$2"
 }
@@ -173,7 +191,7 @@ main() {
 
     check_members "$work/$asset" "$work/members" "$asset"
     mkdir -p "$work/release"
-    tar -xzf "$work/$asset" -C "$work/release"
+    tar --no-same-owner -xzf "$work/$asset" -C "$work/release"
     [ -f "$work/release/ai-memory" ] || die "$asset has no ai-memory binary"
     chmod 0755 "$work/release/ai-memory"
     "$work/release/ai-memory" --version >/dev/null 2>&1 ||

@@ -69,7 +69,11 @@ ai-memory setup
 `install.sh.sha256`. It picks `ai-memory-<os>-<arch>.tar.gz` for the machine,
 downloads it with its `.sha256` file, and stops before unpacking anything when
 the checksum file is missing, names another asset, or does not match. It also
-refuses an archive holding an absolute or `..` path. The release goes to
+refuses an archive holding an absolute or `..` path, or any member that is not
+a plain file or directory (a symlink or hard link), and unpacks with
+`--no-same-owner`. Without curl it falls back to wget, and for the default
+GitHub URL only to a wget that supports `--https-only` (so a redirect cannot
+drop to plain http); BusyBox wget is refused there. The release goes to
 `~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
 binary, so the bundled `hooks/` directory sits beside it and
 `ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
@@ -109,7 +113,13 @@ the commands a native install otherwise needs one by one:
    `$XDG_CONFIG_HOME`) on Linux, rendered from the packaged user unit, or
    `~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist` on macOS,
    rendered from the packaged LaunchAgent. The unit runs the binary `setup` ran
-   from. The step is skipped when a server already answers at the configured
+   from. When that binary sits in a versioned package location (Homebrew's
+   `Cellar/ai-memory/<version>` or a `/nix/store` path, both gone after an
+   upgrade and `brew cleanup` or garbage collection), the unit names a stable
+   link that resolves to the same file instead: the path as invoked, an
+   `ai-memory` on `PATH` such as `~/.nix-profile/bin/ai-memory`, or Homebrew's
+   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`. With no such link it names
+   the versioned path, and you re-run `setup` after upgrading. The step is skipped when a server already answers at the configured
    URL and no unit of ours exists yet (Docker, a packaged system unit, a
    foreground `serve`), when the configured server is not on this machine,
    with `--no-service`, and on Windows.
@@ -3245,7 +3255,11 @@ token into the volume), `docker restart ai-memory`, then re-run
 `install-hooks` copies the token from the volume to an owner-only file under
 `~/.local/share/ai-memory/native-runner/`, and the commands the wrapper runs
 natively (`install-hooks`, `mcp-bridge`, `run`) read it from there, never from
-a command line.
+a command line. When `install-hooks` finds no token in the volume any more (auth
+turned off, or the token file gone), it deletes that copy; a container engine
+that cannot be reached leaves it alone. A full `ai-memory uninstall --apply`
+through the wrapper deletes it once the uninstall succeeds; a dry run or an
+`--only` subset keeps it.
 
 Then wire up the agent CLI. Both commands default to
 `http://127.0.0.1:49374` - no extra flags needed for the local case:
