@@ -4841,12 +4841,41 @@ async fn namespace_pages_split_at_25_and_clamp_bad_page_values() {
         assert_eq!(status, StatusCode::OK, "page={junk}");
         assert!(body.contains("Showing 1&ndash;25"), "page={junk}");
     }
+    // A repeated key does not parse into the options at all; it falls back
+    // too instead of becoming axum's 400.
+    let (status, body) = get_body(&app, &format!("{base}?sort=a&sort=b&page=2")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Showing 1&ndash;25"), "{body}");
 
     // Exactly one page of results: no pager, no range.
     let (_tmp, app) = seed_notes(25).await;
     let (_, exact) = get_body(&app, base).await;
     assert!(exact.contains("25 pages in this namespace"));
     assert!(!exact.contains("Showing") && !exact.contains("aria-label=\"Pagination\""));
+}
+
+/// Every page URL takes the namespace options, so an unparseable query
+/// string must not turn an ordinary page into a 400.
+#[tokio::test]
+async fn page_url_ignores_an_unparseable_query_string() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/bar.md", "# Bar\n\nbody"))
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+    let (status, body) = get_body(&app, "/w/default/scratch/p/notes/bar.md?sort=a&sort=b").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Bar"), "{body}");
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ai_memory_core::PagePath;
 use ai_memory_store::PageSummary;
 use askama::Template;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
@@ -20,7 +21,7 @@ const NAMESPACE_PAGE_SIZE: usize = 25;
 
 /// Namespace listing options. Strings, so a bad value falls back to a
 /// default instead of becoming axum's 400.
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub(crate) struct NamespaceQuery {
     sort: Option<String>,
     page: Option<String>,
@@ -31,8 +32,11 @@ pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
-    Query(query): Query<NamespaceQuery>,
+    query: Result<Query<NamespaceQuery>, QueryRejection>,
 ) -> Response {
+    // A query string that does not parse at all (a repeated key) is ignored
+    // too: every page URL takes this extractor, not only namespaces.
+    let query = query.map(|Query(q)| q).unwrap_or_default();
     if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
         return refusal_response(&refusal);
     }
