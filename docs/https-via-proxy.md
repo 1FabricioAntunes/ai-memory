@@ -387,6 +387,12 @@ server {
 The `proxy_http_version 1.1` + empty `Connection` are required for
 MCP's Streamable HTTP transport to stream correctly.
 
+Keep the `Host` and `X-Forwarded-For` lines in every nginx block, including a
+plain-HTTP one. Without them nginx sends the upstream address as `Host` and no
+forwarding header, so a server running without a bearer token cannot tell the
+request came through a proxy and treats it like a local client (see the
+browser-request notes in [`security.md`](security.md)).
+
 ---
 
 ## Native (non-Docker) Caddy

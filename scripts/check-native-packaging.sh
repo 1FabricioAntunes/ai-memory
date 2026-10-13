@@ -137,6 +137,97 @@ main() {
     fail "AI_MEMORY_NATIVE_BIN pointing to the wrapper must be refused instead of recursing"
   fi
 
+  log "Checking the wrapper hands host commands the volume's root bearer"
+  # New-install default: a server initialized on the named volume keeps its token at
+  # /data/auth-tokens/default. Host-native commands must receive it as a
+  # 0600 token file named by AI_MEMORY_AUTH__BEARER_TOKEN_FILE, never in argv.
+  local token_docker token_native token_log token_docker_log token_home bind_dir
+  token_docker="${TMP_ROOT}/token-docker"
+  token_native="${TMP_ROOT}/token-native"
+  token_log="${TMP_ROOT}/token-native.log"
+  token_docker_log="${TMP_ROOT}/token-docker.log"
+  token_home="${TMP_ROOT}/token-home"
+  bind_dir="${TMP_ROOT}/bind-data"
+  mkdir -p "${token_home}" "${bind_dir}"
+  # An explicit env token wins over the volume copy, so a contributor shell
+  # that exports one would hide the hand-off this section checks.
+  unset AI_MEMORY_AUTH_TOKEN
+  cat >"${token_docker}" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
+case "$*" in
+  *"--entrypoint /bin/sh"*) printf 'VOLUME-ROOT-TOKEN\n' ;;
+esac
+FAKE
+  cat >"${token_native}" <<'FAKE'
+#!/usr/bin/env bash
+{
+  printf 'argv=%s\n' "$*"
+  printf 'file=%s\n' "${AI_MEMORY_AUTH__BEARER_TOKEN_FILE:-}"
+  printf 'data_dir=%s\n' "${AI_MEMORY_DATA_DIR:-}"
+  if [ -n "${AI_MEMORY_AUTH__BEARER_TOKEN_FILE:-}" ]; then
+    printf 'content=%s\n' "$(cat "${AI_MEMORY_AUTH__BEARER_TOKEN_FILE}")"
+    printf 'mode=%s\n' "$(stat -c '%a' "${AI_MEMORY_AUTH__BEARER_TOKEN_FILE}" 2>/dev/null || stat -f '%Lp' "${AI_MEMORY_AUTH__BEARER_TOKEN_FILE}")"
+  fi
+} >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+FAKE
+  chmod 0755 "${token_docker}" "${token_native}"
+  for cmd in "install-hooks --agent claude-code --apply" "run codex" \
+    "mcp-bridge --server-url http://127.0.0.1:49374/mcp"; do
+    : >"${token_log}"
+    case "${cmd}" in install-hooks*) ;; *) : >"${token_docker_log}" ;; esac
+    # shellcheck disable=SC2086 # the command string is split on purpose
+    HOME="${token_home}" XDG_DATA_HOME="${token_home}/.local/share" \
+      AI_MEMORY_DOCKER="${token_docker}" AI_MEMORY_NATIVE_BIN="${token_native}" \
+      AI_MEMORY_DOCKER_TEST_LOG="${token_docker_log}" AI_MEMORY_WRAPPER_TEST_LOG="${token_log}" \
+      bin/ai-memory ${cmd}
+    assert_contains "${token_log}" "file=${token_home}/.local/share/ai-memory/native-runner/server-token"
+    assert_contains "${token_log}" "content=VOLUME-ROOT-TOKEN"
+    assert_contains "${token_log}" "mode=600"
+    if grep -F 'argv=' "${token_log}" | grep -Fq 'VOLUME-ROOT-TOKEN'; then
+      fail "the volume token reached the native client's argv for: ${cmd}"
+    fi
+    # Only the setup step asks the container; the managed host commands and
+    # the per-session bridge read the copy it left.
+    case "${cmd}" in
+      install-hooks*) ;;
+      *) [ ! -s "${token_docker_log}" ] || fail "${cmd} reached the container engine" ;;
+    esac
+  done
+  : >"${token_docker_log}"
+  HOME="${token_home}" XDG_DATA_HOME="${token_home}/.local/share" \
+    AI_MEMORY_DOCKER="${token_docker}" AI_MEMORY_NATIVE_BIN="${token_native}" \
+    AI_MEMORY_DOCKER_TEST_LOG="${token_docker_log}" AI_MEMORY_WRAPPER_TEST_LOG="${token_log}" \
+    bin/ai-memory install-hooks --agent claude-code --apply
+  assert_contains "${token_docker_log}" "-v ai-memory-data:/data:ro"
+
+  # Control: a bind-mounted data dir is read directly by the native client;
+  # the wrapper neither asks the container nor sets a token file.
+  : >"${token_log}"
+  : >"${token_docker_log}"
+  HOME="${token_home}" XDG_DATA_HOME="${token_home}/.local/share" \
+    AI_MEMORY_DATA_DIR="${bind_dir}" \
+    AI_MEMORY_DOCKER="${token_docker}" AI_MEMORY_NATIVE_BIN="${token_native}" \
+    AI_MEMORY_DOCKER_TEST_LOG="${token_docker_log}" AI_MEMORY_WRAPPER_TEST_LOG="${token_log}" \
+    bin/ai-memory install-hooks --agent claude-code --apply
+  assert_contains "${token_log}" "data_dir=${bind_dir}"
+  assert_contains "${token_log}" "file="
+  if grep -Fq 'file=/' "${token_log}" || [ -s "${token_docker_log}" ]; then
+    fail "a bind-mounted data dir must not go through the volume token copy"
+  fi
+
+  # Control: an explicit AI_MEMORY_AUTH_TOKEN wins; no copy is made.
+  : >"${token_log}"
+  : >"${token_docker_log}"
+  HOME="${token_home}" XDG_DATA_HOME="${token_home}/.local/share" \
+    AI_MEMORY_AUTH_TOKEN="explicit" \
+    AI_MEMORY_DOCKER="${token_docker}" AI_MEMORY_NATIVE_BIN="${token_native}" \
+    AI_MEMORY_DOCKER_TEST_LOG="${token_docker_log}" AI_MEMORY_WRAPPER_TEST_LOG="${token_log}" \
+    bin/ai-memory install-hooks --agent claude-code --apply
+  if grep -Fq 'file=/' "${token_log}" || [ -s "${token_docker_log}" ]; then
+    fail "an explicit AI_MEMORY_AUTH_TOKEN must win over the volume token copy"
+  fi
+
   log "Creating temporary alternate root"
   mkdir -p \
     "${TMP_ROOT}/etc" \

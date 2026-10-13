@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::RecoverArgs;
 use crate::commands::hook_spool::{self, DrainLockWait, MaxAttempts, RestoreOutcome};
+use crate::commands::transcript_capture::TranscriptCapture;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, ServerProbe, probe_server};
 
@@ -984,6 +985,7 @@ async fn recover_finish_failed(
         ai_memory_core::WorkstreamCheckpoint::default(),
         entry.exit_code,
         sanitizer,
+        &TranscriptCapture::for_checkout(&config.data_dir, Path::new(&entry.cwd)),
     )
     .await
     {
@@ -1073,6 +1075,7 @@ async fn recover_degraded_run(
         entry.source_cursor.as_deref(),
         final_cursor,
         expected_digests,
+        &TranscriptCapture::for_checkout(&config.data_dir, Path::new(&entry.cwd)),
     )
     .await
     {
@@ -2203,5 +2206,175 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(load_journal(temp.path()).unwrap().len(), 1);
         server.abort();
+    }
+
+    /// Plants a Claude transcript for a checkout whose marker excludes
+    /// `secrets/**`, journals it as `kind` with its exact digests and cursor,
+    /// and runs the whole recovery pass against a fake server. Returns the
+    /// recovery outcome and every request body the server received.
+    #[cfg(unix)]
+    async fn recover_planted_transcript_with_excluded_read(
+        kind: JournalKind,
+    ) -> (&'static str, String) {
+        use std::sync::{Arc, Mutex};
+
+        let posted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = posted.clone();
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = captured.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                if path == "/hook/batch" {
+                    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+                    let results: Vec<_> = (0..items.len())
+                        .map(|index| serde_json::json!({ "index": index, "outcome": "stored" }))
+                        .collect();
+                    axum::Json(serde_json::json!({ "accepted": items.len(), "results": results }))
+                } else if path.starts_with("/workstream/runs/") {
+                    axum::Json(serde_json::json!({ "imported_events": 1, "latest_sequence": 1 }))
+                } else {
+                    axum::Json(serde_json::json!({ "status": "ok" }))
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server_url = format!("http://{address}");
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets/**\"]\n",
+        )
+        .unwrap();
+        let session_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(repo.path().to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&session_dir).unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let cwd = repo.path().to_string_lossy();
+        let record = |uuid: &str, role: &str, content: serde_json::Value| {
+            serde_json::json!({
+                "type": role, "uuid": uuid, "sessionId": sid, "cwd": cwd,
+                "timestamp": "2026-09-01T10:00:00Z",
+                "message": {"role": role, "content": content},
+            })
+            .to_string()
+        };
+        let read = |id: &str, path: PathBuf| serde_json::json!({"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": path}});
+        let output = |id: &str, text: &str| serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": text});
+        let lines = [
+            record("u1", "user", serde_json::json!("read the key and the lib")),
+            record(
+                "a1",
+                "assistant",
+                serde_json::json!([
+                    read("toolu_secret", repo.path().join("secrets/key.txt")),
+                    read("toolu_public", repo.path().join("src/lib.rs")),
+                ]),
+            ),
+            record(
+                "u2",
+                "user",
+                serde_json::json!([
+                    output("toolu_secret", "SENTINEL_RECOVERY_MUST_NOT_POST"),
+                    output("toolu_public", "PUBLIC_RECOVERY_CONTROL"),
+                ]),
+            ),
+        ];
+        fs::write(
+            session_dir.join(format!("{sid}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+
+        let exported = ai_memory_workstream::export_transcript(
+            ai_memory_workstream::ManagedHarness::Claude,
+            home.path(),
+            repo.path(),
+            None,
+            sid,
+            None,
+        )
+        .await
+        .unwrap();
+        let all = serde_json::to_string(&exported.events).unwrap();
+        assert!(
+            all.contains("SENTINEL_RECOVERY_MUST_NOT_POST")
+                && all.contains("PUBLIC_RECOVERY_CONTROL"),
+            "the native transcript must carry both reads: {all}"
+        );
+        let entry = JournalEntry {
+            native_session_id: Some(sid.into()),
+            cwd: repo.path().to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            event_digests: Some(ai_memory_workstream::transcript_interval_digests(
+                &exported.events,
+            )),
+            final_cursor: exported.source_cursor.clone(),
+            ..test_entry("capture-policy", kind)
+        };
+        append_journal_entry(data_dir.path(), entry).unwrap();
+        let config = Config {
+            data_dir: data_dir.path().to_path_buf(),
+            home_dir: Some(home.path().to_string_lossy().into_owned()),
+            server_url,
+            ..Config::default()
+        };
+        let report = recover(&config, &RecoverBudgets::default()).await.unwrap();
+        server.abort();
+        assert_eq!(report.sessions.len(), 1, "{report:?}");
+        let outcome = report.sessions[0].outcome;
+        let posted = posted.lock().unwrap().join("\n");
+        (outcome, posted)
+    }
+
+    /// GHSA-gcpc-88hm-3xqr, recovery leg: re-importing a finish-failed managed
+    /// run's transcript goes through the checkout's `[capture] ignore_paths`.
+    /// The excluded read's path and output never reach the server; the public
+    /// read's output does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_failed_recovery_never_posts_content_the_capture_policy_excludes() {
+        let (outcome, posted) =
+            recover_planted_transcript_with_excluded_read(JournalKind::FinishFailed).await;
+        assert_eq!(outcome, "imported", "{posted}");
+        for sentinel in ["SENTINEL_RECOVERY_MUST_NOT_POST", "secrets/key.txt"] {
+            assert!(
+                !posted.contains(sentinel),
+                "{sentinel} was posted: {posted}"
+            );
+        }
+        assert!(posted.contains("PUBLIC_RECOVERY_CONTROL"), "{posted}");
+    }
+
+    /// GHSA-gcpc-88hm-3xqr, recovery leg: replaying a degraded run's exact
+    /// transcript range through `/hook/batch` goes through the checkout's
+    /// `[capture] ignore_paths`, with the public read as the control.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn degraded_run_recovery_never_posts_content_the_capture_policy_excludes() {
+        let (outcome, posted) =
+            recover_planted_transcript_with_excluded_read(JournalKind::DegradedRun).await;
+        assert_eq!(outcome, "imported", "{posted}");
+        for sentinel in ["SENTINEL_RECOVERY_MUST_NOT_POST", "secrets/key.txt"] {
+            assert!(
+                !posted.contains(sentinel),
+                "{sentinel} was posted: {posted}"
+            );
+        }
+        assert!(posted.contains("PUBLIC_RECOVERY_CONTROL"), "{posted}");
     }
 }

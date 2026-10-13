@@ -112,7 +112,8 @@ pub use copilot::{
 };
 pub use cursor_agent::{CURSOR_DEFAULT_MODEL, CursorAgentProvider, cursor_executable};
 pub use embedding::{
-    Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine,
+    Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, QueryVector, SyntheticEmbedder, VoyageEmbedder,
+    cosine, embed_search_query,
 };
 pub use error::{LlmError, LlmResult};
 pub use factory::{
@@ -146,7 +147,7 @@ pub use opencode::{
     OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OPENCODE_SESSION_HEADER, OpenCodeProvider,
 };
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
-pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
+pub use reranker::{LlmReranker, RerankCandidate, RerankScore, RerankStage, Reranker};
 pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Role,

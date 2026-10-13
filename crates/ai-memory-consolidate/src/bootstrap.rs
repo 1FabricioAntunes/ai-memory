@@ -1436,7 +1436,11 @@ fn split_oversized_source(source: BootstrapSource, usable: usize) -> Vec<Bootstr
 
 /// System prompt for bootstrap. Loaded at compile time from
 /// `prompts/bootstrap_system.md`.
-const SYSTEM_PROMPT: &str = include_str!("../prompts/bootstrap_system.md");
+pub(crate) const SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikilinks!(
+    include_str!("../prompts/bootstrap_system.md"),
+    "the supplied sources",
+    "the sources"
+);
 
 fn build_chunk_request(
     sources: &[BootstrapSource],

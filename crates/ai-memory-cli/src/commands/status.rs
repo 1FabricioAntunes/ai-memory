@@ -4,6 +4,7 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+use ai_memory_core::fix_lines;
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -115,15 +116,6 @@ struct Derived {
     stale_links_from_latest_pages: u64,
 }
 
-/// Suggest compaction only above this share of the file. Below it the
-/// exclusive lock costs more than the space is worth, and SQLite will reuse
-/// those pages on its own as the store grows.
-const RECLAIM_ADVICE_PCT: f64 = 20.0;
-
-/// …and only when the absolute figure is worth a stall. 20% of a 4 MiB
-/// database is not a reason to block every write.
-const RECLAIM_ADVICE_MIN_BYTES: u64 = 64 * 1024 * 1024;
-
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Storage {
     page_size: u64,
@@ -212,8 +204,9 @@ fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool
         return;
     }
     eprintln!(
-        "  run `ai-memory recover` once the server is back to deliver queued events and \
-         repair unrecorded runs ({journal_pending} journaled)"
+        "  run `{}` once the server is back to deliver queued events and \
+         repair unrecorded runs ({journal_pending} journaled)",
+        fix_lines::RECOVER
     );
 }
 
@@ -256,6 +249,9 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     };
     let (journal_pending, journal_degraded, journal_finish_failed, journal_error) =
         super::recovery::journal_summary(&config.data_dir);
+    // `/admin/status` answered. Without a credential that can only mean the
+    // server does not require one.
+    let auth_posture = crate::local_auth::AuthPosture::classify(ep.auth_token.is_none(), &ep.url);
 
     if args.json {
         println!(
@@ -269,6 +265,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 journal_error,
                 capture_mode,
                 &ep,
+                auth_posture,
             ))?
         );
     } else {
@@ -277,6 +274,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         println!("  data-dir:     {}", report.data_dir);
         println!("  db:           {}", report.db_path);
         println!("  bind:         {}", report.bind);
+        println!("  auth:         {}", auth_posture.line());
         println!(
             "  pages:        {} (all versions: {})",
             report.counts.pages_latest, report.counts.pages_all
@@ -329,12 +327,13 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             if let Some(free) = report.storage.data_dir_free_bytes {
                 println!("    filesystem free: {}", super::compact::human_bytes(free));
             }
-            if pct >= RECLAIM_ADVICE_PCT
-                && report.storage.reclaimable_bytes >= RECLAIM_ADVICE_MIN_BYTES
-            {
+            if fix_lines::reclaim_advised(
+                report.storage.reclaimable_bytes,
+                report.storage.database_bytes,
+            ) {
                 println!(
-                    "    `ai-memory compact --confirm` would return it \
-                     (blocks writes while it runs)"
+                    "    `{}` would return it (blocks writes while it runs)",
+                    fix_lines::COMPACT
                 );
             }
         }
@@ -386,7 +385,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             if let Some(error) = &journal_error {
                 println!("    error:      {error}");
             }
-            println!("    action:     run `ai-memory recover`");
+            println!("    action:     run `{}`", fix_lines::RECOVER);
         }
         if let Some(ingest) = &report.ingest {
             println!("  ingest (server, this process):");
@@ -496,6 +495,7 @@ fn json_report(
     journal_error: Option<String>,
     capture_mode: &str,
     endpoint: &ServerEndpoint,
+    auth_posture: crate::local_auth::AuthPosture,
 ) -> serde_json::Value {
     serde_json::json!({
         "version": report.version,
@@ -521,6 +521,7 @@ fn json_report(
         "capture_mode": capture_mode,
         "ingest": report.ingest,
         "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
     })
 }
 
@@ -615,7 +616,10 @@ mod tests {
             None,
             "denylist",
             &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
         );
+        assert_eq!(value["auth_posture"]["posture"], "none_loopback");
+        assert_eq!(value["auth_posture"]["fix"], "ai-memory auth enable");
         for key in [
             "version",
             "data_dir",

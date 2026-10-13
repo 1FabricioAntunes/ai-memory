@@ -8,6 +8,7 @@
 //! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/metrics`        — content-free Prometheus counters and latency histograms.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
 //! - `GET  /admin/project-coordinate` — read-only exact/compatibility diagnosis.
 //! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent
@@ -130,6 +131,9 @@ pub struct AdminState {
     /// Shared hook-ingestion counters, written by the hook path and read
     /// here for status reporting.
     pub ingest_metrics: std::sync::Arc<ai_memory_core::IngestMetrics>,
+    /// The MCP server's own counters ([`crate::AiMemoryServer::mcp_metrics`]),
+    /// read by `GET /admin/metrics`. A fresh instance reports zeros.
+    pub mcp_metrics: std::sync::Arc<crate::McpMetrics>,
     /// Retention-decay parameters forwarded from server config.
     pub decay_params: DecayParams,
     /// Lower edge of `memory_lint`'s A5 zero-LLM contradiction-similarity
@@ -584,6 +588,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/metrics`
 /// - `GET  /admin/projects`
 /// - `GET  /admin/project-coordinate`
 /// - `GET  /admin/open-sessions`
@@ -666,6 +671,7 @@ pub fn admin_router_with_sweep_tuning(
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/metrics", get(handle_metrics))
         .route("/admin/projects", get(handle_list_projects))
         .route("/admin/project-coordinate", get(handle_project_coordinate))
         .route("/admin/open-sessions", get(handle_open_sessions))
@@ -1225,6 +1231,21 @@ async fn handle_audit_log(
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
+}
+
+/// Handler for `GET /admin/metrics`: process counters and latency
+/// histograms in the Prometheus text format. Root-only on a multi-user server
+/// through the same gate as every `/admin/*` route. Content-free by
+/// construction: see [`crate::metrics`].
+async fn handle_metrics(State(state): State<Arc<AdminState>>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            crate::metrics::PROMETHEUS_CONTENT_TYPE,
+        )],
+        crate::metrics::render_prometheus(&state.ingest_metrics, &state.mcp_metrics),
+    )
+        .into_response()
 }
 
 /// JSON response body for `GET /admin/status`. The CLI's `status`
@@ -9529,6 +9550,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9598,6 +9620,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9725,6 +9748,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9963,6 +9987,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -10160,6 +10185,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -10383,6 +10409,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -10950,6 +10977,7 @@ mod tests {
     ) -> AdminState {
         AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -12756,6 +12784,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -12868,6 +12897,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -12973,6 +13003,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -13084,6 +13115,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -13634,6 +13666,7 @@ mod tests {
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -13693,6 +13726,7 @@ mod tests {
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -13857,6 +13891,7 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/metrics", serde_json::Value::Null),
             (
                 "GET",
                 "/admin/project-coordinate?workspace=default&project=scratch",
@@ -14365,6 +14400,23 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/admin/metrics")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            crate::metrics::PROMETHEUS_CONTENT_TYPE
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/admin/activity/by-client?since_days=7")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
@@ -14398,6 +14450,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -14532,6 +14585,7 @@ mod tests {
             ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: missing_db_reader,
             wiki,
@@ -15381,6 +15435,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,

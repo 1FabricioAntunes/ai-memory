@@ -2,9 +2,25 @@
 
 > The full security model. Moved from the README front page; the README keeps a summary.
 
-Loopback-only (`127.0.0.1:49374`) with no auth is the default because
-it is safe for a single-user laptop: no process outside the machine can
-reach the server.
+A new install requires a bearer token. `ai-memory init` on a fresh data
+dir writes a random root bearer to `<data_dir>/auth-tokens/default` (owner
+only) and records `[auth].bearer_token_file`; the server then refuses every
+route except `/healthz` without it. The hooks, the CLI and the
+`ai-memory mcp-bridge` stdio bridge read it from the data dir, so the token is
+never pasted into a harness config or passed on a command line. Claude Code
+runs the session-aware bridge, Codex and Prime Agent reference the token as
+`$AI_MEMORY_AUTH_TOKEN`, and every other MCP client `install-mcp` supports
+runs `ai-memory mcp-bridge --no-session-id` as a local stdio server. ZCode,
+which takes only HTTP entries, is the exception and needs a manual entry.
+
+An install created before this default keeps its loopback-only
+(`127.0.0.1:49374`), no-auth behaviour. That stays safe from the network, but
+every local process and browser page can reach the server. `ai-memory status`
+and `ai-memory doctor` show `auth: none (loopback)` with the fix,
+`ai-memory auth enable`, which mints the token, records it in config, gives
+the hooks the token and re-registers every MCP client that points at this
+server. Restart
+the server afterwards.
 
 Unauthenticated non-loopback HTTP now fails closed. Set
 `AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
@@ -54,6 +70,53 @@ HTTPS reverse proxy owns the browser-facing edge. It makes the session cookie
 HTTPS-only. Close or redirect direct HTTP access to that hostname.
 Non-loopback binds should also set `AI_MEMORY_ALLOWED_HOSTS` to guard against
 DNS rebinding.
+
+With no token (the loopback default), a web page open in your browser can
+still address `127.0.0.1:49374`. The server refuses those requests on the
+machine and admin routes: a request the browser marks as cross-site
+(`Sec-Fetch-Site`), or one whose `Origin` is not the server's own host, gets a
+403. So does any browser request that is not a script `fetch()` call
+(`Sec-Fetch-Dest` other than `empty`): a link, image or navigation is refused
+even when it comes from the server's own pages or from another application.
+Hooks, the CLI and MCP clients never send those headers, and the web UI's own
+admin calls use `fetch()`.
+
+Browsers send that fetch metadata over plain HTTP only to `localhost`,
+`*.localhost`, `127.0.0.0/8` and `[::1]`. When an unauthenticated server is
+reached through any other name in the `Host` allowlist (a LAN address or name
+with `--allow-insecure-no-auth`, or `host.docker.internal` in the Docker
+image's default list), an image request carries neither fetch metadata nor
+`Origin`. There the session-start handoff fetch, the only state-changing `GET`,
+must also carry the `X-AI-Memory-Client` header that every ai-memory hook,
+CLI command and generated integration sends; a web page cannot add it without
+a CORS preflight, which these routes never answer. Hooks staged before this
+header existed get a 403 on such a server until you re-run
+`ai-memory install-hooks` (or `ai-memory upgrade`); on a loopback host they
+keep working unchanged. A request that carries a proxy's forwarding header
+(`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`,
+`X-Forwarded-Server`, `X-Forwarded-Port`, `X-Original-Forwarded-For`,
+`X-Real-IP`, `X-Client-IP`, `CF-Connecting-IP`, `True-Client-IP` or `Via`)
+counts as non-loopback here even when its `Host` is a loopback address,
+because a plain-HTTP reverse proxy may rewrite `Host` to the address it
+forwards to while the browser behind it saw a non-loopback origin. ai-memory's
+own clients connect directly and send none of these headers. The server cannot
+see a proxy that says nothing, though: nginx's default `proxy_pass` rewrites
+`Host` to the upstream address and adds no `Forwarded`, `X-Forwarded-*` or
+`Via` header, so its requests look like a local client's. A plain-HTTP proxy in
+front of an unauthenticated server must therefore add `X-Forwarded-For`
+(`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) or keep the
+browser's host (`proxy_set_header Host $host;`, which also needs that name in
+the `Host` allowlist). Better still, terminate TLS at the proxy or set a bearer
+token. A browser that sends no fetch metadata even to loopback
+(Safari before 16.4) only gets the `Origin` check there, which an image or link
+does not trigger; set a bearer token if you use one. The `Host`
+allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
+content types a browser can send without a CORS preflight. The public sign-in
+routes (`POST /auth/login`, `POST /auth/recovery`) accept only
+`application/json` bodies too, so a page on another site cannot sign your
+browser in or try passwords. Images in wiki pages
+rendered by the web UI may only use relative paths that stay inside the UI, so
+viewing a stored page cannot make your browser call those routes either.
 
 Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
 second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to

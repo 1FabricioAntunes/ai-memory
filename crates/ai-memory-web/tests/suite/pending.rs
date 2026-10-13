@@ -442,6 +442,8 @@ async fn pending_page_gate_sees_the_trusted_proxy_setting_through_the_mount() {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();

@@ -8,6 +8,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a recall trace to web search. A project page has its own search box,
+  and a search with `workspace` and `project`
+  (`/web/search?q=…&workspace=…&project=…`) now ranks with the same hybrid
+  ranker as `memory_query` for that project: FTS5, entity, vector, graph and
+  observation streams, the authority adjustment, and the reranker when one is
+  configured. The server now hands its configured embedder and reranker to the
+  web UI, and the reranker's four-call concurrency limit is shared with
+  `memory_query`. With "Explain ranking" (`explain=1`) each hit shows its rank,
+  raw score and RRF contribution in every stream, the fused score, the
+  authority multiplier, and the intent boost and rerank score when present;
+  the page also lists the streams that ran, the embedder and reranker in use,
+  and each stream's time in milliseconds. A scoped `/api/v1/search` (one
+  project or `scopes`) uses the same ranker, so it returns the same order as
+  `memory_query`, and its `rank` is now the fused rank. A search without a
+  scope is still the cross-project FTS5 search, as `memory_query(global=true)`
+  is. Project search follows the per-project read rule: a viewer without a
+  grant on a restricted project gets a 403 and no trace, and an unknown project
+  is a 404.
+- Added a root-only server health page at `/web/health`, linked from the web UI
+  header. It shows the hook counters since the server started (accepted, shed
+  with 429 by saturation or rate limit, stored, failed, dropped), the writer
+  queue depth, the hook spool and recovery journal in the server's data
+  directory, the consolidation queue (last completion, pending, running,
+  completed and failed jobs), the configured embedder, both providers' status
+  and the stored vector identities. Failing checks are listed with the command
+  that fixes them, the same lines `ai-memory status` prints: `ai-memory
+  recover` for a backed-up spool or journal, `ai-memory compact --confirm` for
+  reclaimable space, `ai-memory embed` for pages without vectors, `ai-memory
+  embed --force` for vectors made under another model, and the LLM provider's
+  retry command. The page is read-only and is gated like `/web/pending`: on a
+  multi-user server anonymous requests get a 401 and database users a 403. It
+  never shows provider error text, page content or project names.
+- Added a two-command native install for Linux and macOS:
+  `curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh`,
+  then `ai-memory setup`. `install.sh` is a new release asset with its own
+  `install.sh.sha256`. It downloads the release tarball for the machine, checks
+  it against the published `.sha256` file and refuses to install when that file
+  is missing, names another asset or does not match, or when the archive holds
+  an absolute or `..` path. It unpacks under `~/.local/lib/ai-memory`, links
+  `~/.local/bin/ai-memory`, needs no root, leaves an existing non-link
+  `ai-memory` (such as the Docker wrapper) alone, and runs nothing when the
+  download is cut short. The new `ai-memory setup [--yes] [--agent <name>]...
+  [--no-service]` runs `init` (a fresh data dir gets the root bearer token),
+  installs and starts a per-user service rendered from the packaged systemd
+  user unit or launchd LaunchAgent with this install's binary, data dir and
+  config, wires MCP, hooks and global Agent Skills for each named or detected
+  agent, and ends with a read-only check of `/healthz`, `memory_status` and
+  `doctor`. It shows the plan and asks first; without a terminal it changes
+  nothing unless given `--yes`. A second run changes nothing. Windows has no
+  service step. `ai-memory uninstall --apply` stops and removes that service,
+  but only a unit `setup` wrote and nobody edited since; any other unit at that
+  path is left alone and reported. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
+  ai-memory for its user, and `scripts/onboarding-acceptance.sh` measures the
+  path from a clean home to the first returned memory.
+- Added page history and session replay to the read-only web UI. Each page
+  links to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version,
+  newest first, superseded ones included, so a version a concurrent write
+  replaced stays visible, with timestamps and the author of attributed writes,
+  plus a server-side unified diff between any two versions (by default the
+  latest against the version it replaced). Expired versions are hidden, and a
+  page whose TTL has passed shows no history. The same data is available as JSON
+  at `GET /api/v1/workspaces/{ws}/projects/{proj}/history/{*path}`. The version
+  list is capped at 200 per request, and the diff refuses inputs over 512 KiB,
+  10,000 lines or 1,000 changed lines and stops at 2,000 output lines. The
+  project page lists recent sessions, and each opens a timeline
+  (`/web/w/<ws>/<proj>/s/<session-id>`) that pages through its observations in
+  capture order with first/prev/next/last links and a jump field; with
+  JavaScript, a slider and `j`/`k` keys step one observation at a time. It uses
+  the same readers, owner filter and caps as the `/api/v1` session routes, and
+  observations render as escaped text. Both views follow the per-project read
+  rule: a non-grantee of a restricted project gets a 403, and a version id or
+  session id from another project or workspace reads as not found. The
+  `ai-memory-web` crate now has a `clippy.toml` that forbids the `Wiki` write
+  and destructive methods, so a write path in the web UI or `/api/v1` fails
+  `cargo clippy -D warnings`.
+- Added an observation stream to `memory_query` ranking:
+  `[retrieval] observation_stream` (env
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM`, on by default). A zero-LLM
+  session page keeps only a short excerpt of each turn, so the detail a
+  question asks about often lives only in the session's observations. With the
+  flag on, project and `scopes` searches also run full-text search over
+  observations in the same project, and each matching session votes once,
+  through its best-matching observation, for its own latest
+  `sessions/<id>.md` page as one more RRF stream. When page search did not
+  match the page itself, the matching excerpt becomes the hit's snippet, and
+  `explain=true` reports an `observation` stream with the matched observation
+  ids. Hits are still pages and nothing is written; sessions without a page
+  keep the `raw_hits` fallback, and `global=true` search is unchanged.
+- Added a root-only `GET /admin/metrics` endpoint in Prometheus text format.
+  It exposes the hook admission and delivery counters, MCP tool calls split
+  into reads and writes, and fixed-bucket latency histograms for `POST /hook`
+  and `memory_query`. Every label comes from a fixed set: no query text, page
+  body, prompt, client or project name, scope or token appears in the output.
+  On a multi-user server only root can read it, like every `/admin/*` route.
+- Added a `timings` object to `memory_query` responses with `explain=true`:
+  each retrieval stream's wall time in milliseconds (`fts_ms`, `entity_ms`,
+  `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`), summed over `scopes`.
+  Streams that did not run are left out, and a query without `explain` reads
+  no clock for them.
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,
@@ -15,7 +114,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quit from anything else, and the zero-LLM session page closes its summary
   with `ended (<reason>)`. Payloads without a reason are stored as before.
   (#1225)
-
 - The web UI shows pending cross-project mail. Project cards carry an amber
   `N inbox` badge when messages are waiting for an agent in that project, the
   home page summarises the total and links the projects holding mail, and the
@@ -136,37 +234,339 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`typscript`) is refused instead of silently hiding the entry, and both
   arguments are refused on any page the digest does not read: one outside
   `profile/`, or a `profile/` path in an ordinary project. (#1178)
-
 - Added the server version to the footer of every signed-in `/web` page (the
   public login and change-password pages leave it out), on the right
   side opposite "ai-memory · read-only", so you can tell which build a browser
   tab is talking to without running `ai-memory status`. (#1171)
-
 - Added `install-mcp --client dsh` for the DeepSeek Harness (aliases
   `deepseek-harness` and `deepseek_harness`). DSH keeps its MCP client in
   a Cordis profile patch rather than a fixed config file, so the command prints a
   ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
   refuses `--apply`. (#1193)
+- The `ai-memory-importer` companion imports agentmemory data. `agentmemory-vault`
+  reads its Obsidian vault export; `agentmemory-export` reads its `ExportData`
+  JSON file, from disk only, and needs a mapping file from agentmemory's
+  project names (or exact session working directories) to ai-memory
+  workspaces and projects. `--apply` refuses to run while any record is
+  unmapped. Pages land under `imported/agentmemory/` (`--dest-prefix`), never
+  under `sessions/` or another reserved family, and links to pages that were
+  not imported become plain text. Every write goes through `memory_write_page`
+  with `create_only` or `expected_page_id`, and the importer refuses servers
+  older than 2.7. A memory's versions are written oldest first so ai-memory
+  keeps the supersession chain, and `forgetAfter` becomes `expires_at`. Each
+  page carries a stable UUIDv5 ingest key, so an interrupted import resumes
+  without duplicates and a rerun writes nothing. Text is redacted before
+  anything is planned or sent. Observations are dropped unless
+  `--replay-observations` replays them as `external-import` sessions through
+  `/hook/batch`, and records with no ai-memory counterpart are counted in the
+  manifest. The cookbook has a "Coming from agentmemory" section.
+- `ai-memory doctor` reports agentmemory configuration left behind after a
+  migration: an MCP server entry in any harness config `install-mcp` knows (or
+  in a project's `.mcp.json`, `.cursor/mcp.json`, `.gemini/settings.json` or
+  `.vscode/mcp.json`), and agentmemory guideline blocks in rules files such as
+  `AGENTS.md`, `GEMINI.md`, `.cursor/rules/` and `.kiro/steering/`. It names
+  each file and the key or lines, prints the fix, and warns when a block names
+  `memory_consolidate`, which ai-memory also has with different arguments. The
+  check only reads; it never edits or deletes another tool's files. `doctor
+  --json` carries the findings as `agentmemory_residue`.
+- Added `ai-memory auth enable`, which turns on bearer auth for an install
+  created without it. It reuses or creates an owner-only token at
+  `<data_dir>/auth-tokens/default`, records it in `config.toml`, gives the
+  installed hooks the token when they hold no other credential, and
+  re-registers every MCP client whose `ai-memory` entry points at this server
+  the way `install-mcp` now wires a token-file install. It lists each client
+  it changed, each entry for another server it left alone, and anything that
+  needs a manual change. Running it again changes nothing, and the token is
+  never printed or written into a harness config. Restart the server
+  afterwards.
+- Added `ai-memory mcp-bridge --no-session-id`, a plain stdio-to-HTTP MCP
+  bridge for any client that runs local commands. It authenticates with the
+  token from config (`AI_MEMORY_AUTH_TOKEN`, `[auth] bearer_token`, or the
+  file `[auth] bearer_token_file` names), forwards no session identity (the
+  client passes `workspace` and `project` like any static MCP client, and an
+  inherited `CLAUDE_CODE_SESSION_ID` is ignored), and exits at once with
+  `401 Unauthorized` when the server refuses it. Without the flag the bridge
+  keeps Claude Code's session forwarding and still refuses to start without
+  `CLAUDE_CODE_SESSION_ID`.
+- Added the `[auth] bearer_token_file` config key (env
+  `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`): a file holding the root bearer token,
+  read once at startup. A relative path resolves against the data dir.
+  `AI_MEMORY_AUTH_TOKEN` still takes precedence; setting the key together with
+  `[auth] bearer_token` is a startup error, and a server whose configured file
+  is missing or empty refuses to start. A token read from the file is never
+  written into a harness config: `install-mcp` registers Claude Code through
+  the session-aware `ai-memory mcp-bridge`, gives Codex and Prime Agent a
+  reference to `$AI_MEMORY_AUTH_TOKEN`, and writes every other client a stdio
+  entry for `ai-memory mcp-bridge --no-session-id` in that client's own config
+  format (OpenCode, OpenCode 2, Cursor, Claude Desktop, Gemini CLI, OpenClaw,
+  OMP, Antigravity CLI, Zero, Devin, Grok, Kimi Code, Kiro CLI, Command Code,
+  Copilot CLI, Swival, VS Code, Zed, Muse Code; DeepSeek Harness's printed
+  patch too). Only ZCode, whose config keeps HTTP entries only, is refused with
+  the manual option. `uninstall` recognises these entries.
+  `install-hooks --apply` stores the token in the hook credential files only.
+- `ai-memory status` and `ai-memory doctor` now show the server's auth
+  posture, and for an unauthenticated loopback server print
+  `auth: none (loopback)` with the fix, `ai-memory auth enable`.
+- Added `--project-id` to `purge-project`, `rename-project` and
+  `move-project` (and `project_id` to their admin endpoints), as an
+  alternative to the project name. A legacy twin row whose name collides with
+  another project's `legacy_name` (the empty leftover an older migration
+  leaves behind) was refused as ambiguous by name, so it could not be purged
+  or renamed. The id is looked up inside the named workspace: sending both or
+  neither is a 400, a malformed UUID is a 400, and an id that names no project
+  in that workspace is a 404. `list-projects` now prints each project's id so
+  an operator can copy it. (#1208, #1226)
 
 ### Changed
+- Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
+  `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
+  FTS5 alone, so it returns the same order as `memory_query`, and `rank` is
+  now the fused rank. Cross-project search without a scope is unchanged.
+- Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
+  Code, Goose, Qwen Code and OpenHuman in `docs/install.md`, and listed them
+  in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
+  the client's own documentation at a named version and has not yet been run
+  end to end. Aider is not listed because it has no MCP support.
+- Published `docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md`, which
+  splits the LongMemEval-S retrieval number into capture cost, ranking quality
+  and harness artifacts, and records what the observation stream recovered
+  (zero-LLM FTS `hit@5` 0.666 → 0.868 on all 470 questions). The benchmark,
+  evals and comparison docs no longer blame the 2 KB excerpt cap for the gap
+  (pages holding exactly the captured text score 0.968 against 0.972 for whole
+  sessions) and no longer attribute agentmemory's 0.967 to LongMemEval-S: it is
+  the grep baseline on agentmemory's in-house corpus, and its LongMemEval-S
+  figure is 95.2% from a component harness with the reranker disabled, not
+  like-for-like with ai-memory's pipeline numbers. `docs/comparison.md` gains a
+  "From agentmemory" migration note.
+- Changed `memory_query` ranking to include the observation stream by
+  default, after it raised hit@5 on the retrieval eval for both zero-LLM and
+  local-embedding search while staying inside its latency and context-token
+  budgets. `explain=true` lists `observation` in
+  `streams_active` whenever it runs. To keep the previous ranking, set
+  `[retrieval] observation_stream = false` (or
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`); ranking is then identical
+  to before.
+- Changed `ai-memory init` on a fresh data dir (no config file and no
+  database yet) to create a root bearer token at
+  `<data_dir>/auth-tokens/default` and record `[auth] bearer_token_file`, so
+  a new install's server requires the token on every route except `/healthz`.
+  The hooks, the CLI and `ai-memory mcp-bridge` read it from the data dir;
+  client commands of a packaged install, whose config lives outside the data
+  dir, find it there too when they read no config file and target a loopback
+  server. Existing installs are unchanged and keep running without auth until
+  `ai-memory auth enable`; so is an `init` that finds a database or a bearer
+  supplied another way. `uninstall` keeps this token, since it is the
+  server's credential. The Docker wrapper hands a host command (`install-hooks`,
+  `mcp-bridge`, `run`) the token of a server initialized on its volume as an
+  owner-only file that `install-hooks` copies from the volume, never on a
+  command line. With no human accounts the built-in web UI answers a browser
+  with a Basic sign-in prompt instead of redirecting to a login form that
+  could not succeed: any username, and the token file's contents as the
+  password. `ai-memory setup` prints that URL and the file to read, never the
+  token. The macOS menu bar app reads the token from its data dir when none is
+  saved in Settings, so an install it initialized turns green without pasting
+  anything.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites
   unedited files of an earlier export in place. (#1164)
 
 ### Fixed
-- Fixed the admin project operations being unaddressable when a NAME is
-  ambiguous. `purge-project`, `rename-project` and `move-project` resolved
-  their target by name alone, so a legacy twin row whose name collides with
-  another project's `legacy_name` (the empty leftover an older migration
-  leaves behind) could not be reached: the lookup answered with whichever row
-  it found first. Each endpoint now also accepts `project_id` (a UUID) as an
-  alternative to `project`/`from`, and the CLI exposes it as `--project-id`,
-  mutually exclusive with the name flag. Sending both or neither is a 400, a
-  malformed UUID is a 400, and an id that names no row in the workspace is a
-  404, so a foreign-scope id is refused rather than guessed at.
-  `list-projects` now prints each project's id so an operator can copy it
-  into `--project-id`. (#1208)
+- Fixed SessionEnd consolidation repeating the same expensive prompt on the
+  durable queue when the structured LLM response fails deterministically: a
+  truncated or empty response, malformed JSON, or an unexpected response
+  shape now ends the queue on the first attempt, keeping the heuristic page
+  the hook already wrote; pre-send connection and capacity (`503`) failures
+  retain the bounded backoff. (#1131)
+- Fixed structured LLM responses stopped at the output budget
+  (`finish_reason = "length"`) or returned without usable content: they now
+  fail with redacted terminal errors, without copying the response. (#1130)
+- Replaced the unmaintained YAML library (`serde_yaml` and its
+  `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
+  reads existing page frontmatter to exactly the same values as before. One
+  formatting change: when a page is next saved, a frontmatter value that needs
+  quoting (a title containing `: `, for example) is written in double quotes
+  instead of single quotes. `ai-memory-importer` reads three rare
+  hand-written forms differently: a numeric-looking `title` or tag such as
+  `007` is no longer used, a `!!timestamp`-tagged title fails that page's
+  import, and a custom-tagged title (`!foo x`) imports as its plain text.
+
+## [2.6.5] - 2026-10-12
+
+### Fixed
+- Fixed the detached hook drainer recreating a deleted data directory. A
+  drainer started just before `ai-memory uninstall --purge-data` (or one
+  whose data directory was removed some other way) brought back an empty
+  `hook-spool/` with its lock file. The drainer now exits when the data
+  directory is gone. A spool directory the drainer creates is also private
+  (`0700`) now, as one created by a queued event always was; before, it
+  took the default permissions.
+- Fixed the profile harvest writing a fresh copy of a stack preference on
+  every pass. A statement classified `stack` (for example "Use Rust by default
+  for everything else.") lives in `profile/stack/` beside the per-language
+  stack entries, and the step that finds an entry's existing page skipped that
+  whole directory, so each harvest saw no page and wrote another `-2`, `-3`,
+  … copy, each one shown in the session-start profile digest. Only the
+  per-language pages (`profile/stack/rust.md` and the like) are skipped now.
+  Copies already written stay until they are deleted.
+
+## [2.6.4] - 2026-10-12
+
+### Fixed
+- Fixed Gemini CLI's `run_shell_command` and `read_many_files` tools being
+  classified as unknown, so `[capture] ignore_paths` never checked them and a
+  call reading an ignored file still had its output written to the local hook
+  spool and sent to the server, which then discarded it. `run_shell_command` is
+  now a shell tool, read like `Bash` and resolved from its `dir_path`, and
+  `read_many_files` is a file tool: the call is dropped when any of its
+  `include` globs names or could expand into an ignored path, and glob syntax
+  the matcher cannot evaluate makes it metadata-only. Gemini's
+  `list_directory` and the legacy `search_file_content` name are now search
+  tools, dropped under an active policy like `grep_search` and `glob`. A shell
+  command whose `**` glob could recurse into an ignored directory (zsh, or bash
+  with `globstar`) is now dropped too. A `read_many_files` entry naming a
+  directory above an ignored path (`docs`, `.`), which Gemini reads
+  recursively, is dropped as well. GitHub Copilot CLI's `view`, `create` and
+  `str_replace_editor` are now file tools, checked against `ignore_paths` like
+  `Read` and `Write`. Under an active or invalid policy, tools that read back
+  output of an earlier command (Claude Code `BashOutput`/`TaskOutput`, Codex
+  `write_stdin`, Hermes and OpenClaw `process`, Copilot CLI `read_bash` and
+  `write_bash`) and shell commands using brace expansion or a bracket class
+  are now metadata-only, since the matcher cannot prove they miss an ignored
+  path; upgrade the server before the clients, because an older server drops
+  those events. A script quoted inside a string-form shell command (an
+  `sh -c` argument, a command substitution in double quotes) is now read like
+  the rest of the command line, the path in a git object name (`REV:path`) is
+  checked, Antigravity's `run_command` resolves its arguments from its `Cwd`,
+  and ANSI-C strings and backslash-escaped letters are read the way the shell
+  reads them. Inline interpreter code (`python3 -c`, `node -e` and similar)
+  and further glob syntax the matcher does not evaluate (zsh glob groups,
+  extglobs, encoded escapes) are now metadata-only under an active policy.
+  Line continuations, parameter defaults, values glued to short flags,
+  `file:` URLs, `~+`, PowerShell and cmd escape characters, and shell or
+  interpreter options placed before the script or code are now read too, and
+  more script runners and interpreters are recognized. A path under a
+  directory only the running shell knows (`~-`, `~name`) makes the call
+  metadata-only, and on macOS paths match without regard to case, as its
+  default filesystem does, including non-ASCII letters and decomposed accents.
+  A checkout's `ignore_paths` now also hold for a file, search/list or shell
+  tool call made from another checkout or from an unmarked directory that
+  reaches one of its files, including through glob syntax in a directory
+  name, a search's path or file filter, or the files an `apply_patch` names.
+  Glob directories outside the event's own checkout are followed through the
+  directories on disk within fixed bounds of count and time; past them, or for
+  glob syntax that cannot be followed, the call is metadata-only, and so is a
+  file tool whose target cannot be read. A glob inside the event's own
+  checkout is not walked, so ordinary monorepo commands over many packages
+  (`cat packages/*/package.json`, `du -sh packages/*`) keep their output with
+  or without a marker, and neither are a large brace expansion that cannot
+  leave it (`touch test/file{1..200}.txt`) or the checkout's own subtree under
+  a `**` that starts above it. Each directory's marker is looked up once, so
+  many paths in a deep tree stay within the hook's time budget, and a
+  dotfiles `.git` in the home directory no longer counts as every project's
+  own checkout. A `..` after a `**`, a dot glob that older bash
+  expands to the parent directory (POSIX classes and extglobs included), a
+  brace expansion, a zsh glob group, an ANSI-C escape (also inside a
+  double-quoted `bash -c` or `eval` script), an indented `apply_patch` header
+  and Hermes `search_files`' `file_glob` filter can no longer hide which
+  checkout a call reaches. A broken
+  marker makes a search metadata-only, as it does a file or shell call.
+  Reading back a file a harness saved an earlier tool's output to
+  (Claude Code's saved large results and background task output, OpenCode's
+  and Pi's truncated output files), or a glob that could match one, is
+  metadata-only under an active or invalid policy, like `BashOutput`; an
+  ordinary log glob (`tail -n 50 log/*.log`, `cat /tmp/*.log`) is not taken
+  for one. A `file:` URL's query or fragment is no longer
+  read as part of its path, a parameter default nested deeper than the matcher
+  reads is metadata-only, and a backslash escape inside a default is read. A
+  quoted `~` (`git commit -m "fix ~approx"`) is no longer treated as a home
+  or user directory, so such commands are kept again.
+  In a Windows session, Git Bash, MSYS2 and Cygwin spellings (`/c/...`,
+  `/cygdrive/c/...`), a rooted path without a drive, the `\\?\`, `\\.\` and
+  `\\localhost\C$` prefixes, an alternate data stream suffix and trailing dots
+  or spaces are read as the file they open, so they no longer slip past a
+  pattern. The `cwd`, the marker's directory and an absolute pattern get the
+  same reading, so a session started from `\\?\C:\repo` or
+  `\\localhost\C$\repo` matches its relative patterns again. A bare or
+  double-quoted `\\server\share\...` or `\\?\C:\...` argument keeps both
+  backslashes, as PowerShell and cmd read it, and `/a/x` is also read from the
+  root of the `cwd`'s drive, as a native tool reads it. The generated
+  TypeScript marker reader no longer takes a line inside a multi-line array
+  (`["docs"]`) for a table header. Hermes `execute_code` is metadata-only under an active policy, like
+  `python3 -c`, and a shell command longer than 1 MiB is metadata-only instead
+  of being split. The generated TypeScript integrations now read a dotted
+  `capture.ignore_paths` key and quoted `[capture]` headers, reject the shapes
+  the native hook rejects (an inline `capture = { ... }` table among them),
+  recognize the same file tools (`read_file`, `patch`, `fs_read`, ...), and stop
+  reading a directory at the walk's entry bound. Checking a path of thousands
+  of wildcard segments for a saved output file no longer takes seconds.
+  In a Windows session, a shell argument or `workdir` that is drive-relative
+  (`C:docs\x`) or a device path naming no drive (`\\?\GLOBALROOT\...`) now
+  makes the command metadata-only instead of being skipped, a PowerShell
+  `FileSystem::` provider prefix is read as the path after it, and a Windows
+  marker holding a POSIX absolute pattern (`/c/repo/docs/**`), which matched
+  nothing, is now invalid and fails closed.
+  This applies to the native hook, the server, and the
+  generated TypeScript integrations. (GHSA-gcpc-88hm-3xqr)
+- Fixed `ai-memory backfill`, including the automatic first-boot import, and
+  the `ai-memory run` workstream ledger not applying `[capture] ignore_paths`
+  to the harness transcripts they import, so the arguments and output of a
+  tool call on an ignored file could be stored even though live hooks drop
+  them. Both now apply the same decision as the live hook to every imported
+  tool call and its result: an excluded call is not imported at all, one the
+  policy cannot prove safe keeps only its tool family, and prompts and
+  assistant messages are imported as before, and under allowlist capture
+  mode a checkout without a marker imports nothing. Results recorded without an id
+  linking them to their call take the strictest decision of their turn.
+  A call the transcript names differently from the hook (Codex's shell tool) is
+  judged under the hook's name, each event is judged from the working directory
+  its own record names, and a call or event the live hook would deliver to
+  another checkout is imported only when that checkout would capture it and
+  sends to the same server and project; events recorded in, or calls reaching
+  into, a checkout of another project are left out instead of being filed
+  under the importing project, and so are events from a different
+  subdirectory of the same repository, which the server files under a
+  project of their own. The output of a Claude Code `!` shell command,
+  which live capture never receives, is no longer imported. Claude Code's
+  background-task notifications (a monitored command's output, a finished
+  background command or agent) are no longer imported as prompts, whatever the
+  case or spacing of their opening tag, and its compaction summary is
+  imported as a compaction record instead of a prompt.
+  A tool ai-memory does not recognize, such as an MCP tool, is imported as a
+  record that it ran without its arguments, output or name, which is all live
+  capture stores for it, and so is a result whose call is not in the
+  transcript. (GHSA-gcpc-88hm-3xqr)
+- Fixed a web page open in the operator's browser being able to act on an
+  unauthenticated server (the loopback default, no token), such as claiming a
+  project's pending handoff or starting admin jobs. With auth off, the machine
+  and admin routes now refuse browser requests that come from another site or
+  that are not script calls from a page, such as links and images; hooks, the
+  CLI, MCP clients and the built-in web UI are unaffected, and servers with a
+  bearer token are unchanged. Images in wiki pages rendered by the web UI are
+  also limited to relative paths that stay inside the UI. When an
+  unauthenticated server is reached through a non-loopback host name in its
+  allowlist (a LAN address or name, or `host.docker.internal`), where browsers
+  do not send the request metadata the check relies on, the session-start
+  handoff fetch now also requires an `X-AI-Memory-Client` header that every
+  ai-memory hook, CLI command and generated integration sends; the same holds
+  for a request that arrives through a forwarding proxy or CDN (any of the
+  common forwarding headers, including `CF-Connecting-IP`, `True-Client-IP`
+  and `X-Forwarded-Proto`), even one that rewrites
+  the host to the loopback address. Hooks on such a
+  server must be re-staged with `ai-memory install-hooks` (or
+  `ai-memory upgrade`); loopback installs need nothing.
+  (GHSA-6mc4-46pr-w82w)
+- Fixed `POST /auth/login` and `POST /auth/recovery` accepting request bodies
+  that are not declared as JSON, which a page on another site could use to
+  sign the operator's browser in or to try passwords when human sign-in is
+  enabled. Both routes now answer 415 unless the body is `application/json`;
+  the built-in login page and the documented `curl` recovery already send
+  that. (GHSA-6mc4-46pr-w82w)
+- Fixed the web UI allowing other sites to frame it. With auth off, a page
+  that framed `/web/pending` could trick a click on Approve or Reject, since
+  the framed page's own requests are same-origin. Every web page and API
+  response now sends `X-Frame-Options: DENY` and
+  `Content-Security-Policy: frame-ancestors 'none'`. (GHSA-6mc4-46pr-w82w)
 - Fixed the cross-project profile harvester treating pages the auto-improve
   scheduler auto-approved as curated human input: model output nobody
   reviewed fed the profile like a hand-written rule. A page stamped from an
@@ -230,15 +630,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or page by a name that two projects answer to. The page and project routes
   now return a 400 that names the clash, matching the API and MCP surfaces.
   (#1204)
-- Fixed SessionEnd consolidation repeating the same expensive prompt on the
-  durable queue when the structured LLM response fails deterministically: a
-  truncated or empty response, malformed JSON, or an unexpected response
-  shape now ends the queue on the first attempt, keeping the heuristic page
-  the hook already wrote; pre-send connection and capacity (`503`) failures
-  retain the bounded backoff. (#1131)
-- Fixed structured LLM responses stopped at the output budget
-  (`finish_reason = "length"`) or returned without usable content: they now
-  fail with redacted terminal errors, without copying the response. (#1130)
 - Fixed the Jev choice reranker adapter silently fabricating scores from a
   malformed judge response: `docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`
   defaulted missing or misnamed `probabilities` entries to `0.0`, so an HTTP
@@ -261,7 +652,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[capture] ignore_paths` would drop the event, so an exclusion that names a
   path outside its checkout, or a source file read by a command whose
   `workdir` points at another project, is no longer judged only by the
-  destination's policy. (#1199)
+  destination's policy. When the payload `cwd`'s own capture policy is
+  invalid, an event aimed at another repository is no longer rerouted; it
+  stays with that source repository as metadata only. (#1199)
 
 - `scope_refusal` (the hooks-side mirror of the web surfaces
   `refusal_response` mapped in #1204) now answers `404 Not Found`
@@ -9018,7 +9411,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...HEAD
+[2.6.5]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...v2.6.5
+[2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/akitaonrails/ai-memory/compare/v2.6.1...v2.6.2
 [2.6.1]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...v2.6.1

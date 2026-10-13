@@ -38,13 +38,23 @@ rather than either alone.
 ## 2. How the original research subjects evolved
 
 **agentmemory (rohitg00)** is actively maintained and maturing along the
-trajectory the May report predicted. Notable since then: a real-workload
-benchmark ("coding-agent-life-v1", 635 requests / 888K tokens / 35 hours,
-R@5 = 0.967 for the hybrid retriever), `AGENT_ID` multi-agent isolation
-with an opt-in isolated recall scope, and runtime cost warnings when a
-premium model is configured for compression. Still on the iii-engine +
-JSON-in-KV substrate the May report identified as its structural
-constraint. The 53-tool surface did not shrink.
+trajectory the May report predicted. Notable since then: an in-house
+benchmark, "coding-agent-life-v1" (15 sessions and 15 queries; hybrid R@5
+1.000 after a 2026-06-03 correction, grep 0.967), `AGENT_ID` multi-agent
+isolation with an opt-in isolated recall scope, and runtime cost warnings
+when a premium model is configured for compression. Its LongMemEval-S figure
+is still 95.2% `recall_any@5`, measured on whole raw sessions in a component
+harness with the reranker disabled; a 2026-10-09 baseline adds a stricter
+metric and archived receipts. Still on the iii-engine + JSON-in-KV
+substrate the May report identified as its structural constraint, now with
+an opt-in Redis backend, vectors kept in buckets with a pending log, and the
+BM25 index rebuilt at every boot. The tool surface grew from 53 to 54, and
+all 54 are now visible by default. Version 0.9.30 (2026-10-06) turned auth
+on by default with a generated secret and added a durable capture inbox
+with an offline hook spool. (Corrected 2026-10-10: this entry used to give
+the benchmark as 635 requests / 888K tokens / 35 hours with hybrid R@5 =
+0.967. Those workload figures could not be found in agentmemory's
+repository, and 0.967 is now the grep baseline.)
 
 **basic-memory** is alive, with the same positioning (structured markdown both
 humans and LLMs edit; local files). No architectural surprises. Its
@@ -166,7 +176,7 @@ rewrite of cold clusters that is **off by default and never deletes a
 source**. We designed *against* Hindsight's own documented failure,
 belief *entrenchment* (raw proof-count pins a wrong page), with
 breadth-not-count weighting, a confidence cap, and supersession always
-winning over evidence. Honest caveat: no R2 delta has been run, so this is
+winning over evidence. Honest caveat: no R2 delta has shown a gain yet, so this is
 parity of *mechanism*, not a measured accuracy win. Full analysis in
 [`research-hindsight.md`](research-hindsight.md).
 
@@ -437,7 +447,7 @@ research). This is a healthy, crowded, fast-moving field: "we picked a dead
 space" is not a claim we can make, and none of these can be dismissed as
 unmaintained. (The five issue-#810 new-entrant rows, TencentDB Agent Memory,
 memU, EverOS, Engram and Caura, were verified against the GitHub metadata endpoint
-on 2026-09-22.)
+on 2026-09-22, and the agentmemory row was re-checked on 2026-10-10.)
 
 | Project | Stars (~) | Last commit | Latest release | Status |
 |---|---|---|---|---|
@@ -446,7 +456,7 @@ on 2026-09-22.)
 | Zep/Graphiti | 31.0k | 2026-09-17 | v0.30.2 (2026-09-08) | ACTIVE |
 | Cognee | 30.8k | 2026-09-18 | v1.5.4rc1 (2026-09-15) | ACTIVE |
 | Supermemory | 30.1k | 2026-09-18 | server-v0.0.8 (2026-08-17) | ACTIVE |
-| agentmemory | 28.6k | 2026-09-14 | v0.9.29 (2026-08-16) | ACTIVE |
+| agentmemory | 29.3k | 2026-10-10 | v0.9.30 (2026-10-06) | ACTIVE |
 | TencentDB Agent Memory | 27.2k | 2026-09-22 | v2.0.1 (2026-08-25) | ACTIVE |
 | Letta | 24.8k | 2026-09-10 | 0.16.8 (2026-05-14) | ACTIVE (releases lag code) |
 | Hindsight | 23.9k | 2026-09-18 | v0.10.0 (2026-09-14) | ACTIVE |
@@ -554,8 +564,8 @@ accuracy, agentmemory/mcp-memory-service quote R@5; pick one and state
 it) so our result is comparable, not just present. **Now load-bearing on
 2.4:** the two aging features that can move quality, belief-strength folded
 into ranking (#815) and the LLM "dream" pass (#816), ship **off by default
-and gated on this harness before they may default on**; no R2 delta has been
-run yet, so both remain opt-in and unproven (see
+and gated on this harness before they may default on**; no R2 delta has
+shown a gain yet, so both remain opt-in and unproven (see
 [`design-memory-aging.md`](design-memory-aging.md) R2 acceptance).
 
 **R3: Typed relation edges (small-medium).** `causes` / `fixes` /
@@ -661,7 +671,15 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
   sharing"; document360.com and mindstudio.ai explainers (spec v0.1,
   2026-06-12).
 - agentmemory: github.com/rohitg00/agentmemory (README, CHANGELOG,
-  docs/benchmarks/2026-05-20-coding-agent-life-v1.md).
+  docs/benchmarks/2026-05-20-coding-agent-life-v1.md). Re-checked
+  2026-10-10 at commit `7ee1628`: README, CHANGELOG (0.9.27–0.9.30),
+  `benchmark/longmemeval-bench.ts` and `benchmark/LONGMEMEVAL.md` (whole
+  sessions, `rerankEnabled=false`), `docs/benchmarks/2026-10-09-evaluation-baseline.md`,
+  `eval/README.md` and `eval/runner/adapters/`, `src/state/hybrid-search.ts`
+  and `src/state/reranker.ts` (reranker opt-in via `RERANK_ENABLED`),
+  `src/mcp/tools-registry.ts` (54 tools), the git history of the
+  coding-agent-life-v1 report (correction in `e5c9dc6`), and the GitHub
+  repository and release metadata.
 - mcp-memory-service: github.com/doobidoo/mcp-memory-service (README,
   Wiki, v11.10.0 release notes, issue #27).
 - mempalace: github.com/MemPalace/mempalace (BENCHMARKS.md, issue #29);

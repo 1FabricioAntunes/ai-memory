@@ -18,6 +18,10 @@
 //!
 //! It never opens the store directly; the server remains the source of truth
 //! for the captured side, and the local side is read-only.
+//!
+//! It also reports configuration agentmemory left behind (an MCP server entry
+//! or a guideline block in a rules file) with the line to fix by hand; see
+//! [`super::agentmemory_residue`]. That check only reads.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -163,6 +167,9 @@ struct DoctorReport {
     marker_capture_problem: Option<MarkerCaptureProblem>,
     capture_owner_active: bool,
     identity: Option<OperatorIdentity>,
+    /// From `identity.level`: `anonymous` only when the server has no bearer
+    /// configured. `None` when the identity was unavailable.
+    auth_posture: Option<crate::local_auth::AuthPosture>,
     project_coordinate: Option<ProjectCoordinateReport>,
     /// Native "memory" stores found for harnesses that keep one, and whether
     /// the nearest marker would exclude a read of them (harness-issue
@@ -179,6 +186,9 @@ struct DoctorReport {
     /// itself. `None` when no ai-memory Codex hook is installed or Codex could
     /// not be asked.
     codex_hooks: Option<super::codex_hook_trust::CodexHookTrust>,
+    /// agentmemory MCP entries and rules-file guideline blocks still present
+    /// after a migration. Detected only; never changed.
+    agentmemory_residue: Vec<super::agentmemory_residue::ResidueFinding>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,6 +280,24 @@ pub(crate) fn relocated_session_dir(harness: ManagedHarness) -> Option<PathBuf> 
     build_launch_plan(harness, None, Vec::new(), None)
         .ok()
         .and_then(|plan| plan.session_dir)
+}
+
+/// [`relocated_session_dir`] reading the relocation variables through `env`,
+/// for `setup`, which reads the environment `Config::load` captured.
+pub(crate) fn relocated_session_dir_with(
+    harness: ManagedHarness,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    ai_memory_workstream::build_launch_plan_with_env_lookup(
+        harness,
+        None,
+        Vec::new(),
+        None,
+        |name: &str| env(name),
+        None,
+    )
+    .ok()
+    .and_then(|plan| plan.session_dir)
 }
 
 /// Harnesses whose native "memory" store location is known, so `doctor` can
@@ -574,8 +602,21 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
 
     let native_memory = native_memory_reports(&home, &cwd);
     let codex_hooks = codex_hook_trust(&cwd).await;
+    let repo_root =
+        ai_memory_consolidate::discover_main_repo_root(&cwd).unwrap_or_else(|_| cwd.clone());
+    let agentmemory_residue = super::agentmemory_residue::scan(
+        &home,
+        &repo_root,
+        &super::agentmemory_residue::mcp_config_candidates(&repo_root, &|name| {
+            std::env::var_os(name)
+        }),
+    );
 
+    let auth_posture = identity.as_ref().map(|identity| {
+        crate::local_auth::AuthPosture::classify(identity.level == "anonymous", &ep.url)
+    });
     let report = DoctorReport {
+        auth_posture,
         workspace,
         project,
         server: ep.url.clone(),
@@ -591,6 +632,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         spool,
         server_unreachable,
         codex_hooks,
+        agentmemory_residue,
     };
 
     if args.json {
@@ -742,6 +784,9 @@ fn render_human(report: &DoctorReport) {
     } else {
         println!("  identity: unavailable");
     }
+    if let Some(posture) = report.auth_posture {
+        println!("  auth: {}", posture.line());
+    }
     if report.capture_owner_active {
         println!(
             "  AI_MEMORY_CAPTURE_OWNER is active: native capture is suppressed in this process.\n  \
@@ -755,6 +800,10 @@ fn render_human(report: &DoctorReport) {
         println!("  capture coverage: unavailable ({})", problem.reason);
     }
     print!("{}", render_capture_health(report));
+    print!(
+        "{}",
+        super::agentmemory_residue::render(&report.agentmemory_residue)
+    );
     if report.since_days == 0 {
         println!("  recent window: all on-disk sessions\n");
     } else {
@@ -874,11 +923,13 @@ mod tests {
             marker_capture_problem: None,
             capture_owner_active: false,
             identity: None,
+            auth_posture: None,
             project_coordinate: None,
             native_memory: Vec::new(),
             spool,
             server_unreachable,
             codex_hooks,
+            agentmemory_residue: Vec::new(),
         }
     }
 

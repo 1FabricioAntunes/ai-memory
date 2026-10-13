@@ -46,8 +46,10 @@ audits published numbers (mempalace). We publish none until this exists.
   HuggingFace (`xiaowu0162/longmemeval-v2`) with an official harness,
   but its trajectories are WebArena/ServiceNow-style *web-agent*
   histories, not coding sessions. The numbers competitors publish
-  (agentmemory 0.967 R@5, mcp-memory-service 0.804/0.860) are against
-  **v1** chat histories. Therefore: target **v1 (S variant) for
+  (agentmemory 95.2% R@5, mcp-memory-service 0.804/0.860) are against
+  **v1** chat histories. (Corrected 2026-10-12: this line used to say
+  agentmemory 0.967, which is the grep baseline on its in-house
+  coding-agent-life-v1 corpus, not a LongMemEval number.) Therefore: target **v1 (S variant) for
   cross-project comparability**, and adopt **V2's five-ability taxonomy**
   (static state recall, dynamic state tracking, workflow knowledge,
   environment gotchas, premise awareness) as the rubric for a

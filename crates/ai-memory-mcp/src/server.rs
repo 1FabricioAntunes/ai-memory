@@ -510,22 +510,25 @@ pub struct AiMemoryServer {
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
-    /// Optional post-RRF reranker. When `None`, `memory_query` returns
-    /// fused, authority-adjusted order and stays on the zero-LLM path.
-    reranker: Option<Arc<dyn ai_memory_llm::Reranker>>,
+    /// Optional post-RRF reranker behind its concurrency gate, shared with
+    /// the web search so cloned request handlers and both surfaces together
+    /// cannot create an unbounded number of billable provider calls. When
+    /// `None`, `memory_query` returns fused, authority-adjusted order and
+    /// stays on the zero-LLM path.
+    rerank: Option<ai_memory_llm::RerankStage>,
     /// Per-client MCP tool-call counters, buffered in memory and folded
     /// into `client_activity` at most once per flush interval so a query
     /// burst costs the writer one tiny upsert batch, not one write per
     /// call (same reasoning as the M8 access-bump throttle).
     client_activity: Arc<std::sync::Mutex<ClientActivityBuffer>>,
+    /// Content-free process counters read by `GET /admin/metrics`: the
+    /// `memory_query` latency histogram and read/write tool-call totals.
+    mcp_metrics: Arc<crate::McpMetrics>,
     /// Shared "last client activity" clock (microseconds), bumped on every tool
     /// call. The B3 dream scheduler reads it to detect idle and to cancel a
     /// running pass the moment the operator returns — consolidation must never
     /// contend with live work.
     activity_clock: ai_memory_consolidate::ActivityClock,
-    /// Shared across cloned request handlers so concurrent searches cannot
-    /// create an unbounded number of billable provider calls.
-    rerank_gate: Arc<tokio::sync::Semaphore>,
     /// Privacy strip. Applied to agent-supplied handoff fields in
     /// `memory_handoff_begin` (handoffs bypass `Wiki::write_page` so
     /// the wiki-level scrub doesn't cover them).
@@ -654,9 +657,10 @@ struct QueryArgs {
     #[serde(default)]
     pin_first: Option<bool>,
     /// Attach `score_details` to project/scopes hits: per-stream ranks
-    /// (FTS5, entity, vector, graph), raw scores, and RRF contributions, plus a
-    /// top-level `streams_active` list. A `global=true` query uses a
-    /// different FTS-only ranker, so it reports only `streams_active`.
+    /// (FTS5, entity, vector, graph, observation), raw scores, and RRF
+    /// contributions, plus top-level `streams_active` and per-stream
+    /// `timings` (milliseconds). A `global=true` query uses a different
+    /// FTS-only ranker, so it reports only `streams_active` and its FTS time.
     /// Default false.
     #[serde(default)]
     explain: Option<bool>,
@@ -787,11 +791,50 @@ impl From<ai_memory_store::PageHit> for QueryHit {
 #[derive(Clone, Copy)]
 struct ProjectSearchOptions<'a> {
     query: &'a str,
-    query_vec: Option<&'a [f32]>,
+    query_vec: Option<&'a ai_memory_llm::QueryVector>,
     limit: usize,
     include_expired: bool,
     explain: bool,
     include_superseded: bool,
+}
+
+/// Borrow an embedded query as the store's vector-stream input.
+fn vector_query(qv: &ai_memory_llm::QueryVector) -> ai_memory_store::VectorQuery<'_> {
+    ai_memory_store::VectorQuery {
+        vector: &qv.vector,
+        provider: &qv.provider,
+        model: &qv.model,
+        dim: qv.dim,
+    }
+}
+
+/// Rerank fused page hits through `stage`, recording each judged hit's
+/// relevance in its explain details.
+async fn rerank_page_hits(
+    stage: &ai_memory_llm::RerankStage,
+    query: &str,
+    hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+    limit: usize,
+    timeout: std::time::Duration,
+) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+    stage
+        .apply(
+            query,
+            hits,
+            limit,
+            timeout,
+            |(hit, _)| ai_memory_llm::RerankCandidate {
+                id: hit.id.to_string(),
+                title: hit.title.clone(),
+                snippet: hit.snippet.clone(),
+            },
+            |(_, explain), relevance| {
+                if let Some(explain) = explain.as_mut() {
+                    explain.rerank_score = Some(relevance);
+                }
+            },
+        )
+        .await
 }
 
 /// Synthesized "dialectic" answer attached to a `memory_query` response when
@@ -848,10 +891,19 @@ struct MemoryQueryResponse {
     /// Present only when `explain=true`: which retrieval streams ran for
     /// the primary search. Project/scopes retrieval always runs `fts` and
     /// `entity`, and `graph`; `vector` is present only when an embedder
-    /// produced a query vector. Cross-project `global=true` retrieval is FTS-only.
+    /// produced a query vector, and `observation` while `[retrieval]
+    /// observation_stream` is on (the default). Cross-project `global=true`
+    /// retrieval is FTS-only.
     /// An `as_of` query runs `entity` plus version-filtered `fts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     streams_active: Option<Vec<&'static str>>,
+    /// Present only when `explain=true`: wall time per retrieval stream for
+    /// the primary search (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`,
+    /// `observation_ms`, `rerank_ms`), summed over `scopes`; a stream that
+    /// did not run is omitted. `global=true` reports `fts_ms` only. Not
+    /// measured at all without `explain`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<ai_memory_store::StreamTimings>,
 }
 
 /// Response for `memory_recent`. `hits` carries the current project's recent
@@ -893,20 +945,6 @@ struct AnsweredScope {
     /// `default_after_mismatch`.
     resolved_by: &'static str,
 }
-
-/// How many extra candidates to fetch for the reranker to reorder. The
-/// point of reranking is promoting a hit RRF put below the cut, so the
-/// candidate pool has to be deeper than the caller's limit.
-const RERANK_OVERFETCH: usize = 3;
-/// Hard cap on rerank candidates, whatever `limit * RERANK_OVERFETCH`
-/// works out to — bounds both prompt size and latency.
-const RERANK_MAX_CANDIDATES: usize = 30;
-/// Maximum number of provider-backed rerank calls executing concurrently.
-/// Saturated requests keep the locally computed order without waiting.
-const RERANK_MAX_IN_FLIGHT: usize = 4;
-/// Wall-clock budget for one rerank call. Past this, `memory_query`
-/// answers from the adjusted pre-rerank order instead of waiting.
-const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Microseconds in one UTC day, for `client_activity` bucketing.
 const US_PER_DAY: i64 = 86_400_000_000;
@@ -1793,12 +1831,12 @@ impl AiMemoryServer {
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             embedder: None,
-            reranker: None,
+            rerank: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
+            mcp_metrics: Arc::new(crate::McpMetrics::default()),
             activity_clock: ai_memory_consolidate::ActivityClock::new(
                 jiff::Timestamp::now().as_microsecond(),
             ),
-            rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
@@ -2350,97 +2388,60 @@ impl AiMemoryServer {
         ))
     }
 
-    async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
-        let Some(embedder) = &self.embedder else {
-            return None;
-        };
-        // `embed_query`, not `embed`: an asymmetric embedder (configured
-        // query/document prefixes, or Google's RETRIEVAL_QUERY task type)
-        // must see this text on the query side, not the document side.
-        match embedder.embed_query(query).await {
-            Ok(qv) => Some(qv),
-            Err(e) => {
-                tracing::warn!(
-                    provider = embedder.provider(),
-                    model = embedder.model(),
-                    error = %e,
-                    "embedder failed; degrading memory_query to FTS5 + entity + graph"
-                );
-                None
-            }
-        }
+    async fn embed_query(&self, query: &str) -> Option<ai_memory_llm::QueryVector> {
+        let embedder = self.embedder.as_ref()?;
+        ai_memory_llm::embed_search_query(embedder.as_ref(), query).await
     }
 
+    /// One project's fused hits, plus per-stream timings when
+    /// `options.explain` asked for them.
     async fn search_project(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>> {
+    ) -> ai_memory_store::StoreResult<(
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Option<ai_memory_store::StreamTimings>,
+    )> {
+        self.search_scopes(&[(workspace_id, project_id)], options)
+            .await
+    }
+
+    /// Fused hits over `scopes` through the shared hybrid ranker
+    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes`]), the same call
+    /// the web search makes.
+    async fn search_scopes(
+        &self,
+        scopes: &[(WorkspaceId, ProjectId)],
+        options: ProjectSearchOptions<'_>,
+    ) -> ai_memory_store::StoreResult<(
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Option<ai_memory_store::StreamTimings>,
+    )> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = options.include_expired.then_some(i64::MIN);
-        // Provider/model/dim only select which stored vectors are
-        // eligible; with no query vector the vector stream never runs,
-        // so the empty triple is inert rather than a fake identity.
-        let (provider, model, dim) = match (&self.embedder, options.query_vec) {
-            // Not `.model()`: eligible stored vectors are keyed by the
-            // DOCUMENT identity they were embedded under, which a
-            // configured document prefix folds in. See
-            // `Embedder::model_identity`.
-            (Some(e), Some(_)) => (e.provider().to_string(), e.model_identity(), e.dim()),
-            _ => (String::new(), String::new(), 0),
-        };
-        let fused: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = if options.explain {
-            self.reader
-                .hybrid_search_explained(
-                    workspace_id,
-                    project_id,
-                    options.query.to_owned(),
-                    options.query_vec.map(<[f32]>::to_vec),
-                    provider,
-                    model,
-                    dim,
-                    options.limit,
-                    expiry_cutoff,
-                    options.include_superseded,
-                )
-                .await?
-                .into_iter()
-                .map(|(hit, details)| (hit, Some(details)))
-                .collect()
-        } else {
-            self.reader
-                .hybrid_search(
-                    workspace_id,
-                    project_id,
-                    options.query.to_owned(),
-                    options.query_vec.map(<[f32]>::to_vec),
-                    provider,
-                    model,
-                    dim,
-                    options.limit,
-                    expiry_cutoff,
-                    options.include_superseded,
-                )
-                .await?
-                .into_iter()
-                .map(|hit| (hit, None))
-                .collect()
-        };
-        Ok(fused)
+        self.reader
+            .hybrid_search_scopes(
+                scopes,
+                ai_memory_store::HybridSearch {
+                    query: options.query,
+                    vector: options.query_vec.map(vector_query),
+                    limit: options.limit,
+                    expiry_cutoff_us: expiry_cutoff,
+                    include_superseded: options.include_superseded,
+                    explain: options.explain,
+                },
+            )
+            .await
     }
 
     fn rerank_fetch_limit(&self, limit: usize) -> usize {
-        if self.reranker.is_none() {
-            return limit;
-        }
-        limit.max(
-            limit
-                .saturating_mul(RERANK_OVERFETCH)
-                .min(RERANK_MAX_CANDIDATES),
-        )
+        self.rerank
+            .as_ref()
+            .map_or(limit, |stage| stage.fetch_limit(limit))
     }
 
     async fn rerank_hits(
@@ -2449,7 +2450,7 @@ impl AiMemoryServer {
         hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
         limit: usize,
     ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
-        self.rerank_hits_with_timeout(query, hits, limit, RERANK_TIMEOUT)
+        self.rerank_hits_with_timeout(query, hits, limit, ai_memory_llm::reranker::RERANK_TIMEOUT)
             .await
     }
 
@@ -2460,124 +2461,40 @@ impl AiMemoryServer {
         limit: usize,
         timeout: std::time::Duration,
     ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
-        let Some(reranker) = &self.reranker else {
+        let Some(stage) = &self.rerank else {
             hits.truncate(limit);
             return hits;
         };
-        let candidate_count = hits.len().min(RERANK_MAX_CANDIDATES);
-        if candidate_count < 2 {
-            hits.truncate(limit);
-            return hits;
-        }
-        let Ok(_permit) = self.rerank_gate.clone().try_acquire_owned() else {
-            tracing::debug!(
-                reranker = reranker.name(),
-                model = reranker.model(),
-                max_in_flight = RERANK_MAX_IN_FLIGHT,
-                "reranker concurrency limit reached; keeping pre-rerank order"
-            );
-            hits.truncate(limit);
-            return hits;
-        };
-        let candidates: Vec<ai_memory_llm::RerankCandidate> = hits
-            .iter()
-            .take(candidate_count)
-            .map(|(hit, _)| ai_memory_llm::RerankCandidate {
-                id: hit.id.to_string(),
-                title: hit.title.clone(),
-                snippet: hit.snippet.clone(),
-            })
-            .collect();
-        let scored = match tokio::time::timeout(timeout, reranker.rerank(query, &candidates)).await
-        {
-            Ok(Ok(scores)) => scores,
-            Ok(Err(e)) => {
-                // Redacted fields only: the `Display` of a provider failure
-                // carries the upstream response body.
-                tracing::warn!(
-                    reranker = reranker.name(),
-                    model = reranker.model(),
-                    error_class = %e.class(),
-                    error_status = ?e.http_status(),
-                    "reranker failed; keeping pre-rerank order"
-                );
-                hits.truncate(limit);
-                return hits;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    reranker = reranker.name(),
-                    model = reranker.model(),
-                    timeout_secs = timeout.as_secs_f64(),
-                    "reranker timed out; keeping pre-rerank order"
-                );
-                hits.truncate(limit);
-                return hits;
-            }
-        };
-        let candidate_index: HashMap<&str, usize> = candidates
-            .iter()
-            .enumerate()
-            .map(|(idx, candidate)| (candidate.id.as_str(), idx))
-            .collect();
-        let mut relevance = vec![None; candidates.len()];
-        let mut invalid = scored.len() != candidates.len();
-        for score in &scored {
-            let Some(&idx) = candidate_index.get(score.id.as_str()) else {
-                invalid = true;
-                continue;
-            };
-            if !score.relevance.is_finite()
-                || !(0.0..=1.0).contains(&score.relevance)
-                || relevance[idx].replace(score.relevance).is_some()
-            {
-                invalid = true;
-            }
-        }
-        if invalid || relevance.iter().any(Option::is_none) {
-            tracing::warn!(
-                reranker = reranker.name(),
-                model = reranker.model(),
-                scored = scored.len(),
-                candidates = candidates.len(),
-                "reranker returned incomplete or invalid scores; keeping pre-rerank order"
-            );
-            hits.truncate(limit);
-            return hits;
-        }
-        let relevance: Vec<f32> = relevance
-            .into_iter()
-            .map(Option::unwrap_or_default)
-            .collect();
+        rerank_page_hits(stage, query, hits, limit, timeout).await
+    }
 
-        let tail = hits.split_off(candidate_count);
-        let mut indexed: Vec<(usize, (PageHit, Option<ai_memory_store::SearchExplain>))> =
-            hits.into_iter().enumerate().collect();
-        indexed.sort_by(|a, b| {
-            relevance[b.0]
-                .total_cmp(&relevance[a.0])
-                .then(a.0.cmp(&b.0))
-        });
-        let mut out: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = indexed
-            .into_iter()
-            .map(|(idx, mut entry)| {
-                if let Some(explain) = entry.1.as_mut() {
-                    explain.rerank_score = Some(relevance[idx]);
-                }
-                entry
-            })
-            .collect();
-        out.extend(tail);
-        out.truncate(limit);
-        out
+    /// The process counters this server records into. `serve` hands the same
+    /// instance to the admin router so `GET /admin/metrics` reads them.
+    #[must_use]
+    pub fn mcp_metrics(&self) -> Arc<crate::McpMetrics> {
+        Arc::clone(&self.mcp_metrics)
     }
 
     /// Attach a reranker. Without one, `memory_query` keeps its
     /// RRF-only, zero-LLM behaviour.
     #[must_use]
-    pub fn with_reranker(mut self, reranker: Arc<dyn ai_memory_llm::Reranker>) -> Self {
-        self.reranker = Some(reranker);
+    pub fn with_reranker(self, reranker: Arc<dyn ai_memory_llm::Reranker>) -> Self {
+        self.with_rerank_stage(ai_memory_llm::RerankStage::new(reranker))
+    }
+
+    /// Attach a rerank stage built elsewhere, sharing its concurrency gate
+    /// (`serve` hands the same stage to the web search).
+    #[must_use]
+    pub fn with_rerank_stage(mut self, stage: ai_memory_llm::RerankStage) -> Self {
+        self.rerank = Some(stage);
         self
+    }
+
+    /// The configured rerank stage, if any, so another search surface can
+    /// share its reranker and concurrency gate.
+    #[must_use]
+    pub fn rerank_stage(&self) -> Option<ai_memory_llm::RerankStage> {
+        self.rerank.clone()
     }
 
     /// Attach a bare LLM provider so `memory_query(answer=true)` can synthesize
@@ -2693,7 +2610,8 @@ impl AiMemoryServer {
         score (lower rank = better match). Only latest page versions. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
-        project/scopes hits; it also returns `streams_active`. \
+        project/scopes hits; it also returns `streams_active` and per-stream \
+        `timings` in milliseconds. \
         Cross-project `global=true` search is FTS-only and therefore reports \
         `streams_active` without per-hit RRF details. \
         If compiled wiki search misses in default/project/`scopes` mode, \
@@ -2714,6 +2632,8 @@ impl AiMemoryServer {
         Parameters(args): Parameters<QueryArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        // Dropped on every return path, so errors are timed too.
+        let _latency = self.mcp_metrics.query_latency().start();
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
@@ -2745,6 +2665,7 @@ impl AiMemoryServer {
                     None,
                 ));
             }
+            let fts_started = explain.then(std::time::Instant::now);
             let global_hits = self
                 .reader
                 .search_pages_with_meta(
@@ -2755,6 +2676,10 @@ impl AiMemoryServer {
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let timings = fts_started.map(|started| ai_memory_store::StreamTimings {
+                fts_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
+                ..Default::default()
+            });
             return ok_json(&MemoryQueryResponse {
                 hits: Vec::new(),
                 answer: None,
@@ -2766,6 +2691,7 @@ impl AiMemoryServer {
                 global_hits,
                 global_scope_hits: Vec::new(),
                 streams_active: explain.then(|| vec!["fts"]),
+                timings,
             });
         }
         if !args.scopes.is_empty()
@@ -2835,6 +2761,8 @@ impl AiMemoryServer {
                 global_hits: Vec::new(),
                 global_scope_hits: Vec::new(),
                 streams_active: explain.then(|| vec!["entity", "fts"]),
+                // Time travel fuses inside one store call; no per-stream split.
+                timings: None,
             });
         }
 
@@ -2849,47 +2777,19 @@ impl AiMemoryServer {
                     .await?,
             )
         };
+        // Explain-only: per-stream timings of the primary search, summed over
+        // `scopes`. `None` on the normal path, which reads no clocks for it.
+        let mut timings: Option<ai_memory_store::StreamTimings> = None;
+        let options = ProjectSearchOptions {
+            query: &args.query,
+            query_vec: query_vec.as_ref(),
+            limit: candidate_limit,
+            include_expired,
+            explain,
+            include_superseded,
+        };
         let hits = if let Some(scopes) = &resolved_scopes {
-            let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
-                HashMap::new();
-            for &(ws, proj) in scopes {
-                let hits = self
-                    .search_project(
-                        ws,
-                        proj,
-                        ProjectSearchOptions {
-                            query: &args.query,
-                            query_vec: query_vec.as_deref(),
-                            limit: candidate_limit,
-                            include_expired,
-                            explain,
-                            include_superseded,
-                        },
-                    )
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                for hit in hits {
-                    hits_by_id
-                        .entry(hit.0.id)
-                        .and_modify(|existing| {
-                            if hit.0.rank < existing.0.rank {
-                                *existing = hit.clone();
-                            }
-                        })
-                        .or_insert(hit);
-                }
-            }
-            let mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> =
-                hits_by_id.into_values().collect();
-            hits.sort_by(|a, b| {
-                a.0.rank
-                    .partial_cmp(&b.0.rank)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
-                    .then_with(|| a.0.id.as_bytes().cmp(b.0.id.as_bytes()))
-            });
-            hits.truncate(candidate_limit);
-            Ok(hits)
+            self.search_scopes(scopes, options).await
         } else {
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
@@ -2899,22 +2799,18 @@ impl AiMemoryServer {
                     Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
-            self.search_project(
-                ws,
-                proj,
-                ProjectSearchOptions {
-                    query: &args.query,
-                    query_vec: query_vec.as_deref(),
-                    limit: candidate_limit,
-                    include_expired,
-                    explain,
-                    include_superseded,
-                },
-            )
-            .await
-        };
+            self.search_project(ws, proj, options).await
+        }
+        .map(|(hits, search_timings)| {
+            timings = search_timings;
+            hits
+        });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let rerank_started = (explain && self.rerank.is_some()).then(std::time::Instant::now);
         let hits = self.rerank_hits(&args.query, hits, limit).await;
+        if let (Some(timings), Some(started)) = (timings.as_mut(), rerank_started) {
+            timings.rerank_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
         let bump_actor = Self::bump_actor_from_parts(&parts);
         self.spawn_access_bump(
             hits.iter().map(|(h, _)| h.id).collect(),
@@ -2992,13 +2888,13 @@ impl AiMemoryServer {
                     if current == scope.as_tuple() {
                         Vec::new()
                     } else {
-                        let hits = self
+                        let (hits, _) = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
                                 ProjectSearchOptions {
                                     query: &args.query,
-                                    query_vec: query_vec.as_deref(),
+                                    query_vec: query_vec.as_ref(),
                                     limit,
                                     include_expired,
                                     explain,
@@ -3061,13 +2957,13 @@ impl AiMemoryServer {
                     .await
                 {
                     Ok(Some(scope)) if scope.as_tuple() != current => {
-                        let hits = self
+                        let (hits, _) = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
                                 ProjectSearchOptions {
                                     query: &args.query,
-                                    query_vec: query_vec.as_deref(),
+                                    query_vec: query_vec.as_ref(),
                                     limit,
                                     include_expired,
                                     explain,
@@ -3092,17 +2988,7 @@ impl AiMemoryServer {
                 }
             }
         }
-        let streams_active = explain.then(|| {
-            let mut streams = vec!["fts", "entity"];
-            if query_vec.is_some() {
-                streams.push("vector");
-                if self.reader.retrieval_tuning().abstract_vectors {
-                    streams.push("abstract");
-                }
-            }
-            streams.push("graph");
-            streams
-        });
+        let streams_active = explain.then(|| self.reader.active_streams(query_vec.is_some()));
         let hits: Vec<QueryHit> = hits
             .into_iter()
             .map(|(hit, score_details)| QueryHit {
@@ -3214,6 +3100,7 @@ impl AiMemoryServer {
             global_hits: Vec::new(),
             global_scope_hits,
             streams_active,
+            timings,
         };
         ok_json(&response)
     }
@@ -6927,6 +6814,7 @@ impl AiMemoryServer {
         self.activity_clock.mark(now_us);
         let day = now_us.div_euclid(US_PER_DAY);
         let is_write = tool_call_is_write(tool);
+        self.mcp_metrics.record_tool_call(is_write);
         let schedule_flush = {
             let mut buffer = self
                 .client_activity
@@ -7503,7 +7391,7 @@ mod tests {
         let query_vec = server.embed_query("anything").await;
 
         assert_eq!(
-            query_vec.as_deref(),
+            query_vec.as_ref().map(|qv| qv.vector.as_slice()),
             Some([0.0_f32, 1.0].as_slice()),
             "memory_query's embed_query helper must call Embedder::embed_query \
              (query-side vector [0.0, 1.0]), not the generic Embedder::embed \
@@ -7771,8 +7659,9 @@ mod tests {
         let (_tmp, _store, server, _ws, _proj) = setup_server().await;
         let (reranker, calls, _) = stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
         let server = server.with_reranker(reranker);
-        let _permits: Vec<_> = (0..RERANK_MAX_IN_FLIGHT)
-            .map(|_| server.rerank_gate.clone().try_acquire_owned().unwrap())
+        let gate = server.rerank_stage().unwrap().gate().clone();
+        let _permits: Vec<_> = (0..ai_memory_llm::reranker::RERANK_MAX_IN_FLIGHT)
+            .map(|_| gate.clone().try_acquire_owned().unwrap())
             .collect();
         let hits = rerank_test_hits(4);
         let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
@@ -10395,6 +10284,7 @@ mod tests {
         assert!(text.contains("foo.md"), "expected hit; got {text}");
         assert!(!text.contains("score_details"));
         assert!(!text.contains("streams_active"));
+        assert!(!text.contains("timings"), "{text}");
 
         let explained = server
             .memory_query(
@@ -10421,7 +10311,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
         assert_eq!(
             value["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
         let details = &value["hits"][0]["score_details"];
         assert_eq!(details["fts_rank"], 1);
@@ -10437,6 +10327,97 @@ mod tests {
         let fused = details["fused"].as_f64().unwrap();
         let authority = details["authority"].as_f64().unwrap();
         assert!((rank + fused * authority).abs() < f64::EPSILON);
+        // Explain times exactly the streams it reports as active: no
+        // embedder means no vector timing, no reranker means no rerank one.
+        let timings = value["timings"].as_object().expect("explain timings");
+        let mut keys: Vec<&str> = timings.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["entity_ms", "fts_ms", "graph_ms", "observation_ms"],
+            "{value}"
+        );
+        assert!(
+            timings
+                .values()
+                .all(|ms| ms.as_f64().is_some_and(|ms| ms >= 0.0)),
+            "{value}"
+        );
+    }
+
+    /// `rerank_ms` appears with a reranker attached, and only on an explained
+    /// query; global search reports its single FTS pass.
+    #[tokio::test]
+    async fn explain_timings_cover_the_reranker_and_global_search() {
+        let (_tmp, store, server, ws, pj) = setup_server().await;
+        // The reranker needs two candidates to be called at all.
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: pj,
+                path: PagePath::new("bar.md").unwrap(),
+                title: "Bar".into(),
+                body: "karpathy compiled wiki notes".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let (reranker, calls, _) = stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+        let ask = async |explain: bool, global: bool| -> serde_json::Value {
+            call_tool_json(
+                server
+                    .memory_query(
+                        Parameters(QueryArgs {
+                            query: "karpathy".into(),
+                            limit: Some(5),
+                            project: None,
+                            scopes: Vec::new(),
+                            workspace: None,
+                            global: global.then_some(true),
+                            include_expired: None,
+                            include_superseded: None,
+                            pin_first: None,
+                            explain: Some(explain),
+                            as_of: None,
+                            answer: None,
+                            reasoning: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        };
+
+        let explained = ask(true, false).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            explained["timings"]["rerank_ms"]
+                .as_f64()
+                .is_some_and(|ms| ms >= 0.0),
+            "{explained}"
+        );
+        let plain = ask(false, false).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(plain.get("timings").is_none(), "{plain}");
+
+        let global = ask(true, true).await;
+        let timings = global["timings"].as_object().expect("global timings");
+        assert_eq!(
+            timings.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["fts_ms"],
+            "{global}"
+        );
+        assert!(ask(false, true).await.get("timings").is_none());
     }
 
     /// With NO embedder configured — the default deployment —
@@ -10542,7 +10523,7 @@ mod tests {
         );
         assert_eq!(
             entity_hit["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
 
         let graph_hit = query("graphseed").await;
@@ -12845,7 +12826,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             value["streams_active"],
-            serde_json::json!(["fts", "entity", "graph"])
+            serde_json::json!(["fts", "entity", "graph", "observation"])
         );
         assert_eq!(
             value["hits"]
@@ -16326,6 +16307,218 @@ mod tests {
         // No viewer is stamped and nothing changes.
         assert!(found_by_query(bob, false).await);
         assert!(found_by_recent(bob, false).await);
+    }
+
+    /// R1 observation stream, per-project authorization (row 14) and pages
+    /// shared (row 5a). The stream reads observation bodies, which hold more
+    /// than the session page does, so it must sit behind the same resolver
+    /// gate as page search: a non-grantee reaches neither the session page
+    /// nor its evidence by naming the restricted project, listing it in
+    /// `scopes`, or querying their own project. Controls: the writer and a
+    /// second operator holding only a read grant both get the session page,
+    /// lifted by the first operator's observation.
+    #[tokio::test]
+    async fn observation_stream_evidence_stays_inside_a_restricted_project() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store
+            .reader
+            .set_retrieval_tuning(ai_memory_store::RetrievalTuning {
+                observation_stream: true,
+                ..ai_memory_store::RetrievalTuning::default()
+            });
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let scratch = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let client = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        let carol = human("carol").await;
+        grant_writer(store.db_path(), alice, client);
+        grant_role(store.db_path(), carol, client, "read");
+
+        // Alice's finished session: the page keeps a short excerpt, the
+        // observation keeps the confidential detail.
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: client,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: Some(ai_memory_core::IdentityKey::User("alice".into()).storage_key()),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: client,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "the zircon day rate for this client is confidential".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        let session_path = format!("sessions/{session_id}.md");
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: client,
+                path: PagePath::new(session_path.clone()).unwrap(),
+                title: "Session".into(),
+                body: "User asked about pricing.".into(),
+                tier: Tier::Episodic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: Some(alice),
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, scratch);
+
+        let as_user = |user: ai_memory_core::UserId| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(user));
+            parts
+        };
+        let ask =
+            |user, workspace: Option<&str>, project: Option<&str>, scopes: Vec<MemoryScopeArg>| {
+                let server = &server;
+                let workspace = workspace.map(str::to_string);
+                let project = project.map(str::to_string);
+                async move {
+                    server
+                        .memory_query(
+                            Parameters(QueryArgs {
+                                reasoning: None,
+                                answer: None,
+                                include_superseded: None,
+                                pin_first: None,
+                                query: "zircon".into(),
+                                limit: Some(10),
+                                project,
+                                workspace,
+                                scopes,
+                                global: None,
+                                include_expired: None,
+                                explain: Some(true),
+                                as_of: None,
+                            }),
+                            OptionalParts(as_user(user)),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|result| {
+                            result
+                                .content
+                                .first()
+                                .and_then(|c| c.as_text())
+                                .map(|t| t.text.clone())
+                        })
+                }
+            };
+        let client_scope = || {
+            vec![MemoryScopeArg {
+                workspace: "default".into(),
+                project: "alice-client-work".into(),
+            }]
+        };
+        let leaked = |text: &Option<String>| {
+            text.as_deref()
+                .is_some_and(|t| t.contains("zircon") || t.contains(&session_path))
+        };
+
+        // Bob holds nothing on the repository: naming it, scoping to it, or
+        // searching his own project never surfaces the session or its
+        // evidence.
+        let named = ask(bob, Some("default"), Some("alice-client-work"), Vec::new()).await;
+        assert!(!leaked(&named), "bob reached it by name: {named:?}");
+        let scoped = ask(bob, None, None, client_scope()).await;
+        assert!(
+            !leaked(&scoped),
+            "bob reached it through scopes: {scoped:?}"
+        );
+        let own = ask(bob, Some("default"), Some("scratch"), Vec::new()).await;
+        assert!(own.is_some(), "bob's own project still answers");
+        assert!(
+            !leaked(&own),
+            "bob reached it from his own project: {own:?}"
+        );
+
+        // Alice, and Carol with only a read grant, get the session page,
+        // lifted by Alice's observation.
+        for (who, user) in [("alice", alice), ("carol", carol)] {
+            for text in [
+                ask(user, Some("default"), Some("alice-client-work"), Vec::new()).await,
+                ask(user, None, None, client_scope()).await,
+            ] {
+                let text = text.unwrap_or_else(|| panic!("{who}'s query failed"));
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let hit = json["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|h| h["path"] == session_path.as_str())
+                    .unwrap_or_else(|| panic!("{who} missed the session page: {text}"));
+                assert_eq!(hit["score_details"]["observation_rank"], 1, "{text}");
+            }
+        }
     }
 
     fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {

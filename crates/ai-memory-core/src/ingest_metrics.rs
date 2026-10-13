@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 
+use crate::LatencyHistogram;
+
 /// Process-lifetime counters for the hook ingestion pipeline.
 ///
 /// Deliberately a fixed set of scalars, never a map. #428 asked for
@@ -64,6 +66,9 @@ pub struct IngestMetrics {
     /// Unix milliseconds of the last newly persisted observation or effect, or 0
     /// when none has since this process started.
     last_persisted_ms: AtomicU64,
+    /// Time `POST /hook` took to answer (admission, not the spawned
+    /// processing). Counts only; never in [`IngestMetricsSnapshot`].
+    hook_latency: LatencyHistogram,
 }
 
 impl IngestMetrics {
@@ -118,6 +123,12 @@ impl IngestMetrics {
     /// Stamp the moment an event reached durable storage.
     pub fn record_persisted(&self, unix_ms: u64) {
         self.last_persisted_ms.store(unix_ms, Ordering::Relaxed);
+    }
+
+    /// The `POST /hook` response-time histogram.
+    #[must_use]
+    pub fn hook_latency(&self) -> &LatencyHistogram {
+        &self.hook_latency
     }
 
     /// Read every counter for status reporting.

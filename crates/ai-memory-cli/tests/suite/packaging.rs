@@ -671,6 +671,7 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
         "ai-memory-wrapper.cmd",
         "ai-memory-install-hooks",
         "ai-memory-hooks.tar.gz",
+        "install.sh",
     ] {
         assert!(release.contains(asset), "release must publish {asset}");
         assert!(
@@ -1566,14 +1567,14 @@ struct PrePushFixture {
     cygpath: Option<PathBuf>,
     hook_toplevel: String,
     fixture_toplevel: String,
+    _guard: tempfile::TempDir,
 }
 
 #[cfg(any(unix, windows))]
 impl PrePushFixture {
     fn new() -> Option<Self> {
-        // `keep()`: the sandbox is the evidence behind a failure, so it outlives
-        // the test rather than being deleted on drop.
-        let root = sandbox_root(tempfile::tempdir().unwrap().keep());
+        let guard = tempfile::tempdir().unwrap();
+        let root = sandbox_root(guard.path().to_path_buf());
         assert!(
             !root.starts_with(repo_root()),
             "the sandbox must live outside this checkout, got {}",
@@ -1635,6 +1636,7 @@ impl PrePushFixture {
             system_config,
             hook_toplevel: String::new(),
             fixture_toplevel: String::new(),
+            _guard: guard,
         };
         fixture.git(&fixture.hook_repo, &["init", "-q"]);
         fixture.git(&fixture.fixture_repo, &["init", "-q"]);

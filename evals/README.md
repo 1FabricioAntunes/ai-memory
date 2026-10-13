@@ -199,6 +199,7 @@ on upstream drift.
 cargo build --release -p ai-memory-cli   # the server under test
 cargo run --release -p ai-memory-eval -- retrieval --fetch   # full 500
 cargo run -p ai-memory-eval -- retrieval --sample 10         # smoke
+cargo run -p ai-memory-eval -- retrieval --question-id 07741c44,07741c45  # chosen questions
 ```
 
 Output: a per-slice table on stdout plus
@@ -292,7 +293,11 @@ cargo run -p ai-memory-eval -- retrieval --sample 3 \
 
 These flags split a hit@k number into evidence the index never saw and
 ranking on evidence it did. All are opt-in; the defaults reproduce the
-published baselines.
+published baselines. The results are in
+[`docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md`](../docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md).
+On a 2.7 server the observation stream is on by default, so reproducing a
+2.6-era baseline also needs
+`--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
 
 - `--reachability` reads every evidence session back after the query and
   reports, per slice, how many answer-bearing turns (the dataset's
@@ -334,12 +339,24 @@ cargo run --release -p ai-memory-eval -- retrieval --stratify 5 \
 Honest-numbers notes:
 
 - capture is production-shaped: excerpts are bounded at the 2 KB
-  privacy boundary, so evidence buried deep inside one long turn is
-  genuinely out of reach — that is the system being measured, not a
-  harness artifact;
+  privacy boundary. The decomposition measured what that costs: pages
+  holding exactly the captured text score 0.968 FTS `hit@5` against
+  0.972 for whole raw sessions. The larger cost was the zero-LLM session
+  page, which indexed only 80-character turn titles; the observation
+  stream (on by default in 2.7) puts the observation bodies back into
+  ranking;
 - each session's original date is prepended to its turn text, since a
   replayed history must carry its own timestamps (the official
-  harness exposes the same information to retrievers);
-- competitors' published numbers (e.g. agentmemory 0.967 R@5,
-  mcp-memory-service 0.804 R@5) are answer-evidence Recall@5 on this
-  same v1 dataset, comparable to our `hit@5`.
+  harness exposes the same information to retrievers). The prefix is 39
+  characters, about half of a turn title, and production capture adds
+  none, so the default `--date-prefix turn` understates the pipeline on
+  this content (+0.133 FTS `hit@5` on a 120-question sample with the date
+  moved to session start). It stays the default so earlier baselines
+  remain reproducible;
+- other systems' published numbers on this dataset (e.g. agentmemory's
+  95.2% `recall_any@5`, mcp-memory-service 0.804 R@5) use the same
+  statistic as our `hit@5`. agentmemory's indexes whole raw sessions
+  directly, a component measurement rather than a pipeline one, so it is
+  not like-for-like with the default `--ingest hooks` numbers. Its
+  0.967 is a different benchmark (the grep baseline on its 15-query
+  coding-agent-life-v1 corpus), not LongMemEval-S.

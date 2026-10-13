@@ -14,6 +14,7 @@ use crate::commands::apply_shared::{PrivateBackup, apply_atomic_with_backup};
 use crate::commands::path_util::{
     agent_config_home, claude_config_dir, claude_config_paths, home_dir,
 };
+use crate::commands::user_service::{self, ServiceManager};
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
@@ -698,6 +699,15 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     let plan = build_plan(&args, &config.data_dir)?;
     print_plan(&plan);
+    let service = if args.only.is_none() {
+        setup_service(config)
+    } else {
+        None
+    };
+    if let Some((_, removal)) = &service {
+        print_service_plan(removal);
+    }
+    let remove_service = matches!(&service, Some((_, user_service::Removal::Removed(_))));
     let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
     if hooks_removed {
         // Only the current checkout's project file is reachable from here.
@@ -716,19 +726,8 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         println!("(dry-run; pass --apply to remove)");
         return Ok(());
     }
-    if plan.is_empty() && !args.purge_data {
+    if plan.is_empty() && !args.purge_data && !remove_service {
         return Ok(());
-    }
-
-    // All-or-nothing: when we're going to purge data, refuse before touching
-    // anything if an ai-memory process is alive (matches reset's guard-at-top).
-    // Wiring-only uninstall stays unguarded — it edits agent config files the
-    // server never touches.
-    if args.purge_data {
-        let siblings = crate::process_guard::sibling_processes();
-        if !siblings.is_empty() {
-            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
-        }
     }
 
     if std::io::stdin().is_terminal() && !args.yes {
@@ -740,6 +739,28 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
             println!("aborted.");
             return Ok(());
+        }
+    }
+
+    // The service `setup` installed runs the server this uninstall is taking
+    // away; stop it first, so a purge below does not find it alive.
+    if let Some((manager, user_service::Removal::Removed(path))) = &service {
+        match user_service::remove(*manager, path, &user_service::SystemRunner)? {
+            user_service::Removal::Removed(path) => {
+                println!("✓ stopped and removed the user service {}", path.display());
+            }
+            other => print_service_plan(&other),
+        }
+    }
+
+    // All-or-nothing: when we're going to purge data, refuse before touching
+    // the data if an ai-memory process is alive (matches reset's guard-at-top).
+    // Wiring-only uninstall stays unguarded — it edits agent config files the
+    // server never touches.
+    if args.purge_data {
+        let siblings = crate::process_guard::sibling_processes();
+        if !siblings.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
         }
     }
 
@@ -772,8 +793,12 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
-    // reasoning applies; the registry of URLs stays.
-    if let Err(error) = crate::server_profiles::clear_tokens(&config.data_dir) {
+    // reasoning applies; the registry of URLs stays. The root bearer the
+    // server itself reads (`[auth].bearer_token_file`) is not a hook's and
+    // stays with the server's config.
+    if let Err(error) =
+        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+    {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
             config.data_dir.display()
@@ -789,6 +814,35 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     print_docker_hint(args.purge_data);
 
     Ok(())
+}
+
+/// The user service `setup` installs on this platform and what uninstall
+/// would do about it; `None` on a platform without one or with no home.
+fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Removal)> {
+    let manager = ServiceManager::current()?;
+    let home = crate::commands::run::native_home(config)?;
+    let xdg_config_home = config
+        .runtime_env
+        .process_env()
+        .iter()
+        .find(|(key, _)| key == "XDG_CONFIG_HOME")
+        .map(|(_, value)| PathBuf::from(value));
+    let path = user_service::unit_path(manager, &home, xdg_config_home.as_deref());
+    Some((manager, user_service::planned_removal(&path)))
+}
+
+fn print_service_plan(removal: &user_service::Removal) {
+    match removal {
+        user_service::Removal::Absent => {}
+        user_service::Removal::Removed(path) => {
+            println!("would stop and remove the user service {}", path.display());
+        }
+        user_service::Removal::NotOurs(path) => println!(
+            "leaving {}: `ai-memory setup` did not write it, or it was edited since; remove it \
+             yourself if it runs ai-memory",
+            path.display()
+        ),
+    }
 }
 
 /// Print the manual Docker teardown steps (never executed). When the
@@ -1286,16 +1340,35 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
             return true;
         }
     }
+    // Our stdio bridge, in any client's shape (`command` + `args`, or
+    // OpenCode's single `command` array), aimed at this server.
+    if install_mcp::bridge_entry_url(entry) == Some(url) {
+        return true;
+    }
     if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
         let has_remote = args.iter().any(|a| a.as_str() == Some("mcp-remote"));
-        let has_session_bridge = entry.get("command").and_then(|v| v.as_str()) == Some("ai-memory")
-            && args.iter().any(|a| a.as_str() == Some("mcp-bridge"));
         let has_url = args.iter().any(|a| a.as_str() == Some(url));
-        if (has_remote || has_session_bridge) && has_url {
+        if has_remote && has_url {
             return true;
         }
     }
     false
+}
+
+/// A TOML `[mcp_servers.<name>]` table (Codex, Grok) aimed at `url`: an HTTP
+/// entry by its `url`, or our stdio bridge by `command` + `args`.
+fn toml_mcp_entry_targets(table: &dyn toml_edit::TableLike, url: &str) -> bool {
+    if table.get("url").and_then(|u| u.as_str()) == Some(url) {
+        return true;
+    }
+    let as_json = serde_json::json!({
+        "command": table.get("command").and_then(|c| c.as_str()),
+        "args": table
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+    });
+    install_mcp::bridge_entry_url(&as_json) == Some(url)
 }
 
 /// URL forms uninstall matches for `client`: the endpoint as given, plus
@@ -1441,10 +1514,8 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                 for k in keys {
                     let matches_url = servers
                         .get(&k)
-                        .and_then(|item| item.as_table())
-                        .and_then(|t| t.get("url"))
-                        .and_then(|u| u.as_str())
-                        == Some(url);
+                        .and_then(|item| item.as_table_like())
+                        .is_some_and(|t| toml_mcp_entry_targets(t, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -1457,9 +1528,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
                     let matches_url = servers
                         .get(&k)
                         .and_then(|value| value.as_inline_table())
-                        .and_then(|table| table.get("url"))
-                        .and_then(|value| value.as_str())
-                        == Some(url);
+                        .is_some_and(|table| toml_mcp_entry_targets(table, url));
                     if name.is_none_or(|name| k == name) && matches_url {
                         servers.remove(&k);
                         removed.push(k);
@@ -2312,6 +2381,62 @@ mod tests {
         )
         .unwrap();
         assert!(removed.is_empty());
+    }
+
+    /// The stdio bridge entries `install-mcp` writes on a token-file install
+    /// are ours when they target this server, in every client shape, and a
+    /// bridge aimed at another server is not.
+    #[test]
+    fn bridge_entries_are_recognised_by_their_upstream_url() {
+        let url = "http://127.0.0.1:49374/mcp";
+        let bridge = |target: &str| {
+            serde_json::json!({
+                "type": "stdio",
+                "command": "ai-memory",
+                "args": ["mcp-bridge", "--no-session-id", "--server-url", target],
+            })
+        };
+        let opencode = serde_json::json!({
+            "type": "local",
+            "command": ["ai-memory", "mcp-bridge", "--no-session-id", "--server-url", url],
+            "enabled": true,
+        });
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &bridge(url),
+            Some("ai-memory"),
+            url
+        ));
+        assert!(mcp_entry_is_ours(
+            "ai-memory",
+            &opencode,
+            Some("ai-memory"),
+            url
+        ));
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &bridge("https://team.example/mcp"),
+            Some("ai-memory"),
+            url
+        ));
+        let foreign =
+            serde_json::json!({"command": "other", "args": ["mcp-bridge", "--server-url", url]});
+        assert!(!mcp_entry_is_ours(
+            "ai-memory",
+            &foreign,
+            Some("ai-memory"),
+            url
+        ));
+
+        let toml = format!(
+            "[mcp_servers.ai-memory]\ncommand = \"ai-memory\"\nargs = [\"mcp-bridge\", \"--no-session-id\", \"--server-url\", \"{url}\"]\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+        );
+        let (out, removed) = strip_mcp_toml(&toml, Some("ai-memory"), url).unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        assert!(out.contains("[mcp_servers.other]"), "{out}");
+        let (_, kept) =
+            strip_mcp_toml(&toml, Some("ai-memory"), "https://team.example/mcp").unwrap();
+        assert!(kept.is_empty());
     }
 
     #[test]
