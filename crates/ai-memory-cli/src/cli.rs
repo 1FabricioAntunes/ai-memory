@@ -238,6 +238,10 @@ pub enum Command {
     /// Hidden hook spool drainer used by native session-end hooks.
     #[command(hide = true, name = "hook-drain")]
     HookDrain(HookDrainArgs),
+    /// Generate the marketplace plugins under `plugins/` and their catalogs
+    /// (maintainer tool: `bin/release` and the drift test call it).
+    #[command(hide = true, name = "render-plugins")]
+    RenderPlugins(RenderPluginsArgs),
     /// Print MCP server registration snippets for any supported client.
     /// Current values are listed under `--client`; see docs/mcp-install.md
     /// for the full guide.
@@ -3042,8 +3046,9 @@ pub struct HookArgs {
     /// Agent name to attribute the event to, e.g. `claude-code`.
     #[arg(long)]
     pub agent: String,
-    /// Base URL of the ai-memory hook server.
-    #[arg(long)]
+    /// Base URL of the ai-memory hook server. Empty or omitted means the
+    /// `server_url` of this install's config.
+    #[arg(long, default_value = "")]
     pub server_url: String,
     /// Optional bearer token (`Authorization: Bearer <token>`).
     #[arg(long, hide_env_values = true)]
@@ -3074,6 +3079,14 @@ pub struct HookArgs {
 /// Arguments for hidden `hook-drain`.
 #[derive(Debug, Args)]
 pub struct HookDrainArgs {}
+
+/// Arguments for hidden `render-plugins`.
+#[derive(Debug, Args)]
+pub struct RenderPluginsArgs {
+    /// Repository root to write `plugins/` and the catalogs under.
+    #[arg(long)]
+    pub out: PathBuf,
+}
 
 /// Arguments for `install-hooks`.
 #[derive(Debug, Args)]

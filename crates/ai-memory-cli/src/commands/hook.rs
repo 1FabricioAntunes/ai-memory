@@ -514,6 +514,23 @@ fn is_redundant_cursor_copy(
         && cursor_hooks_installed()
 }
 
+/// A plugin-launched event that a settings-file hook already delivers, or
+/// that belongs to a session with no project folder (#1166). Ordinary
+/// settings-file hooks carry no origin and never take this path.
+fn is_dropped_plugin_copy(
+    args: &HookArgs,
+    raw: &serde_json::Value,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> bool {
+    use super::plugin_origin::{PluginOrigin, drops_plugin_event, settings_files_for};
+    let Some(origin) = PluginOrigin::from_env(&mut lookup) else {
+        return false;
+    };
+    let (cwd, _) = hook_context(&args.agent, raw);
+    let settings = settings_files_for(origin, cwd.as_deref(), &mut lookup);
+    drops_plugin_event(origin, &args.event, cwd.as_deref(), &settings)
+}
+
 fn write_success_response<W: std::io::Write>(
     stdout: &mut W,
     agent: AgentKind,
@@ -653,6 +670,12 @@ where
         Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd), runtime_env.clone())
             .unwrap_or_default();
     let max_attempts = hook_spool::MaxAttempts::new(spool_policy.hook_spool.max_attempts);
+    // An empty `--server-url` means "not given": the plugin passes its unset
+    // option through as "", and the install's configured server applies.
+    let mut args = args;
+    if args.server_url.trim().is_empty() {
+        args.server_url.clone_from(&spool_policy.server_url);
+    }
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
@@ -696,7 +719,8 @@ where
             agent_kind,
             &json,
             super::install_hooks::cursor_native_hooks_installed,
-        );
+        )
+        && !is_dropped_plugin_copy(&args, &json, env_lookup);
     if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -5778,6 +5802,98 @@ mod tests {
         .await
         .unwrap();
         stdout
+    }
+
+    /// The Claude Code plugin passes an unset `server_url` option as "": the
+    /// event must go to the install's configured server, never to a bare
+    /// `/hook` path. A real flag value still wins.
+    #[tokio::test]
+    async fn empty_server_url_spools_to_the_configured_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("config.toml"),
+            "server_url = \"http://configured.example:4321\"\n",
+        )
+        .unwrap();
+        // A process-level override outranks the file, exactly as in production.
+        let expected = std::env::var("AI_MEMORY_SERVER_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| "http://configured.example:4321".to_owned());
+
+        run_prompt(&data_dir, claude_args("user-prompt-submit", ""), &work).await;
+        run_prompt(
+            &data_dir,
+            claude_args("user-prompt-submit", "https://flag.example"),
+            &work,
+        )
+        .await;
+
+        let mut urls: Vec<String> = read_spooled_entries(&hook_spool::spool_dir(&data_dir))
+            .into_iter()
+            .map(|entry| entry.url)
+            .collect();
+        urls.sort();
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert!(
+            urls.iter()
+                .any(|url| url.starts_with(&format!("{}/hook?", expected.trim_end_matches('/')))),
+            "{urls:?}"
+        );
+        assert!(
+            urls.iter()
+                .any(|url| url.starts_with("https://flag.example/hook?")),
+            "{urls:?}"
+        );
+    }
+
+    /// The origin check reads the plugin marker and the settings files only
+    /// through the injected lookup, so it is testable without process env.
+    /// Adversarial: a plugin event with a settings hook for the same event is
+    /// dropped; the same event without the origin (a settings-launched copy)
+    /// is never dropped.
+    #[test]
+    fn plugin_copy_is_dropped_only_with_the_plugin_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"/bin/ai-memory hook --event user-prompt-submit --agent claude-code --server-url http://h"}]}]}}"#,
+        )
+        .unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let raw = serde_json::json!({"session_id": "s", "cwd": work, "prompt": "p"});
+        let args = claude_args("user-prompt-submit", "http://h");
+        let config_dir = claude.to_string_lossy().into_owned();
+        let env = |origin: Option<&'static str>| {
+            let config_dir = config_dir.clone();
+            move |name: &str| match name {
+                "CLAUDE_CONFIG_DIR" => Some(config_dir.clone()),
+                super::super::plugin_origin::HOOK_ORIGIN_ENV => origin.map(str::to_owned),
+                _ => None,
+            }
+        };
+
+        assert!(is_dropped_plugin_copy(
+            &args,
+            &raw,
+            env(Some("claude-code-plugin"))
+        ));
+        assert!(!is_dropped_plugin_copy(&args, &raw, env(None)));
+        assert!(
+            !is_dropped_plugin_copy(
+                &claude_args("stop", "http://h"),
+                &raw,
+                env(Some("claude-code-plugin"))
+            ),
+            "no settings hook for stop: the plugin delivers it"
+        );
     }
 
     /// Two repositories on one install deliver to two servers, each with its

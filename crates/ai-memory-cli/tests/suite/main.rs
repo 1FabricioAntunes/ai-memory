@@ -27,6 +27,7 @@ mod marker_scope;
 mod message_e2e;
 mod opencode_dialect;
 mod packaging;
+mod plugins;
 mod profile_e2e;
 mod removal;
 mod repo_layout;
