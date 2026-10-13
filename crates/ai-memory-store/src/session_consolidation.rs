@@ -569,6 +569,36 @@ mod tests {
         );
     }
 
+    /// Without the SessionEnd opt-in nothing supersedes a pending checkpoint,
+    /// so it still runs once after the end and rewrites the whole session.
+    #[tokio::test]
+    async fn pending_checkpoint_survives_an_end_without_the_session_end_opt_in() {
+        let (_tmp, store, workspace_id, project_id, session_id) = open_session().await;
+        assert!(
+            store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
+        insert_observation(&store, workspace_id, project_id, session_id).await;
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        let now = Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("the checkpoint must still be claimable after the end");
+        assert_eq!(job.generation(), 1);
+        store
+            .writer
+            .complete_session_consolidation(job)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn queue_is_idempotent_per_observation_generation() {
         let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;

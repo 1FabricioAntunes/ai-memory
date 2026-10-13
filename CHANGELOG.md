@@ -20,7 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`; the worker now starts whenever
   a consolidator exists so checkpoint jobs still run when that flag is
   off. The rewrite is attributed to the session owner recorded at session
-  start. (#1229)
+  start. With a provider, the checkpoint write still goes through
+  `consolidate` admission, so a refusing policy leaves no page and queues
+  nothing. A failed enqueue fails the event so the redelivery queues the
+  rewrite. A checkpoint still queued when the session ends runs once even
+  with the SessionEnd opt-in off. (#1229)
 - Replaced the unmaintained YAML library (`serde_yaml` and its
   `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
   reads existing page frontmatter to exactly the same values as before. One

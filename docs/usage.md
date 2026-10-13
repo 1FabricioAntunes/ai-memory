@@ -122,9 +122,14 @@ When Claude Code or Codex compact their working context, the
 `sessions/<id>.md` page summarising the session so far. The hook
 response returns after that heuristic page; when a provider is
 configured the LLM rewrite is queued and applied by the same durable
-worker SessionEnd uses. After compaction, the agent can recover the
-summary via `memory_recent` even though its raw chat history was
-compacted away.
+worker SessionEnd uses. With a provider, the checkpoint write also goes
+through `consolidate` admission, so a policy that refuses consolidation
+leaves no page and queues nothing. A rewrite still queued when the
+session ends runs once over the whole session even with
+`AI_MEMORY_CONSOLIDATE_ON_SESSION_END` off, replacing the rule-based
+summary; with the opt-in on, the SessionEnd job supersedes it. After
+compaction, the agent can recover the summary via `memory_recent` even
+though its raw chat history was compacted away.
 
 Generated session pages carry `session_id` and `agent` in frontmatter. The
 `agent` value is the originating harness stored on the session (for example,

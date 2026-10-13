@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 
-use ai_memory_consolidate::{Consolidator, ConsolidatorError, redacted_error_summary};
+use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
@@ -3338,13 +3338,6 @@ async fn enqueue_session_checkpoint_consolidation(
         );
         return Ok(false);
     };
-    let path = PagePath::new(format!("sessions/{session_id}.md"))?;
-    if agent_session_page_id(state, workspace_id, project_id, session_id, &path)
-        .await?
-        .is_some()
-    {
-        return Ok(false);
-    }
     let inserted = state
         .writer
         .enqueue_session_checkpoint(workspace_id, project_id, session_id)
@@ -3884,7 +3877,7 @@ async fn process_authorized(
         .map(IdentityKey::to_actor_context)
         .unwrap_or_default();
     if let Some(checkpoint_label) = checkpoint_label {
-        match consolidate_or_synth(
+        match write_checkpoint_page(
             state,
             session_id,
             ws,
@@ -3893,25 +3886,20 @@ async fn process_authorized(
             HookCheckpoint {
                 label: checkpoint_label,
                 track_page_write: outcome == HookProcessingOutcome::Resumed,
-                defer_llm: true,
             },
             session_actor.clone(),
         )
         .await
         {
-            Ok(checkpoint) => {
-                if checkpoint.should_enqueue_llm
-                    && let Err(e) =
-                        enqueue_session_checkpoint_consolidation(state, session_id, ws, proj).await
-                {
-                    warn!(
-                        error = %e,
-                        "PreCompact/PostCompaction consolidation enqueue failed; continuing"
-                    );
-                }
+            // Unlike the page write, a failed enqueue fails the event: its
+            // ingest key stays incomplete, so the redelivery resumes here and
+            // queues the rewrite instead of losing it, as SessionEnd does.
+            Ok(true) => {
+                enqueue_session_checkpoint_consolidation(state, session_id, ws, proj).await?;
             }
+            Ok(false) => {}
             Err(e) => {
-                warn!(error = %e, "PreCompact/PostCompaction consolidation failed; continuing");
+                warn!(error = %e, "PreCompact/PostCompaction checkpoint failed; continuing");
             }
         }
     }
@@ -4540,64 +4528,21 @@ fn cap_handoff_text(s: &str) -> String {
     }
 }
 
-/// Whether a failed LLM consolidation may degrade to the rule-based
-/// checkpoint that a zero-LLM install would have written anyway.
-///
-/// Only the "the model could not answer" class degrades: a provider refusing
-/// the request (context overflow, rate limit, outage) or returning an
-/// unmappable response says nothing about whether this session deserves a page.
-///
-/// Everything else is policy or infrastructure: an admission webhook rejecting
-/// this actor or scope, a wiki/store failure, or a session that does not
-/// resolve. Those fail closed. The fallback write keeps the `consolidate`
-/// admission operation, so it cannot bypass operation-specific policy.
-fn checkpoint_degrades_to_synth(error: &ConsolidatorError) -> bool {
-    matches!(error, ConsolidatorError::Llm(_))
-}
-
-/// Pure formatting of the checkpoint fallback warning: the label message
-/// plus the redacted class/status summary from
-/// [`redacted_error_summary`]. Computed once so the `warn!` and the
-/// returned [`CheckpointOutcome`] cannot drift apart; neither string ever
-/// carries the provider body.
-fn checkpoint_fallback_warning(
-    checkpoint_label: &str,
-    error: &ConsolidatorError,
-) -> (String, String) {
-    (
-        format!(
-            "{checkpoint_label}: LLM consolidation unavailable; falling back to rule-based checkpoint"
-        ),
-        redacted_error_summary(error),
-    )
-}
-
 struct HookCheckpoint {
     label: &'static str,
     track_page_write: bool,
-    defer_llm: bool,
 }
 
-/// What one checkpoint run did. `fallback_reason` is set exactly when the
-/// LLM consolidation failed and the checkpoint degraded to the rule-based
-/// path: it carries the same redacted summary the fallback warning logs,
-/// so callers and tests observe the degraded checkpoint without depending
-/// on log capture (a callsite's cached `Interest` is process-wide and can
-/// be silenced by sibling tests under a single-process harness).
-#[derive(Debug)]
-struct CheckpointOutcome {
-    // Read by the checkpoint tests (compiled only under `cfg(test)`); the
-    // production caller uses `should_enqueue_llm` and ignores
-    // `fallback_reason`.
-    #[allow(dead_code)]
-    fallback_reason: Option<String>,
-    should_enqueue_llm: bool,
-}
-
-/// Write a fresh `sessions/<id>.md` for the current session without
-/// ending it. Used by the PreCompact and PostCompaction branches to checkpoint
-/// state before/after the agent's working context collapses.
-async fn consolidate_or_synth(
+/// Write a fresh rule-based `sessions/<id>.md` for the current session
+/// without ending it. Used by the PreCompact and PostCompaction branches to
+/// checkpoint state before/after the agent's working context collapses.
+///
+/// The provider is never called here: its rewrite takes far longer than the
+/// client's hook drain, which cancelled it on every delivery (#1229). The
+/// caller queues that rewrite on the durable worker instead. Returns `true`
+/// when a page was written, `false` when the agent owns the page or the
+/// session has nothing to checkpoint; neither case has a rewrite to queue.
+async fn write_checkpoint_page(
     state: &HookState,
     session_id: SessionId,
     workspace_id: WorkspaceId,
@@ -4605,10 +4550,8 @@ async fn consolidate_or_synth(
     agent_kind: AgentKind,
     checkpoint: HookCheckpoint,
     actor: ai_memory_core::ActorContext,
-) -> anyhow::Result<CheckpointOutcome> {
+) -> anyhow::Result<bool> {
     let checkpoint_label = checkpoint.label;
-    let mut fallback_reason = None;
-    let should_enqueue_llm = checkpoint.defer_llm && state.consolidator.is_some();
     // First deliveries already stamped their observation write. Only a retry
     // needs to distinguish a recovered page write from an unchanged checkpoint.
     let previous_page_id = if checkpoint.track_page_write {
@@ -4631,84 +4574,11 @@ async fn consolidate_or_synth(
         .await?
         .is_some()
     {
-        return Ok(CheckpointOutcome {
-            fallback_reason,
-            should_enqueue_llm: false,
-        });
-    }
-    let fallback_from_llm = state.consolidator.is_some() && !checkpoint.defer_llm;
-    if !checkpoint.defer_llm
-        && let Some(c) = state.consolidator.as_ref()
-    {
-        let result = c
-            // The hook path has no per-call override, so `None` lets the
-            // project's standing `_prompts/consolidation.md` preferences
-            // apply; the actor is the session's own operator so the
-            // checkpoint is attributed to them, not to whoever delivered
-            // the event.
-            .consolidate_session(session_id, false, actor.clone(), None, None)
-            .await;
-        match result {
-            Ok(outcome) => {
-                if checkpoint.track_page_write
-                    && outcome.page_id.is_some()
-                    && outcome.page_id != previous_page_id
-                {
-                    state.ingest_metrics.record_persisted(now_unix_ms());
-                }
-
-                debug!(
-                    session = %session_id,
-                    path = %outcome.path,
-                    "{}: LLM consolidation written",
-                    checkpoint_label
-                );
-                let _ = state
-                    .wiki
-                    .commit_all(&format!(
-                        "{}(session {}): checkpoint",
-                        checkpoint_label,
-                        short_id(&session_id.to_string()),
-                    ))
-                    .map_err(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "{}: checkpoint auto-commit failed",
-                            checkpoint_label
-                        );
-                        e
-                    });
-                return Ok(CheckpointOutcome {
-                    fallback_reason,
-                    should_enqueue_llm: false,
-                });
-            }
-            // Nothing to checkpoint. The rule-based path below no-ops on the
-            // same condition, so this is success, not a failure worth logging.
-            Err(ConsolidatorError::EmptySession(_)) => {
-                return Ok(CheckpointOutcome {
-                    fallback_reason,
-                    should_enqueue_llm: false,
-                });
-            }
-            Err(e) if checkpoint_degrades_to_synth(&e) => {
-                let (warning, error_summary) = checkpoint_fallback_warning(checkpoint_label, &e);
-                warn!(
-                    error_summary = %error_summary,
-                    session = %session_id,
-                    "{warning}"
-                );
-                fallback_reason = Some(error_summary);
-            }
-            Err(e) => return Err(e.into()),
-        }
+        return Ok(false);
     }
     let observations = state.reader.observations_for_session(session_id).await?;
     if is_ephemeral_session(&observations) {
-        return Ok(CheckpointOutcome {
-            fallback_reason,
-            should_enqueue_llm: false,
-        });
+        return Ok(false);
     }
     let new_page = synthesize_session_page(
         workspace_id,
@@ -4717,6 +4587,11 @@ async fn consolidate_or_synth(
         agent_kind,
         &observations,
     );
+    // With a provider this page is the first half of a consolidation, so it
+    // carries the `consolidate` admission operation the inline LLM write
+    // used to: a policy refusing consolidation for this actor or scope fails
+    // closed here, before the page lands and before the rewrite is queued.
+    // A zero-LLM install keeps the plain rule-based write, as SessionEnd does.
     let page_id = state
         .wiki
         .write_page(ai_memory_wiki::WritePageRequest {
@@ -4728,7 +4603,7 @@ async fn consolidate_or_synth(
             tier: new_page.tier,
             pinned: new_page.pinned,
             title: None,
-            admission_ctx: fallback_from_llm.then(|| AdmissionContext {
+            admission_ctx: state.consolidator.is_some().then(|| AdmissionContext {
                 op: AdmissionOp::Consolidate,
                 actor: actor.clone(),
                 ..Default::default()
@@ -4754,10 +4629,7 @@ async fn consolidate_or_synth(
             e
         });
     debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
-    Ok(CheckpointOutcome {
-        fallback_reason,
-        should_enqueue_llm,
-    })
+    Ok(true)
 }
 
 /// The id of `sessions/<id>.md` when the agent wrote it itself through
@@ -5119,41 +4991,6 @@ mod tests {
             Ok(
                 serde_json::json!({ "summary": "safe review", "proposals": [], "rejected_candidates": [] }),
             )
-        }
-    }
-
-    /// Provider that rejects every request the way a local engine rejects a
-    /// prompt larger than its context window.
-    struct ContextOverflowLlm;
-
-    #[async_trait::async_trait]
-    impl LlmProvider for ContextOverflowLlm {
-        fn name(&self) -> &'static str {
-            "overflow"
-        }
-        fn model(&self) -> &str {
-            "overflow-test"
-        }
-        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
-            Err(self.overflow())
-        }
-        async fn complete_structured_raw(
-            &self,
-            _request: ChatRequest,
-            _schema: serde_json::Value,
-        ) -> LlmResult<serde_json::Value> {
-            Err(self.overflow())
-        }
-    }
-
-    impl ContextOverflowLlm {
-        fn overflow(&self) -> ai_memory_llm::LlmError {
-            ai_memory_llm::LlmError::Provider {
-                status: 400,
-                body: "request (12000 tokens) exceeds the available context size \
-                       (8192 tokens), try increasing it"
-                    .into(),
-            }
         }
     }
 
@@ -6181,224 +6018,60 @@ mod tests {
         }
     }
 
-    async fn seed_checkpoint_observation(state: &HookState, title: &str) -> SessionId {
-        let session_id = SessionId::new();
-        state
-            .writer
-            .begin_session(NewSession {
-                occurred_at: None,
-                id: session_id,
-                workspace_id: state.workspace_id,
-                project_id: state.project_id,
-                agent_kind: AgentKind::ClaudeCode,
-                cwd: None,
-                actor_user: None,
-            })
-            .await
-            .unwrap();
-        state
-            .writer
-            .insert_observation_ingest(
-                Sanitized::new(
-                    NewObservation {
-                        occurred_at: None,
-                        session_id,
-                        workspace_id: state.workspace_id,
-                        project_id: state.project_id,
-                        kind: ObservationKind::UserPrompt,
-                        extension: None,
-                        source_event: None,
-                        title: title.into(),
-                        body: "state that must survive compaction".into(),
-                        importance: 8,
-                    },
-                    &state.sanitizer,
-                ),
-                format!("checkpoint-fixture-{session_id}"),
-            )
-            .await
-            .unwrap();
-        session_id
-    }
-
-    /// Regression: a configured-but-failing LLM used to make PreCompact
-    /// strictly worse than no LLM at all. `consolidate_or_synth` propagated the
-    /// provider error, the caller only warned, and the rule-based page a
-    /// zero-LLM install would have written never happened, so compaction threw
-    /// the session's working state away with nothing on disk.
-    #[tokio::test]
-    async fn checkpoint_falls_back_to_rule_based_page_when_the_provider_rejects_the_prompt() {
-        let tmp = TempDir::new().unwrap();
-        let mut state = make_state(&tmp).await;
+    /// A consolidator whose provider panics if the hook path ever calls it.
+    fn with_hook_consolidator(state: &mut HookState) {
         state.consolidator = Some(Arc::new(Consolidator::new(
             state.reader.clone(),
             state.writer.clone(),
             state.wiki.clone(),
-            Arc::new(ContextOverflowLlm),
+            Arc::new(SlowHookLlm),
             state.workspace_id,
             state.project_id,
         )));
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+    }
 
-        let session_id = seed_checkpoint_observation(&state, "keep-this-working-state").await;
-
-        consolidate_or_synth(
-            &state,
-            session_id,
-            state.workspace_id,
-            state.project_id,
-            AgentKind::ClaudeCode,
-            HookCheckpoint {
-                label: "pre-compact",
-                track_page_write: true,
-                defer_llm: false,
+    fn checkpoint_envelope(event: &str, sid: &str) -> HookEnvelope {
+        HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: event.into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
             },
-            ai_memory_core::ActorContext::anonymous(),
+            serde_json::json!({ "session_id": sid, "prompt": "keep this working state" }),
         )
-        .await
-        .expect("a provider 400 must not lose the checkpoint");
-
-        let path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md")).unwrap();
-        let page = state
-            .wiki
-            .read_page(state.workspace_id, state.project_id, &path)
-            .expect("rule-based checkpoint page must exist after the LLM failed");
-        assert!(
-            page.body.contains("keep-this-working-state"),
-            "fallback page must carry the session's observations, got: {}",
-            page.body
-        );
-        assert!(
-            page.body.contains("**observations:** 1"),
-            "fallback page must account for every captured observation, got: {}",
-            page.body
-        );
     }
 
-    /// A provider that fails with a private body: the checkpoint fallback
-    /// warning must carry class/status only, never the body.
-    struct CheckpointSentinelLlm;
-
-    #[async_trait::async_trait]
-    impl LlmProvider for CheckpointSentinelLlm {
-        fn name(&self) -> &'static str {
-            "checkpoint-sentinel"
-        }
-
-        fn model(&self) -> &str {
-            "sentinel-model"
-        }
-
-        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
-            Err(self.fail())
-        }
-
-        async fn complete_structured_raw(
-            &self,
-            _request: ChatRequest,
-            _schema: serde_json::Value,
-        ) -> LlmResult<serde_json::Value> {
-            Err(self.fail())
-        }
-    }
-
-    impl CheckpointSentinelLlm {
-        fn fail(&self) -> ai_memory_llm::LlmError {
-            ai_memory_llm::LlmError::Provider {
-                status: 400,
-                body: "SENTINEL_PRIVATE_BODY".into(),
-            }
-        }
-    }
-
-    /// Mutation captured: logging the `ConsolidatorError`'s `Display` on the
-    /// fallback path copies the provider body into the hook log. Both
-    /// checkpoint flavors (PreCompact and PostCompaction) run the same
-    /// function, so both labels are driven against the sentinel provider.
-    /// The warning is asserted from the returned `CheckpointOutcome`
-    /// rather than a capturing subscriber: a callsite's cached `Interest`
-    /// is computed process-wide by whichever thread first executes it, and
-    /// under the single-process test harness a sibling checkpoint test can
-    /// register this `warn!` callsite with no subscriber installed,
-    /// silencing it for this test however long it polls.
-    #[tokio::test]
-    async fn checkpoint_fallback_log_carries_class_status_not_provider_body() {
-        let tmp = TempDir::new().unwrap();
-        let mut state = make_state(&tmp).await;
-        state.consolidator = Some(Arc::new(Consolidator::new(
-            state.reader.clone(),
-            state.writer.clone(),
-            state.wiki.clone(),
-            Arc::new(CheckpointSentinelLlm),
-            state.workspace_id,
-            state.project_id,
-        )));
-
-        for checkpoint_label in ["pre-compact", "post-compaction"] {
-            let session_id = seed_checkpoint_observation(&state, "keep-this-working-state").await;
-            let outcome = consolidate_or_synth(
-                &state,
-                session_id,
-                state.workspace_id,
-                state.project_id,
-                AgentKind::ClaudeCode,
-                HookCheckpoint {
-                    label: checkpoint_label,
-                    track_page_write: true,
-                    defer_llm: false,
-                },
-                ai_memory_core::ActorContext::anonymous(),
-            )
+    async fn checkpoint_job_queued(state: &HookState) -> bool {
+        let now = Timestamp::now().as_microsecond();
+        state
+            .writer
+            .claim_session_consolidation(now, now - 1)
             .await
-            .expect("a provider 400 must not lose the checkpoint");
-
-            // `fallback_reason` is set in the same arm that emits the
-            // fallback warning, from the same helper call, so it proves the
-            // warning fired and carries exactly what the warning logged.
-            let reason = outcome
-                .fallback_reason
-                .unwrap_or_else(|| panic!("the fallback warning must fire for {checkpoint_label}"));
-            assert_eq!(
-                reason, "consolidation failed: class=provider status=400",
-                "the {checkpoint_label} fallback warning must carry class/status only"
-            );
-            assert!(
-                !reason.contains("SENTINEL_PRIVATE_BODY"),
-                "provider body leaked into the checkpoint log: {reason}"
-            );
-
-            let path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md")).unwrap();
-            let page = state
-                .wiki
-                .read_page(state.workspace_id, state.project_id, &path)
-                .unwrap_or_else(|e| panic!("rule-based checkpoint page missing: {e}"));
-            assert!(
-                page.body.contains("keep-this-working-state"),
-                "fallback page must carry the session's observations, got: {}",
-                page.body
-            );
-        }
+            .unwrap()
+            .is_some()
     }
 
-    /// A provider failure happens after the consolidate preflight. The
-    /// fallback write must still use the same operation so consolidate-only
-    /// admission policy and mutations run on the actual page body too.
+    /// With a provider, the compaction checkpoint is the first half of a
+    /// consolidation, so the hook-path write keeps the `consolidate`
+    /// admission operation the inline LLM write used before #1229. The
+    /// provider itself is never called.
     #[tokio::test]
-    async fn llm_fallback_preserves_the_consolidate_admission_operation() {
-        let hits = Arc::new(AtomicUsize::new(0));
+    async fn checkpoint_preserves_the_consolidate_admission_operation() {
+        let ops = Arc::new(Mutex::new(Vec::<String>::new()));
         let app = axum::Router::new().route(
             "/admission",
             axum::routing::post({
-                let hits = hits.clone();
+                let ops = ops.clone();
                 move |headers: HeaderMap| {
-                    let hits = hits.clone();
+                    let ops = ops.clone();
                     async move {
-                        assert_eq!(
-                            headers
-                                .get("X-Memory-Op")
-                                .and_then(|value| value.to_str().ok()),
-                            Some("consolidate")
-                        );
-                        hits.fetch_add(1, Ordering::SeqCst);
+                        let op = headers
+                            .get("X-Memory-Op")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        ops.lock().unwrap().push(op);
                         StatusCode::NO_CONTENT
                     }
                 }
@@ -6411,7 +6084,6 @@ mod tests {
         });
 
         let tmp = TempDir::new().unwrap();
-        let mut state = make_state(&tmp).await;
         let chain = ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
             name: "consolidation-policy".into(),
             url: format!("http://{addr}/admission"),
@@ -6421,156 +6093,134 @@ mod tests {
             blocking: true,
         }])
         .unwrap();
-        state.wiki = state.wiki.clone().with_admission_chain(chain);
-        state.consolidator = Some(Arc::new(Consolidator::new(
-            state.reader.clone(),
-            state.writer.clone(),
-            state.wiki.clone(),
-            Arc::new(ContextOverflowLlm),
-            state.workspace_id,
-            state.project_id,
-        )));
-
-        let session_id = seed_checkpoint_observation(&state, "checkpoint through policy").await;
-
-        consolidate_or_synth(
+        let mut state = make_state_with_admission(&tmp, chain).await;
+        with_hook_consolidator(&mut state);
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c030";
+        process(
             &state,
-            session_id,
-            state.workspace_id,
-            state.project_id,
-            AgentKind::ClaudeCode,
-            HookCheckpoint {
-                label: "pre-compact",
-                track_page_write: true,
-                defer_llm: false,
-            },
-            ai_memory_core::ActorContext::anonymous(),
+            checkpoint_envelope("user-prompt-submit", sid),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        ops.lock().unwrap().clear();
+
+        process(
+            &state,
+            checkpoint_envelope("pre-compact", sid),
+            None,
+            Vec::new(),
         )
         .await
         .unwrap();
 
         assert_eq!(
-            hits.load(Ordering::SeqCst),
-            2,
-            "consolidate admission must run for preflight and fallback persistence"
+            *ops.lock().unwrap(),
+            vec!["consolidate".to_owned()],
+            "the checkpoint write must run consolidate admission exactly once"
+        );
+        assert!(
+            checkpoint_job_queued(&state).await,
+            "an admitted checkpoint must queue the rewrite"
         );
     }
 
+    /// Adversarial: a policy refusing consolidation must not be bypassed by
+    /// moving the provider call off the hook path. The refused checkpoint
+    /// lands no page and queues no rewrite. Control: the same provider with a
+    /// policy that only gates another operation writes the page and queues it.
     #[tokio::test]
-    async fn consolidation_admission_rejection_never_falls_back_to_an_unchecked_write() {
-        let tmp = TempDir::new().unwrap();
-        let mut state = make_state_with_admission(
-            &tmp,
-            refusing_admission_chain("deny-consolidation", vec![AdmissionOp::Consolidate]),
-        )
-        .await;
-        state.consolidator = Some(Arc::new(Consolidator::new(
-            state.reader.clone(),
-            state.writer.clone(),
-            state.wiki.clone(),
-            Arc::new(ContextOverflowLlm),
-            state.workspace_id,
-            state.project_id,
-        )));
-        let session_id = seed_checkpoint_observation(&state, "policy must win").await;
+    async fn checkpoint_admission_refusal_writes_no_page_and_queues_no_rewrite() {
+        for (refused_op, admitted) in [
+            (AdmissionOp::Consolidate, false),
+            (AdmissionOp::HandoffBegin, true),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut state =
+                make_state_with_admission(&tmp, refusing_admission_chain("deny", vec![refused_op]))
+                    .await;
+            with_hook_consolidator(&mut state);
+            let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c040";
+            process(
+                &state,
+                checkpoint_envelope("user-prompt-submit", sid),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            process(
+                &state,
+                checkpoint_envelope("pre-compact", sid),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
 
-        consolidate_or_synth(
+            let path = format!("sessions/{sid}.md");
+            let page = state
+                .reader
+                .page_body_by_ids(state.workspace_id, state.project_id, &path)
+                .await
+                .unwrap();
+            assert_eq!(
+                page.is_some(),
+                admitted,
+                "refusing {refused_op:?}: checkpoint page presence"
+            );
+            assert_eq!(
+                checkpoint_job_queued(&state).await,
+                admitted,
+                "refusing {refused_op:?}: checkpoint rewrite queued"
+            );
+        }
+    }
+
+    /// Mutation captured: warning on a failed enqueue completed the ingest
+    /// key anyway, so the redelivery replayed as a no-op and the rewrite was
+    /// lost for good. A failed enqueue must fail the event and leave the key
+    /// incomplete; the redelivery then resumes and queues the rewrite.
+    #[tokio::test]
+    async fn keyed_checkpoint_redelivery_queues_a_rewrite_whose_enqueue_failed() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_hook_consolidator(&mut state);
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c050";
+        process(
             &state,
-            session_id,
-            state.workspace_id,
-            state.project_id,
-            AgentKind::ClaudeCode,
-            HookCheckpoint {
-                label: "pre-compact",
-                track_page_write: true,
-                defer_llm: false,
-            },
-            ai_memory_core::ActorContext::anonymous(),
+            checkpoint_envelope("user-prompt-submit", sid),
+            None,
+            Vec::new(),
         )
         .await
-        .expect_err("a consolidation admission rejection must remain a hard error");
+        .unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_checkpoint_enqueue BEFORE INSERT ON session_consolidation_jobs \
+             BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END;",
+        )
+        .unwrap();
+        let keyed = || {
+            let mut env = checkpoint_envelope("pre-compact", sid);
+            env.ingest_key = Some("pre-compact-enqueue-fails".into());
+            env
+        };
 
-        let path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md")).unwrap();
+        process(&state, keyed(), None, Vec::new())
+            .await
+            .expect_err("a failed enqueue must fail the event");
+        assert!(!checkpoint_job_queued(&state).await);
+
+        db.execute_batch("DROP TRIGGER fail_checkpoint_enqueue;")
+            .unwrap();
+        process(&state, keyed(), None, Vec::new()).await.unwrap();
         assert!(
-            state
-                .wiki
-                .read_page(state.workspace_id, state.project_id, &path)
-                .is_err(),
-            "rejected consolidation must not persist a fallback page"
+            checkpoint_job_queued(&state).await,
+            "the redelivery must resume and queue the rewrite"
         );
-    }
-
-    /// The fallback is narrow on purpose: only failures contained inside the
-    /// LLM boundary degrade. Admission, store, and scope failures remain hard
-    /// errors.
-    #[test]
-    fn only_provider_failures_degrade_to_the_rule_based_checkpoint() {
-        assert!(checkpoint_degrades_to_synth(&ConsolidatorError::Llm(
-            ai_memory_llm::LlmError::Provider {
-                status: 400,
-                body: "exceed_context_size_error".into(),
-            }
-        )));
-        assert!(checkpoint_degrades_to_synth(&ConsolidatorError::Llm(
-            ai_memory_llm::LlmError::Serde("expected value".into())
-        )));
-        assert!(!checkpoint_degrades_to_synth(&ConsolidatorError::Serde(
-            "non-provider serialization failure".into()
-        )));
-
-        assert!(
-            !checkpoint_degrades_to_synth(&ConsolidatorError::SessionNotFound(SessionId::new())),
-            "an unresolvable session must fail closed"
-        );
-        // An admission webhook rejecting a write surfaces as
-        // `WikiError::Io(io::Error::other(..))` (see `AdmissionChain::notify`).
-        assert!(
-            !checkpoint_degrades_to_synth(&ConsolidatorError::Wiki(ai_memory_wiki::WikiError::Io(
-                std::io::Error::other("admission webhook rejected the write")
-            ))),
-            "an admission rejection must never be laundered through the synth path"
-        );
-    }
-
-    /// The provider-facing warning must expose the class/status and drop
-    /// the provider body: both strings come from the pure helper that
-    /// feeds the `warn!`, so this covers the logged text without a
-    /// log-capture subscriber.
-    #[test]
-    fn checkpoint_fallback_warning_carries_class_status_not_provider_body() {
-        let error = ConsolidatorError::Llm(CheckpointSentinelLlm.fail());
-        let (warning, summary) = checkpoint_fallback_warning("pre-compact", &error);
-        assert_eq!(
-            warning,
-            "pre-compact: LLM consolidation unavailable; falling back to rule-based checkpoint"
-        );
-        assert_eq!(summary, "consolidation failed: class=provider status=400");
-        for text in [&warning, &summary] {
-            assert!(
-                !text.contains("SENTINEL_PRIVATE_BODY"),
-                "provider body leaked into the checkpoint fallback warning: {text}"
-            );
-        }
-    }
-
-    /// Non-LLM control: the helper is pure over every `ConsolidatorError`
-    /// variant, so a non-provider error (which the degrade predicate keeps
-    /// off this path) still renders only class/status, never the payload.
-    #[test]
-    fn checkpoint_fallback_warning_non_llm_error_reports_class_status_only() {
-        let error = ConsolidatorError::Serde("SENTINEL_PRIVATE_BODY".into());
-        let (warning, summary) = checkpoint_fallback_warning("post-compaction", &error);
-        assert_eq!(
-            warning,
-            "post-compaction: LLM consolidation unavailable; falling back to rule-based checkpoint"
-        );
-        assert_eq!(summary, "consolidation failed: class=serde status=none");
-        for text in [&warning, &summary] {
-            assert!(
-                !text.contains("SENTINEL_PRIVATE_BODY"),
-                "provider body leaked into the checkpoint fallback warning: {text}"
-            );
-        }
     }
 
     #[test]
@@ -7680,7 +7330,7 @@ mod tests {
         let sid = resolve_session_id(&env).unwrap();
         process(&state, env, None, Vec::new()).await.unwrap();
         let (ws, proj, _) = state.reader.find_session_scope(sid).await.unwrap().unwrap();
-        consolidate_or_synth(
+        write_checkpoint_page(
             &state,
             sid,
             ws,
@@ -7689,7 +7339,6 @@ mod tests {
             HookCheckpoint {
                 label: "test",
                 track_page_write: true,
-                defer_llm: false,
             },
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -7698,7 +7347,7 @@ mod tests {
         let before = state.reader.status_counts().await.unwrap();
         assert_eq!(before.pages_all, 1);
         state.ingest_metrics.record_persisted(123);
-        consolidate_or_synth(
+        write_checkpoint_page(
             &state,
             sid,
             ws,
@@ -7707,7 +7356,6 @@ mod tests {
             HookCheckpoint {
                 label: "test",
                 track_page_write: true,
-                defer_llm: false,
             },
             ai_memory_core::ActorContext::anonymous(),
         )

@@ -18,7 +18,8 @@ Provider work for those checkpoints, and for opt-in SessionEnd, is durably
 queued after those deterministic writes and handled by one bounded server
 worker, so hook drain latency does not cancel it. The worker starts whenever a
 consolidator is configured; SessionEnd enqueue stays behind the opt-in flag.
-Failed jobs retry with backoff and survive a server restart. A resumed native session is ended again only after its
+A checkpoint rewrite still queued when the session ends runs once anyway, even
+with the flag off. Failed jobs retry with backoff and survive a server restart. A resumed native session is ended again only after its
 observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and
