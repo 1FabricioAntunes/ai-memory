@@ -348,6 +348,42 @@ printf '{}' | run_hook_case "${HOOK_CASE_DIR}/missing-ai-memory" \
 assert_contains "${HOOK_CASE_DIR}/missing.err" "AI_MEMORY_NATIVE_BIN is not executable"
 assert_contains "${HOOK_CASE_DIR}/missing.err" "lifecycle hook event not captured"
 assert_no_container "hook without a native client"
+
+# On the hook path the wrapper only reuses an installed client: no update check
+# and no download, which could take seconds or hang. With nothing installed it
+# never runs curl; with a client installed it execs it without asking GitHub.
+cat >"${HOOK_CASE_DIR}/path/curl" <<'CURL'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"
+exit 1
+CURL
+chmod 0755 "${HOOK_CASE_DIR}/path/curl"
+run_cached_hook_case() {
+  HOME="${HOOK_CASE_DIR}/home" \
+  XDG_CACHE_HOME="${HOOK_CASE_DIR}/cache" \
+  XDG_DATA_HOME="${HOOK_CASE_DIR}/data" \
+  PATH="${HOOK_CASE_DIR}/path:${PATH}" \
+  AI_MEMORY_DOCKER="${HOOK_CASE_DIR}/path/docker" \
+  AI_MEMORY_WRAPPER_TEST_LOG="${HOOK_CASE_DIR}/native.log" \
+  AI_MEMORY_DOCKER_TEST_LOG="${HOOK_CASE_DIR}/docker.log" \
+    "${ROOT}/bin/ai-memory" "$@"
+}
+: >"${HOOK_CASE_DIR}/docker.log"
+hook_status=0
+printf '{}' | run_cached_hook_case hook --agent claude-code --event session-start \
+  2>"${HOOK_CASE_DIR}/uncached.err" || hook_status=$?
+[ "${hook_status}" -eq 0 ] || fail "hook with no installed client exited ${hook_status}, want 0"
+assert_contains "${HOOK_CASE_DIR}/uncached.err" "not installed yet"
+assert_no_container "hook with no installed client (no curl, no engine)"
+
+mkdir -p "${HOOK_CASE_DIR}/data/ai-memory/native-runner"
+cp "${HOOK_NATIVE}" "${HOOK_CASE_DIR}/data/ai-memory/native-runner/ai-memory"
+: >"${HOOK_CASE_DIR}/native.log"
+: >"${HOOK_CASE_DIR}/docker.log"
+printf '{"session_id":"s-2"}' \
+  | run_cached_hook_case hook --agent claude-code --event user-prompt-submit
+assert_contains "${HOOK_CASE_DIR}/native.log" "argv: hook --agent claude-code --event user-prompt-submit"
+assert_no_container "hook with an installed client (no update check)"
 printf 'wrapper hook native routing checks passed\n'
 
 printf 'wrapper upgrade ownership checks passed\n'

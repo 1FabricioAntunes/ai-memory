@@ -2721,9 +2721,11 @@ checksum-verified native client under
 on the host and enforces capture exclusions before spooling. A hook command
 that calls the wrapper (`ai-memory hook --event …`) therefore runs natively in
 a few milliseconds and posts to the host's `127.0.0.1:49374`; it never starts a
-container. If the native client is missing and cannot be installed, the wrapper
-prints the reason on stderr, drops that one event, and exits 0 so the agent is
-not blocked. For local loopback
+container. A hook only reuses the installed client: `install-hooks` and
+`mcp-bridge` install and refresh it, while the hook path never checks for an
+update or downloads. If no client is installed yet, the wrapper says to run
+`ai-memory install-hooks` once, drops that one event, and exits 0 so the agent
+is not blocked. For local loopback
 servers, the wrapper automatically bridges
 that helper back to the host's `127.0.0.1:49374`, so `ai-memory status`,
 `ai-memory search`, and `ai-memory bootstrap` work with the same default

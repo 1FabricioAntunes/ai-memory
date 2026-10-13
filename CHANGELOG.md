@@ -33,8 +33,10 @@ and [0.x](docs/changelog/0.x.md).
   `127.0.0.1` server URL pointed at the container instead of the host server.
   The wrapper now runs `hook` and `hook-drain` through the same
   checksum-verified native host client as `mcp-bridge` and `install-hooks`.
-  When that client is unavailable, the wrapper reports why on stderr, skips
-  the event and exits 0, so the agent is never blocked.
+  A hook only reuses the installed client, with no update check or download
+  on the hook path. When no client is installed yet, the wrapper says to run
+  `ai-memory install-hooks` once, skips the event and exits 0, so the agent
+  is never blocked.
 
 ## [2.6.6] - 2026-10-13
 
