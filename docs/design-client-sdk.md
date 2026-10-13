@@ -190,8 +190,8 @@ release.
 
 One entry class with namespaces that mirror the server's concepts. The first
 release targets Node 22 and newer. Deno and Bun work through standard
-`fetch` in a manual smoke run but are not tested in CI (§9, Q8); callers on other runtimes inject their own
-`fetch`.
+`fetch` in a manual smoke run but are not tested in CI (§9, Q8); callers on
+other runtimes inject their own `fetch`.
 
 ```ts
 import { AiMemoryClient } from "ai-memory-ts"; // final name: decision D1
@@ -859,8 +859,8 @@ fits the plan:
   before sending, so a path cannot climb out of the prefix.
 - Q3 (marker file): **scope always comes from the caller.** No helper reads
   `.ai-memory.toml`. A library that reads files from its working directory
-  surprises callers in servers and bundles, and the static-client rule wants
-  the caller's code to show which project it writes to.
+  surprises callers in servers and bundles, and under the static-client rule
+  the caller's code shows which project it writes to.
 - Q4 (non-project writes): **not wrapped.** `pages.write` always sends a
   project scope. Writes with `scope: "global"` or `"profile"` reach every
   project, so they stay explicit through `callTool` until a caller needs them.
@@ -872,8 +872,9 @@ fits the plan:
   `pages.update(path, change)`. It reads the page, carries its metadata over
   (title, tier, tags, pinned, kind, entities, abstract, relations, TTL), applies
   the change (`null` clears a field), and writes with the read version as
-  `expectedPageId`. One attempt and no retry: a concurrent change raises
-  `PreconditionFailedError` and writes nothing. The page must exist.
+  `expectedPageId`. It makes one attempt and does not retry: a concurrent
+  change raises `PreconditionFailedError` and writes nothing. The page must
+  exist.
 - Q8 (runtimes): **Node 22 floor**, tested on Node 22 and 24 in CI. Bun and
   Deno are documented as untested in CI; the SDK uses only standard `fetch`,
   `AbortSignal`, `TextDecoder` and `URL`, and a manual smoke run against a

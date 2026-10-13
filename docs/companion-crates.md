@@ -426,7 +426,7 @@ See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
 
 ## `ai-memory-ts`: TypeScript client SDK
 
-Typed client for programs that are not coding-agent harnesses (issue #1165):
+A typed client for programs that are not coding-agent harnesses (issue #1165):
 custom agents and bots, editor and app extensions (RFC #1166) and automation
 scripts. It lives at [`companions/ai-memory-ts`](../companions/ai-memory-ts),
 has no runtime dependencies, and talks to ai-memory only through the public
