@@ -10,6 +10,9 @@
 > re-explaining the architecture, the failed approaches, or the open
 > questions.
 
+**Website: [aimemory.sh](https://aimemory.sh)**
+
+[![Website](https://img.shields.io/badge/website-aimemory.sh-blue)](https://aimemory.sh)
 [![Release](https://img.shields.io/github/v/release/akitaonrails/ai-memory)](https://github.com/akitaonrails/ai-memory/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-1.95+-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)

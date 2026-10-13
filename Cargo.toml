@@ -39,6 +39,7 @@ version = "2.6.6"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+homepage = "https://aimemory.sh"
 repository = "https://github.com/akitaonrails/ai-memory"
 authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
