@@ -107,7 +107,7 @@ if new_text == text:
 #    path deps (ai-memory-core, ai-memory-store, etc.).  These always use the
 #    same version as the workspace package itself.
 new_text = re.sub(
-    r'(ai-memory-\w+\s*=\s*\{[^}]*version\s*=\s*")[^"]+(")',
+    r'(ai-memory-[\w-]+\s*=\s*\{[^}]*version\s*=\s*")[^"]+(")',
     r'\g<1>$VERSION\g<2>',
     new_text,
     flags=re.MULTILINE,
