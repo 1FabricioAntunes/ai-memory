@@ -307,6 +307,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ai-memory status` and `ai-memory doctor` now show the server's auth
   posture, and for an unauthenticated loopback server print
   `auth: none (loopback)` with the fix, `ai-memory auth enable`.
+- Added a server-side drop list for tool events: `[ingest]
+  drop_tool_use_id_prefixes` and `drop_tool_names` (both empty by default, at
+  most 64 entries of 128 characters). A PreToolUse or PostToolUse event whose
+  tool-use id starts with a listed prefix, or whose tool name matches exactly,
+  is answered with 202 and counted as a policy drop in `/hook` and
+  `/hook/batch`, before it is sanitized, rate-limited or stored. The lists
+  apply to every project on the server. (#1241)
 
 ### Changed
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or

@@ -1165,6 +1165,12 @@ max_attempts = 8                  # failed drain passes before dropping an event
                                   # only this limit. Age (7 days) and spool size (10,000 files)
                                   # still bound retention. Runtime env wins when set:
                                   # AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS
+
+[ingest]                          # server-side drop list for tool events (#1241)
+drop_tool_use_id_prefixes = []    # e.g. ["toolu_plugin_"]: drop a tool event whose id starts so
+drop_tool_names = []              # exact tool names to drop; both lists apply to every project,
+                                  # at most 64 entries of 128 characters, checked before the
+                                  # sanitizer, rate limiter and ingest semaphore
 ```
 
 The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese

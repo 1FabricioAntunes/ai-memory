@@ -123,6 +123,13 @@ second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to
 bound one runaway session without blocking unrelated hook sources. Unset or `0`
 rate leaves the limiter disabled.
 
+To stop the server from storing particular tool calls whatever the client
+sends, list them in `[ingest]`: `drop_tool_use_id_prefixes` (for example
+`["toolu_plugin_"]`, the id prefix Claude Code gives plugin tool calls) and
+`drop_tool_names` (exact names). A matching PreToolUse or PostToolUse event is
+acknowledged and discarded before it is sanitized, rate-limited or stored. The
+lists apply to every project on the server.
+
 For shared servers where each developer should authenticate their own hook
 writes, native Claude Code hooks can use a stored OIDC device token instead of
 embedding a shared static token:

@@ -601,6 +601,8 @@ pub struct Config {
     pub routing: RoutingSettings,
     /// Client-side hook spool retry policy.
     pub hook_spool: HookSpoolSettings,
+    /// `[ingest]` — server-side drop list for tool events (#1241).
+    pub ingest: IngestSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -1193,6 +1195,22 @@ pub struct RoutingSettings {
     pub mid_session: ai_memory_core::MidSessionRouting,
 }
 
+/// `[ingest]`: tool events the server drops whatever the client sends
+/// (#1241). Both lists are empty by default and apply to every project on the
+/// server. Validated once by [`Config::load`] into [`Self::drop_list`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IngestSettings {
+    /// Drop a tool event whose `tool_use_id` starts with one of these.
+    pub drop_tool_use_id_prefixes: Vec<String>,
+    /// Drop a tool event whose tool name equals one of these exactly.
+    pub drop_tool_names: Vec<String>,
+    /// The validated list the hook router checks. Set by [`Config::load`];
+    /// never read from or written to a config file.
+    #[serde(skip)]
+    pub drop_list: ai_memory_hooks::IngestDropList,
+}
+
 /// Client-side hook spool retry policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
@@ -1282,6 +1300,7 @@ impl Default for Config {
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
             hook_spool: HookSpoolSettings::default(),
+            ingest: IngestSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -2224,6 +2243,11 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
+        config.ingest.drop_list = ai_memory_hooks::IngestDropList::new(
+            config.ingest.drop_tool_use_id_prefixes.clone(),
+            config.ingest.drop_tool_names.clone(),
+        )
+        .map_err(|message| anyhow::anyhow!(message))?;
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -4442,6 +4466,42 @@ input_token_safety_margin = {margin}
     /// rather than written out, so the test keeps meaning "the smallest
     /// accepted budget round-trips" when the floor moves (#1234) instead of
     /// pinning a number the floor happens to allow today.
+    /// `[ingest]` is read once into the validated drop list the hook router
+    /// checks, and an out-of-bounds entry fails startup instead of being
+    /// silently ignored (#1241).
+    #[test]
+    fn ingest_drop_lists_load_into_the_router_list_and_reject_bad_entries() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[ingest]\ndrop_tool_use_id_prefixes = [\"toolu_plugin_\"]\ndrop_tool_names = [\"mcp__noisy__poll\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            config.ingest.drop_list,
+            ai_memory_hooks::IngestDropList::new(
+                vec!["toolu_plugin_".into()],
+                vec!["mcp__noisy__poll".into()]
+            )
+            .unwrap()
+        );
+
+        std::fs::write(&config_path, "[ingest]\ndrop_tool_names = [\" \"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("drop_tool_names"),
+            "{error:#}"
+        );
+
+        // Default: empty, so nothing is dropped.
+        assert_eq!(
+            Config::default().ingest.drop_list,
+            ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
     #[test]
     fn load_accepts_a_small_context_consolidation_budget() {
         let tmp = TempDir::new().unwrap();

@@ -549,6 +549,10 @@ pub struct HookState {
     /// (`docs/design-cross-project-profile.md`). Held here because the hooks
     /// crate makes no config reads.
     pub profile: ai_memory_core::profile::ProfileSettings,
+    /// `[ingest]` drop list: tool events matching a listed tool-use id prefix
+    /// or tool name are acknowledged and dropped before any capacity is spent
+    /// (#1241). Empty by default.
+    pub ingest_drop_list: crate::drop_list::IngestDropList,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -687,6 +691,12 @@ async fn admit_hook(
     if is_cursor_draft_placeholder(&env) {
         HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "cursor draft placeholder dropped");
+    }
+    // The operator's server-side drop list (#1241): acknowledged as a policy
+    // drop before the rate limiter or the semaphore, so it costs nothing.
+    if state.ingest_drop_list.matches(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return (StatusCode::ACCEPTED, "ingest drop list");
     }
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
     // subagent sessions) when the operator opts in. Returning 202 (not an error)
@@ -961,6 +971,16 @@ async fn handle_hook_batch(
             results.push(HookBatchResult {
                 index: idx,
                 outcome: HookProcessingOutcome::DroppedInvalid,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
+        // Server-side drop list (#1241), acknowledged like a policy drop.
+        if state.ingest_drop_list.matches(&env) {
+            HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedPolicy,
             });
             accepted_indices.push(idx);
             continue;
@@ -6049,6 +6069,7 @@ mod tests {
             per_user_slots: false,
             mid_session_routing: MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
+            ingest_drop_list: crate::drop_list::IngestDropList::default(),
         }
     }
 
@@ -8462,6 +8483,108 @@ mod tests {
     /// the subagent tail-drop. They are separate call sites in
     /// `handle_hook_batch`, so a single-branch case would leave the other
     /// silently uncounted — the exact failure this change exists to fix.
+    fn with_drop_list(state: &mut HookState) {
+        state.ingest_drop_list = crate::drop_list::IngestDropList::new(
+            vec!["toolu_plugin_".into()],
+            vec!["mcp__noisy__poll".into()],
+        )
+        .unwrap();
+    }
+
+    /// #1241: a listed tool event is acknowledged and dropped before any
+    /// capacity is spent. With the semaphore exhausted, the listed event
+    /// still answers 202 while an ordinary one gets the 429 (control).
+    #[tokio::test]
+    async fn the_ingest_drop_list_drops_before_any_capacity_is_spent() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_list(&mut state);
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query(),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-1", "tool_name": "Read", "tool_use_id": "toolu_plugin_9" }),
+        )
+        .await;
+        assert_eq!((status, reason), (StatusCode::ACCEPTED, "ingest drop list"));
+        let (status, _) = admit_hook(
+            state.clone(),
+            query(),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-1", "tool_name": "mcp__noisy__poll" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (status, _) = admit_hook(
+            state.clone(),
+            query(),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-1", "tool_name": "Read", "tool_use_id": "toolu_01" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "control: an unlisted event needs capacity"
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 2);
+    }
+
+    /// The batch route drops listed items as committed (so the client clears
+    /// them from its spool) and stores the rest.
+    #[tokio::test]
+    async fn the_ingest_drop_list_applies_to_hook_batches() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_list(&mut state);
+        let metrics = state.ingest_metrics.clone();
+        let item = |body: serde_json::Value| HookBatchItem {
+            url: "http://h/hook?event=post-tool-use&agent=claude-code".into(),
+            body,
+        };
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![
+                item(serde_json::json!({ "session_id": "drop-b", "tool_name": "Read", "tool_use_id": "toolu_plugin_1" })),
+                item(serde_json::json!({ "session_id": "drop-b", "tool_name": "mcp__noisy__poll" })),
+                item(serde_json::json!({ "session_id": "drop-b", "tool_name": "Read", "tool_use_id": "toolu_02" })),
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.dropped_by_policy, 2,
+            "both listed items are policy drops"
+        );
+        assert_eq!(snap.accepted, 1, "control: the unlisted item is ingested");
+    }
+
     #[tokio::test]
     async fn handle_hook_batch_records_dropped_by_policy() {
         let tmp = TempDir::new().unwrap();
