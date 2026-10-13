@@ -3,7 +3,7 @@
 This report splits ai-memory's LongMemEval-S `hit@5` into its parts:
 evidence the index never sees, ranking on evidence it does see, and
 artifacts of the harness itself. It then records what the observation
-stream, shipped in 3.0 (unreleased), recovered.
+stream, shipped in 3.0, recovered.
 
 It publishes two kinds of number, and they answer different questions:
 

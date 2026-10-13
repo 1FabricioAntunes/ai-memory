@@ -46,7 +46,7 @@ What still sets ai-memory apart:
 - **Capture under the harness you already use.** One server; 20+ harnesses
   (Claude Code, Codex, Cursor, Gemini, OpenCode, Kimi, …) feed and read the
   same memory. Replication between servers is not automatic; in 3.0
-  (unreleased) the `ai-memory-wikisync` companion adds two-way,
+  the `ai-memory-wikisync` companion adds two-way,
   conflict-aware sync between a server's wiki and a git repository.
 
 It also publishes retrieval numbers, produced by the in-repo harness with full
@@ -54,7 +54,7 @@ provenance and measured end to end through the shipped capture pipeline:
 LongMemEval-S hit@5 **0.666** zero-LLM and **0.815** with the default local
 embeddings in the published 2.6 line. The observation stream in 3.0
 (unreleased, on by default) raises zero-LLM to **0.951** and local embeddings
-to **0.936** on all 470 questions, measured on one build with the stream off
+to **0.945** on all 470 questions, measured on one build with the stream off
 and on. With capture skipped and each raw session indexed whole (component
 mode, ranking only), zero-LLM FTS scores 0.972; the
 [decomposition report](benchmarks/longmemeval-s-decomposition-2026-10-12.md)
@@ -409,7 +409,7 @@ ships something ai-memory does not, it is named.
   card showing the user which memories were injected.
 - **Retrieval through capture, and no local reranker.** Through the shipped
   pipeline, LongMemEval-S hit@5 is 0.815 with local embeddings and 0.666
-  zero-LLM (2.6); the 3.0 observation stream raises them to 0.936 and 0.951. Ranking
+  zero-LLM (2.6); the 3.0 observation stream raises them to 0.945 and 0.951. Ranking
   the same raw sessions whole scores 0.972 zero-LLM. The
   [decomposition](benchmarks/longmemeval-s-decomposition-2026-10-12.md) traced
   the gap to capture, and within capture not to the 2 KB privacy cap (pages holding exactly the captured text
@@ -430,7 +430,7 @@ ships something ai-memory does not, it is named.
 
   | Tool | Number | Kind | Setup |
   |---|---|---|---|
-  | ai-memory 3.0 (unreleased) | LongMemEval-S hit@5 0.951 FTS / 0.936 local (2.6: 0.666 / 0.815) | Retrieval through capture | In-repo harness, all 470 questions; component mode FTS 0.972 |
+  | ai-memory 3.0 | LongMemEval-S hit@5 0.951 FTS / 0.945 local (2.6: 0.666 / 0.815) | Retrieval through capture | In-repo harness, all 470 questions; component mode FTS 0.972 |
   | MemPalace | 96.6% R@5 raw, 98.4% held-out (450 q) | Retrieval only | Different harness |
   | agentmemory | 95.2% `recall_any@5`; 2026-10-09 baseline 96.2% any-hit, 84.68% strict recall-all@5 | Retrieval, component | Whole raw sessions, reranker disabled; the authors say the baseline supports no competitive claim |
   | Mem0 | LongMemEval 94.4, LoCoMo 92.5, BEAM 64.1 (1M) / 48.6 (10M) | End-to-end QA, LLM-judged | Managed platform, top-200 budget; harness defaults to gpt-4o reader and judge; headline models not stated |

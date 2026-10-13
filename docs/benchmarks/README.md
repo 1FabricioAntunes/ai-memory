@@ -13,21 +13,24 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
-| **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0, unreleased; on by default)** | **0.951** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
-| **2026-10-13** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0, unreleased; on by default)** | **0.936** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0.0 release; on by default)** | **0.951** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0.0 release; on by default)** | **0.945** | [longmemeval-s-3.0.0-release.md](longmemeval-s-3.0.0-release.md) |
 | 2026-09-21 | LongMemEval-S (v1) | local embeddings (2.4 RC, current release) | 0.815 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-21 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (2.4 RC) | 0.666 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
 
-The 2026-10-13 rows are the 3.0 observation stream measured on all 470
-questions, comparing the stream off and on with the same build. Zero-LLM FTS
-`hit@5` went 0.662 → 0.951 (hit@1 0.511 → 0.857, hit@10 0.687 → 0.972; 139
-questions gained, 3 lost) and local embeddings 0.796 → 0.936 (hit@1 0.536 →
-0.757; 72 gained, 6 lost). Context tokens for the top five hits rose 3.8%
-(FTS) and 17.0% (local). Against the last published release numbers (2.4/2.6:
-0.666 FTS, 0.815 local), that is +0.285 and +0.121. These numbers come from
+The 2026-10-13 rows are the 3.0.0 release benchmark: all 470 questions on the
+release-candidate code, comparing the stream off and on with the same build
+([release report](longmemeval-s-3.0.0-release.md)). Zero-LLM FTS `hit@5` went
+0.662 → 0.951 (hit@1 0.511 → 0.857, hit@10 0.687 → 0.972; 139 questions
+gained, 3 lost) and local embeddings 0.800 → 0.945 (hit@1 0.543 → 0.766; 72
+gained, 4 lost). Context tokens for the top five hits rose 3.8% (FTS) and
+17.0% (local). Against the last published release numbers (2.4/2.6: 0.666 FTS,
+0.815 local), that is +0.285 and +0.130, and every slice improved. The
+stream-off local baseline (0.800 against 0.815) is tracked in
+[#1263](https://github.com/akitaonrails/ai-memory/issues/1263). These numbers come from
 the harness corrected on 2026-10-13, which replays each question's sessions
 under their own session ids; the first published stream figures (0.666 →
 0.868) came from a harness that reused them across questions and left a few

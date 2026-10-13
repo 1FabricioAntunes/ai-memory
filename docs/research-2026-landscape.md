@@ -573,7 +573,7 @@ with another or with ours, and no ranking is claimed.
 
 | Tool | Number | Kind | Setup caveats |
 |---|---|---|---|
-| ai-memory 3.0 (unreleased) | LongMemEval-S hit@5 0.951 zero-LLM FTS, 0.936 local embeddings (all 470) | Retrieval through the shipped capture pipeline | 2.6 published 0.666 / 0.815; component mode (raw sessions indexed whole) FTS 0.972 |
+| ai-memory 3.0 | LongMemEval-S hit@5 0.951 zero-LLM FTS, 0.945 local embeddings (all 470) | Retrieval through the shipped capture pipeline | 2.6 published 0.666 / 0.815; component mode (raw sessions indexed whole) FTS 0.972 |
 | MemPalace | 96.6% R@5 raw, 98.4% on 450 held-out questions | Retrieval only | Closest in kind to our hit@5; different harness |
 | agentmemory | 95.2% `recall_any@5`; 2026-10-09 baseline 452/470 (96.2%) any-hit, 84.68% strict recall-all@5 | Retrieval, component (whole raw sessions) | Reranker disabled; the authors say the baseline supports no competitive claim |
 | mcp-memory-service | 80.4% R@5 turn-level, 86.0% session-level | Retrieval | Not re-read on 2026-10-13 |
