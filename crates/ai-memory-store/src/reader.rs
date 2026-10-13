@@ -438,12 +438,16 @@ pub(crate) const OBSERVATION_ROWID_SPAN_SQL: &str = "SELECT \
      (SELECT MAX(rowid) FROM observations INDEXED BY idx_observations_project \
       WHERE project_id = ?1)";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PageAuthority {
     factor: f64,
     /// Kind/tier penalty this page carries *because* it is a session page
     /// (`0.0` for every other kind). A `session_recall` query gives it back.
     session_penalty: f64,
+    /// Semantic kind and tier the factor was derived from, kept so a
+    /// [`PageFilter`] needs no second read of the same rows.
+    kind: String,
+    tier: String,
 }
 
 impl PageAuthority {
@@ -516,6 +520,8 @@ impl PageAuthority {
         Self {
             factor: factor.clamp(0.55, 1.50),
             session_penalty,
+            kind: kind.to_owned(),
+            tier: tier.to_owned(),
         }
     }
 
@@ -869,6 +875,51 @@ pub struct VectorQuery<'a> {
     pub dim: u32,
 }
 
+/// Candidates each stream is asked for when a [`PageFilter`] is active.
+///
+/// The streams have no kind or tier predicate, so a filter can only keep what
+/// they return. A pool this much wider than an unfiltered search's keeps a
+/// rare kind from being crowded out by pages of other kinds that outrank it.
+pub const FILTER_CANDIDATE_POOL: usize = 500;
+
+/// Narrows a [`HybridSearch`] to pages of one kind and/or tier.
+///
+/// Applied after fusion and authority, before the result is cut to
+/// `limit`, so `limit` counts hits that passed it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageFilter<'a> {
+    /// Semantic kind to keep, compared ASCII case-insensitively; `None`
+    /// keeps every kind.
+    pub kind: Option<&'a str>,
+    /// Memory tier to keep; `None` keeps every tier.
+    pub tier: Option<&'a str>,
+}
+
+impl PageFilter<'_> {
+    fn is_active(&self) -> bool {
+        self.kind.is_some() || self.tier.is_some()
+    }
+
+    /// Whether a page of this kind and tier passes the filter.
+    #[must_use]
+    pub fn keeps(&self, kind: &str, tier: &str) -> bool {
+        self.kind.is_none_or(|k| k.eq_ignore_ascii_case(kind))
+            && self.tier.is_none_or(|t| t == tier)
+    }
+}
+
+/// What [`ReaderPool::hybrid_search_scopes`] returns.
+#[derive(Debug)]
+pub struct HybridHits {
+    /// Hits best first, each with its explain details when asked for.
+    pub hits: Vec<(PageHit, Option<SearchExplain>)>,
+    /// Per-stream wall time; `explain` only.
+    pub timings: Option<StreamTimings>,
+    /// A [`PageFilter`] was active and a stream returned its whole
+    /// candidate pool, so matches ranked past it were never looked at.
+    pub filter_pool_full: bool,
+}
+
 /// One [`ReaderPool::hybrid_search_scopes`] request.
 #[derive(Debug, Clone, Copy)]
 pub struct HybridSearch<'a> {
@@ -887,6 +938,8 @@ pub struct HybridSearch<'a> {
     /// Who is asking, as the session timeline sees them: an observation
     /// excerpt is attached only from a session this filter admits.
     pub owner: &'a OwnerFilter,
+    /// Keep only pages of this kind and/or tier; the default keeps all.
+    pub filter: PageFilter<'a>,
 }
 
 /// Per-query wall time of each retrieval stream, in milliseconds, for an
@@ -1299,7 +1352,8 @@ pub struct PageHitWithMeta {
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
     /// Semantic kind, so the web search can filter without a second lookup.
-    /// Not serialized: the MCP `global_hits` shape stays as it was.
+    /// Empty on a recency listing, which nothing filters. Not serialized: the
+    /// MCP `global_hits` shape stays as it was.
     #[serde(skip)]
     pub kind: String,
     /// Memory tier; see `kind`.
@@ -2970,7 +3024,7 @@ impl ReaderPool {
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
-            .map(|(hit, authority)| (hit.id, *authority))
+            .map(|(hit, authority)| (hit.id, authority.clone()))
             .collect();
         // Entity-only hits never passed through an FTS candidate row;
         // read their authority off the version row itself (no latest
@@ -3570,8 +3624,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
-                        CAST(pages.updated_at AS REAL) AS rank, \
-                        {kind_expr} AS kind, pages.tier \
+                        CAST(pages.updated_at AS REAL) AS rank \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
@@ -3579,7 +3632,6 @@ impl ReaderPool {
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
                 descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
-                kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json"),
                 not_expired = not_expired("pages", "?2"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -3593,22 +3645,11 @@ impl ReaderPool {
                 let title: String = row.get(3)?;
                 let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
                 let rank: f64 = row.get(5)?;
-                let kind: String = row.get(6)?;
-                let tier: String = row.get(7)?;
-                Ok((
-                    workspace_name,
-                    project_name,
-                    path,
-                    title,
-                    snippet,
-                    rank,
-                    kind,
-                    tier,
-                ))
+                Ok((workspace_name, project_name, path, title, snippet, rank))
             })?;
             let mut hits = Vec::new();
             for row in rows {
-                let (workspace_name, project_name, path, title, snippet, rank, kind, tier) = row?;
+                let (workspace_name, project_name, path, title, snippet, rank) = row?;
                 hits.push(PageHitWithMeta {
                     workspace_name,
                     project_name,
@@ -3616,8 +3657,8 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
-                    kind,
-                    tier,
+                    kind: String::new(),
+                    tier: String::new(),
                 });
             }
             Ok(hits)
@@ -6156,6 +6197,7 @@ impl ReaderPool {
                 false,
                 include_superseded,
                 &OwnerFilter::Any,
+                PageFilter::default(),
             )
             .await?
             .0
@@ -6220,7 +6262,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<(Vec<(PageHit, SearchExplain)>, StreamTimings)> {
-        let (hits, timings) = self
+        let (hits, timings, _) = self
             .hybrid_search_inner(
                 workspace_id,
                 project_id,
@@ -6234,6 +6276,7 @@ impl ReaderPool {
                 true,
                 include_superseded,
                 &OwnerFilter::Any,
+                PageFilter::default(),
             )
             .await?;
         // Belief-strength fields (`evidence_count`, `confidence`,
@@ -6268,7 +6311,7 @@ impl ReaderPool {
         &self,
         scopes: &[(WorkspaceId, ProjectId)],
         search: HybridSearch<'_>,
-    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, Option<StreamTimings>)> {
+    ) -> StoreResult<HybridHits> {
         // Provider/model/dim only select which stored vectors are eligible;
         // with no query vector the vector stream never runs, so the empty
         // triple is inert rather than a fake identity.
@@ -6282,9 +6325,10 @@ impl ReaderPool {
             None => (None, String::new(), String::new(), 0),
         };
         let mut timings: Option<StreamTimings> = None;
+        let mut filter_pool_full = false;
         let mut per_scope = Vec::with_capacity(scopes.len());
         for &(workspace_id, project_id) in scopes {
-            let (hits, scope_timings) = self
+            let (hits, scope_timings, pool_full) = self
                 .hybrid_search_inner(
                     workspace_id,
                     project_id,
@@ -6298,8 +6342,10 @@ impl ReaderPool {
                     search.explain,
                     search.include_superseded,
                     search.owner,
+                    search.filter,
                 )
                 .await?;
+            filter_pool_full |= pool_full;
             if search.explain {
                 timings
                     .get_or_insert_with(Default::default)
@@ -6345,7 +6391,11 @@ impl ReaderPool {
         } else {
             hits
         };
-        Ok((hits, timings))
+        Ok(HybridHits {
+            hits,
+            timings,
+            filter_pool_full,
+        })
     }
 
     /// The streams [`Self::hybrid_search_scopes`] runs for a query, in the
@@ -6381,7 +6431,8 @@ impl ReaderPool {
         explain: bool,
         include_superseded: bool,
         owner_filter: &OwnerFilter,
-    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings)> {
+        filter: PageFilter<'_>,
+    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings, bool)> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Stream timings exist only for explain: `explain.then(Instant::now)`
         // reads no clock on the normal path.
@@ -6394,7 +6445,13 @@ impl ReaderPool {
         // bounded candidate window used by FTS-only search. A `limit * 2`
         // window was too narrow at small limits for a canonical page to enter
         // the fused pool and receive its bounded promotion.
-        let candidate_limit = authority_candidate_limit(limit);
+        // A filter can only keep what the streams return, so they are asked
+        // for a wide pool and `limit` is applied to what survives.
+        let candidate_limit = authority_candidate_limit(if filter.is_active() {
+            limit.max(FILTER_CANDIDATE_POOL)
+        } else {
+            limit
+        });
         // Tokenize the borrowed query before the FTS candidate call consumes
         // it. This avoids cloning a caller-controlled query on the hot path.
         // The default path uses the latest-only entry; the opt-in path reaches
@@ -6442,7 +6499,7 @@ impl ReaderPool {
         timings.fts_ms = elapsed_ms(started);
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
-            .map(|(hit, authority)| (hit.id, *authority))
+            .map(|(hit, authority)| (hit.id, authority.clone()))
             .collect();
         let fts_hits: Vec<PageHit> = fts_candidates
             .into_iter()
@@ -6542,6 +6599,11 @@ impl ReaderPool {
         } else {
             Vec::new()
         };
+
+        let filter_pool_full = filter.is_active()
+            && [fts_hits.len(), vec_hits.len(), entity_hits.len()]
+                .into_iter()
+                .any(|returned| returned >= candidate_limit);
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
@@ -6852,6 +6914,13 @@ impl ReaderPool {
                 // back to HashMap iteration order.
                 .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
         });
+        if filter.is_active() {
+            out.retain(|(hit, _)| {
+                authorities
+                    .get(&hit.id)
+                    .is_some_and(|a| filter.keeps(&a.kind, &a.tier))
+            });
+        }
         out.truncate(limit);
         // Label the superseded versions among the final hits so the caller can
         // tell historical versions from the current one. Only the opt-in path
@@ -6866,7 +6935,7 @@ impl ReaderPool {
                 hit.superseded = superseded.contains(&hit.id);
             }
         }
-        Ok((out, timings))
+        Ok((out, timings, filter_pool_full))
     }
 
     /// The subset of `page_ids` that are superseded (non-latest) versions in
@@ -8522,52 +8591,6 @@ impl ReaderPool {
                 .query_row(&sql, params![page_id.as_bytes()], page_meta_from_row)
                 .optional()?;
             row_opt.transpose()
-        })
-        .await
-    }
-
-    /// Semantic kind and tier of each latest page in `page_ids`, in one query.
-    ///
-    /// Ids that name no latest page are absent from the map. The caller has
-    /// already scoped the ids (they come from a search the viewer was allowed
-    /// to run), so this reads no repository the viewer could not.
-    ///
-    /// # Errors
-    /// Propagates any SQL or pool error.
-    pub async fn page_kinds_tiers_by_ids(
-        &self,
-        page_ids: &[PageId],
-    ) -> StoreResult<std::collections::HashMap<PageId, (String, String)>> {
-        if page_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        let id_blobs: Vec<Value> = page_ids
-            .iter()
-            .map(|id| Value::Blob(id.as_bytes().to_vec()))
-            .collect();
-        self.with_conn(move |conn| {
-            let placeholders = std::iter::repeat_n("?", id_blobs.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT pg.id, {kind_expr}, pg.tier FROM pages pg \
-                 WHERE pg.is_latest = 1 AND pg.id IN ({placeholders})",
-                kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json"),
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(id_blobs.iter()), |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            let mut out = std::collections::HashMap::new();
-            for row in rows {
-                let (id, kind, tier) = row?;
-                out.insert(PageId::from_slice(&id)?, (kind, tier));
-            }
-            Ok(out)
         })
         .await
     }
@@ -12922,11 +12945,12 @@ mod tests {
                 explain,
                 false,
                 &OwnerFilter::Any,
+                super::PageFilter::default(),
             )
         };
-        let (_, off) = search(false).await.unwrap();
+        let (_, off, _) = search(false).await.unwrap();
         assert_eq!(off, super::StreamTimings::default());
-        let (_, on) = search(true).await.unwrap();
+        let (_, on, _) = search(true).await.unwrap();
         assert!(on.fts_ms.is_some() && on.entity_ms.is_some() && on.graph_ms.is_some());
         assert!(on.observation_ms.is_some(), "the stream is on by default");
         assert!(on.vector_ms.is_none(), "no query vector, no vector scan");

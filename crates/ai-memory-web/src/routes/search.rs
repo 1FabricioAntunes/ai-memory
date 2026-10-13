@@ -12,15 +12,19 @@
 //!   viewer may read, as `memory_query(global=true)` does. Its trace is the
 //!   FTS time alone; there are no per-hit streams to show.
 //!
-//! `kind` and `tier` narrow either mode *after* ranking, so the surviving
-//! hits keep the order `memory_query` gives them.
+//! `kind` and `tier` narrow either mode after fusion, inside the ranker. The
+//! streams are asked for a wider candidate pool so a rare kind is not crowded
+//! out, which means the order of the survivors can differ slightly from the
+//! unfiltered top hits of the same query.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_core::Tier;
-use ai_memory_store::{PAGE_KINDS, SearchExplain, StreamTimings};
+use ai_memory_store::{
+    FILTER_CANDIDATE_POOL, PAGE_KINDS, PageFilter, SearchExplain, StreamTimings,
+};
 use askama::Template;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -40,9 +44,6 @@ const GLOBAL_DEFAULT_LIMIT: usize = 50;
 const SCOPED_DEFAULT_LIMIT: usize = 20;
 /// Upper bound on `limit`, the same clamp `memory_query` applies.
 const MAX_LIMIT: usize = 100;
-/// Matches a filtered search ranks before it filters. The ranker has no
-/// kind or tier predicate, so a filter only sees this many top hits.
-const FILTER_POOL: usize = 500;
 /// Memory tiers the filter offers, in `Tier` declaration order.
 const TIERS: [&str; 4] = ["working", "episodic", "semantic", "procedural"];
 
@@ -138,14 +139,19 @@ pub(crate) async fn handler(
         None => None,
     };
     let filtered = kind.is_some() || tier.is_some();
-    let keeps = |hit_kind: &str, hit_tier: &str| {
-        kind.as_deref()
-            .is_none_or(|k| k.eq_ignore_ascii_case(hit_kind))
-            && tier.as_deref().is_none_or(|t| t == hit_tier)
+    let filter = PageFilter {
+        kind: kind.as_deref(),
+        tier: tier.as_deref(),
     };
-    // A filter runs after ranking, so the ranker is asked for a wide pool
-    // and the limit is applied to what survives.
-    let fetch_limit = |limit: usize| if filtered { FILTER_POOL } else { limit + 1 };
+    // The global search has no ranker-side filter, so a filtered one is asked
+    // for a wide pool and the limit is applied to what survives.
+    let fetch_limit = |limit: usize| {
+        if filtered {
+            FILTER_CANDIDATE_POOL
+        } else {
+            limit + 1
+        }
+    };
     let internal = |error: ai_memory_store::StoreError| {
         tracing::error!(%error, "web search failed");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -177,9 +183,10 @@ pub(crate) async fn handler(
                     &state,
                     &[(resolved.workspace_id, resolved.project_id)],
                     &query,
-                    fetch_limit(limit),
+                    limit + 1,
                     explain,
                     &super::api::owner_filter_for(actor),
+                    filter,
                 )
                 .await
                 {
@@ -188,23 +195,10 @@ pub(crate) async fn handler(
                 };
                 timings = result.timings;
                 streams_active = result.streams_active;
-                // The trace position is the rank before filtering.
-                let mut ranked: Vec<_> = result.hits.into_iter().enumerate().collect();
-                pool_capped = filtered && ranked.len() >= FILTER_POOL;
-                if filtered {
-                    let ids: Vec<_> = ranked.iter().map(|(_, (hit, _))| hit.id).collect();
-                    let facets = match state.reader.page_kinds_tiers_by_ids(&ids).await {
-                        Ok(facets) => facets,
-                        Err(error) => return internal(error),
-                    };
-                    ranked.retain(|(_, (hit, _))| {
-                        facets
-                            .get(&hit.id)
-                            .is_some_and(|(hit_kind, hit_tier)| keeps(hit_kind, hit_tier))
-                    });
-                }
-                truncated = ranked.len() > limit;
-                for (position, (hit, details)) in ranked.into_iter().take(limit) {
+                pool_capped = result.filter_pool_full;
+                truncated = result.hits.len() > limit;
+                // The trace position is the rank among the hits shown.
+                for (position, (hit, details)) in result.hits.into_iter().take(limit).enumerate() {
                     let path = hit.path.as_str().to_owned();
                     hits.push(SearchHit {
                         href: page_href(workspace, project, &path),
@@ -242,10 +236,10 @@ pub(crate) async fn handler(
                 });
                 streams_active = vec!["fts"];
             }
-            pool_capped = filtered && raw.len() >= FILTER_POOL;
+            pool_capped = filtered && raw.len() >= FILTER_CANDIDATE_POOL;
             let raw: Vec<_> = raw
                 .into_iter()
-                .filter(|h| keeps(&h.kind, &h.tier))
+                .filter(|h| filter.keeps(&h.kind, &h.tier))
                 .collect();
             truncated = raw.len() > limit;
             for h in raw.into_iter().take(limit) {
@@ -313,7 +307,7 @@ pub(crate) async fn handler(
         hit_count,
         filtered,
         pool_capped,
-        filter_pool: FILTER_POOL,
+        filter_pool: FILTER_CANDIDATE_POOL,
         unknown_kind,
         kind_options,
         tier_options,

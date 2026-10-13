@@ -2426,7 +2426,8 @@ impl AiMemoryServer {
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = options.include_expired.then_some(i64::MIN);
-        self.reader
+        let found = self
+            .reader
             .hybrid_search_scopes(
                 scopes,
                 ai_memory_store::HybridSearch {
@@ -2437,9 +2438,11 @@ impl AiMemoryServer {
                     include_superseded: options.include_superseded,
                     explain: options.explain,
                     owner: options.owner,
+                    filter: ai_memory_store::PageFilter::default(),
                 },
             )
-            .await
+            .await?;
+        Ok((found.hits, found.timings))
     }
 
     fn rerank_fetch_limit(&self, limit: usize) -> usize {

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use ai_memory_core::{OwnerFilter, ProjectId, WorkspaceId};
 use ai_memory_llm::{Embedder, QueryVector, RerankCandidate, RerankStage};
 use ai_memory_store::{
-    HybridSearch, PageHit, SearchExplain, StoreResult, StreamTimings, VectorQuery,
+    HybridSearch, PageFilter, PageHit, SearchExplain, StoreResult, StreamTimings, VectorQuery,
 };
 
 use crate::state::WebState;
@@ -43,12 +43,17 @@ pub(crate) struct RecallResult {
     pub timings: Option<StreamTimings>,
     /// The streams that ran, in `memory_query`'s `streams_active` order.
     pub streams_active: Vec<&'static str>,
+    /// A filter was set and a stream returned its whole candidate pool, so
+    /// matches ranked past it were not looked at.
+    pub filter_pool_full: bool,
 }
 
-/// Rank `query` over `scopes` exactly as a `memory_query` project/scopes
-/// search does (latest versions only, expired pages hidden). `owner` is the
-/// viewer's session-timeline filter: an observation excerpt is shown only
-/// from a session it admits, as in `memory_query`.
+/// Rank `query` over `scopes` as a `memory_query` project/scopes search does
+/// (latest versions only, expired pages hidden), keeping only pages that pass
+/// `filter`. The filter runs in the ranker, before the reranker, so the
+/// reranker scores only pages the caller can see. `owner` is the viewer's
+/// session-timeline filter: an observation excerpt is shown only from a
+/// session it admits, as in `memory_query`.
 pub(crate) async fn search_scopes(
     state: &WebState,
     scopes: &[(WorkspaceId, ProjectId)],
@@ -56,6 +61,7 @@ pub(crate) async fn search_scopes(
     limit: usize,
     explain: bool,
     owner: &OwnerFilter,
+    filter: PageFilter<'_>,
 ) -> StoreResult<RecallResult> {
     let query_vector: Option<QueryVector> = match &state.recall.embedder {
         Some(embedder) => ai_memory_llm::embed_search_query(embedder.as_ref(), query).await,
@@ -66,7 +72,7 @@ pub(crate) async fn search_scopes(
         .rerank
         .as_ref()
         .map_or(limit, |stage| stage.fetch_limit(limit));
-    let (hits, mut timings) = state
+    let found = state
         .reader
         .hybrid_search_scopes(
             scopes,
@@ -83,9 +89,11 @@ pub(crate) async fn search_scopes(
                 include_superseded: false,
                 explain,
                 owner,
+                filter,
             },
         )
         .await?;
+    let (hits, mut timings) = (found.hits, found.timings);
     let hits = match &state.recall.rerank {
         Some(stage) => {
             let started = explain.then(std::time::Instant::now);
@@ -122,5 +130,6 @@ pub(crate) async fn search_scopes(
         hits,
         timings,
         streams_active: state.reader.active_streams(query_vector.is_some()),
+        filter_pool_full: found.filter_pool_full,
     })
 }

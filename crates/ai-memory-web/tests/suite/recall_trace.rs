@@ -8,13 +8,15 @@
 //! partial scope rejected, and no other project's pages in the result or the
 //! trace.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ai_memory_core::{
     ActorContext, AuthorizedViewer, NewUser, PagePath, ProjectId, Tier, UserId, UserRole,
     WorkspaceId,
 };
-use ai_memory_llm::{Embedder, SyntheticEmbedder};
+use ai_memory_llm::{
+    Embedder, RerankCandidate, RerankScore, RerankStage, Reranker, SyntheticEmbedder,
+};
 use ai_memory_store::{GrantLevel, Store};
 use ai_memory_web::{Recall, WebMountSpec, split_web_routers};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -712,4 +714,139 @@ fn tier_filter_offers_every_tier() {
         };
         assert_eq!(name.parse::<Tier>().unwrap(), tier);
     }
+}
+
+/// Scores every candidate equally and remembers which pages it was shown.
+#[derive(Default)]
+struct RecordingReranker {
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl Reranker for RecordingReranker {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn model(&self) -> &str {
+        "test"
+    }
+
+    async fn rerank(
+        &self,
+        _query: &str,
+        candidates: &[RerankCandidate],
+    ) -> ai_memory_llm::LlmResult<Vec<RerankScore>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .extend(candidates.iter().map(|c| c.title.clone()));
+        Ok(candidates
+            .iter()
+            .map(|c| RerankScore {
+                id: c.id.clone(),
+                relevance: 0.5,
+            })
+            .collect())
+    }
+}
+
+/// The filter runs in the ranker, before the reranker: pages the filter
+/// drops are never sent to the (paid, slow) reranker.
+#[tokio::test]
+async fn reranker_is_shown_only_the_pages_the_filter_keeps() {
+    let f = fixture(false).await;
+    add_procedure(&f).await;
+    // The stage leaves a single candidate alone, so the filter needs two.
+    let ws = f
+        .store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    f.wiki
+        .write_page(WritePageRequest {
+            frontmatter: serde_json::json!({"kind": "procedure"}),
+            tier: Tier::Procedural,
+            ..req(
+                ws,
+                f.alpha,
+                "procedures/audit.md",
+                "# Audit\n\nAudit every token rotation after the script ran.",
+            )
+        })
+        .await
+        .unwrap();
+    let reranker = Arc::new(RecordingReranker::default());
+    let recall = Recall {
+        embedder: None,
+        rerank: Some(RerankStage::new(reranker.clone())),
+    };
+    let app = web(&f, recall);
+    let base = "/web/search?q=token%20rotation&workspace=default&project=alpha";
+
+    // Control: unfiltered, the reranker sees more than the procedure.
+    let (status, body) = get(&app, base, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let unfiltered = std::mem::take(&mut *reranker.seen.lock().unwrap());
+    assert!(unfiltered.len() > 2, "{unfiltered:?}");
+
+    let (status, body) = get(&app, &format!("{base}&kind=procedure"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut shown = hit_paths(&body);
+    shown.sort();
+    assert_eq!(
+        shown,
+        ["procedures/audit.md", "procedures/rotate.md"],
+        "{body}"
+    );
+    let filtered = reranker.seen.lock().unwrap().clone();
+    assert_eq!(filtered.len(), 2, "{filtered:?}");
+}
+
+/// A rare kind that the unfiltered result ranks out of view is still found:
+/// the filter is applied to a candidate pool far wider than one page.
+#[tokio::test]
+async fn kind_filter_finds_a_rare_kind_the_unfiltered_page_ranks_out() {
+    let f = fixture(false).await;
+    let ws = f
+        .store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    for n in 0..60 {
+        f.wiki
+            .write_page(req(
+                ws,
+                f.alpha,
+                &format!("notes/crowd-{n}.md"),
+                "# Crowd\n\ncrowdword crowdword crowdword crowdword crowdword.",
+            ))
+            .await
+            .unwrap();
+    }
+    f.wiki
+        .write_page(WritePageRequest {
+            frontmatter: serde_json::json!({"kind": "gotcha"}),
+            ..req(
+                ws,
+                f.alpha,
+                "gotchas/quiet.md",
+                "# Quiet\n\nOne mention of crowdword among many other unrelated words \
+                 about cats, rivers, mountains, bridges and old maps.",
+            )
+        })
+        .await
+        .unwrap();
+    let app = web(&f, Recall::default());
+    let base = "/web/search?q=crowdword&workspace=default&project=alpha&limit=5";
+
+    let (_, body) = get(&app, base, None).await;
+    assert!(
+        !hit_paths(&body).contains(&"gotchas/quiet.md".to_owned()),
+        "control: the gotcha must be ranked out of the first page: {body}"
+    );
+    let (_, body) = get(&app, &format!("{base}&kind=gotcha"), None).await;
+    assert_eq!(hit_paths(&body), ["gotchas/quiet.md"], "{body}");
 }

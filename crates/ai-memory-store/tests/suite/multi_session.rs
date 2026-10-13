@@ -3550,11 +3550,12 @@ async fn explained_search_as(
                 include_superseded: false,
                 explain: true,
                 owner,
+                filter: ai_memory_store::PageFilter::default(),
             },
         )
         .await
         .unwrap()
-        .0
+        .hits
         .into_iter()
         .map(|(hit, details)| (hit, details.unwrap()))
         .collect()
