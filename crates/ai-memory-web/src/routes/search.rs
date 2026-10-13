@@ -20,7 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_core::Tier;
-use ai_memory_store::{SearchExplain, StreamTimings};
+use ai_memory_store::{PAGE_KINDS, SearchExplain, StreamTimings};
 use askama::Template;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -40,20 +40,9 @@ const GLOBAL_DEFAULT_LIMIT: usize = 50;
 const SCOPED_DEFAULT_LIMIT: usize = 20;
 /// Upper bound on `limit`, the same clamp `memory_query` applies.
 const MAX_LIMIT: usize = 100;
-/// Page kinds the filter offers: the kinds a path convention implies, which
-/// are also the ones the consolidator writes.
-const KINDS: [&str; 10] = [
-    "rule",
-    "slot",
-    "session",
-    "decision",
-    "gotcha",
-    "concept",
-    "procedure",
-    "note",
-    "preference",
-    "fact",
-];
+/// Matches a filtered search ranks before it filters. The ranker has no
+/// kind or tier predicate, so a filter only sees this many top hits.
+const FILTER_POOL: usize = 500;
 /// Memory tiers the filter offers, in `Tier` declaration order.
 const TIERS: [&str; 4] = ["working", "episodic", "semantic", "procedural"];
 
@@ -150,12 +139,13 @@ pub(crate) async fn handler(
     };
     let filtered = kind.is_some() || tier.is_some();
     let keeps = |hit_kind: &str, hit_tier: &str| {
-        kind.as_deref().is_none_or(|k| k == hit_kind)
+        kind.as_deref()
+            .is_none_or(|k| k.eq_ignore_ascii_case(hit_kind))
             && tier.as_deref().is_none_or(|t| t == hit_tier)
     };
-    // A filter runs after ranking, so the ranker is asked for the most it can
-    // return and the limit is applied to what survives.
-    let fetch_limit = |limit: usize| if filtered { MAX_LIMIT + 1 } else { limit + 1 };
+    // A filter runs after ranking, so the ranker is asked for a wide pool
+    // and the limit is applied to what survives.
+    let fetch_limit = |limit: usize| if filtered { FILTER_POOL } else { limit + 1 };
     let internal = |error: ai_memory_store::StoreError| {
         tracing::error!(%error, "web search failed");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -166,6 +156,8 @@ pub(crate) async fn handler(
     // apart from one that has exactly `limit` matches.
     let mut limit_used = 0;
     let mut truncated = false;
+    // The filter saw a full pool, so matches ranked past it were not looked at.
+    let mut pool_capped = false;
     let mut timings = None;
     let mut streams_active: Vec<&'static str> = Vec::new();
     match &scope {
@@ -198,6 +190,7 @@ pub(crate) async fn handler(
                 streams_active = result.streams_active;
                 // The trace position is the rank before filtering.
                 let mut ranked: Vec<_> = result.hits.into_iter().enumerate().collect();
+                pool_capped = filtered && ranked.len() >= FILTER_POOL;
                 if filtered {
                     let ids: Vec<_> = ranked.iter().map(|(_, (hit, _))| hit.id).collect();
                     let facets = match state.reader.page_kinds_tiers_by_ids(&ids).await {
@@ -249,6 +242,7 @@ pub(crate) async fn handler(
                 });
                 streams_active = vec!["fts"];
             }
+            pool_capped = filtered && raw.len() >= FILTER_POOL;
             let raw: Vec<_> = raw
                 .into_iter()
                 .filter(|h| keeps(&h.kind, &h.tier))
@@ -302,7 +296,12 @@ pub(crate) async fn handler(
         })
         .collect();
     let hit_count = hits.len();
-    let kind_options = filter_options(&KINDS, kind.as_deref());
+    let unknown_kind = kind
+        .as_deref()
+        .filter(|k| !PAGE_KINDS.iter().any(|known| known.eq_ignore_ascii_case(k)))
+        .unwrap_or_default()
+        .to_owned();
+    let kind_options = filter_options(&PAGE_KINDS, kind.as_deref());
     let tier_options = filter_options(&TIERS, tier.as_deref());
     let global_href = format!("search?q={}", encode_segment(&query));
     let view = SearchView {
@@ -313,6 +312,9 @@ pub(crate) async fn handler(
         hits,
         hit_count,
         filtered,
+        pool_capped,
+        filter_pool: FILTER_POOL,
+        unknown_kind,
         kind_options,
         tier_options,
         workspace,
@@ -341,14 +343,14 @@ pub(crate) async fn handler(
 /// outside `known` (a custom frontmatter kind) is kept so the form round-trips.
 fn filter_options(known: &[&str], current: Option<&str>) -> Vec<FilterOption> {
     let mut values: Vec<&str> = known.to_vec();
-    if let Some(current) = current.filter(|c| !known.contains(c)) {
+    if let Some(current) = current.filter(|c| !known.iter().any(|k| k.eq_ignore_ascii_case(c))) {
         values.push(current);
     }
     values
         .into_iter()
         .map(|value| FilterOption {
             value: value.to_owned(),
-            selected: current == Some(value),
+            selected: current.is_some_and(|c| c.eq_ignore_ascii_case(value)),
         })
         .collect()
 }

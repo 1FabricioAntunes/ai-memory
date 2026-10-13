@@ -674,3 +674,42 @@ async fn kind_filter_does_not_widen_what_a_viewer_can_read() {
     let (_, body) = get(&app, "/web/search?q=token%20rotation&kind=fact", None).await;
     assert!(body.contains("notes/beta-rotation.md"), "{body}");
 }
+
+#[tokio::test]
+async fn kind_filter_is_case_insensitive_and_flags_a_nonstandard_kind() {
+    let f = fixture(false).await;
+    add_procedure(&f).await;
+    let app = web(&f, Recall::default());
+    let base = "/web/search?q=token%20rotation&workspace=default&project=alpha";
+
+    let (_, body) = get(&app, &format!("{base}&kind=Procedure"), None).await;
+    assert_eq!(hit_paths(&body), ["procedures/rotate.md"], "{body}");
+    assert!(!body.contains("is not a standard page kind"), "{body}");
+
+    // A typo matches nothing and says so, instead of looking like no results.
+    let (status, body) = get(&app, &format!("{base}&kind=procedures"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(hit_paths(&body).is_empty(), "{body}");
+    assert!(body.contains("is not a standard page kind"), "{body}");
+}
+
+#[test]
+fn tier_filter_offers_every_tier() {
+    use ai_memory_core::Tier;
+    // An exhaustive match: a new `Tier` variant fails to compile here until
+    // the filter's list is revisited.
+    for tier in [
+        Tier::Working,
+        Tier::Episodic,
+        Tier::Semantic,
+        Tier::Procedural,
+    ] {
+        let name = match tier {
+            Tier::Working => "working",
+            Tier::Episodic => "episodic",
+            Tier::Semantic => "semantic",
+            Tier::Procedural => "procedural",
+        };
+        assert_eq!(name.parse::<Tier>().unwrap(), tier);
+    }
+}

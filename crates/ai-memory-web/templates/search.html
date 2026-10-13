@@ -113,6 +113,8 @@
 <p class="text-sm text-slate-500 dark:text-slate-400">Enter a search term above.</p>
 {% else if hits.is_empty() %}
 <p class="text-sm text-slate-500 dark:text-slate-400">No results for <strong>{{ query }}</strong>{% if filtered %} with these filters{% endif %}.
+  {% if pool_capped %}Only the top {{ filter_pool }} matches were searched.{% endif %}
+  {% if unknown_kind != "" %}<code>{{ unknown_kind }}</code> is not a standard page kind; check the spelling.{% endif %}
   {% if self.scoped() %}
   <a href="{{ global_href }}" class="ml-2 inline-block rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900">Search all projects</a>
   {% endif %}
@@ -122,6 +124,9 @@
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">Showing the first {{ max_results }} results. Refine your search to narrow them.</p>
 {% else %}
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{{ hit_count }} result{% if hit_count != 1 %}s{% endif %}</p>
+{% endif %}
+{% if pool_capped %}
+<p class="text-sm text-slate-500 dark:text-slate-400 mb-4">The filters were applied to the top {{ filter_pool }} matches; refine the query to reach lower-ranked pages.</p>
 {% endif %}
 <ul class="divide-y divide-slate-100 dark:divide-slate-800">
   {% for hit in hits %}

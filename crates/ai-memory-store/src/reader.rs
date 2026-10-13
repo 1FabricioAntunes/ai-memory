@@ -201,24 +201,85 @@ fn readable_repository_sql(
     )
 }
 
+/// Path prefix to kind, in match order: the kind a page has when its
+/// frontmatter names none.
+const PATH_KINDS: [(&str, &str); 9] = [
+    ("_rules/", "rule"),
+    ("_slots/", "slot"),
+    ("sessions/", "session"),
+    ("decisions/", "decision"),
+    ("gotchas/", "gotcha"),
+    ("concepts/", "concept"),
+    ("procedures/", "procedure"),
+    ("notes/", "note"),
+    ("profile/", "preference"),
+];
+
+/// Kind of a page whose frontmatter names none and whose path matches no
+/// [`PATH_KINDS`] prefix.
+const DEFAULT_PAGE_KIND: &str = "fact";
+
+/// Every kind a page can have without custom frontmatter, as
+/// `page_kind_expr` derives it.
+pub const PAGE_KINDS: [&str; 10] = [
+    "rule",
+    "slot",
+    "session",
+    "decision",
+    "gotcha",
+    "concept",
+    "procedure",
+    "note",
+    "preference",
+    DEFAULT_PAGE_KIND,
+];
+
 fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
+    let arms: String = PATH_KINDS
+        .iter()
+        .map(|(prefix, kind)| {
+            // `_` is a LIKE wildcard; escape it so `_rules/` matches only itself.
+            let prefix = prefix.replace('_', "\\_");
+            format!("WHEN {path_column} LIKE '{prefix}%' ESCAPE '\\' THEN '{kind}' ")
+        })
+        .collect();
+    // The cast keeps a non-string frontmatter `kind` (`kind: 5`) readable as
+    // text instead of failing the row.
     format!(
         "COALESCE( \
-            json_extract({frontmatter_column}, '$.kind'), \
-            CASE \
-                WHEN {path_column} LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                WHEN {path_column} LIKE '\\_slots/%' ESCAPE '\\' THEN 'slot' \
-                WHEN {path_column} LIKE 'sessions/%' THEN 'session' \
-                WHEN {path_column} LIKE 'decisions/%' THEN 'decision' \
-                WHEN {path_column} LIKE 'gotchas/%' THEN 'gotcha' \
-                WHEN {path_column} LIKE 'concepts/%' THEN 'concept' \
-                WHEN {path_column} LIKE 'procedures/%' THEN 'procedure' \
-                WHEN {path_column} LIKE 'notes/%' THEN 'note' \
-                WHEN {path_column} LIKE 'profile/%' THEN 'preference' \
-                ELSE 'fact' \
-            END \
+            CAST(json_extract({frontmatter_column}, '$.kind') AS TEXT), \
+            CASE {arms}ELSE '{DEFAULT_PAGE_KIND}' END \
         )"
     )
+}
+
+#[cfg(test)]
+mod page_kind_tests {
+    use super::*;
+
+    #[test]
+    fn page_kinds_lists_every_path_kind_and_the_default() {
+        let mut expected: Vec<&str> = PATH_KINDS.iter().map(|(_, kind)| *kind).collect();
+        expected.push(DEFAULT_PAGE_KIND);
+        assert_eq!(PAGE_KINDS.to_vec(), expected);
+    }
+
+    #[test]
+    fn page_kind_expr_resolves_paths_and_non_string_kinds() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "SELECT {} FROM (SELECT ?1 AS path, ?2 AS fm)",
+            page_kind_expr("path", "fm")
+        );
+        let kind = |path: &str, fm: &str| -> String {
+            conn.query_row(&sql, [path, fm], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(kind("_rules/a.md", "{}"), "rule");
+        assert_eq!(kind("xrules/a.md", "{}"), "fact");
+        assert_eq!(kind("profile/a.md", "{}"), "preference");
+        assert_eq!(kind("sessions/a.md", r#"{"kind":"custom"}"#), "custom");
+        assert_eq!(kind("sessions/a.md", r#"{"kind":5}"#), "5");
+    }
 }
 
 /// Leading body characters scanned when a page carries no frontmatter
