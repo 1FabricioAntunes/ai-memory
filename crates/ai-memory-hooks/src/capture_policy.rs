@@ -103,7 +103,17 @@ pub enum PolicyState {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExtractionState {
-    /// Tool does not require path extraction.
+    /// No path extraction applied to this event. Two cases produce it:
+    ///
+    /// - An active policy met a search/list tool ([`ToolFamily::SearchList`]).
+    ///   The policy drops it whatever its arguments say, so no path is
+    ///   extracted or counted. Under an inactive or invalid policy the same
+    ///   tool reports [`Self::Extracted`]: the state depends on the policy,
+    ///   not only on the tool.
+    /// - `ai-memory hook --check-capture` evaluated no policy at all, because
+    ///   the event is not a tool event or no working directory was found. The
+    ///   report then pairs it with `policy_state: inactive` and
+    ///   `tool_family: unknown`.
     NotApplicable,
     /// Direct fields were extracted successfully.
     Extracted,

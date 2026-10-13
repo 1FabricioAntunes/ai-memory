@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed the `ExtractionState::NotApplicable` doc-comment, which described
+  `extraction_state: "not-applicable"` as a property of the tool. It now says
+  the value comes from an active policy dropping a search/list tool, or from
+  `ai-memory hook --check-capture` when no policy was evaluated. (#1352)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
