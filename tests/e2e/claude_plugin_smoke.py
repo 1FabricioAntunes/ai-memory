@@ -88,6 +88,9 @@ class Sandbox:
             "LANG": "C.UTF-8",
             "TERM": "dumb",
             "CLAUDE_CONFIG_DIR": str(self.claude_dir),
+            # No update checks or other background traffic from the CLI.
+            "DISABLE_AUTOUPDATER": "1",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         }
         env.update(extra)
         return env

@@ -16,6 +16,8 @@ event="${2:-}"
 reply_without_binary() {
     cat >/dev/null
     if [ "$event" = "session-start" ]; then
+        # The backticks are literal Markdown in the message, not a command.
+        # shellcheck disable=SC2016
         printf '%s\n' '{"systemMessage":"ai-memory: the ai-memory binary was not found, so this session is not captured. Install it and run `ai-memory setup`: https://github.com/akitaonrails/ai-memory#install"}'
     else
         printf '{}\n'
