@@ -39,7 +39,8 @@ command says so in its changelog, and you trust the new command once.
   shell script, which hands the event to the installed binary
   (`ai-memory hook`). The binary applies your capture exclusions, spools the
   event, and delivers it only to your ai-memory server. On Windows the hooks
-  call `ai-memory hook` directly, so `ai-memory` must be on `PATH`.
+  call `ai-memory hook` directly, so `ai-memory` must be on `PATH`; without
+  it Codex reports a failed hook, and folderless sessions are captured.
 - MCP: the ai-memory memory tools, through `ai-memory mcp-bridge
   --no-session-id`.
 - Skills: the ai-memory routing skills and a `status` skill.

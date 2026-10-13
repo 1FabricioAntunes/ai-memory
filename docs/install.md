@@ -265,7 +265,12 @@ changelog. `ai-memory doctor` and the `status` skill report hooks Codex
 skips. The Codex plugin has no options: the server URL and credentials come
 from your ai-memory config, and the MCP entry runs `ai-memory mcp-bridge
 --no-session-id` from `PATH`. On Windows the hooks call `ai-memory hook`
-directly (`commandWindows`), so `ai-memory` must be on `PATH`.
+directly (`commandWindows`), so `ai-memory` must be on `PATH`. That direct
+call is a known limitation: it skips the launcher, so a Windows event is not
+marked as plugin-launched (folderless sessions are captured, as with a
+settings hook), and without the binary Codex reports a failed hook instead
+of the launcher's silent no-op. Changing it would also change the command
+Codex keys hook trust on.
 
 Codex runs plugin hooks and `~/.codex/hooks.json` hooks side by side, and an
 untrusted settings hook is skipped silently, so the plugin cannot safely drop
