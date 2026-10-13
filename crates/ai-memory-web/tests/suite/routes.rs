@@ -4764,3 +4764,243 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
         }
     }
 }
+
+async fn page_body(
+    app: &axum::Router,
+    uri: &str,
+    viewer: Option<ai_memory_core::UserId>,
+) -> (StatusCode, String) {
+    let mut request = Request::builder().uri(uri);
+    if let Some(viewer) = viewer {
+        request = request.extension(ai_memory_core::AuthorizedViewer(viewer));
+    }
+    let resp = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn page_sidebar_shows_links_and_hides_superseded_and_expired_neighbours() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (path, body) in [
+        ("notes/target.md", "# Target\n\nThe decision."),
+        ("notes/other.md", "# Other\n\nNo links."),
+        (
+            "notes/source.md",
+            "# Source Title\n\nSee [[notes/target]] and [[notes/other]].",
+        ),
+        ("notes/stale.md", "# Stale Citer\n\nSee [[notes/target]]."),
+    ] {
+        wiki.write_page(wiki_req(ws, proj, path, body))
+            .await
+            .unwrap();
+    }
+    // A later version without the link supersedes the one that cited.
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "notes/stale.md",
+        "# Stale Citer\n\nGone.",
+    ))
+    .await
+    .unwrap();
+    let mut expiring = wiki_req(
+        ws,
+        proj,
+        "notes/expired.md",
+        "# Expired Citer\n\n[[notes/target]]",
+    );
+    expiring.frontmatter = serde_json::json!({"kind": "fact", "expires_at": "2000-01-01"});
+    wiki.write_page(expiring).await.unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+
+    let (status, target) = page_body(&app, "/w/default/scratch/p/notes/target.md", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(target.contains("Cited by"), "{target}");
+    assert!(
+        target.contains(r#"href="w/default/scratch/p/notes/source.md""#)
+            && target.contains("Source Title"),
+        "{target}"
+    );
+    assert!(!target.contains("Stale Citer"), "{target}");
+    assert!(!target.contains("Expired Citer"), "{target}");
+    // Nothing to cite from here, so no "Cites" group.
+    assert!(!target.contains(">Cites<"), "{target}");
+
+    let (_, source) = page_body(&app, "/w/default/scratch/p/notes/source.md", None).await;
+    assert!(source.contains(">Cites<"), "{source}");
+    assert!(
+        source.contains("w/default/scratch/p/notes/target.md"),
+        "{source}"
+    );
+    assert!(source.contains("No page links here yet."), "{source}");
+    // Under two headings, no outline.
+    assert!(!source.contains("On this page"), "{source}");
+}
+
+#[tokio::test]
+async fn page_sidebar_caps_each_group_at_ten() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/hub.md", "# Hub\n\nCited a lot."))
+        .await
+        .unwrap();
+    for i in 0..13 {
+        wiki.write_page(wiki_req(
+            ws,
+            proj,
+            &format!("notes/citer-{i:02}.md"),
+            &format!("# Citer {i:02}\n\n[[notes/hub]]"),
+        ))
+        .await
+        .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+    let (_, hub) = page_body(&app, "/w/default/scratch/p/notes/hub.md", None).await;
+    assert_eq!(
+        hub.matches("w/default/scratch/p/notes/citer-").count(),
+        10,
+        "{hub}"
+    );
+    assert!(hub.contains("and 3 more"), "{hub}");
+}
+
+#[tokio::test]
+async fn page_outline_links_to_the_ids_on_the_headings() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "notes/long.md",
+        "# Long\n\n## Intro\n\ntext\n\n### Intro\n\n## Intro\n\n#### Too deep\n",
+    ))
+    .await
+    .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+    let (_, html) = page_body(&app, "/w/default/scratch/p/notes/long.md", None).await;
+    assert!(html.contains("On this page"), "{html}");
+    for id in ["intro", "intro-1", "intro-2"] {
+        assert!(html.contains(&format!(r#" id="{id}">"#)), "{id}: {html}");
+        // Anchored on the page URL, since `#id` alone resolves against <base>.
+        assert!(
+            html.contains(&format!(r#"href="w/default/scratch/p/notes/long.md#{id}""#)),
+            "{id}: {html}"
+        );
+    }
+    assert!(!html.contains("p/notes/long.md#too-deep"), "{html}");
+}
+
+#[tokio::test]
+async fn page_backlink_from_an_unreadable_project_is_hidden() {
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let a = store
+        .writer
+        .get_or_create_project(ws, "proj-a", None)
+        .await
+        .unwrap();
+    let b = store
+        .writer
+        .get_or_create_project(ws, "proj-b", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, a, "notes/target.md", "# Target\n\nIn A."))
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        b,
+        "notes/secret.md",
+        "# Secret Plan\n\nPoints at [[proj-a:notes/target]].",
+    ))
+    .await
+    .unwrap();
+    let user = |name: &str| ai_memory_core::NewUser {
+        username: name.into(),
+        name: None,
+        email: None,
+    };
+    let alice = store
+        .writer
+        .create_human_user(user("alice"), ai_memory_core::UserRole::User, None, false)
+        .await
+        .unwrap();
+    let bob = store
+        .writer
+        .create_human_user(user("bob"), ai_memory_core::UserRole::User, None, false)
+        .await
+        .unwrap();
+    for (who, project) in [(alice, a), (bob, a), (bob, b)] {
+        store
+            .writer
+            .grant_memory(who, project, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+    let uri = "/w/default/proj-a/p/notes/target.md";
+
+    let (status, body) = page_body(&app, uri, Some(alice)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for leaked in ["Secret Plan", "notes/secret.md", "proj-b"] {
+        assert!(!body.contains(leaked), "alice saw {leaked}: {body}");
+    }
+    assert!(body.contains("No page links here yet."), "{body}");
+
+    // Controls: a reader of both projects, and an unrestricted viewer.
+    for viewer in [Some(bob), None] {
+        let (status, body) = page_body(&app, uri, viewer).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("Secret Plan"), "{body}");
+        assert!(body.contains("default/proj-b"), "{body}");
+        assert!(
+            body.contains(r#"href="w/default/proj-b/p/notes/secret.md""#),
+            "{body}"
+        );
+    }
+}

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added backlinks, outgoing links and an outline to the web page view. A page
+  in `/web` now has a side column (below the text on narrow screens) with "On
+  this page", the h2 and h3 headings linked to their anchors (shown from two
+  headings up); "Cited by", the pages that link to it, with an empty state;
+  and "Cites", the pages it links to. Each group lists ten pages and then "and
+  N more", and a page in another project carries its `workspace/project`. A
+  link from a project the viewer cannot read is left out, as in the
+  `/api/v1` page response. (#NNN)
 - Added a recall trace to web search. A project page has its own search box,
   and a search with `workspace` and `project`
   (`/web/search?q=…&workspace=…&project=…`) now ranks with the same hybrid

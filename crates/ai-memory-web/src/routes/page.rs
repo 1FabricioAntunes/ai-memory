@@ -11,7 +11,8 @@ use axum::response::{Html, IntoResponse, Response};
 use crate::markdown;
 use crate::state::WebState;
 use crate::templates::{
-    NamespaceView, NotFoundView, PageRow, PageView, history_href, humanize, page_href, project_href,
+    NamespaceView, NotFoundView, OutlineItem, PageRow, PageView, RELATED_LIMIT, RelatedRow,
+    encode_segment, history_href, humanize, page_href, project_href,
 };
 
 /// Handler for `GET /w/:workspace/:project/p/*path`.
@@ -20,6 +21,7 @@ pub(crate) async fn handler(
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
 ) -> Response {
+    let viewer_id = viewer.as_ref().map(|axum::Extension(v)| v.user());
     if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
         return refusal_response(&refusal);
     }
@@ -48,11 +50,47 @@ pub(crate) async fn handler(
     // Drop a leading H1 that repeats the title — the template already
     // renders the title in its header, so leaving it in the body
     // duplicates it.
-    let body_html = markdown::render(
+    let rendered = markdown::render_document(
         markdown::strip_leading_h1(&markdown_doc.body, &meta.title),
         &workspace,
         &project,
     );
+
+    // The far end of each link is filtered by what the viewer may read, so a
+    // backlink from a restricted project never reaches the sidebar.
+    let links = match state
+        .reader
+        .page_links(
+            meta.workspace_id,
+            meta.project_id,
+            meta.path.clone(),
+            viewer_id,
+        )
+        .await
+    {
+        Ok(l) => l,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let (cited_by, cited_by_more) = related_rows(links.backlinks, &workspace, &project);
+    let (cites, cites_more) = related_rows(links.links, &workspace, &project);
+
+    // `#id` alone would resolve against the injected `<base href>`.
+    let own_href = page_href(&workspace, &project, &meta.path);
+    let outline: Vec<OutlineItem> = rendered
+        .outline
+        .iter()
+        .filter(|h| (2..=3).contains(&h.level))
+        .map(|h| OutlineItem {
+            href: format!("{own_href}#{}", encode_segment(&h.id)),
+            text: h.text.clone(),
+            nested: h.level == 3,
+        })
+        .collect();
+    let outline = if outline.len() < 2 {
+        Vec::new()
+    } else {
+        outline
+    };
 
     let project_href = project_href(&workspace, &project);
     let supersedes_path = meta.supersedes.unwrap_or_default();
@@ -87,8 +125,13 @@ pub(crate) async fn handler(
         created_relative: humanize(&meta.created_at),
         supersedes_path,
         supersedes_href,
-        body_html,
+        body_html: rendered.html,
         history_href,
+        outline,
+        cited_by,
+        cited_by_more,
+        cites,
+        cites_more,
         author_username,
         author_name,
         author_email,
@@ -98,6 +141,30 @@ pub(crate) async fn handler(
         Ok(html) => Html(html).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// The first [`RELATED_LIMIT`] neighbours as rows, and how many were left out.
+/// A neighbour in another project carries a `workspace/project` hint.
+fn related_rows(
+    related: Vec<ai_memory_store::RelatedPage>,
+    workspace: &str,
+    project: &str,
+) -> (Vec<RelatedRow>, usize) {
+    let more = related.len().saturating_sub(RELATED_LIMIT);
+    let rows = related
+        .into_iter()
+        .take(RELATED_LIMIT)
+        .map(|r| RelatedRow {
+            href: page_href(&r.workspace, &r.project, &r.path),
+            scope_hint: if r.workspace == workspace && r.project == project {
+                String::new()
+            } else {
+                format!("{}/{}", r.workspace, r.project)
+            },
+            title: r.title,
+        })
+        .collect();
+    (rows, more)
 }
 
 /// When a path is not a page, list the pages under it as a namespace

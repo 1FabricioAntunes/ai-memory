@@ -296,6 +296,29 @@ pub(crate) struct NamespaceView {
 // page.html
 // ---------------------------------------------------------------------------
 
+/// How many backlinks or outgoing links the page sidebar lists per group.
+pub(crate) const RELATED_LIMIT: usize = 10;
+
+/// One entry of a page's "On this page" outline.
+pub(crate) struct OutlineItem {
+    /// Link to the heading, anchored on the page's own URL.
+    pub href: String,
+    /// Heading text.
+    pub text: String,
+    /// Whether the heading is an h3 (indented under its h2).
+    pub nested: bool,
+}
+
+/// One row of a page's "Cited by" or "Cites" group.
+pub(crate) struct RelatedRow {
+    /// Link to the related page.
+    pub href: String,
+    /// Title of the related page.
+    pub title: String,
+    /// `workspace/project` when the page lives in another project, else empty.
+    pub scope_hint: String,
+}
+
 /// View-model for `GET /w/:workspace/:project/p/*path`.
 #[derive(Template)]
 #[template(path = "page.html")]
@@ -328,6 +351,16 @@ pub(crate) struct PageView {
     pub body_html: String,
     /// Link to this page's version history.
     pub history_href: String,
+    /// h2/h3 headings of the body, empty with fewer than two.
+    pub outline: Vec<OutlineItem>,
+    /// Pages that link to this one, at most [`RELATED_LIMIT`].
+    pub cited_by: Vec<RelatedRow>,
+    /// Backlinks beyond [`RELATED_LIMIT`].
+    pub cited_by_more: usize,
+    /// Pages this one links to, at most [`RELATED_LIMIT`].
+    pub cites: Vec<RelatedRow>,
+    /// Outgoing links beyond [`RELATED_LIMIT`].
+    pub cites_more: usize,
     /// Username of the page's last author. Empty string when the page
     /// was authored anonymously / by root / pre-multi-user — the
     /// template uses the empty check to omit the "Last edited by"
