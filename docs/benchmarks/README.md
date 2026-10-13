@@ -13,20 +13,24 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
-| **2026-10-12** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (2.7, unreleased; on by default)** | **0.868** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (2.7, unreleased; on by default)** | **0.855** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
 | **2026-09-21** | LongMemEval-S (v1) | **local embeddings (2.4 RC, current)** | **0.815** | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-21 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (2.4 RC) | 0.666 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
 
-The 2026-10-12 row is the 2.7 observation stream measured on all 470
-questions: zero-LLM FTS `hit@5` 0.666 → 0.868 (hit@1 0.530 → 0.619, hit@10
-0.694 → 0.936). Local embeddings with the stream went 0.800 → 0.867 on a
+The 2026-10-13 row is the 2.7 observation stream measured on all 470
+questions, stream off against stream on on the same build: zero-LLM FTS
+`hit@5` 0.662 → 0.855 (hit@1 0.511 → 0.611, hit@10 0.687 → 0.934; 91 questions
+gained, none lost). Local embeddings with the stream went 0.800 → 0.867 on a
 90-question stratified sample; a full-set local run with the stream has not
 been done yet, so 0.815 stays the latest full-set local number. Context
-tokens for the top five hits rose 7–19% in the final A/B runs, and p95
-latency stayed within the stream's budget. Details and commands are in the
+tokens for the top five hits rose 7–18%, and p95 latency rose 13 ms on the
+full set (84 → 97 ms). These numbers come from the harness corrected on
+2026-10-13, which replays each question's sessions under their own session
+ids; the first published figures (0.666 → 0.868) came from a harness that
+reused them across questions and left a few sessions without a page. Details and commands are in the
 decomposition report below.
 
 The 2026-09-21 (2.4 RC) re-run shows no default-ranking regression: local
@@ -49,7 +53,7 @@ harness before the next change landed.
 [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md)
 splits the pipeline number into capture cost, ranking quality and harness
 artifacts. With each raw session indexed whole (component mode, ranking
-only), zero-LLM FTS scores 0.972 `hit@5` on all 470 questions, against 0.666
+only), zero-LLM FTS scores 0.972 `hit@5` on all 470 questions, against 0.662
 through the shipped capture path. The gap was not the 2 KB excerpt cap: pages
 holding exactly the text capture keeps score 0.968. It was the zero-LLM
 session page, which indexed only 80-character turn titles and no assistant

@@ -139,7 +139,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 
 | You say | Agent calls | Effect |
 |---|---|---|
-| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + entity/graph/vector RRF over compiled wiki pages, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
+| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + entity/graph/vector RRF over compiled wiki pages, plus an observation stream (on by default) that lifts a session's page when only its captured turns match, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_list` then `memory_handoff_accept` with that `handoff_id` if no block exists | Inspects pending handoffs without claiming, then claims the chosen id once. |
@@ -543,13 +543,17 @@ code; external schemes inside the brackets (`http://`, `https://`,
 `mailto:`, `data:`, `javascript:`, `vbscript:`, `tel:`, `file:`)
 stay literal too.
 
-With no authority configured on loopback, the built-in wiki remains
-anonymous. For human-authenticated administration, serve the compiled admin SPA
+With no bearer token configured on loopback (an install from before 2.7 that
+never ran `ai-memory auth enable`), the built-in wiki remains anonymous. A
+fresh install has a bearer token and no human accounts, so a browser gets a
+Basic sign-in prompt: any username, and the contents of
+`<data_dir>/auth-tokens/default` as the password. That GET-only browser path
+then keeps an HttpOnly `ai_memory_auth` cookie, and it stops immediately after
+a human password or completed bootstrap exists. For human-authenticated
+administration, create the first root account ([first-time
+root](install.md#first-time-root-greenfield)) and serve the compiled admin SPA
 with `--web-ui-dir`: it signs in through `/auth/login` and uses an HttpOnly web
-session plus CSRF protection. Before human auth is active, deprecated GET-only
-browser compatibility accepts the root bearer through HTTP Basic and an
-HttpOnly `ai_memory_auth` cookie; it stops immediately after a human password or
-completed bootstrap exists. Browser-stored Bearers remain unsupported.
+session plus CSRF protection. Browser-stored Bearers remain unsupported.
 `AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only credentials sent
 as `Authorization: Bearer <token>` by MCP, hook, handoff, and workstream clients.
 

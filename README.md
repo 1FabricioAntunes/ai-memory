@@ -270,8 +270,9 @@ open "companions/ai-memory-macos/dist/AI Memory.app"
 ```
 
 Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
-from the menu extra (no Dock icon). When the status item is green, wire an
-agent with the bundled binary:
+from the menu extra (no Dock icon). The app reads the bearer token `init`
+wrote into its data dir, so the status item turns green on its own. Then wire
+an agent with the bundled binary:
 
 ```bash
 BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
@@ -514,7 +515,10 @@ readable wiki pages; the next session starts with a handoff.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
-  the wiki and a JSON API under `/api/v1`.
+  the wiki and a JSON API under `/api/v1`. On a server with a bearer token
+  and no user accounts (every fresh install), the browser asks for a username
+  and password: any username, and the contents of
+  `<data_dir>/auth-tokens/default` as the password.
 - Back up host-side harness configuration with
   `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
   `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only
@@ -583,8 +587,9 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 Hooks POST observations to the server. The server serializes writes
 through one SQLite writer, compiles session observations into markdown
 pages, and serves retrieval through FTS5, entity-match and graph-neighbor RRF,
-optional vector RRF, bounded source-authority adjustment, and bounded
-raw-observation fallback for non-global searches.
+optional vector RRF, an observation-evidence stream that lifts a session's
+page when its captured turns match (on by default), bounded source-authority
+adjustment, and bounded raw-observation fallback for non-global searches.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data-flow
 diagram, crate breakdown, schema notes, and invariants.
@@ -631,7 +636,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
-| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), and [team-wiki export](companions/ai-memory-wikisync). |
+| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), and [team-wiki sync](companions/ai-memory-wikisync). |
 | [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 

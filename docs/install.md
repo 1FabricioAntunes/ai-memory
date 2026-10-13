@@ -1,8 +1,8 @@
 # Installation cookbook
 
 The [README quick-start](../README.md#quick-start) covers the happy
-paths (Docker + Claude Code, Arch AUR, Fedora RPM, macOS menu bar app). This
-page covers everything else:
+paths (the two-command native install, Docker + Claude Code, Arch AUR, Fedora
+RPM, macOS menu bar app). This page covers everything else:
 
 - [One-step native install](#one-step-native-install-installsh--ai-memory-setup)
   (`install.sh` + `ai-memory setup`, Linux and macOS, no root)
@@ -18,7 +18,7 @@ page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Factory Droid, Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -129,6 +129,13 @@ others; `setup` lists each `problem:` at the end and exits non-zero. The token
 is never printed or passed on a command line, and no harness config holds it:
 hooks read the credential files `init` writes, and MCP clients reach the
 server through `ai-memory mcp-bridge`.
+
+The service serves the web UI at `http://127.0.0.1:49374/web`, and `setup`
+prints that address at the end. A fresh install has a bearer token and no user
+accounts, so the browser asks for a username and password: type any username,
+and the contents of `<data_dir>/auth-tokens/default` as the password. To sign
+in with a password of your own instead, create the first root account as in
+[first-time root](#first-time-root-greenfield).
 
 `uninstall --apply` removes what `setup` wired, the service included. Every
 unit `setup` renders carries an identity line holding the SHA-256 of the rest of
@@ -412,7 +419,9 @@ ai-memory \
   init
 ```
 
-Edit provider/auth settings if you want LLM consolidation or bearer auth:
+`init` on a fresh data dir already turned bearer auth on (the token is in
+`auth-tokens/default` under the data dir). Edit the provider settings if you
+want LLM consolidation:
 
 ```bash
 $EDITOR ~/.config/ai-memory/config.toml
@@ -505,7 +514,8 @@ sudo cat /var/lib/ai-memory/auth-tokens/default \
 ```
 
 For LAN exposure, set a non-loopback bind and allowed hosts in
-`/etc/ai-memory/config.toml`, and set a bearer token in `/etc/ai-memory/env`:
+`/etc/ai-memory/config.toml`. The bearer `init` wrote already protects every
+route; set `AI_MEMORY_AUTH_TOKEN` in `/etc/ai-memory/env` only to replace it:
 
 ```toml
 bind = "0.0.0.0:49374"
@@ -513,6 +523,7 @@ allowed_hosts = ["homelab", "192.168.0.90", "localhost", "127.0.0.1"]
 ```
 
 ```bash
+# optional: replace the token init wrote
 TOKEN=$(ai-memory generate-auth-token)
 printf 'AI_MEMORY_AUTH_TOKEN=%s\n' "$TOKEN" | sudo tee -a /etc/ai-memory/env
 ```
@@ -530,7 +541,7 @@ Verify from the host:
 
 ```bash
 curl -sI http://127.0.0.1:49374/handoff
-# 401 Unauthorized when AI_MEMORY_AUTH_TOKEN is set.
+# 401 Unauthorized without the bearer token.
 ```
 
 ### LLM provider login with native services
@@ -611,7 +622,8 @@ sudo systemctl restart ai-memory.service        # system mode
 
 ### Wire agent CLIs after native install
 
-For a local loopback server with no bearer token:
+For a local loopback server (the CLI finds the token file `init` wrote, so no
+token goes on the command line):
 
 ```bash
 ai-memory install-mcp   --client claude-code --apply
@@ -2228,8 +2240,9 @@ Data dir defaults to `~/.local/share/ai-memory` on Linux,
 `~/Library/Application Support/ai-memory` on macOS, and the platform
 local-data directory on Windows, typically
 `%LOCALAPPDATA%\ai-memory`. Override with `AI_MEMORY_DATA_DIR=/path`.
-To require bearer-token auth, set `AI_MEMORY_AUTH_TOKEN` in the
-server's environment.
+`init` on a fresh data dir already requires the bearer token it wrote to
+`auth-tokens/default`; `AI_MEMORY_AUTH_TOKEN` in the server's environment
+overrides it.
 
 #### Optional serve flags
 
@@ -2263,8 +2276,11 @@ the repo's `hooks/` automatically. Extracted release archives also
 auto-discover the sibling `hooks/` bundle beside the `ai-memory` binary:
 
 ```bash
-./target/release/ai-memory install-hooks --agent claude-code --auth-token "$TOKEN"
+./target/release/ai-memory install-hooks --agent claude-code --apply
 ```
+
+The hooks read the token from the data dir; pass `--auth-token` only for a
+server whose token lives elsewhere.
 
 (No need for `setup-agent` in this case - the scripts already live
 at the right host path.)
@@ -2736,6 +2752,8 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
+| `setup [--yes] [--agent <name>]... [--no-service]` | native binary (after `install.sh`) | `init` a fresh data dir (with its root bearer token), install and start a per-user service, wire MCP, hooks and Agent Skills for each named or detected agent, then run a read-only self-check. Shows the plan and asks first; a second run changes nothing. |
+| `auth enable` | native binary or host wrapper | Give an existing install without auth a root bearer token in `auth-tokens/default` and re-render its hook and MCP wiring to read it. Idempotent. |
 | `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, or GitHub Copilot CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
@@ -2764,7 +2782,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |
 | `install-instructions [--target] [--print] [--no-skills]` | same host environment used for the agent prompt files | Install or update the slim CLAUDE.md / AGENTS.md routing block and, by default, the managed ai-memory Agent Skills |
 | `install-skills [--scope] [--agent]` | same host environment used for the agent skill dirs | Install or update only the managed ai-memory Agent Skills |
-| `uninstall --apply` | same host environment used for install | Remove only ai-memory-owned hooks, MCP entries, instruction blocks, managed skill files, and generated plugin files after content/marker validation. Removing hooks or MCP also deletes the `ai-memory run` auto-wire sentinels under `<data_dir>/autowire-state/`, so the next managed launch wires again. Use `--mcp-url` for custom MCP endpoints and `--mcp-name` only to narrow removal. |
+| `uninstall --apply` | same host environment used for install | Remove only ai-memory-owned hooks, MCP entries, instruction blocks, managed skill files, and generated plugin files after content/marker validation, plus the user service `setup` installed when nobody edited it since. Removing hooks or MCP also deletes the `ai-memory run` auto-wire sentinels under `<data_dir>/autowire-state/`, so the next managed launch wires again. Use `--mcp-url` for custom MCP endpoints and `--mcp-name` only to narrow removal. |
 | `llm-test --provider …` | `docker run --rm -e …` | Smoke-test an LLM provider |
 | `completions <shell>` | `docker run --rm` or native binary | Print a bash/zsh/fish/PowerShell/elvish completion script; see [`shell-completions.md`](shell-completions.md) |
 

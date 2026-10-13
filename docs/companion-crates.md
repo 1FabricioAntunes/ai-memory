@@ -67,7 +67,7 @@ Read-only companions can start ai-memory with `serve --enable-api` to mount
 Both modes use the normal machine Bearer or browser-session auth boundary;
 writes continue through MCP or authenticated admin routes.
 
-### Proposed team-wiki sync (#986)
+### Team-wiki sync (#986)
 
 A repository-backed team-wiki sync is accepted as a companion shape, not as a
 repo-local storage mode in the core server. A contribution should preserve the
@@ -249,7 +249,7 @@ Re-home by kind:
 
 ## `ai-memory-wikisync`: team-wiki export and sync
 
-Slices 1, 3, 4 and 5 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
+Slices 1, 3, 4 and 5 of the accepted [team-wiki sync](#team-wiki-sync-986)
 shape, implemented at [`companions/ai-memory-wikisync`](../companions/ai-memory-wikisync)
 as a standalone Cargo package with its own `[workspace]` (mirroring the
 importer): it is not a member of the root workspace and is not covered by
@@ -572,14 +572,16 @@ and preference for a separate repository above remain unchanged.
   from shipped callers, as discussed in PR #1058. This appendix neither requires
   a particular SDK nor approves speculative endpoints or wire fields. A reported
   capability would not replace authorization.
-- Conditional editing needs a safe core compare-and-write seam covering body
-  and editable metadata, coordinated with the normal Wiki and writer paths.
-  Re-reading a page and then writing unconditionally is insufficient. Without
-  that seam, applying edits must remain unavailable; stale revisions require a
-  fresh diff and confirmation. Conditional deletion needs its own evaluation.
+- Conditional editing needs a safe core compare-and-write seam, coordinated
+  with the normal Wiki and writer paths. 2.7 ships it: `memory_write_page` and
+  `memory_delete_page` take `expected_page_id` (and writes `create_only`), and
+  a stale version writes or deletes nothing
+  ([`programmatic-memory.md`](programmatic-memory.md)). An editor still needs
+  to show a fresh diff and ask again when its revision went stale.
 - Any retained-version or evidence reads need current access checks and bounded
   retention semantics; they must not recover expired or purged content from Git.
-  No new history, graph, or procedure interface is approved here.
+  2.7's read-only page history in the built-in web UI follows those rules (it
+  hides expired versions); no graph or procedure interface is approved here.
 - Mutations must retain sanitization, admission, attribution, and disk/SQL
   recovery. Direct admission follows the configured failure policy; it is not
   the automatic loop's separate pending-write approval flow. Uncertain delivery

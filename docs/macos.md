@@ -131,10 +131,10 @@ extracted `./ai-memory` path (or upgrade).
 
 Notes:
 
-- The MCP endpoint, capture hooks, and `ai-memory status` work without a token
-  in this single-user loopback setup. If you explicitly configure
-  `AI_MEMORY_AUTH_TOKEN` for the server, pass the same token with `--auth-token`
-  or export it for CLI commands.
+- `init` on a fresh data dir writes a root bearer token to
+  `<data_dir>/auth-tokens/default`. The hooks, the CLI and `install-mcp` read
+  it from there, so you never pass `--auth-token` locally. An install from
+  before 2.7 keeps running without a token until `ai-memory auth enable`.
 - Keep the extracted `ai-memory` at a stable path; the hook commands (and the
   symlink, if you made one) reference it. Re-run `install-hooks` and re-point
   the symlink if you move it.
@@ -232,7 +232,10 @@ across rebuilds. The menu extra has no Dock icon.
    server on first launch by itself.
 2. The status item is green when `GET /admin/status` succeeds, yellow when the
    server is up but the LLM/embedding role is in error or the write queue is
-   non-empty, red when the server is unreachable.
+   non-empty, red when the server is unreachable. The app sends the token saved
+   in Settings, or, when none is saved, the one `init` wrote to
+   `auth-tokens/default` in its data dir, so an install the app initialized
+   needs no pasting.
 3. **Open Web UI**, **Show Status…**, **Open Config**, **Open Data Directory**,
    and **Open Logs** call the existing browser UI, the bundled CLI, and Finder.
 
@@ -316,12 +319,14 @@ tail -f ~/Library/Logs/ai-memory/stderr.log
 `bootout` then `bootstrap` again; `kickstart -k` only restarts the process and
 does not re-read the definition.
 
-### If you configure a bearer token
+### Bearer token
 
-`AI_MEMORY_AUTH_TOKEN` is read from the process environment only. It is not a
-`config.toml` key, and launchd has no `EnvironmentFile`. A single-user loopback
-setup needs no token at all. If you do set one, add it to your rendered plist
-and tighten the file, because `~/Library/LaunchAgents` is not private:
+`init` on a fresh data dir writes the root bearer to
+`<data_dir>/auth-tokens/default` and records `[auth] bearer_token_file` in
+`config.toml`, so the LaunchAgent needs no token in its plist. To replace that
+token with one from the environment, note that launchd has no
+`EnvironmentFile`: add `AI_MEMORY_AUTH_TOKEN` to your rendered plist and
+tighten the file, because `~/Library/LaunchAgents` is not private:
 
 ```xml
   <key>EnvironmentVariables</key>

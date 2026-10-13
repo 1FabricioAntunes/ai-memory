@@ -933,9 +933,12 @@ that drain: the lock is an OS file lock released when its holder exits.
 
 ## ZCode (z.ai)
 
-**Status:** MCP supported. Lifecycle hooks are not installed by this command;
-they are tracked in issue #512, so until then capture is not active and
-ai-memory only sees the sessions where an agent calls its MCP tools.
+**Status:** MCP supported. Lifecycle hooks are installed separately with
+`ai-memory install-hooks --agent zcode --apply` (see the
+[support matrix](support-matrix.md)). On a token-file install (every fresh
+`init`) `install-mcp --client zcode` is refused, because ZCode keeps only a
+literal header; add the entry by hand with the header read from
+`<data_dir>/auth-tokens/default`.
 
 **Config file:** ZCode keeps its user-scope config at
 `~/.zcode/cli/config.json`, with servers under the nested `mcp.servers` map

@@ -38,14 +38,19 @@ Decomposition runs (M1, 2026-10-10 to 2026-10-11):
   or a stratified sample: `--stratify N` takes the first N questions of each
   of the six types (single-session-preference has only 30)
 
-Observation-stream runs (R1, 2026-10-12):
+Pipeline re-runs (2026-10-13, corrected harness): the FTS full-set pipeline
+with reachability, both date-prefix ablations and the strat-230 local
+pipeline-vs-whole-session A/B, on `release/2.7` at `85eb1723` with
+`AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` on every arm (see "Harness
+correction").
 
-- final build: `release/2.7` at `8d8c7780`, stream switched on with
-  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true` (it became the default in
-  `5b550300`)
-- full-set A/B: run twice, on observation-stream work not yet committed on
-  top of `b7ac5a70` (the reports record that commit); the final build's
-  full-set run reproduces the candidate's accuracy exactly
+Observation-stream runs (R1, re-run 2026-10-13 on the corrected harness):
+
+- build: `release/2.7` at `85eb1723`, where the stream is on by default; the
+  baseline side sets `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` and the
+  candidate side `=true`
+- harness: `85eb1723`, which replays each question's sessions under their own
+  session ids (see "Harness correction")
 - dataset, hardware and model as above (original `longmemeval_s` file)
 
 Latency and ingest throughput were measured while two or three runs shared
@@ -57,10 +62,10 @@ its own data dir.
 | What is measured | FTS (zero-LLM) | Local embeddings |
 |---|---|---|
 | Grep over whole raw sessions, no server (`--engine grep`) | 0.887 (470; 417/470 on both dataset files) | n/a |
-| **Pipeline**, shipped 2.6 capture and ranking (`--ingest hooks`) | **0.666** (470) | 0.809 and 0.804 (strat-230, two runs); 0.800 (strat-120, three runs) |
-| Pipeline with the per-turn date prefix removed (strat-120) | 0.658 → 0.792 | 0.800 → 0.900 |
-| Pages holding only the text capture keeps (`--ingest captured-session`) | 0.968 (470) | 0.804 → 0.943 (strat-230) |
-| **Component**, whole raw sessions (`--ingest whole-session`) | **0.972** (470, both dataset files) | 0.809 → 0.957 (strat-230) |
+| **Pipeline**, shipped 2.6 capture and ranking (`--ingest hooks`) | **0.662** (470) | 0.787 (strat-230); 0.800 (strat-120) |
+| Pipeline with the per-turn date prefix removed (strat-120) | 0.658 → 0.792 | 0.800 → 0.892 |
+| Pages holding only the text capture keeps (`--ingest captured-session`) | 0.968 (470) | 0.943 (strat-230) |
+| **Component**, whole raw sessions (`--ingest whole-session`) | **0.972** (470, both dataset files) | 0.957 (strat-230) |
 
 Strat-230 is `--stratify 40` and strat-120 is `--stratify 20`. The published
 full-set local pipeline number is 0.815
@@ -71,25 +76,28 @@ Other FTS metrics on all 470 questions:
 
 | | pipeline | captured-session pages | whole-session pages |
 |---|---|---|---|
-| hit@1 | 0.530 | 0.887 | 0.885 |
-| hit@10 | 0.694 | 0.979 | 0.977 |
-| recall@5 | 0.536 | 0.918 | 0.922 |
-| context tokens, mean | 351 | 502 | 505 |
-| query p50 / p95 ms | 14 / 99 | 27 / 99 | 28 / 93 |
+| hit@1 | 0.511 | 0.887 | 0.885 |
+| hit@10 | 0.687 | 0.979 | 0.977 |
+| recall@5 | 0.533 | 0.918 | 0.922 |
+| context tokens, mean | 367 | 502 | 505 |
+| query p50 / p95 ms | 14 / 95 | 27 / 99 | 28 / 93 |
 
 FTS `hit@5` per slice, pipeline → whole-session: knowledge-update 0.764 →
-1.000, multi-session 0.579 → 0.975, single-session-assistant 0.804 → 1.000,
+1.000, multi-session 0.562 → 0.975, single-session-assistant 0.804 → 1.000,
 single-session-preference 0.533 → 0.900, single-session-user 0.688 → 1.000,
-temporal-reasoning 0.654 → 0.945. Whole-session pages gained 145 questions
-and lost 1.
+temporal-reasoning 0.654 → 0.945. Whole-session pages gained about 146
+questions and lost 1 (the pipeline row is from the corrected harness, the
+whole-session row from the original run; whole-session ingest does not use
+session ids, so it is unaffected).
 
 Confirmation runs on strat-120 reproduce each effect: whole vs pipeline FTS
-+0.308 (+38/−1) against +0.306 on the full set; captured vs pipeline FTS
-+0.300 (+38/−2); local whole vs pipeline +0.142 against +0.148 on strat-230.
++0.308 (+38/−1) against +0.310 on the full set; captured vs pipeline FTS
++0.300 (+38/−2); local whole vs pipeline +0.142, against +0.170 (+42/−3) on
+strat-230 with the corrected harness.
 FTS returned identical per-question results across repeated runs.
 
 With the evidence in the index, the same FTS ranks an evidence session into
-the top 5 for 97.2% of questions; through capture it managed 66.6%. Most of
+the top 5 for 97.2% of questions; through capture it managed 66.2%. Most of
 the gap is therefore in capture.
 
 ## Reachability: the evidence was not on the page
@@ -124,13 +132,14 @@ turns (`stop` observations) are titled just `stop`, so no assistant text
 reaches the page at all. The full observation bodies were indexed in
 `observations_fts` the whole time, but `memory_query` read them only when page
 search found nothing. With about 50 session pages per question that almost
-never happened: 50 of 470 questions took that fallback, and those hit at
-46/50.
+never happened: 44 of 470 questions took that fallback, and those hit at
+42/44.
 
-The pipeline still reached 0.666 because sessions were often found through
+The pipeline still reached 0.662 because sessions were often found through
 topic words at the start of a prompt rather than through the answer. Only 39
-of its 313 hits had page-reachable evidence. Of its 157 misses, 148 had none,
-and whole-session pages recover 145 of the 157.
+of its 311 hits had page-reachable evidence. Of its 159 misses, 150 had none;
+whole-session pages, which hit 0.972 of the full set, recover nearly all of
+them.
 
 The local embedder reads the page body cut to 6,144 bytes and then to 512
 tokens. On these short pipeline pages that window holds the whole page. On
@@ -149,7 +158,7 @@ session-start`) or dropping it (`none`) on strat-120:
 
 - FTS `hit@5` 0.658 → 0.792 (+0.133; 21 gained, 5 lost). Two independent runs
   gave identical per-question results, and `none` gives the same number.
-- Local `hit@5` 0.800 → 0.900 (+0.100; 14 gained, 2 lost).
+- Local `hit@5` 0.800 → 0.892 (+0.092; 14 gained, 3 lost).
 - Session-page turn reachability rises from 0.080 to 0.267, and the page
   ceiling from 0.142 to 0.408.
 
@@ -184,43 +193,73 @@ nothing new is written to the wiki. It is on by default in 2.7; setting it to
 `false` restores the previous ranking exactly.
 
 Baseline is the stream off, candidate is the stream on, same build, same
-questions:
+questions. These are the corrected-harness runs (see "Harness correction"
+below):
 
 | run | questions | hit@5 | hit@1 | hit@10 | recall@5 | p95 ms | flips |
 |---|---|---|---|---|---|---|---|
-| FTS, full set | 470 | 0.666 → **0.868** | 0.530 → 0.619 | 0.694 → 0.936 | 0.536 → 0.767 | 103 → 98 | +96/−1 |
-| FTS, final build | 180 (`--stratify 30`) | 0.656 → **0.850** | 0.494 → 0.589 | 0.689 → 0.928 | 0.558 → 0.741 | 32 → 43 | +36/−1 |
-| Local, final build | 90 (`--stratify 15`) | 0.800 → **0.867** | 0.489 → 0.533 | 0.867 → 0.933 | 0.677 → 0.773 | 77 → 84 | +7/−1 |
+| FTS, full set | 470 | 0.662 → **0.855** | 0.511 → 0.611 | 0.687 → 0.934 | 0.533 → 0.743 | 84 → 97 | +91/−0 |
+| FTS | 180 (`--stratify 30`) | 0.656 → **0.828** | 0.483 → 0.594 | 0.689 → 0.917 | 0.558 → 0.719 | 25 → 40 | +32/−1 |
+| Local | 90 (`--stratify 15`) | 0.800 → **0.867** | 0.500 → 0.533 | 0.867 → 0.933 | 0.677 → 0.764 | 68 → 75 | +7/−1 |
 
 FTS `hit@5` per slice on the full set, off → on: knowledge-update 0.764 →
-0.944, multi-session 0.579 → 0.893, single-session-assistant 0.804 → 0.857,
-single-session-preference 0.533 → 0.667, single-session-user 0.688 → 0.891,
-temporal-reasoning 0.654 → 0.843. No slice dropped. The two full-set A/B runs
-gave identical accuracy, and the final build's single-config full-set run
-gave the same 0.868, with a p95 of 95 ms. The full-set p95 in the table is
-from the second A/B run. The first ran on a build whose observation scan was
-not yet bounded to the project, and measured a baseline p95 of 76 ms and a
-candidate p95 of 1,373 ms; the bounded scan is what shipped.
+0.944, multi-session 0.562 → 0.868, single-session-assistant 0.804 → 0.839,
+single-session-preference 0.533 → 0.667, single-session-user 0.688 → 0.875,
+temporal-reasoning 0.654 → 0.835. No slice dropped, and no question lost its
+top-5 hit. The three runs shared the host one after another, never with each
+other. An earlier build whose observation scan was not yet bounded to the
+project measured a candidate p95 of 1,373 ms; the bounded scan is what
+shipped.
 
 Context tokens rise. The candidate returns more hits: with the stream off,
-FTS returned fewer than five hits for 242 of 470 questions (5.2 hits on
-average), and with it on, 9.8. So the raw mean rises more than the cost of the
+FTS returned fewer than five hits for 219 of 470 questions (5.6 hits on
+average), and with it on, 9.9. So the raw mean rises more than the cost of the
 top five hits does:
 
 | run | mean context tokens, all hits | top five hits only |
 |---|---|---|
-| FTS, 180 questions | 411.2 → 561.7 | 264.0 → 283.6 (+7.4%) |
-| Local, 90 questions | 473.6 → 562.4 | 236.8 → 281.2 (+18.8%) |
-| FTS, 470 questions | 350.2 → 542.1 | 249.6 → 273.6 (+9.6%) |
+| FTS, 470 questions | 366.7 → 548.8 | 256.3 → 276.4 (+7.9%) |
+| FTS, 180 questions | 414.9 → 565.7 | 266.7 → 285.4 (+7.0%) |
+| Local, 90 questions | 476.6 → 563.2 | 238.3 → 281.6 (+18.2%) |
 
 "Top five hits only" scales each question's estimate by `min(returned, 5) /
-returned`. In the 470-question row the "off" side is from the `b7ac5a70` A/B
-and the "on" side is the final build; the final build trimmed the excerpt a
-hit carries, which affects only the "on" side.
+returned`.
 
 The stream recovered about two thirds of the FTS headroom the decomposition
-found (0.666 → 0.868, against 0.968 for captured-text pages). A full-set
+found (0.662 → 0.855, against 0.968 for captured-text pages). A full-set
 local run with the stream on has not been done yet.
+
+## Harness correction (2026-10-13)
+
+LongMemEval reuses session ids across questions: 4,715 of the 23,566 scored
+haystack sessions, 8 of them evidence sessions, also appear in an earlier
+question's haystack. The first runs replayed every session under its raw id,
+so a reused session already existed in the earlier question's project when
+the later replay arrived. The store filed its turns under the new project but
+dropped its `session-end` as naming a foreign scope, so those sessions never
+got a session page in the later project. This was the "8 of 845 evidence
+sessions had no session page" the first version of this report could not
+explain. A real harness mints a fresh id per session, so the replay now
+namespaces each id by question (`stored_session_uuid` in
+`evals/src/retrieval/ingest.rs`, harness `85eb1723`), and all 845 evidence
+pages are present.
+
+The pipeline numbers above, and the observation-stream runs, are from the
+corrected harness. The changes were small for the pipeline and larger for the
+stream, which had partly been scoring sessions whose page was missing:
+
+| run | first published | corrected |
+|---|---|---|
+| FTS pipeline, 470 | 0.666 | 0.662 |
+| Local pipeline, strat-230 | 0.809 / 0.804 | 0.787 |
+| FTS date-prefix ablation, strat-120 | 0.658 → 0.792 | 0.658 → 0.792 |
+| Local date-prefix ablation, strat-120 | 0.800 → 0.900 | 0.800 → 0.892 |
+| FTS stream off → on, 470 | 0.666 → 0.868 | 0.662 → 0.855 |
+| Local stream off → on, 90 | 0.800 → 0.867 | 0.800 → 0.867 |
+
+Component, grep and captured-session runs write pages directly or read the
+dataset, never replaying session ids through hooks, so they are unchanged.
+Reachability is unchanged too (0.056 / 0.102 on the session page).
 
 ## Comparability with other published numbers
 
@@ -255,8 +294,6 @@ local run with the stream on has not been done yet.
 - With full text in the index, local embeddings scored below FTS alone on the
   same 230 questions (0.943 against 0.974 on captured-text pages; 10 lost,
   3 gained). The page vector covers only the first 512 tokens.
-- 8 of 845 evidence sessions had no session page after hook ingest, affecting
-  at most 5 questions. The cause was not investigated.
 - Hook ingest slows as the store grows: in the full pipeline run, completed
   questions per minute fell from about 22 to about 5 (about 23,000 sessions
   across 470 projects, contended host). The cause was not profiled.
@@ -299,22 +336,16 @@ $E retrieval --stratify 20 --embeddings local --date-prefix turn --candidate-dat
 $E retrieval --stratify 20 --embeddings local --candidate-server-env AI_MEMORY_RETRIEVAL__BELIEF_AUTHORITY_WEIGHT=0.3
 ```
 
-Observation stream. These ran against builds where the stream was off by
-default; on a build where it defaults on, pass
-`--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` for the baseline
-side:
+Observation stream (corrected harness, stream on by default):
 
 ```bash
 B=target/release
-FLAG=AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true
-# full set, A/B
-$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 300 \
-    --candidate-server-env $FLAG
-# final build: FTS on 180, local on 90, then the full set with the stream on
-$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 300 \
-    --stratify 30 --candidate-server-env $FLAG
-$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 600 \
-    --embeddings local --stratify 15 --candidate-server-env $FLAG
-$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 300 \
-    --server-env $FLAG
+AB="--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false
+    --candidate-server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true"
+# full set, then FTS on 180 and local on 90
+$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 900 $AB
+$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 900 \
+    --stratify 30 $AB
+$B/ai-memory-eval retrieval --server-bin $B/ai-memory --concurrency 6 --http-timeout-secs 900 \
+    --embeddings local --stratify 15 $AB
 ```

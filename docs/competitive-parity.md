@@ -43,7 +43,7 @@ None of the competitors below has more than one or two of these; none has all.
 - **Multi-user shared-within-project** ("pages shared, batons owned", invariant
   #16), self-hosted, with no paid tier.
 - **Honest, reproducible benchmarks**: LongMemEval-S hit@5 about 0.82 local and
-  0.666 zero-LLM through the shipped pipeline, 0.868 zero-LLM with the 2.7
+  0.666 zero-LLM through the shipped pipeline, 0.855 zero-LLM with the 2.7
   observation stream, and a published pipeline-vs-component decomposition
   ([`benchmarks/`](benchmarks/README.md)).
 
@@ -119,7 +119,7 @@ implemented without a separate decision.** Ordered by leverage.
    ([`benchmarks/longmemeval-s-decomposition-2026-10-12.md`](benchmarks/longmemeval-s-decomposition-2026-10-12.md))
    split the pipeline number into capture cost, ranking and harness
    artifacts, which led to the 2.7 observation stream (zero-LLM FTS hit@5
-   0.666 → 0.868). What is still unrun is the dormant substrate below: the
+   0.662 → 0.855). What is still unrun is the dormant substrate below: the
    belief-strength weight cannot move a zero-LLM corpus (every page's
    confidence is 0.0 without consolidation evidence, so the measured delta
    was 0.000 FTS), so it needs an LLM-consolidated corpus; typed-edge rank
@@ -259,7 +259,7 @@ implemented without a separate decision.** Ordered by leverage.
   page indexed only 80-character turn titles and no assistant text, while
   ranking whole sessions scored 0.972. The 2.7 observation stream, on by
   default after a measured R2 delta, recovered about two thirds
-  of that (0.666 → 0.868 zero-LLM FTS on the full set; 0.800 → 0.867 local on
+  of that (0.662 → 0.855 zero-LLM FTS on the full set; 0.800 → 0.867 local on
   a 90-question sample). Still open: no local zero-LLM reranker, a full-set
   local run with the stream, belief-strength (`page_evidence`) wired but
   **default-off** and unmeasurable without an LLM-consolidated corpus, and
