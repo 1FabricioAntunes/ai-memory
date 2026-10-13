@@ -3,12 +3,12 @@
 {% block title %}Session {{ session_id }} — ai-memory{% endblock %}
 
 {% block content %}
-<nav class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
   <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
-  <span>/</span>
+  <span aria-hidden="true">/</span>
   <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
-  <span>/</span>
-  <span class="text-slate-700 dark:text-slate-200 font-mono text-xs truncate max-w-xs">session {{ session_id }}</span>
+  <span aria-hidden="true">/</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-mono text-xs truncate max-w-xs">session {{ session_id }}</span>
 </nav>
 
 <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">Session timeline</h1>
@@ -16,7 +16,7 @@
   <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ agent_kind }}</span>
   started <span title="{{ started_at }}">{{ started_at }}</span>{% if ended_at != "" %}, ended <span title="{{ ended_at }}">{{ ended_at }}</span>{% else %}, still open{% endif %}
 </p>
-<p class="mb-6 text-xs text-slate-400 dark:text-slate-500">
+<p class="mb-6 text-xs text-slate-500 dark:text-slate-400">
   Captured observations, in order. They were sanitized when captured and are shown as plain text.
   {% if elided_other_scope > 0 %}This session also left {{ elided_other_scope }} observation{% if elided_other_scope != 1 %}s{% endif %} in another project, not shown here.{% endif %}
 </p>
@@ -39,14 +39,14 @@
 </nav>
 
 {% if observations.is_empty() %}
-<p class="text-sm text-slate-400 dark:text-slate-600">No observations on this page.</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">No observations on this page.</p>
 {% else %}
 <ol class="space-y-4">
   {% for obs in observations %}
   <li id="obs-{{ obs.position }}" data-position="{{ obs.position }}" tabindex="-1"
       class="rounded border border-slate-200 dark:border-slate-800 p-3 focus:outline-none focus:ring-2 focus:ring-blue-500">
     <div class="flex flex-wrap items-center gap-2 mb-2 text-xs text-slate-500 dark:text-slate-400">
-      <a href="{{ session_href }}?at={{ obs.position }}&amp;limit={{ limit }}#obs-{{ obs.position }}" class="font-mono text-slate-400 dark:text-slate-500 hover:text-blue-600 dark:hover:text-blue-400">#{{ obs.position }}</a>
+      <a href="{{ session_href }}?at={{ obs.position }}&amp;limit={{ limit }}#obs-{{ obs.position }}" class="font-mono text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400">#{{ obs.position }}</a>
       <span class="inline-flex items-center rounded px-1.5 py-0.5 font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ obs.kind }}</span>
       <span class="font-medium text-slate-700 dark:text-slate-200">{{ obs.title }}</span>
       <span class="ml-auto whitespace-nowrap" title="{{ obs.created_at }}">{{ obs.created_relative }}</span>

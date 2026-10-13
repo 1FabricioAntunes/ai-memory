@@ -122,8 +122,8 @@ pub enum Command {
     Status(StatusArgs),
     /// List every workspace/project pair the server knows about (plain,
     /// scriptable output — the read-only equivalent of hitting
-    /// `GET /api/v1/projects` directly, which was previously the only way to
-    /// see this from outside an interactive `show` session).
+    /// `GET /api/v1/projects` directly, falling back to `GET /admin/projects`
+    /// when the server runs without `--enable-web` or `--enable-api`).
     ListProjects(ListProjectsArgs),
     /// Check capture coverage: compare local harness session stores for this
     /// project against what the server captured, and warn when a harness ran
@@ -935,11 +935,17 @@ pub struct ProjectArgs {
 /// `project` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
+    /// Interactively create this checkout's `.ai-memory.toml` marker.
+    Init(ProjectInitArgs),
     /// Set a project `open` or `restricted`.
     Access(ProjectAccessArgs),
     /// List who holds a grant on one project.
     Grants(ProjectGrantsArgs),
 }
+
+/// Arguments for `project init`.
+#[derive(Debug, Args)]
+pub struct ProjectInitArgs {}
 
 /// Arguments for `profile`.
 #[derive(Debug, Args)]
@@ -1541,8 +1547,16 @@ pub struct PurgeProjectArgs {
     pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
+    /// Project id (UUID) to purge, as an alternative to `--project`.
+    ///
+    /// Use this when the NAME lookup is ambiguous: a legacy row whose name
+    /// collides with another project's `legacy_name` is refused by name, so
+    /// only the id reaches it. Find it in the
+    /// `list-projects` output. Mutually exclusive with `--project`.
+    #[arg(long)]
+    pub project_id: Option<String>,
     /// REQUIRED for the purge to run. Without this flag the CLI errors
     /// out — purging is destructive and irreversible.
     ///
@@ -1631,8 +1645,16 @@ pub struct RenameProjectArgs {
     /// running `ai-memory rename-project --to new-name` from a dir
     /// that was JUST renamed (the basename will be the new name, so
     /// you'll want to pass --from explicitly in that workflow).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub from: Option<String>,
+    /// Project id (UUID) to rename, as an alternative to `--from`.
+    ///
+    /// Use this when the NAME lookup is ambiguous: a legacy row whose name
+    /// collides with another project's `legacy_name` is refused by name, so
+    /// only the id reaches it. Find it in the
+    /// `list-projects` output. Mutually exclusive with `--from`.
+    #[arg(long)]
+    pub project_id: Option<String>,
     /// New project name. Must be non-empty and contain no slashes.
     #[arg(long)]
     pub to: String,
@@ -1648,8 +1670,16 @@ pub struct MoveProjectArgs {
     pub from_workspace: Option<String>,
     /// Project name to move. When omitted, auto-derived from the basename
     /// of the current git repo root (or CWD if no git repo).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
+    /// Project id (UUID) to move, as an alternative to `--project`.
+    ///
+    /// Use this when the NAME lookup is ambiguous: a legacy row whose name
+    /// collides with another project's `legacy_name` is refused by name, so
+    /// only the id reaches it. Find it in the
+    /// `list-projects` output. Mutually exclusive with `--project`.
+    #[arg(long)]
+    pub project_id: Option<String>,
     /// Destination workspace. Auto-created if it doesn't exist.
     #[arg(long)]
     pub to_workspace: String,
@@ -2354,9 +2384,9 @@ pub enum AgentChoice {
     /// xAI Grok Build CLI — JSON-config hooks in
     /// `~/.grok/hooks/ai-memory.json`. Native `ai-memory hook --event`
     /// integration using Grok-specific hook scripts. NOTE: Grok ignores
-    /// hook stdout on `SessionStart`, so
-    /// capture works but handoff injection does not — recover the prior
-    /// session's handoff via the MCP `memory_handoff_accept` tool.
+    /// hook stdout on `SessionStart`; `--apply` also writes
+    /// `$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
+    /// `memory_handoff_list`, and the first `PostToolUse` injects the baton.
     Grok,
     /// Zero coding agent (Gitlawb/zero) — JSON-config lifecycle hooks in
     /// `$XDG_CONFIG_HOME/zero/hooks.json` (exec-form `command` + `args`,
@@ -2658,8 +2688,8 @@ pub enum McpClient {
     /// xAI Grok Build CLI — `~/.grok/config.toml` under
     /// `[mcp_servers.<name>]` with native HTTP `url` + `headers`.
     /// Pair with `install-hooks --agent grok` for lifecycle capture.
-    /// Grok ignores SessionStart stdout, so handoffs are recovered via
-    /// MCP `memory_handoff_accept` rather than hook injection.
+    /// Grok ignores SessionStart stdout; that apply also writes the
+    /// first-turn `memory_handoff_list` rule under `$GROK_HOME/rules`.
     Grok,
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
@@ -3515,6 +3545,16 @@ mod tests {
             Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
         assert!(Cli::try_parse_from(["ai-memory", "grant", "list"]).is_err());
+    }
+
+    #[test]
+    fn project_init_parses_without_server_scope_flags() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "project", "init"]).expect("project init parses");
+        let Command::Project(args) = parsed.command else {
+            panic!("expected project command");
+        };
+        assert!(matches!(args.command, ProjectCommand::Init(_)));
     }
 
     #[test]
@@ -4906,5 +4946,90 @@ mod tests {
         };
         assert_eq!(args.version.as_deref(), Some("v2.3.2"));
         assert!(args.force);
+    }
+
+    /// #1208: each destructive project op takes `--project-id` as an
+    /// alternative to its name flag, and the two are mutually exclusive so an
+    /// ambiguous request never reaches the server to be guessed at.
+    #[test]
+    fn project_id_flags_parse_and_conflict_with_their_name_flags() {
+        let id = "11111111-2222-3333-4444-555555555555";
+
+        let cli = Cli::try_parse_from(["ai-memory", "purge-project", "--project-id", id]).unwrap();
+        let Command::PurgeProject(args) = cli.command else {
+            panic!("expected purge-project");
+        };
+        assert_eq!(args.project_id.as_deref(), Some(id));
+        assert!(args.project.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "purge-project",
+                "--project",
+                "doomed",
+                "--project-id",
+                id,
+            ])
+            .is_err(),
+            "--project and --project-id must not both be accepted"
+        );
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "rename-project",
+            "--project-id",
+            id,
+            "--to",
+            "new",
+        ])
+        .unwrap();
+        let Command::RenameProject(args) = cli.command else {
+            panic!("expected rename-project");
+        };
+        assert_eq!(args.project_id.as_deref(), Some(id));
+        assert!(args.from.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "rename-project",
+                "--from",
+                "old",
+                "--project-id",
+                id,
+                "--to",
+                "new",
+            ])
+            .is_err(),
+            "--from and --project-id must not both be accepted"
+        );
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "move-project",
+            "--project-id",
+            id,
+            "--to-workspace",
+            "elsewhere",
+        ])
+        .unwrap();
+        let Command::MoveProject(args) = cli.command else {
+            panic!("expected move-project");
+        };
+        assert_eq!(args.project_id.as_deref(), Some(id));
+        assert!(args.project.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "move-project",
+                "--project",
+                "movable",
+                "--project-id",
+                id,
+                "--to-workspace",
+                "elsewhere",
+            ])
+            .is_err(),
+            "--project and --project-id must not both be accepted"
+        );
     }
 }

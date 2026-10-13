@@ -957,6 +957,16 @@ fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option
     )
 }
 
+/// The tool a tool event names, under the keys the observation title uses.
+pub(crate) fn event_tool_name(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool", "tool_name", "name"])
+}
+
+/// The tool-use id a tool event carries (Claude-family payloads).
+pub(crate) fn event_tool_use_id(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool_use_id"])
+}
+
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     for key in keys {
         for candidate in extraction_candidates(value) {

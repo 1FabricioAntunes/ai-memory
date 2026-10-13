@@ -1669,8 +1669,15 @@ pub struct BriefPageBody {
 /// Returned by [`ReaderPool::list_projects_with_stats`].
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSummary {
+    /// Id of the workspace, as the stable half of the scope coordinate. (#1208)
+    pub workspace_id: String,
     /// Name of the workspace.
     pub workspace_name: String,
+    /// Id of the project, as the stable coordinate an operator can hand to an
+    /// id-targeted admin operation. Names are not stable -- a legacy twin row
+    /// can shadow another project's `legacy_name` -- so this is what makes a
+    /// `list-projects` row unambiguous. (#1208)
+    pub project_id: String,
     /// Name of the project within the workspace.
     pub project_name: String,
     /// Number of `is_latest = 1` pages.
@@ -1906,7 +1913,7 @@ pub struct PageMeta {
     pub tier: String,
     /// Whether the page is pinned (decay-immune).
     pub pinned: bool,
-    /// ISO-8601 creation timestamp.
+    /// ISO-8601 instant the oldest retained version of the page was written.
     pub created_at: String,
     /// ISO-8601 last-update timestamp.
     pub updated_at: String,
@@ -4135,6 +4142,30 @@ impl ReaderPool {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Whether LLM consolidation of the session's current observation
+    /// generation is already running or finished. A redelivered checkpoint
+    /// checks this before rewriting the rule-based page, so a retry that
+    /// arrives after the worker finished cannot replace the LLM page it
+    /// wrote.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_generation_consolidating_or_done(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM session_consolidation_jobs \
+                 WHERE session_id = ?1 AND state IN ('running', 'completed') \
+                   AND generation = (SELECT COUNT(*) FROM observations WHERE session_id = ?1))",
+                params![session_id.as_bytes()],
+                |row| row.get::<_, bool>(0),
+            )?)
         })
         .await
     }
@@ -8243,10 +8274,11 @@ impl ReaderPool {
     pub async fn page_meta_by_id(&self, page_id: PageId) -> StoreResult<Option<PageMeta>> {
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let created_expr = PAGE_FIRST_CREATED_EXPR;
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
-                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        pg.tier, pg.pinned, {created_expr}, pg.updated_at, \
                         sp.path AS supersedes_path, \
                         au.username, au.name, au.email, pg.expires_at, pg.id \
                  FROM pages pg \
@@ -8276,10 +8308,11 @@ impl ReaderPool {
         let path = path.to_owned();
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let created_expr = PAGE_FIRST_CREATED_EXPR;
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
-                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        pg.tier, pg.pinned, {created_expr}, pg.updated_at, \
                         sp.path AS supersedes_path, \
                         au.username, au.name, au.email, pg.expires_at, pg.id \
                  FROM pages pg \
@@ -8751,7 +8784,9 @@ impl ReaderPool {
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
             let mut stmt = conn.prepare(&format!(
-                "SELECT w.name AS workspace_name, \
+                "SELECT w.id AS workspace_id, \
+                        w.name AS workspace_name, \
+                        p.id AS project_id, \
                         p.name AS project_name, \
                         COUNT(pg.id) AS page_count, \
                         MAX(pg.updated_at) AS last_updated_us \
@@ -8763,20 +8798,40 @@ impl ReaderPool {
                  ORDER BY last_updated_us DESC NULLS LAST"
             ))?;
             let rows = stmt.query_map(params![workspace], |row| {
-                let workspace_name: String = row.get(0)?;
-                let project_name: String = row.get(1)?;
-                let page_count: i64 = row.get(2)?;
-                let last_updated_us: Option<i64> = row.get(3)?;
-                Ok((workspace_name, project_name, page_count, last_updated_us))
+                let workspace_id: Vec<u8> = row.get(0)?;
+                let workspace_name: String = row.get(1)?;
+                let project_id: Vec<u8> = row.get(2)?;
+                let project_name: String = row.get(3)?;
+                let page_count: i64 = row.get(4)?;
+                let last_updated_us: Option<i64> = row.get(5)?;
+                Ok((
+                    workspace_id,
+                    workspace_name,
+                    project_id,
+                    project_name,
+                    page_count,
+                    last_updated_us,
+                ))
             })?;
             let mut out = Vec::new();
             for r in rows {
-                let (workspace_name, project_name, page_count, last_updated_us) = r?;
+                let (
+                    workspace_id,
+                    workspace_name,
+                    project_id,
+                    project_name,
+                    page_count,
+                    last_updated_us,
+                ) = r?;
+                let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
+                let project_id = ProjectId::from_slice(&project_id)?;
                 let last_updated = last_updated_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
                 out.push(ProjectSummary {
+                    workspace_id: workspace_id.to_string(),
                     workspace_name,
+                    project_id: project_id.to_string(),
                     project_name,
                     page_count: u64::try_from(page_count).unwrap_or(0),
                     last_updated,
@@ -9175,10 +9230,11 @@ impl ReaderPool {
         let page_path = page_path.to_owned();
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let created_expr = PAGE_FIRST_CREATED_EXPR;
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
-                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        pg.tier, pg.pinned, {created_expr}, pg.updated_at, \
                         sp.path AS supersedes_path, \
                         au.username, au.name, au.email, pg.expires_at, pg.id \
                  FROM pages pg \
@@ -11420,6 +11476,25 @@ fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage>
         kind: row.get(4)?,
     })
 }
+
+/// SQL for [`PageMeta::created_at`]: when the page itself first appeared.
+///
+/// `pages.created_at` is per version, so the latest row alone would report the
+/// last rewrite. The page's versions form its `supersedes` chain (a
+/// tombstone-resurrected page is re-linked onto its old chain, #929), so the
+/// oldest retained version is the minimum along that chain. Each step is a
+/// primary-key lookup, so no index on `(path, created_at)` is needed and the
+/// walk cannot reach a same-path page in another project. Versions removed by
+/// retention or ledger reclaim end the chain early and no longer count.
+const PAGE_FIRST_CREATED_EXPR: &str = "COALESCE(\
+    (WITH RECURSIVE chain(supersedes, created_at, depth) AS (\
+        SELECT pg.supersedes, pg.created_at, 0 \
+        UNION ALL \
+        SELECT v.supersedes, v.created_at, chain.depth + 1 \
+          FROM pages v JOIN chain ON v.id = chain.supersedes \
+         WHERE chain.depth < 100000) \
+     SELECT MIN(created_at) FROM chain), \
+    pg.created_at)";
 
 fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<PageMeta>> {
     let workspace_name: String = row.get(0)?;

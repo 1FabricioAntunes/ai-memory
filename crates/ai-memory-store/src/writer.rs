@@ -274,6 +274,12 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    EnqueueSessionCheckpoint {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     ClaimSessionConsolidation {
         now: i64,
         stale_before: i64,
@@ -1674,7 +1680,29 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Atomically claim the oldest due SessionEnd consolidation job.
+    /// Persist one checkpoint job (PreCompact / PostCompaction) for the
+    /// current observation generation. Duplicate generations are idempotent.
+    /// The session may already have ended: a resumed session keeps
+    /// `ended_at` while it captures again.
+    pub async fn enqueue_session_checkpoint(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EnqueueSessionCheckpoint {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically claim the oldest due session consolidation job (SessionEnd
+    /// or checkpoint).
     pub async fn claim_session_consolidation(
         &self,
         now: i64,
@@ -3957,6 +3985,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     session_id,
                 );
                 send_or_warn(reply, result, "enqueue_session_consolidation");
+            }
+            WriteCmd::EnqueueSessionCheckpoint {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result = crate::session_consolidation::enqueue_checkpoint(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                );
+                send_or_warn(reply, result, "enqueue_session_checkpoint");
             }
             WriteCmd::ClaimSessionConsolidation {
                 now,
