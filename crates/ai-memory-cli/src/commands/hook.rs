@@ -33,8 +33,8 @@ use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, hook_scope,
-    marker_capture_policy, marker_query_suffix, marker_query_suffix_without_briefing,
+    HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
+    hook_scope, marker_capture_policy, marker_query_suffix, marker_query_suffix_without_briefing,
     marker_requests_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
@@ -1744,8 +1744,16 @@ pub(crate) fn delivers_to_same_server(data_dir: &Path, source: &str, destination
 /// A transcript import posts every event under one project, so an event the
 /// hook would file under another project must not ride along.
 pub(crate) fn routes_to_same_project(source: &str, destination: &str) -> bool {
-    let scope = hook_scope(source, None);
-    if scope != hook_scope(destination, None) {
+    routes_to_same_project_with(source, destination, |cwd| hook_scope(cwd, None))
+}
+
+fn routes_to_same_project_with(
+    source: &str,
+    destination: &str,
+    scope_of: impl Fn(&str) -> HookScope,
+) -> bool {
+    let scope = scope_of(source);
+    if scope != scope_of(destination) {
         return false;
     }
     if scope.names_the_project() {
@@ -4388,6 +4396,14 @@ mod tests {
         )
         .unwrap();
         let path = |dir: &Path| dir.to_string_lossy().into_owned();
+        // An empty home keeps a developer's own `~/.ai-memory.toml` (which
+        // applies to every cwd) out of the routing decision.
+        let home = tempfile::tempdir().unwrap();
+        let routes_to_same_project = |source: &str, destination: &str| {
+            routes_to_same_project_with(source, destination, |cwd| {
+                crate::commands::hook_capture::hook_scope_with_home(cwd, None, Some(home.path()))
+            })
+        };
         assert!(!routes_to_same_project(
             &path(&basename.join("sub1")),
             &path(&basename.join("sub2"))
