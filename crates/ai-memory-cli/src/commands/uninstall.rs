@@ -15,7 +15,7 @@ use crate::commands::path_util::{
     agent_config_home, claude_config_dir, claude_config_paths, home_dir,
 };
 use crate::commands::user_service::{self, ServiceManager};
-use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
+use crate::commands::{agent_plugins, data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
@@ -729,6 +729,17 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     let plan = build_plan(&args, &config.data_dir)?;
     print_plan(&plan);
+    // The marketplace plugins carry hooks, MCP and skills together, so only a
+    // full uninstall removes them; the harness's own CLI does the removal.
+    let plugins = if args.only.is_none() {
+        installed_plugins(config)
+    } else {
+        Vec::new()
+    };
+    for plugin in &plugins {
+        let (program, plugin_args) = plugin.harness.uninstall_command();
+        println!("would run `{program} {}`", plugin_args.join(" "));
+    }
     let service = if args.only.is_none() {
         setup_service(config)
     } else {
@@ -756,7 +767,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         println!("(dry-run; pass --apply to remove)");
         return Ok(());
     }
-    if plan.is_empty() && !args.purge_data && !remove_service {
+    if plan.is_empty() && plugins.is_empty() && !args.purge_data && !remove_service {
         return Ok(());
     }
 
@@ -810,6 +821,8 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         apply_change(change, private_backup.as_ref(), name.as_deref(), &url)?;
     }
 
+    uninstall_plugins(&plugins, &user_service::SystemRunner);
+
     // Removing the hooks removes the only readers of the stored bearer, so
     // leaving it on disk would strand a live credential (#552). An uninstall
     // that keeps the hooks (`--only mcp|instructions|skills`) keeps it: the
@@ -844,6 +857,43 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     print_docker_hint(args.purge_data);
 
     Ok(())
+}
+
+/// The ai-memory marketplace plugins installed for this user.
+fn installed_plugins(config: &Config) -> Vec<agent_plugins::InstalledPlugin> {
+    let Some(home) = crate::commands::run::native_home(config) else {
+        return Vec::new();
+    };
+    agent_plugins::installed(&home, &|name| {
+        config
+            .runtime_env
+            .process_env()
+            .iter()
+            .find(|(key, _)| key.as_os_str() == name)
+            .map(|(_, value)| value.clone())
+    })
+}
+
+/// Remove each plugin through its harness's CLI. A failure is reported with
+/// the command to run, and never stops the rest of the teardown.
+fn uninstall_plugins(
+    plugins: &[agent_plugins::InstalledPlugin],
+    runner: &dyn user_service::CommandRunner,
+) {
+    for plugin in plugins {
+        let (program, args) = plugin.harness.uninstall_command();
+        let shown = format!("{program} {}", args.join(" "));
+        match runner.run(program, &args) {
+            Ok(outcome) if outcome.success => println!("✓ {shown}"),
+            Ok(outcome) => eprintln!(
+                "ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
+                outcome.stderr.trim()
+            ),
+            Err(error) => eprintln!(
+                "ai-memory uninstall warning: could not run `{shown}` ({error:#}); run it yourself"
+            ),
+        }
+    }
 }
 
 /// The user service `setup` installs on this platform and what uninstall
@@ -1583,6 +1633,35 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each installed plugin is removed through its own harness CLI, and one
+    /// failure does not stop the next.
+    #[test]
+    fn uninstall_removes_each_plugin_through_its_harness() {
+        use crate::commands::agent_plugins::test_support::{
+            RecordingRunner, install_claude_plugin, install_codex_plugin,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            home_dir: Some(home.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        assert!(installed_plugins(&config).is_empty());
+        install_claude_plugin(home.path(), "3.0.0", false);
+        install_codex_plugin(home.path());
+        let plugins = installed_plugins(&config);
+        assert_eq!(plugins.len(), 2, "a disabled plugin is still removed");
+
+        let runner = RecordingRunner::new(Some(1));
+        uninstall_plugins(&plugins, &runner);
+        assert_eq!(
+            *runner.calls.borrow(),
+            vec![
+                "claude plugin uninstall ai-memory@ai-memory",
+                "codex plugin remove ai-memory@ai-memory"
+            ]
+        );
+    }
 
     /// The Windows global Devin skill root (`%APPDATA%\devin\skills`) is
     /// swept alongside the cwd/home roots — `install-skills --scope global`

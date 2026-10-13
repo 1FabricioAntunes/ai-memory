@@ -46,16 +46,31 @@ struct HookMetadata {
     source_path: String,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    plugin_id: Option<String>,
+}
+
+/// Which ai-memory hooks a probe reports on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HookSource<'a> {
+    /// The hooks `install-hooks` wrote to this hooks file.
+    File(&'a Path),
+    /// The hooks of the installed plugin with this id (#1166).
+    Plugin(&'a str),
 }
 
 /// Ask `codex` (the program at `program`) for the trust state of the
 /// ai-memory hooks in `hooks_file`. `None` when Codex is not installed, does
 /// not answer in time, speaks a protocol this does not understand, or lists
 /// no ai-memory hook in that file — the caller reports the state as unknown.
-pub(crate) async fn probe(program: &Path, hooks_file: &Path, cwd: &Path) -> Option<CodexHookTrust> {
+pub(crate) async fn probe(
+    program: &Path,
+    source: HookSource<'_>,
+    cwd: &Path,
+) -> Option<CodexHookTrust> {
     let result = tokio::time::timeout(PROBE_TIMEOUT, list_hooks(program, cwd)).await;
     let response = result.ok()??;
-    summarize(&response, hooks_file)
+    summarize(&response, source)
 }
 
 async fn list_hooks(program: &Path, cwd: &Path) -> Option<serde_json::Value> {
@@ -96,20 +111,27 @@ async fn list_hooks(program: &Path, cwd: &Path) -> Option<serde_json::Value> {
     None
 }
 
-/// The trust state of the ai-memory hooks `hooks_file` declares, from a
-/// `hooks/list` result. A hook is ai-memory's when its command runs
-/// `ai-memory ... hook --event ...`, the form `install-hooks` writes.
-fn summarize(result: &serde_json::Value, hooks_file: &Path) -> Option<CodexHookTrust> {
+/// The trust state of the ai-memory hooks `source` names, from a
+/// `hooks/list` result. A hooks-file hook is ai-memory's when its command runs
+/// `ai-memory ... hook --event ...`, the form `install-hooks` writes; a plugin
+/// hook is ai-memory's when Codex reports it under the plugin's id.
+fn summarize(result: &serde_json::Value, source: HookSource<'_>) -> Option<CodexHookTrust> {
     let response = serde_json::from_value::<ListResponse>(result.clone()).ok()?;
     let mut trust = CodexHookTrust {
         trusted: Vec::new(),
         skipped: Vec::new(),
     };
     for hook in response.data.into_iter().flat_map(|entry| entry.hooks) {
-        let ours = hook.command.as_deref().is_some_and(|command| {
-            command.contains("ai-memory") && command.contains(" hook --event ")
-        });
-        if !ours || Path::new(&hook.source_path) != hooks_file {
+        let ours = match source {
+            HookSource::File(hooks_file) => {
+                Path::new(&hook.source_path) == hooks_file
+                    && hook.command.as_deref().is_some_and(|command| {
+                        command.contains("ai-memory") && command.contains(" hook --event ")
+                    })
+            }
+            HookSource::Plugin(id) => hook.plugin_id.as_deref() == Some(id),
+        };
+        if !ours {
             continue;
         }
         match hook.trust_status.as_str() {
@@ -142,7 +164,7 @@ mod tests {
             hook("postToolUse", "untrusted", file, "/usr/bin/other-tool --check"),
             hook("userPromptSubmit", "untrusted", "/repo/.codex/hooks.json", ours),
         ]}]});
-        let trust = summarize(&result, Path::new(file)).unwrap();
+        let trust = summarize(&result, HookSource::File(Path::new(file))).unwrap();
         assert_eq!(trust.trusted, vec!["sessionStart"]);
         assert_eq!(
             trust.skipped,
@@ -153,15 +175,46 @@ mod tests {
         );
     }
 
+    /// Plugin hooks run the launcher, not `ai-memory hook`, so they are
+    /// recognised by the plugin id Codex reports; another plugin's hooks and
+    /// the hooks-file hooks are not counted.
+    #[test]
+    fn summarizes_the_ai_memory_plugin_hooks_by_plugin_id() {
+        let cache = "/home/me/.codex/plugins/cache/ai-memory/ai-memory/3.0.0/hooks/hooks.json";
+        let launcher = "sh \"/home/me/.codex/plugins/cache/ai-memory/ai-memory/3.0.0/scripts/ai-memory-hook\" codex stop";
+        let mut ours = hook("sessionStart", "trusted", cache, launcher);
+        ours["pluginId"] = "ai-memory@ai-memory".into();
+        let mut stale = hook("stop", "modified", cache, launcher);
+        stale["pluginId"] = "ai-memory@ai-memory".into();
+        let mut other = hook("stop", "untrusted", "/x/hooks.json", "other");
+        other["pluginId"] = "other@market".into();
+        let file = hook(
+            "preToolUse",
+            "untrusted",
+            "/home/me/.codex/hooks.json",
+            "ai-memory hook --event pre-tool-use --agent codex",
+        );
+        let result = serde_json::json!({"data": [{"hooks": [ours, stale, other, file]}]});
+        let trust = summarize(&result, HookSource::Plugin("ai-memory@ai-memory")).unwrap();
+        assert_eq!(trust.trusted, vec!["sessionStart"]);
+        assert_eq!(
+            trust.skipped,
+            vec![("stop".to_owned(), "modified".to_owned())]
+        );
+    }
+
     #[test]
     fn no_ai_memory_hook_or_an_unknown_shape_is_unknown() {
         let file = Path::new("/home/me/.codex/hooks.json");
         let other = serde_json::json!({"data": [{"hooks": [
             hook("stop", "untrusted", "/home/me/.codex/hooks.json", "/usr/bin/other-tool"),
         ]}]});
-        assert_eq!(summarize(&other, file), None);
+        assert_eq!(summarize(&other, HookSource::File(file)), None);
         assert_eq!(
-            summarize(&serde_json::json!({"unexpected": true}), file),
+            summarize(
+                &serde_json::json!({"unexpected": true}),
+                HookSource::File(file)
+            ),
             None
         );
     }
@@ -188,14 +241,21 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let trust = probe(&fake, &hooks_file, temp.path()).await.unwrap();
+        let trust = probe(&fake, HookSource::File(&hooks_file), temp.path())
+            .await
+            .unwrap();
         assert!(trust.trusted.is_empty());
         assert_eq!(
             trust.skipped,
             vec![("sessionStart".to_owned(), "modified".to_owned())]
         );
         assert_eq!(
-            probe(&temp.path().join("missing"), &hooks_file, temp.path()).await,
+            probe(
+                &temp.path().join("missing"),
+                HookSource::File(&hooks_file),
+                temp.path()
+            )
+            .await,
             None
         );
     }

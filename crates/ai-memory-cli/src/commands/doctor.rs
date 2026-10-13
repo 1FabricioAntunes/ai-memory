@@ -189,6 +189,29 @@ struct DoctorReport {
     /// agentmemory MCP entries and rules-file guideline blocks still present
     /// after a migration. Detected only; never changed.
     agentmemory_residue: Vec<super::agentmemory_residue::ResidueFinding>,
+    /// The ai-memory marketplace plugins installed for Claude Code and Codex,
+    /// with version skew and any parallel settings-file wiring (#1166).
+    plugins: Vec<PluginReport>,
+}
+
+/// One installed ai-memory marketplace plugin and what else wires the same
+/// harness.
+#[derive(Debug, Clone, Serialize)]
+struct PluginReport {
+    #[serde(flatten)]
+    plugin: super::agent_plugins::InstalledPlugin,
+    /// This binary's version, for the skew check.
+    binary_version: &'static str,
+    /// Settings-file ai-memory hooks for the same harness.
+    settings_hooks: Option<PathBuf>,
+    /// The managed routing skills installed in the harness's skill dir too.
+    installed_skills: Option<PathBuf>,
+    /// A settings-file `ai-memory` MCP entry for the same harness.
+    settings_mcp: Option<PathBuf>,
+    /// A Claude Code setting that stops plugin hooks from running.
+    hooks_disabled_by: Option<&'static str>,
+    /// Codex: whether Codex will run the plugin's hooks.
+    hook_trust: Option<super::codex_hook_trust::CodexHookTrust>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -612,6 +635,16 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         }),
     );
 
+    let plugins = plugin_reports(&home, &cwd, &|name| {
+        config
+            .runtime_env
+            .process_env()
+            .iter()
+            .find(|(key, _)| key.as_os_str() == name)
+            .map(|(_, value)| value.clone())
+    })
+    .await;
+
     let auth_posture = identity.as_ref().map(|identity| {
         crate::local_auth::AuthPosture::classify(identity.level == "anonymous", &ep.url)
     });
@@ -633,6 +666,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         server_unreachable,
         codex_hooks,
         agentmemory_residue,
+        plugins,
     };
 
     if args.json {
@@ -652,7 +686,199 @@ async fn codex_hook_trust(cwd: &Path) -> Option<super::codex_hook_trust::CodexHo
     if !installed.contains("ai-memory") {
         return None;
     }
-    super::codex_hook_trust::probe(Path::new("codex"), &hooks_file, cwd).await
+    super::codex_hook_trust::probe(
+        Path::new("codex"),
+        super::codex_hook_trust::HookSource::File(&hooks_file),
+        cwd,
+    )
+    .await
+}
+
+/// The installed ai-memory plugins, each with what else wires its harness.
+/// Asking Codex for hook trust starts it, so that runs only when the Codex
+/// plugin is enabled.
+async fn plugin_reports(
+    home: &Path,
+    cwd: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PluginReport> {
+    use super::agent_plugins::PluginHarness;
+    let mut reports = Vec::new();
+    for plugin in super::agent_plugins::installed(home, env) {
+        let mut report = PluginReport {
+            binary_version: env!("CARGO_PKG_VERSION"),
+            settings_hooks: None,
+            installed_skills: None,
+            settings_mcp: None,
+            hooks_disabled_by: None,
+            hook_trust: None,
+            plugin,
+        };
+        match report.plugin.harness {
+            PluginHarness::ClaudeCode => {
+                let root = super::agent_plugins::claude_root(home, env);
+                let user = root.join("settings.json");
+                let project = super::install_hooks::project_claude_settings_local(cwd);
+                report.settings_hooks = [user.clone(), project]
+                    .into_iter()
+                    .find(|path| super::install_hooks::settings_file_carries_ai_memory_hooks(path));
+                let skills = root.join("skills");
+                report.installed_skills = managed_skill_installed(&skills).then_some(skills);
+                // `install-mcp`'s target: `.claude.json` in CLAUDE_CONFIG_DIR
+                // when set, else in the home.
+                let mcp = super::path_util::claude_config_dir(env("CLAUDE_CONFIG_DIR"))
+                    .unwrap_or_else(|| home.to_path_buf())
+                    .join(".claude.json");
+                report.settings_mcp = json_mcp_entry(&mcp).then_some(mcp);
+                report.hooks_disabled_by = claude_hooks_disabled_by(&user);
+            }
+            PluginHarness::Codex => {
+                let codex = super::agent_plugins::codex_home(home, env);
+                let hooks = codex.join("hooks.json");
+                report.settings_hooks = std::fs::read_to_string(&hooks)
+                    .is_ok_and(|text| text.contains("ai-memory") && text.contains(" hook --event "))
+                    .then_some(hooks);
+                let config = codex.join("config.toml");
+                report.settings_mcp = std::fs::read_to_string(&config)
+                    .ok()
+                    .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+                    .is_some_and(|doc| {
+                        doc.get("mcp_servers")
+                            .and_then(|servers| servers.get("ai-memory"))
+                            .is_some()
+                    })
+                    .then_some(config);
+                if report.plugin.enabled {
+                    report.hook_trust = super::codex_hook_trust::probe(
+                        Path::new("codex"),
+                        super::codex_hook_trust::HookSource::Plugin(
+                            super::agent_plugins::PLUGIN_ID,
+                        ),
+                        cwd,
+                    )
+                    .await;
+                }
+            }
+        }
+        reports.push(report);
+    }
+    reports
+}
+
+/// Whether an ai-memory-managed routing skill sits under `skills`.
+fn managed_skill_installed(skills: &Path) -> bool {
+    ai_memory_core::routing_skills::MANAGED_SKILLS
+        .iter()
+        .any(|skill| {
+            std::fs::read_to_string(skills.join(skill.relative_path))
+                .is_ok_and(|text| text.contains(ai_memory_core::routing_skills::MANAGED_MARKER))
+        })
+}
+
+/// Whether the JSON MCP config at `path` registers an `ai-memory` server.
+fn json_mcp_entry(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|doc| {
+            doc.get("mcpServers")
+                .and_then(|s| s.get("ai-memory"))
+                .is_some()
+        })
+}
+
+/// The Claude Code user setting that keeps plugin hooks from running.
+fn claude_hooks_disabled_by(settings: &Path) -> Option<&'static str> {
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings).ok()?).ok()?;
+    let set = |key: &str| doc.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    if set("disableAllHooks") {
+        Some("disableAllHooks")
+    } else if set("allowManagedHooksOnly") {
+        Some("allowManagedHooksOnly")
+    } else {
+        None
+    }
+}
+
+/// Human lines for the installed plugins; empty without any.
+fn render_plugins(plugins: &[PluginReport]) -> String {
+    use super::agent_plugins::{PLUGIN_ID, PluginHarness};
+    let mut out = String::new();
+    for report in plugins {
+        let plugin = &report.plugin;
+        let agent = plugin.harness.agent();
+        out.push_str(&format!(
+            "  plugin: {PLUGIN_ID} {} for {agent} ({})\n",
+            plugin.version.as_deref().unwrap_or("(version unknown)"),
+            if plugin.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        ));
+        if !plugin.enabled {
+            continue;
+        }
+        if let Some(version) = plugin.version_skew() {
+            out.push_str(&format!(
+                "⚠ The {agent} plugin is {version} but this binary is {}. Run `ai-memory \
+                 upgrade` (it updates the Claude Code plugin too) or update the plugin in {agent}.\n",
+                report.binary_version
+            ));
+        }
+        if let Some(path) = &report.settings_hooks {
+            let consequence = match plugin.harness {
+                PluginHarness::ClaudeCode => {
+                    "The settings hooks win and the plugin skips every event they deliver, so \
+                     nothing is captured twice"
+                }
+                PluginHarness::Codex => "Codex runs both, so each event is captured twice",
+            };
+            out.push_str(&format!(
+                "⚠ {agent} also has ai-memory settings-file hooks in {}. {consequence}. Keep \
+                 one: remove the ai-memory entries from that file, or run `{}`.\n",
+                path.display(),
+                uninstall_line(plugin.harness),
+            ));
+        }
+        if let Some(path) = &report.installed_skills {
+            out.push_str(&format!(
+                "⚠ The ai-memory routing skills are installed in {} as well as in the plugin, so \
+                 {agent} loads both copies. Keep one: `ai-memory uninstall --only skills --apply` \
+                 removes the installed ones.\n",
+                path.display()
+            ));
+        }
+        if let Some(path) = &report.settings_mcp {
+            out.push_str(&format!(
+                "⚠ An ai-memory MCP server is registered in {} as well as by the plugin, so \
+                 {agent} lists the memory tools twice. Keep one.\n",
+                path.display()
+            ));
+        }
+        if let Some(setting) = report.hooks_disabled_by {
+            out.push_str(&format!(
+                "⚠ {setting} is set in your Claude Code settings: the plugin's hooks do not run \
+                 and sessions are not captured.\n"
+            ));
+        }
+        if let Some(trust) = &report.hook_trust
+            && !trust.skipped.is_empty()
+        {
+            out.push_str(&format!(
+                "⚠ Codex skips {} of the plugin's hooks (untrusted or modified). Open Codex, run \
+                 /hooks, and trust them; until then Codex sessions are not captured.\n",
+                trust.skipped.len()
+            ));
+        }
+    }
+    out
+}
+
+fn uninstall_line(harness: super::agent_plugins::PluginHarness) -> String {
+    let (program, args) = harness.uninstall_command();
+    format!("{program} {}", args.join(" "))
 }
 
 /// Human lines for the spool, the server and the Codex hook trust; empty
@@ -800,6 +1026,7 @@ fn render_human(report: &DoctorReport) {
         println!("  capture coverage: unavailable ({})", problem.reason);
     }
     print!("{}", render_capture_health(report));
+    print!("{}", render_plugins(&report.plugins));
     print!(
         "{}",
         super::agentmemory_residue::render(&report.agentmemory_residue)
@@ -930,7 +1157,66 @@ mod tests {
             server_unreachable,
             codex_hooks,
             agentmemory_residue: Vec::new(),
+            plugins: Vec::new(),
         }
+    }
+
+    /// Doctor reports the plugin and every way the same harness is wired
+    /// twice: settings hooks, installed skills, a second MCP entry, a setting
+    /// that disables plugin hooks, and version skew. A plugin alone is quiet.
+    #[tokio::test]
+    async fn plugin_report_names_double_wiring_and_skew() {
+        use crate::commands::agent_plugins::test_support::install_claude_plugin;
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let env = |_: &str| None;
+        assert!(plugin_reports(home.path(), &cwd, &env).await.is_empty());
+
+        install_claude_plugin(home.path(), env!("CARGO_PKG_VERSION"), true);
+        let reports = plugin_reports(home.path(), &cwd, &env).await;
+        assert_eq!(reports.len(), 1);
+        let quiet = render_plugins(&reports);
+        assert!(quiet.contains("plugin: ai-memory@ai-memory"), "{quiet}");
+        assert!(!quiet.contains('⚠'), "{quiet}");
+
+        install_claude_plugin(home.path(), "0.0.1", true);
+        let root = home.path().join(".claude");
+        let settings = root.join("settings.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        doc["hooks"] = serde_json::json!({"Stop": [{"matcher": "", "hooks": [{"type": "command",
+            "command": "/bin/ai-memory hook --event stop --agent claude-code --server-url http://h"}]}]});
+        doc["disableAllHooks"] = true.into();
+        std::fs::write(&settings, doc.to_string()).unwrap();
+        let skill = &ai_memory_core::routing_skills::MANAGED_SKILLS[0];
+        let skill_path = root.join("skills").join(skill.relative_path);
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(&skill_path, skill.content).unwrap();
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"mcpServers":{"ai-memory":{"command":"ai-memory"}}}"#,
+        )
+        .unwrap();
+        let reports = plugin_reports(home.path(), &cwd, &env).await;
+        let report = &reports[0];
+        assert_eq!(report.settings_hooks.as_deref(), Some(settings.as_path()));
+        assert!(report.installed_skills.is_some());
+        assert!(report.settings_mcp.is_some());
+        assert_eq!(report.hooks_disabled_by, Some("disableAllHooks"));
+        let out = render_plugins(&reports);
+        for needle in [
+            "is 0.0.1 but this binary is",
+            "settings-file hooks",
+            "loads both copies",
+            "lists the memory tools twice",
+            "disableAllHooks is set",
+        ] {
+            assert!(out.contains(needle), "{needle}: {out}");
+        }
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["harness"], "claude-code");
+        assert_eq!(json["version"], "0.0.1");
     }
 
     /// A dead server, a full spool and Codex hooks Codex skips are each silent

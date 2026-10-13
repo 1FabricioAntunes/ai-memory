@@ -34,7 +34,9 @@ use ai_memory_workstream::{ManagedHarness, OpenCodeDialect, native_store_root};
 use anyhow::{Context as _, Result, bail};
 
 use super::user_service::{self, CommandRunner, ServiceChange, ServiceManager, ServiceUnit};
-use super::{doctor, init, install_hooks, install_mcp, install_skills, run_autowire};
+use super::{
+    agent_plugins, doctor, init, install_hooks, install_mcp, install_skills, run_autowire,
+};
 use crate::cli::{
     AgentChoice, DoctorArgs, HookInstallScope, InitArgs, InstallHooksArgs, InstallMcpArgs,
     InstallSkillsAgent, InstallSkillsArgs, InstallSkillsScope, McpClient, SetupArgs,
@@ -80,6 +82,9 @@ struct AgentPlan {
     agent: AgentChoice,
     mcp: Option<McpClient>,
     skills: InstallSkillsAgent,
+    /// The ai-memory marketplace plugin is enabled for this agent: it carries
+    /// the hooks, MCP entry and skills, so setup writes none of them (#1166).
+    plugin: bool,
 }
 
 impl AgentPlan {
@@ -88,6 +93,21 @@ impl AgentPlan {
             agent,
             mcp: install_hooks::mcp_client_for_agent(agent),
             skills: skills_for(agent),
+            plugin: false,
+        }
+    }
+
+    /// [`Self::new`], with the plugin state of `agent` under `home`.
+    fn detect(agent: AgentChoice, home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Self {
+        let harness = match agent {
+            AgentChoice::ClaudeCode => Some(agent_plugins::PluginHarness::ClaudeCode),
+            AgentChoice::Codex => Some(agent_plugins::PluginHarness::Codex),
+            _ => None,
+        };
+        Self {
+            plugin: harness
+                .is_some_and(|harness| agent_plugins::enabled(harness, home, env).is_some()),
+            ..Self::new(agent)
         }
     }
 }
@@ -169,7 +189,10 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         fresh: !written_config.exists(),
         config_path: written_config,
         service,
-        agents: agents.into_iter().map(AgentPlan::new).collect(),
+        agents: agents
+            .into_iter()
+            .map(|agent| AgentPlan::detect(agent, &home, &env))
+            .collect(),
         detected: args.agents.is_empty(),
     };
 
@@ -290,6 +313,14 @@ fn print_plan(plan: &SetupPlan) {
     }
     for agent in &plan.agents {
         let name = agent.agent.kind().as_str();
+        if agent.plugin {
+            println!(
+                "  - leave {name} to its enabled ai-memory plugin ({}), which carries the \
+                 hooks, MCP entry and skills",
+                agent_plugins::PLUGIN_ID
+            );
+            continue;
+        }
         let mcp = if agent.mcp.is_some() {
             "MCP + hooks"
         } else {
@@ -457,6 +488,18 @@ async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> b
 /// failures.
 fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<String>) -> Vec<String> {
     let mut problems = Vec::new();
+    if plan.plugin {
+        // Writing the settings-file wiring as well would load every skill
+        // twice and register a second MCP server; the hook copies would be
+        // de-duplicated, but nothing would be gained.
+        println!(
+            "plugin: {} is enabled; leaving the settings-file hooks, MCP entry and skills \
+             alone (run `ai-memory install-hooks --agent {} --apply` to add them anyway)",
+            agent_plugins::PLUGIN_ID,
+            plan.agent.kind().as_str()
+        );
+        return problems;
+    }
     let dialect = opencode_dialect(plan.agent);
     if let Some(client) = plan.mcp {
         if install_mcp::existing_entry_is_session_aware(client, None, ENTRY_NAME) {
@@ -581,6 +624,28 @@ async fn memory_status(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An enabled plugin takes an agent's wiring over; a disabled or absent
+    /// one, and an agent the plugins do not cover, keep the full plan.
+    #[test]
+    fn an_enabled_plugin_takes_over_the_agents_wiring() {
+        use crate::commands::agent_plugins::test_support::{
+            install_claude_plugin, install_codex_plugin,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let env = |_: &str| None;
+        assert!(!AgentPlan::detect(AgentChoice::ClaudeCode, home.path(), &env).plugin);
+
+        install_claude_plugin(home.path(), "3.0.0", false);
+        assert!(!AgentPlan::detect(AgentChoice::ClaudeCode, home.path(), &env).plugin);
+        install_claude_plugin(home.path(), "3.0.0", true);
+        assert!(AgentPlan::detect(AgentChoice::ClaudeCode, home.path(), &env).plugin);
+        assert!(!AgentPlan::detect(AgentChoice::Codex, home.path(), &env).plugin);
+        assert!(!AgentPlan::detect(AgentChoice::Grok, home.path(), &env).plugin);
+
+        install_codex_plugin(home.path());
+        assert!(AgentPlan::detect(AgentChoice::Codex, home.path(), &env).plugin);
+    }
 
     /// A token-file install learns how to open the web UI: the URL and the
     /// file to read, never the token. An inline or absent token prints no hint.
