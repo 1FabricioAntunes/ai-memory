@@ -371,6 +371,25 @@ and [0.x](docs/changelog/0.x.md).
   applies to them: verified against the Droid 0.240.0 tool schemas; no
   tool-call id in Droid payloads. `setup-agent --agent droid` prints the
   hook config and `uninstall` removes both entries. (#1240)
+- Added an optional TypeScript client SDK in `companions/ai-memory-ts` for
+  programs that are not coding-agent harnesses: custom agents, bots, editor
+  and app extensions, scripts and CI jobs. `AiMemoryClient` wraps the page,
+  query, status, recent, handoff, message, briefing, explore,
+  session-observation and feedback tools, the read-only `/api/v1` routes (with
+  cursor paging and `ETag` revalidation) and `GET /identity`, with typed
+  results, a typed error taxonomy and scope checks before any request.
+  `pages.update` reads a page, applies a change and writes it back guarded by
+  `expectedPageId`, keeping the page's metadata. A separate
+  `ai-memory-ts/admin` entry point covers checkpoints, page restore and
+  session or project purges, which default to a dry run and need both
+  `dryRun: false` and `confirm: true` to delete. The SDK has no runtime
+  dependencies, needs Node 22 and a 3.0.0 server, and is built from a checkout
+  for now; it is not published to npm and is never part of the server's
+  tarballs, Docker image, Homebrew, AUR, RPM or Nix packages, which
+  `scripts/check-native-packaging.sh` now enforces. CI runs it against the
+  server built from the same commit, including a schema drift test that fails
+  when an MCP tool changes without an SDK update. See
+  `companions/ai-memory-ts/README.md` and `docs/design-client-sdk.md`. (#1165)
 
 ### Changed
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or

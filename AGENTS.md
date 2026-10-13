@@ -214,6 +214,8 @@ companions/ai-memory-wikisync/  team-wiki git sync through the public MCP tools;
 companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace member —
                            `swift test --package-path companions/ai-memory-macos`
                            and `./companions/ai-memory-macos/build.sh`.
+companions/ai-memory-ts/        optional TypeScript client SDK (npm, Node 22+); NOT a workspace
+                           member and never shipped with the server.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
 install.sh                 two-command native install, step one (release asset).
@@ -301,6 +303,13 @@ covers the same tests, slower, no tiers.
   `swift test --package-path companions/ai-memory-macos`
   (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
   Root `--workspace` commands do not cover it.
+- Run the TypeScript SDK separately, from `companions/ai-memory-ts`:
+  `npm ci --ignore-scripts`, `npm run check` (typecheck, unit tests, schema
+  and generated-docs checks, TypeDoc) and
+  `AI_MEMORY_BIN=../../target/debug/ai-memory npm run test:integration`
+  (real server, schema drift test, examples). npm tooling and its lockfile
+  stay inside that directory; nothing in the core workspace or the server
+  distribution depends on Node.
 
 ### Platform notes
 
@@ -676,7 +685,13 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 23 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 23 (see `docs/ARCHITECTURE.md`). They also
+  update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
+  the schema snapshot (`npm run schema:update`), the wrapper or its
+  classification in `src/coverage.ts`, types, tests and docs. The SDK's
+  schema drift test in CI fails until they do. Changes to the `/api/v1`
+  routes the SDK wraps follow the same rule, enforced by its integration
+  tests.
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys, a new agent harness or LLM
   provider); major = breaking (on-disk format without migration, removed

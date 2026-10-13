@@ -424,16 +424,35 @@ override is written only into the rendered LaunchAgent plist
 
 See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
 
-## Planned: client SDK
+## `ai-memory-ts`: TypeScript client SDK
 
-Issue #1165 asks for a typed client for programs that are not coding-agent
-harnesses: custom agents and bots, editor and app extensions (RFC #1166) and
-automation scripts. The plan is a TypeScript companion at
-`companions/ai-memory-ts`, with Python as a later decision. It wraps the
-existing MCP tools, `/api/v1` reads and `GET /identity`, adds no core surface,
-and is never bundled in the server's tarballs, Docker image, AUR, Homebrew or
-Nix packages. Nothing is implemented yet; the design, test plan and the
-maintainer decisions per phase are in [design-client-sdk.md](design-client-sdk.md).
+Typed client for programs that are not coding-agent harnesses (issue #1165):
+custom agents and bots, editor and app extensions (RFC #1166) and automation
+scripts. It lives at [`companions/ai-memory-ts`](../companions/ai-memory-ts),
+has no runtime dependencies, and talks to ai-memory only through the public
+MCP tools at `/mcp`, the read-only `/api/v1` routes, `GET /identity` and, from
+the separate `ai-memory-ts/admin` entry point, the root-only `/admin/*`
+lifecycle routes. It adds no core surface. Python is a later, separate
+decision.
+
+It is not part of the server distribution: release tarballs, Homebrew, the
+Docker image, AUR, RPM and Nix never build or ship it, and
+`scripts/check-native-packaging.sh` fails if one of their build files starts
+referencing it. It is unpublished until the maintainer picks the npm name and
+owner. Build and test it separately:
+
+```bash
+cd companions/ai-memory-ts
+npm ci --ignore-scripts
+npm run check                                        # typecheck, unit, schema, docs
+AI_MEMORY_BIN=../../target/debug/ai-memory npm run test:integration
+```
+
+CI runs its integration tests, schema drift test and examples against the
+server built in the `test` job, so a change to an MCP tool schema fails until
+the SDK's `schema/tools.json` is updated. The design, test plan and decisions
+are in [design-client-sdk.md](design-client-sdk.md); usage is in the package
+[README](../companions/ai-memory-ts/README.md).
 
 ## `ai-memory-web-editor`: browser chat/editor companion
 

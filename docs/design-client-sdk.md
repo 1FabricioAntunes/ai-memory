@@ -1,12 +1,15 @@
 # Design: an optional client SDK (#1165)
 
-**Status: planned, parked (2026-10-10) — implementation waits for the maintainer's go.**
+**Status: phases 1 to 3 implemented for 3.0 (2026-10-13) in
+`companions/ai-memory-ts`. Phase 4 (publishing) is prepared but disabled until
+decision D1. Phase 5 (Python) is out of scope.**
 
 This document plans a typed client library for programs that call ai-memory
-over HTTP. Nothing here is implemented. It records the shape the maintainer
-would accept (issue #1165, owner comments), the evidence from the repository
-behind each choice, and the decisions that remain the maintainer's. It does not
-approve any new core endpoint, MCP tool or wire field.
+over HTTP. It records the shape the maintainer accepted (issue #1165, owner
+comments), the evidence from the repository behind each choice, and the
+decisions taken or still pending (§9). It does not approve any new core
+endpoint, MCP tool or wire field. Where the implementation settled a detail
+the plan left open, the section says so in an "Implemented" note.
 
 ## 1. Goals, non-goals and audience
 
@@ -121,6 +124,14 @@ companions/ai-memory-ts/
     └── integration/
 ```
 
+Implemented: the shipped layout adds `src/core.ts` (shared tool-call
+plumbing), `src/decode.ts` (result decoders), `src/coverage.ts` (the tool
+classification table the drift test, the static schema check and the README
+generator read), `src/admin.ts` (the `ai-memory-ts/admin` entry point),
+`test/support/` (the real-server harness, the scripted `fetch` and schema
+normalization) and `scripts/` (`schema:update`, `schema:check`,
+`docs:generate`/`docs:check`).
+
 ### 2.2 Never part of the server distribution
 
 The server's distribution channels are built from the root Cargo workspace and
@@ -178,8 +189,9 @@ release.
 ### 3.1 Client surface
 
 One entry class with namespaces that mirror the server's concepts. The first
-release targets Node 22 and newer and also runs on Deno and Bun through
-standard `fetch`; callers on other runtimes inject their own `fetch`.
+release targets Node 22 and newer. Deno and Bun work through standard
+`fetch` in a manual smoke run but are not tested in CI (§9, Q8); callers on other runtimes inject their own
+`fetch`.
 
 ```ts
 import { AiMemoryClient } from "ai-memory-ts"; // final name: decision D1
@@ -337,6 +349,12 @@ Examples of result types:
 - `query` returns `{ hits }`, where a superseded version has
   `superseded: true` when `includeSuperseded` was set.
 
+Implemented: result fields are camelCase and every result also carries the
+server's decoded JSON in `raw`, so fields a newer server adds are reachable
+without an SDK update, and user-supplied keys (frontmatter, relation maps)
+are never renamed. A global query puts its cross-project hits in `hits` with
+`workspace` and `project` set (the server sends them as `global_hits`).
+
 ### 3.4 Error taxonomy
 
 All errors extend `AiMemoryError`, which carries a stable `code` string for
@@ -345,6 +363,7 @@ callers who prefer a switch over `instanceof`.
 | Class | When | Notable fields |
 |---|---|---|
 | `ConfigError` | invalid server URL, URL with credentials, query or fragment; token over plain HTTP to a non-loopback host without `allowInsecureHttp` | none |
+| `ArgumentError` | an argument fails validation before sending: `pages.read` without exactly one of `path` and `query`, `expectedPageId` with `createOnly`, an admin purge without both flags | none |
 | `ScopeError` | missing, partial or empty scope; scope combined with `global` | none |
 | `TransportError` | DNS, connection refused, TLS, refused redirect | `cause` (sanitized) |
 | `TimeoutError` | the client's own deadline expired | `uncertain` |
@@ -407,6 +426,11 @@ header or a request body.
   into a duplicate or a lost claim.
 - JSON-RPC ids increase per client instance.
 
+Implemented: response bodies are read with a size cap (32 MiB by default,
+`maxResponseBytes`). Server text that reaches an error is also scrubbed of the
+token before the 300-character preview, so a hostile server that echoes the
+`Authorization` header cannot get it into a log.
+
 ### 3.6 Protocol version and server compatibility
 
 - The client sends `initialize` with the newest MCP protocol version it
@@ -421,7 +445,7 @@ header or a request body.
   incremental `recent` shipped in 2.6.0. A floor below the precondition seam
   would let an older server ignore `expectedPageId` as an unknown argument and
   turn a guarded write into an unconditional one, which is why wikisync
-  refuses servers older than 3.0 (`ensure_conditional_writes` in
+  refuses servers without that seam (`ensure_conditional_writes` in
   `companions/ai-memory-wikisync/src/mcp.rs`).
 - `capabilities()` runs `initialize` (server name, version, protocol version),
   `tools/list` (tool names and input-schema property names) and
@@ -503,6 +527,11 @@ admin dry run. Each example takes its server URL and token from the
 environment, and the integration job runs every one against the CI server
 (§5.5).
 
+Implemented: the quickstart confirms the connection with `identity()` and
+calls `status()` after the first write, because reads never create a project
+and `status()` on a fresh scope fails closed. Running the examples in CI
+caught this.
+
 ### 4.5 Troubleshooting
 
 `docs/troubleshooting.md` maps each error class to causes and fixes:
@@ -569,6 +598,15 @@ synthetic root token in `AI_MEMORY_AUTH_TOKEN`, and a readiness loop with a
 deadline. Setup creates a DB user and an `aim_` key through `ai-memory user
 add-human` and `ai-memory api-key add` ([users.md](users.md)), so tests run at
 both root and user level. Each test uses its own workspace and project.
+
+Implemented: each test file starts its own server (`test/support/server.ts`),
+so files run in parallel without sharing state. The server gets a synthetic
+root token and token pepper and an environment built from scratch, so no
+`AI_MEMORY_*` variable from the developer's shell reaches it. Sessions for the
+observation and purge tests are seeded through `POST /hook/batch`. Handoff
+ownership is tested between two DB users, because handoffs created with the
+root token have no owner. Extra servers cover `--enable-api` off and a
+stateful server under `--base-path /wiki`.
 
 Every public method has at least one success test and its failure paths:
 
@@ -718,6 +756,8 @@ Estimates assume one developer familiar with TypeScript and the repository.
 
 ### Phase 1: first slice (about 6 to 8 working days)
 
+Status: implemented.
+
 Files:
 
 - `companions/ai-memory-ts/` with the layout in §2.1, `"private": true`.
@@ -745,11 +785,15 @@ and confirm the 3.0.0 floor.
 
 ### Phase 2: reads and messaging (about 4 to 5 days)
 
+Status: implemented.
+
 `api.*` with pagination and ETag, `recent`, `messages.*`, `briefing`,
 `explore`, `observations`, `feedback`; matching tests, examples and docs.
 Decision: none beyond phase 1, unless the maintainer wants to trim the list.
 
 ### Phase 3: `AdminClient` (about 3 to 4 days)
+
+Status: implemented (D3 approved).
 
 `checkpoints`, `restorePage`, `purgeSession`, `purgeProject`, behind
 `ai-memory-ts/admin`, with the dry-run defaults and the admin security tests.
@@ -758,12 +802,19 @@ lifecycle operations to the CLI and the documented HTTP recipes.
 
 ### Phase 4: publishing (about 1 to 2 days, then ongoing)
 
+Status: prepared, disabled. `.github/workflows/sdk-ts-publish.yml` publishes
+with npm trusted publishing and `--provenance`, but its only trigger is a
+manual dispatch and it fails while `package.json` is `"private": true`.
+Enabling it is the checklist in that file's header, after D1.
+
 The publish workflow with trusted publishing and provenance, the package name,
 hosted API reference. Decision D1: publish to npm, under which name, and who
 owns the npm account and responds to security reports for the package.
 Publishing is a long-term maintenance commitment (owner comment on #1165).
 
 ### Phase 5: Python client (about 7 to 10 days)
+
+Status: out of scope for 3.0.
 
 `companions/ai-memory-py/` with the same surface, standard library only
 (`urllib.request`, `json`), the same error taxonomy, sharing the schema
@@ -786,26 +837,50 @@ None is required for phases 1 to 5. Per [companion-crates.md, When to move a
 seam into core](companion-crates.md#when-to-move-a-seam-into-core), each should
 wait until shipped SDK callers show the need.
 
-## 9. Open questions
+## 9. Decisions
 
-- Q1 (package name). The directory is `ai-memory-ts`; the npm name needs
-  an availability check and the maintainer's choice (D1).
-- Q2 (base paths). wikisync refuses servers behind a path prefix. Should the
-  SDK accept `https://host/prefix` for reverse-proxy deployments, and how would
-  CI test it?
-- Q3 (marker file). Should a helper read `.ai-memory.toml` when both names
-  are declared, or should scope always come from the caller?
-- Q4 (non-project writes). `memory_write_page` accepts a `scope` of
-  `global` or `profile`. Should the SDK expose those writes in phase 2, given
-  that they affect every project?
-- Q5 (admission rejections). Is a typed `AdmissionRejectedError` worth a
-  core change to add `data.reason`?
-- Q6 (session attribution). `memory_write_page` accepts `session_id`. Is
-  there an SDK caller that needs to attribute writes to a captured
-  session, or does that belong to the relay and harness integrations?
-- Q7 (read-modify-write helper). A `pages.update(path, change)` helper that
-  reads, applies a change and writes with `expectedPageId` would remove a
-  common mistake (a write clears omitted metadata). Should it ship in phase 1,
-  or wait for a caller?
-- Q8 (Node floor). Node 22 is the proposed minimum. Should CI also cover
-  Deno and Bun, or document them as untested?
+Decisions taken for the 3.0 implementation, each the smallest choice that
+fits the plan:
+
+- D1 (publishing, package name and owner): **pending.** The directory and the
+  placeholder package name are `ai-memory-ts`. The package stays
+  `"private": true` and the publish workflow stays dispatch-only and refuses to
+  run until the maintainer picks the npm name and the account that owns it and
+  answers security reports.
+- D2 (Python): out of scope for 3.0.
+- D3 (admin methods): approved; shipped behind `ai-memory-ts/admin`.
+- D4 (core changes): none made. The SDK uses only existing routes and tools.
+- Q1 (package name): see D1.
+- Q2 (base paths): **supported.** The server already moves every route under
+  `--base-path`, so the SDK accepts `https://host/prefix` and appends routes
+  to it. The integration suite starts a server with `--base-path /wiki` and
+  checks MCP, `/identity` and `/api/v1` under the prefix, with the unprefixed
+  URL as the control. Dot segments in page paths and scope names are refused
+  before sending, so a path cannot climb out of the prefix.
+- Q3 (marker file): **scope always comes from the caller.** No helper reads
+  `.ai-memory.toml`. A library that reads files from its working directory
+  surprises callers in servers and bundles, and the static-client rule wants
+  the caller's code to show which project it writes to.
+- Q4 (non-project writes): **not wrapped.** `pages.write` always sends a
+  project scope. Writes with `scope: "global"` or `"profile"` reach every
+  project, so they stay explicit through `callTool` until a caller needs them.
+- Q5 (admission rejections): **no core change.** They stay `RpcError`
+  (`-32603`) until the server marks them with a `data.reason`.
+- Q6 (session attribution): **not wrapped.** `session_id` on writes belongs to
+  the relay and harness integrations; `callTool` covers the rare SDK caller.
+- Q7 (read-modify-write helper): **shipped** as
+  `pages.update(path, change)`. It reads the page, carries its metadata over
+  (title, tier, tags, pinned, kind, entities, abstract, relations, TTL), applies
+  the change (`null` clears a field), and writes with the read version as
+  `expectedPageId`. One attempt and no retry: a concurrent change raises
+  `PreconditionFailedError` and writes nothing. The page must exist.
+- Q8 (runtimes): **Node 22 floor**, tested on Node 22 and 24 in CI. Bun and
+  Deno are documented as untested in CI; the SDK uses only standard `fetch`,
+  `AbortSignal`, `TextDecoder` and `URL`, and a manual smoke run against a
+  real server passed on Bun 1.4.3 and Deno 2.9.6. Adding them to CI would need
+  a second test runner, since the suite uses `node:test`.
+- Server floor: **3.0.0** (§3.6).
+- Lint: no ESLint, to keep development dependencies to `typescript`,
+  `@types/node` and `typedoc`. Strict `tsc` (unused locals and parameters,
+  exact optional properties, no unchecked index access) and TypeDoc with
+  warnings as errors stand in for it.
