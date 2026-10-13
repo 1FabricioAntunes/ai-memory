@@ -4727,6 +4727,8 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
         ("/w/default/scratch/p/notes/bar.md", "header-search", true),
         ("/w/default/scratch/p/notes/", "header-search", true),
         ("/search?q=bar", "search-q", false),
+        ("/w/default/scratch", "project-search-q", true),
+        ("/w/default/scratch/h/notes/bar.md", "header-search", true),
     ];
     for (uri, input_id, breadcrumb) in cases {
         let resp = app
