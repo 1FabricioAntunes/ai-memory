@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed `ai-memory list-projects` failing with `404 Not Found` against a
+  server started without `--enable-web` or `--enable-api`, the routes that
+  mount `GET /api/v1/projects`. On a 404 it now reads the always-mounted
+  `GET /admin/projects` and applies `--workspace` itself; `ai-memory show`
+  lists projects the same way instead of falling back to local scan results.
+  If both calls fail, the error names both routes and the likely causes.
+  (#1236)
 - Replaced the unmaintained YAML library (`serde_yaml` and its
   `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
   reads existing page frontmatter to exactly the same values as before. One

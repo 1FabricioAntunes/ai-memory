@@ -117,8 +117,8 @@ pub enum Command {
     Status(StatusArgs),
     /// List every workspace/project pair the server knows about (plain,
     /// scriptable output — the read-only equivalent of hitting
-    /// `GET /api/v1/projects` directly, which was previously the only way to
-    /// see this from outside an interactive `show` session).
+    /// `GET /api/v1/projects` directly, falling back to `GET /admin/projects`
+    /// when the server runs without `--enable-web` or `--enable-api`).
     ListProjects(ListProjectsArgs),
     /// Check capture coverage: compare local harness session stores for this
     /// project against what the server captured, and warn when a harness ran

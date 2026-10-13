@@ -21,7 +21,7 @@ use crate::cli::{
 };
 use crate::commands::{install_instructions, project_registry};
 use crate::config::{Config, DEFAULT_WORKSPACE};
-use crate::http_client::{ServerEndpoint, get_json};
+use crate::http_client::ServerEndpoint;
 
 const PROJECT_MARKERS: [&str; 12] = [
     ".git",
@@ -251,10 +251,12 @@ async fn collect_candidates(
     workspace_filter: Option<&str>,
     scan: bool,
 ) -> Vec<Candidate> {
-    let query = workspace_filter
-        .filter(|value| !value.is_empty())
-        .map_or_else(Vec::new, |workspace| vec![("workspace", workspace)]);
-    let rows: Option<Vec<ProjectRow>> = match get_json(endpoint, "/api/v1/projects", &query).await {
+    let rows: Option<Vec<ProjectRow>> = match crate::commands::list_projects::fetch_project_rows(
+        endpoint,
+        workspace_filter,
+    )
+    .await
+    {
         Ok(rows) => Some(rows),
         Err(error) => {
             eprintln!(
