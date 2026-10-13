@@ -831,6 +831,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Zcode
             | AgentKind::CopilotCli
             | AgentKind::Grizzybot
+            | AgentKind::Droid
     )
 }
 
@@ -2461,6 +2462,38 @@ mod tests {
         assert_eq!(env.title_hint.as_deref(), Some("tool file"));
         assert_eq!(env.session_id.as_deref(), Some("gb-session"));
         assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
+    }
+
+    /// Factory Droid's PostToolUse is Claude-shaped with no tool-call id
+    /// (0.240.0 tool schemas, #1240): a `Create` is a closed `file` family and
+    /// its `tool_response` is the captured output.
+    #[test]
+    fn droid_create_post_tool_use_is_a_closed_file_family_without_call_id() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "permission_mode": "auto-low",
+            "tool_name": "Create",
+            "tool_input": {"file_path": "/repo/notes.md", "content": "hello"},
+            "tool_response": {"filePath": "/repo/notes.md", "success": true},
+            "session_id": "droid-session",
+            "transcript_path": "/home/u/.factory/sessions/x.jsonl",
+            "cwd": "/repo"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("droid".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Droid);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("droid-session"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(!body.contains("tool_call_id"), "{body}");
+        assert!(body.contains("/repo/notes.md"), "{body}");
     }
 
     /// Body is well-formed JSON but the expected `session_id` /

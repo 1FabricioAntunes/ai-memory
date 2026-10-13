@@ -285,6 +285,9 @@ pub enum AgentKind {
     CopilotCli,
     /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
     Grizzybot,
+    /// Factory Droid CLI (`droid`), whose hooks send Claude Code-shaped
+    /// payloads (#1240).
+    Droid,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -295,7 +298,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -318,6 +321,7 @@ impl AgentKind {
         Self::Zcode,
         Self::CopilotCli,
         Self::Grizzybot,
+        Self::Droid,
         Self::Other,
     ];
 
@@ -347,6 +351,7 @@ impl AgentKind {
             Self::Zcode => "zcode",
             Self::CopilotCli => "copilot-cli",
             Self::Grizzybot => "grizzybot",
+            Self::Droid => "droid",
             Self::Other => "other",
         }
     }
@@ -379,6 +384,7 @@ impl AgentKind {
             "zcode" | "zai" => Self::Zcode,
             "copilot-cli" | "copilot_cli" => Self::CopilotCli,
             "grizzybot" | "grizzy-bot" => Self::Grizzybot,
+            "droid" | "factory-droid" | "factory_droid" => Self::Droid,
             _ => Self::Other,
         }
     }
@@ -423,6 +429,10 @@ impl AgentKind {
     /// `additionalContext` key (GitHub's hooks reference), not Claude Code's
     /// `hookSpecificOutput` envelope, even in its PascalCase payload mode; the
     /// native hook prints that top-level envelope for it.
+    ///
+    /// Factory Droid documents `SessionStart` stdout as session context and
+    /// parses a JSON stdout's `hookSpecificOutput.additionalContext`, the
+    /// envelope the native hook prints for Claude Code (#1240).
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -667,6 +677,32 @@ mod tests {
         // which the native hook prints for it.
         assert!(AgentKind::CopilotCli.session_start_injects_handoff());
         assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_droid_round_trips() {
+        assert_eq!(AgentKind::Droid.as_str(), "droid");
+        for alias in ["droid", "factory-droid", "factory_droid"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::Droid, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Droid).unwrap(),
+            "\"droid\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"droid\"").unwrap(),
+            AgentKind::Droid
+        );
+        // The bare vendor name is not an alias, and unknown tags still
+        // degrade to Other.
+        assert_eq!(AgentKind::from_wire("factory"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("droid-2"), AgentKind::Other);
+        // Droid reads `hookSpecificOutput.additionalContext` from SessionStart
+        // stdout, so the native hook fetches the handoff there.
+        assert!(AgentKind::Droid.session_start_injects_handoff());
+        assert!(!AgentKind::Droid.user_prompt_injects_handoff());
+        assert!(!AgentKind::Droid.post_tool_injects_handoff());
+        assert!(!AgentKind::Droid.reuses_session_id_after_end());
     }
 
     #[test]

@@ -217,6 +217,11 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // no tool-call id is documented. Unknown payload shapes fail safe to
         // metadata-only under an active policy.
         AgentKind::Pool => (object.get("tool_name")?.as_str()?, None),
+        // Factory Droid sends Claude Code's `tool_name` + `tool_input` but no
+        // tool-call id at all: Droid tracks its call ids internally and none
+        // reaches a hook payload (verified against the 0.240.0 tool schemas,
+        // #1240).
+        AgentKind::Droid => (object.get("tool_name")?.as_str()?, None),
         _ => return None,
     };
     Some((name, id))
@@ -251,6 +256,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Zcode
                             | AgentKind::CopilotCli
                             | AgentKind::Grizzybot
+                            | AgentKind::Droid
                     ) {
                         "tool_input"
                     } else {
@@ -1086,7 +1092,9 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Zcode
         // GitHub Copilot CLI, PascalCase-configured for the Claude-compatible
         // payload shape (#1040).
-        | AgentKind::CopilotCli => object
+        | AgentKind::CopilotCli
+        // Factory Droid's hooks send the same Claude Code shape (#1240).
+        | AgentKind::Droid => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -1107,13 +1115,20 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         .then(|| args.and_then(shell_command))
         .flatten();
     let search_paths = (family == ToolFamily::SearchList)
-        .then(|| args.and_then(|value| direct_paths(value.as_object()?)))
+        .then(|| args.and_then(|value| search_direct_paths(agent, value.as_object()?)))
         .flatten();
     let search_scope = (family == ToolFamily::SearchList)
-        .then(|| search_scope(name, args))
+        .then(|| search_scope(agent, name, args))
         .flatten();
+    // Droid's `ApplyPatch` takes the same envelope in `input` as Codex's
+    // `apply_patch`.
+    let patch_name = if agent == AgentKind::Droid && name.eq_ignore_ascii_case("applypatch") {
+        "apply_patch"
+    } else {
+        name
+    };
     let patch_paths = (family == ToolFamily::File && paths.is_none())
-        .then(|| args.and_then(|value| patch_paths(name, value)))
+        .then(|| args.and_then(|value| patch_paths(patch_name, value)))
         .flatten();
     // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
     // when given, Gemini CLI `run_shell_command` in `dir_path` (`directory`
@@ -1184,6 +1199,16 @@ fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
         match name.to_ascii_lowercase().as_str() {
             "view" | "create" | "str_replace_editor" => return ToolFamily::File,
             "rg" => return ToolFamily::SearchList,
+            _ => {}
+        }
+    }
+    if agent == AgentKind::Droid {
+        // Factory Droid writes a new file with `Create` and applies a
+        // Codex-style patch envelope with `ApplyPatch` (0.240.0 tool
+        // schemas, #1240). Its `Read`, `Edit`, `LS`, `Grep`, `Glob` and
+        // `Execute` already carry shared names.
+        match name.to_ascii_lowercase().as_str() {
+            "create" | "applypatch" => return ToolFamily::File,
             _ => {}
         }
     }
@@ -1700,7 +1725,7 @@ struct SearchScope {
 /// grep `pattern` is a regular expression, not a path, and is left out.
 /// `None` when one of them is present but not a string (or, for a filter, a
 /// list of strings).
-fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
+fn search_scope(agent: AgentKind, name: &str, args: Option<&Value>) -> Option<SearchScope> {
     let object = match args {
         None | Some(Value::Null) => return Some(SearchScope::default()),
         Some(value) => value.as_object()?,
@@ -1723,6 +1748,13 @@ fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
             scope.roots.push(value.as_str()?.to_owned());
         }
     }
+    if agent == AgentKind::Droid {
+        for key in DROID_SEARCH_ROOT_KEYS {
+            if let Some(value) = object.get(key) {
+                scope.roots.push(value.as_str()?.to_owned());
+            }
+        }
+    }
     let glob_tool = matches!(
         name.to_ascii_lowercase().as_str(),
         "glob" | "find" | "find_by_name"
@@ -1740,7 +1772,14 @@ fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
     } else {
         &["glob", "include", "file_pattern", "file_glob", "Includes"]
     };
-    for key in pattern_keys {
+    // Droid's `Glob` takes `patterns` (a string or a list) and its `Grep`
+    // filters files with `glob_pattern`; `excludePatterns` only narrows.
+    let droid_pattern_keys: &[&str] = match agent {
+        AgentKind::Droid if glob_tool => &["patterns", "glob_pattern"],
+        AgentKind::Droid => &["glob_pattern"],
+        _ => &[],
+    };
+    for key in pattern_keys.iter().chain(droid_pattern_keys) {
         match object.get(*key) {
             None => {}
             Some(Value::String(pattern)) => scope.patterns.push(pattern.clone()),
@@ -2203,6 +2242,34 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
         }
         for value in values.as_array()? {
             paths.push(value.as_str()?.to_owned());
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Directory arguments of Factory Droid's search/list tools: `LS` lists
+/// `directory_path` and `Glob` searches below `folder` (#1240).
+const DROID_SEARCH_ROOT_KEYS: [&str; 2] = ["directory_path", "folder"];
+
+/// A search/list tool's explicit directory or file arguments: the shared
+/// single-path fields, plus [`DROID_SEARCH_ROOT_KEYS`] for Droid.
+fn search_direct_paths(agent: AgentKind, object: &Map<String, Value>) -> Option<Vec<String>> {
+    let mut paths = match direct_paths(object) {
+        Some(paths) => paths,
+        // A shared field that is present but unreadable stays unreadable.
+        None if object
+            .keys()
+            .any(|key| DIRECT_PATH_KEYS.contains(&key.as_str()) || key == "paths") =>
+        {
+            return None;
+        }
+        None => Vec::new(),
+    };
+    if agent == AgentKind::Droid {
+        for key in DROID_SEARCH_ROOT_KEYS {
+            if let Some(value) = object.get(key) {
+                paths.push(value.as_str()?.to_owned());
+            }
         }
     }
     (!paths.is_empty()).then_some(paths)
@@ -4443,6 +4510,7 @@ mod tests {
             AgentKind::Grizzybot,
             AgentKind::Zcode,
             AgentKind::CopilotCli,
+            AgentKind::Droid,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -4574,6 +4642,217 @@ mod tests {
             ExtractionState::UnsupportedSchema
         );
         assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    /// Factory Droid's tool calls, in the 0.240.0 tool schemas (#1240): each
+    /// file tool naming an ignored path is dropped or stripped while a control
+    /// path is kept, search/list tools drop under an active marker, and
+    /// `Execute` is matched like any shell. The same payloads under
+    /// `AgentKind::Other` stay unrecognized and keep their output, which is
+    /// what the Droid mapping changes.
+    #[test]
+    fn droid_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "droid-session",
+                "transcript_path": "/home/u/.factory/sessions/s.jsonl",
+                "cwd": "/repo",
+                "permission_mode": "auto-low",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_response": {"success": true},
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        let file_tools = [
+            (
+                "Read",
+                json!({"file_path": "docs/adr/1.md", "offset": 0, "limit": 20}),
+            ),
+            (
+                "Create",
+                json!({"file_path": "/repo/docs/adr/2.md", "content": "secret"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path": "docs/adr/1.md", "old_str": "a", "new_str": "b", "change_all": false}),
+            ),
+        ];
+        for (name, input) in file_tools {
+            let excluded = disposition(AgentKind::Droid, &call(name, input.clone()));
+            assert_eq!(excluded.tool_family(), ToolFamily::File, "{name}");
+            assert_eq!(excluded.disposition(), CaptureDisposition::Drop, "{name}");
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the Droid mapping the call is not recognized"
+            );
+            let mut control = input;
+            control["file_path"] = json!("src/lib.rs");
+            let kept = disposition(AgentKind::Droid, &call(name, control));
+            assert_eq!(
+                kept.disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+
+        // `ApplyPatch` names its files only inside the patch text, like Codex
+        // `apply_patch`: under an active marker that fails closed to
+        // metadata-only, and the patch headers locate the call for the
+        // cross-checkout marker lookup.
+        let patch = |path: &str| {
+            call(
+                "ApplyPatch",
+                json!({"input": format!("*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch")}),
+            )
+        };
+        let excluded = disposition(AgentKind::Droid, &patch("docs/adr/1.md"));
+        assert_eq!(excluded.tool_family(), ToolFamily::File);
+        assert_eq!(excluded.disposition(), CaptureDisposition::MetadataOnly);
+        let codex = tool_call_payload(
+            AgentKind::Codex,
+            "apply_patch",
+            Some(
+                &json!({"input": "*** Begin Patch\n*** Update File: docs/adr/1.md\n*** End Patch"}),
+            ),
+            None,
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &codex, "/repo")
+                .protocol()
+                .disposition(),
+            excluded.disposition(),
+            "ApplyPatch is decided like Codex apply_patch"
+        );
+        assert_eq!(
+            disposition(AgentKind::Other, &patch("docs/adr/1.md")).disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            capture_lookup_locations(AgentKind::Droid, &patch("../other/x.rs"), "/repo", None),
+            Some(vec!["/other/x.rs".to_owned()])
+        );
+        assert_eq!(
+            CapturePolicy::inactive()
+                .inspect(AgentKind::Droid, &patch("docs/adr/1.md"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "control: no marker keeps the patch"
+        );
+
+        for (name, input) in [
+            ("LS", json!({"directory_path": "docs/adr"})),
+            ("Grep", json!({"pattern": "KEY", "path": "docs/adr"})),
+            (
+                "Glob",
+                json!({"patterns": ["docs/adr/*.md"], "folder": "/repo"}),
+            ),
+        ] {
+            let decision = disposition(AgentKind::Droid, &call(name, input.clone()));
+            assert_eq!(decision.tool_family(), ToolFamily::SearchList, "{name}");
+            assert_eq!(decision.disposition(), CaptureDisposition::Drop, "{name}");
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the Droid mapping the call is not recognized"
+            );
+        }
+        // Droid's directory and glob arguments locate the call in another
+        // checkout.
+        let elsewhere = |name: &str, input: Value| {
+            capture_lookup_locations(AgentKind::Droid, &call(name, input), "/repo", None)
+        };
+        assert_eq!(
+            elsewhere("LS", json!({"directory_path": "/other/docs"})),
+            Some(vec!["/other/docs".to_owned()])
+        );
+        assert_eq!(
+            elsewhere("Glob", json!({"patterns": "src/*.rs", "folder": "/other"})),
+            Some(vec!["/other".to_owned(), "/other/src/*.rs".to_owned()])
+        );
+        assert_eq!(
+            elsewhere(
+                "Grep",
+                json!({"pattern": "KEY", "path": "/other", "glob_pattern": "a/*.env"})
+            ),
+            Some(vec!["/other".to_owned(), "/other/a/*.env".to_owned()])
+        );
+        assert_eq!(
+            absolute_tool_location_paths(
+                AgentKind::Droid,
+                &call("LS", json!({"directory_path": "/other/docs"})),
+                "/repo"
+            ),
+            Some(vec!["/other/docs".to_owned()])
+        );
+
+        let shell =
+            |command: &str| call("Execute", json!({"command": command, "riskLevel": "low"}));
+        let excluded = disposition(AgentKind::Droid, &shell("cat docs/adr/1.md"));
+        assert_eq!(excluded.tool_family(), ToolFamily::NonFile);
+        assert_eq!(excluded.disposition(), CaptureDisposition::Drop);
+        assert_eq!(
+            disposition(AgentKind::Droid, &shell("cat src/lib.rs")).disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(AgentKind::Other, &shell("cat docs/adr/1.md")).disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
+    /// Droid hook payloads carry no tool-call id, so the drop list and the
+    /// observation metadata read the tool name alone (#1240).
+    #[test]
+    fn droid_tool_payload_fields_have_no_call_id() {
+        let raw = json!({
+            "tool_name": "Execute",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "would-be-ignored"
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Droid, &raw),
+            Some(("Execute", None))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Droid, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id, None);
+        let no_input = json!({"tool_name": "Read"});
+        assert!(tool_observation_metadata(AgentKind::Droid, &no_input, true).is_none());
+        assert!(tool_observation_metadata(AgentKind::Droid, &no_input, false).is_some());
+        for (tool, expected) in [
+            ("Read", ToolFamily::File),
+            ("Create", ToolFamily::File),
+            ("Edit", ToolFamily::File),
+            ("ApplyPatch", ToolFamily::File),
+            ("LS", ToolFamily::SearchList),
+            ("Grep", ToolFamily::SearchList),
+            ("Glob", ToolFamily::SearchList),
+            ("Execute", ToolFamily::NonFile),
+        ] {
+            assert_eq!(agent_family(AgentKind::Droid, tool), expected, "{tool}");
+        }
+        // The Droid-only names keep their classification for other agents.
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "ApplyPatch"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "Create"),
+            ToolFamily::Unknown
+        );
     }
 
     #[test]
