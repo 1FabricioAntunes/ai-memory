@@ -97,6 +97,10 @@ pub(crate) async fn handler(
     };
 
     let mut hits = Vec::new();
+    // One more hit than shown is requested, so a cut-off list can be told
+    // apart from one that has exactly `limit` matches.
+    let mut limit_used = 0;
+    let mut truncated = false;
     let mut timings = None;
     let mut streams_active: Vec<&'static str> = Vec::new();
     match &scope {
@@ -111,11 +115,12 @@ pub(crate) async fn handler(
                     .limit
                     .unwrap_or(SCOPED_DEFAULT_LIMIT)
                     .clamp(1, MAX_LIMIT);
+                limit_used = limit;
                 let result = match crate::recall::search_scopes(
                     &state,
                     &[(resolved.workspace_id, resolved.project_id)],
                     &query,
-                    limit,
+                    limit + 1,
                     explain,
                 )
                 .await
@@ -125,7 +130,8 @@ pub(crate) async fn handler(
                 };
                 timings = result.timings;
                 streams_active = result.streams_active;
-                for (position, (hit, details)) in result.hits.into_iter().enumerate() {
+                truncated = result.hits.len() > limit;
+                for (position, (hit, details)) in result.hits.into_iter().take(limit).enumerate() {
                     let path = hit.path.as_str().to_owned();
                     hits.push(SearchHit {
                         href: page_href(workspace, project, &path),
@@ -146,10 +152,11 @@ pub(crate) async fn handler(
                 .limit
                 .unwrap_or(GLOBAL_DEFAULT_LIMIT)
                 .clamp(1, MAX_LIMIT);
+            limit_used = limit;
             let started = explain.then(std::time::Instant::now);
             let raw = match state
                 .reader
-                .search_pages_with_meta(query.clone(), limit, None, viewer)
+                .search_pages_with_meta(query.clone(), limit + 1, None, viewer)
                 .await
             {
                 Ok(raw) => raw,
@@ -162,7 +169,8 @@ pub(crate) async fn handler(
                 });
                 streams_active = vec!["fts"];
             }
-            for h in raw {
+            truncated = raw.len() > limit;
+            for h in raw.into_iter().take(limit) {
                 let path = h.path.as_str().to_owned();
                 hits.push(SearchHit {
                     href: page_href(&h.workspace_name, &h.project_name, &path),
@@ -199,6 +207,8 @@ pub(crate) async fn handler(
             || "none".to_owned(),
             |stage| format!("{} / {}", stage.reranker().name(), stage.reranker().model()),
         ),
+        truncated,
+        max_results: limit_used,
     };
     match view.render() {
         Ok(html) => Html(html).into_response(),

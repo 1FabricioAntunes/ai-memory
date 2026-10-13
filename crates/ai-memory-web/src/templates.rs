@@ -596,6 +596,10 @@ pub(crate) struct SearchView {
     pub embedder: String,
     /// `name / model` of the reranker, or `none`.
     pub reranker: String,
+    /// More matches existed than `max_results`; the list is cut.
+    pub truncated: bool,
+    /// Most rows the page renders.
+    pub max_results: usize,
     /// The same query across every project.
     pub global_href: String,
 }

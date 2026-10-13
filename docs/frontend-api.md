@@ -225,6 +225,9 @@ links + back-links.
 the token to pass back as `expected_page_id` to a conditional
 `memory_write_page` or `memory_delete_page`.
 
+`created_at` is when the page's oldest retained version was written, so it
+stays put across rewrites; `updated_at` is when the latest version was written.
+
 `404` for missing workspace/project, missing page row, or missing file
 on disk (the body is read from the markdown file at request time).
 

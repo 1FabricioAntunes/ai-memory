@@ -372,6 +372,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+
+## [2.6.6] - 2026-10-13
+
+### Fixed
+- Fixed `ai-memory list-projects` failing with `404 Not Found` against a
+  server started without `--enable-web` or `--enable-api`, the routes that
+  mount `GET /api/v1/projects`. On a 404 it now reads the always-mounted
+  `GET /admin/projects` and applies `--workspace` itself; `ai-memory show`
+  lists projects the same way instead of falling back to local scan results.
+  If both calls fail, the error names both routes and the likely causes.
+  (#1236)
+- Fixed consolidation sending the model a prompt with no evidence when
+  `consolidation.max_input_tokens` sat at the validated floor. The floor was
+  checked against the raw token count, but the prompt builders work on a
+  smaller character budget (tokens × a chars-per-token estimate ×
+  `input_token_safety_margin`, default 0.8). At the old 6,500 floor the batch
+  prompt's fixed part alone overflowed that budget, so every observation became
+  an omission marker. The floor is now 8,350 tokens at the default margin, and
+  a lower margin needs a proportionally larger budget. A project's existing
+  page titles are now optional prompt context, listed only as far as they fit,
+  so a project with many pages no longer crowds observations out at a small
+  budget. An install configured between 6,500 and 8,350 tokens now fails at
+  startup with a message naming both numbers. (#1234, #1242)
+- Fixed PreCompact and PostCompaction waiting for the LLM provider inside
+  `/hook` and `/hook/batch`. That 12-135 s call outlived the client's drain
+  timeout, left the ingest key incomplete and restarted on every redelivery.
+  The request now writes the rule-based `sessions/<id>.md` checkpoint and
+  returns; with a provider, the LLM rewrite is queued for the bounded worker
+  SessionEnd already uses, which now starts whenever a provider is configured
+  and runs each job as the session's recorded owner. A resumed session's
+  checkpoint queues its rewrite too, and a retried checkpoint never puts the
+  rule-based page back over a finished rewrite. Two side effects: SessionEnd
+  jobs queued while `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` was on now run even
+  if the flag has since been turned off, and without the flag a session that
+  ends while its checkpoint rewrite runs keeps that rewrite as the latest page,
+  with the SessionEnd summary as the superseded version. (#1229, #1243)
 - Replaced the unmaintained YAML library (`serde_yaml` and its
   `unsafe-libyaml` parser, RUSTSEC-2024-0449) with `serde-saphyr`. The server
   reads existing page frontmatter to exactly the same values as before. One
@@ -381,6 +417,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written forms differently: a numeric-looking `title` or tag such as
   `007` is no longer used, a `!!timestamp`-tagged title fails that page's
   import, and a custom-tagged title (`!foo x`) imports as its plain text.
+- Fixed the web search page printing "50 results" with no hint when more
+  pages matched. It now says it shows the first 50 results and suggests
+  refining the search. (#1239)
+- Fixed the web page header and the `/api/v1` page response reporting the
+  date of the latest version as "Created", so a page rewritten many times
+  looked new. They now report when the oldest retained version was written.
+  "Updated" is unchanged. (#1238)
+- Fixed keyboard and screen reader support in the web UI. Every page now has
+  a "Skip to content" link, the search fields have labels, and breadcrumbs
+  are a labelled landmark that marks the current page. Footer text, page
+  paths and relative dates now meet AA contrast in both themes. (#1237)
 
 ## [2.6.5] - 2026-10-12
 
@@ -9402,7 +9449,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.6...HEAD
+[2.6.6]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...v2.6.6
 [2.6.5]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
