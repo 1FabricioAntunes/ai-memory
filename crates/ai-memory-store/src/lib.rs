@@ -200,6 +200,19 @@ impl Store {
             );
         }
 
+        // Refresh planner statistics, as SQLite recommends for a long-lived
+        // connection. Without `sqlite_stat1` the planner ranks indexes by
+        // equality-column count alone and can pick one that scans a whole
+        // project per row. This analyzes only tables lacking statistics or
+        // grown/shrunk tenfold since the last run, each capped by SQLite's
+        // built-in optimize analysis limit: the first open of a never-analyzed
+        // store pays once (about 12 s for a 1.6 GB store on an ARM VM), later
+        // opens are a size check per table. It runs here, not on a timer,
+        // because ANALYZE does not bump the schema cookie: pooled read
+        // connections keep the statistics they loaded when they opened, and
+        // they all open after this point.
+        conn.execute_batch("PRAGMA optimize=0x10002;")?;
+
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
         Ok(Self {

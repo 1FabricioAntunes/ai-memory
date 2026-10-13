@@ -11,6 +11,18 @@ and [0.x](docs/changelog/0.x.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `GET /admin/sessions/by-agent`, and so `ai-memory doctor` and
+  `ai-memory backfill`, taking minutes on a large project (178 s for 780
+  sessions over 185k observations). Without planner statistics SQLite
+  answered each session's capture probe from the project-wide index and
+  rescanned the whole project once per session; the probe now always uses the
+  session index (0.3 s on the same store). The store also refreshes SQLite's
+  planner statistics on every start (`PRAGMA optimize`), which it had never
+  done. The first start of an existing store analyzes it once (about 12 s for
+  a 1.6 GB store); later starts only check table sizes. (#1257)
+
 ## [2.6.7] - 2026-10-13
 
 ### Deprecated
