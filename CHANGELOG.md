@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written forms differently: a numeric-looking `title` or tag such as
   `007` is no longer used, a `!!timestamp`-tagged title fails that page's
   import, and a custom-tagged title (`!foo x`) imports as its plain text.
+- Fixed the web search page printing "50 results" with no hint when more
+  pages matched. It now says it shows the first 50 results and suggests
+  refining the search. (#1239)
 
 ## [2.6.5] - 2026-10-12
 

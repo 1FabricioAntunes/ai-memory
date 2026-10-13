@@ -277,6 +277,10 @@ pub(crate) struct SearchView {
     pub hits: Vec<SearchHit>,
     /// Pre-computed hit count for display (avoids needing `|length` filter).
     pub hit_count: usize,
+    /// More matches existed than `max_results`; the list is cut.
+    pub truncated: bool,
+    /// Most rows the page renders.
+    pub max_results: usize,
 }
 
 // ---------------------------------------------------------------------------
