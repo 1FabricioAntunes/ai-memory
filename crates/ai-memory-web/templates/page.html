@@ -77,7 +77,8 @@
 <aside aria-label="Page navigation" class="mt-8 space-y-6 text-sm lg:mt-0 lg:w-64 lg:shrink-0 lg:sticky lg:top-4 lg:max-h-screen lg:overflow-y-auto">
   {% if !outline.is_empty() %}
   <details open>
-    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:pointer-events-none">On this page</summary>
+    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">On this page</summary>
+    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">On this page</h2>
     <ul class="mt-2 space-y-1">
       {% for item in outline %}
       <li{% if item.nested %} class="pl-3"{% endif %}><a href="{{ item.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ item.text }}</a></li>
@@ -87,7 +88,8 @@
   {% endif %}
 
   <details open>
-    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:pointer-events-none">Cited by</summary>
+    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">Cited by</summary>
+    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Cited by</h2>
     {% if cited_by.is_empty() %}
     <p class="mt-2 text-slate-500 dark:text-slate-400">No page links here yet.</p>
     {% else %}
@@ -102,7 +104,8 @@
 
   {% if !cites.is_empty() %}
   <details open>
-    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:pointer-events-none">Cites</summary>
+    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">Cites</summary>
+    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Cites</h2>
     <ul class="mt-2 space-y-1">
       {% for rel in cites %}
       <li><a href="{{ rel.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ rel.title }}</a>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %}</li>

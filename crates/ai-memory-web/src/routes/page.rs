@@ -60,19 +60,21 @@ pub(crate) async fn handler(
     // backlink from a restricted project never reaches the sidebar.
     let links = match state
         .reader
-        .page_links(
+        .page_links_preview(
             meta.workspace_id,
             meta.project_id,
             meta.path.clone(),
             viewer_id,
+            RELATED_LIMIT,
         )
         .await
     {
         Ok(l) => l,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let (cited_by, cited_by_more) = related_rows(links.backlinks, &workspace, &project);
-    let (cites, cites_more) = related_rows(links.links, &workspace, &project);
+    let (cited_by, cited_by_more) =
+        related_rows(links.backlinks, links.backlinks_total, &workspace, &project);
+    let (cites, cites_more) = related_rows(links.links, links.links_total, &workspace, &project);
 
     // `#id` alone would resolve against the injected `<base href>`.
     let own_href = page_href(&workspace, &project, &meta.path);
@@ -143,17 +145,17 @@ pub(crate) async fn handler(
     }
 }
 
-/// The first [`RELATED_LIMIT`] neighbours as rows, and how many were left out.
+/// Neighbours as rows, and how many of `total` were left out.
 /// A neighbour in another project carries a `workspace/project` hint.
 fn related_rows(
     related: Vec<ai_memory_store::RelatedPage>,
+    total: usize,
     workspace: &str,
     project: &str,
 ) -> (Vec<RelatedRow>, usize) {
-    let more = related.len().saturating_sub(RELATED_LIMIT);
+    let more = total.saturating_sub(related.len());
     let rows = related
         .into_iter()
-        .take(RELATED_LIMIT)
         .map(|r| RelatedRow {
             href: page_href(&r.workspace, &r.project, &r.path),
             scope_hint: if r.workspace == workspace && r.project == project {

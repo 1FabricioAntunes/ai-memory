@@ -4915,6 +4915,14 @@ async fn page_outline_links_to_the_ids_on_the_headings() {
     let app = router(store.reader.clone(), wiki.clone());
     let (_, html) = page_body(&app, "/w/default/scratch/p/notes/long.md", None).await;
     assert!(html.contains("On this page"), "{html}");
+    // On wide screens the groups are always open: the toggle is hidden and a
+    // plain heading stands in, so neither a mouse nor a keyboard collapses it.
+    assert_eq!(
+        html.matches("<summary ").count(),
+        html.matches(r#"lg:hidden">"#).count(),
+        "{html}"
+    );
+    assert!(html.contains(r#"lg:block text-xs"#) && html.contains(">On this page</h2>"));
     for id in ["intro", "intro-1", "intro-2"] {
         assert!(html.contains(&format!(r#" id="{id}">"#)), "{id}: {html}");
         // Anchored on the page URL, since `#id` alone resolves against <base>.
