@@ -122,16 +122,26 @@ fn render_human(rows: &[ProjectRow]) -> String {
         .max()
         .unwrap_or(0)
         .max("PROJECT".len());
+    // The id column carries what `--project-id` takes. A row from an older
+    // server has no id; render `-` rather than hiding the column, so the
+    // header stays stable across server versions. (#1208)
+    let id_width = rows
+        .iter()
+        .map(|row| row.project_id.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(0)
+        .max("PROJECT ID".len());
 
     let mut out = format!(
-        "{:workspace_width$}  {:project_width$}  {:>6}  LAST UPDATED\n",
-        "WORKSPACE", "PROJECT", "PAGES"
+        "{:workspace_width$}  {:project_width$}  {:id_width$}  {:>6}  LAST UPDATED\n",
+        "WORKSPACE", "PROJECT", "PROJECT ID", "PAGES"
     );
     for row in rows {
         out += &format!(
-            "{:workspace_width$}  {:project_width$}  {:>6}  {}\n",
+            "{:workspace_width$}  {:project_width$}  {:id_width$}  {:>6}  {}\n",
             row.workspace_name,
             row.project_name,
+            row.project_id.as_deref().unwrap_or("-"),
             row.page_count,
             row.last_updated.as_deref().unwrap_or("-")
         );
@@ -145,11 +155,47 @@ mod tests {
 
     fn row(workspace: &str, project: &str, pages: u64, last_updated: Option<&str>) -> ProjectRow {
         ProjectRow {
+            workspace_id: Some(format!("{workspace}-id")),
             workspace_name: workspace.to_owned(),
+            project_id: Some(format!("{project}-id")),
             project_name: project.to_owned(),
             page_count: pages,
             last_updated: last_updated.map(str::to_owned),
         }
+    }
+
+    /// The id column is what makes `--project-id` usable: the operator reads
+    /// the UUID here and passes it to the destructive admin commands. (#1208)
+    #[test]
+    fn render_human_includes_the_project_id_needed_by_project_id_flags() {
+        let rows = vec![row("default", "acme-api", 12, None)];
+        let out = render_human(&rows);
+        assert!(out.contains("PROJECT ID"), "{out}");
+        assert!(
+            out.contains("acme-api-id"),
+            "the id is what an operator passes to --project-id: {out}"
+        );
+    }
+
+    /// A row from a server that predates the id fields still renders: the
+    /// column shows `-` instead of collapsing or panicking.
+    #[test]
+    fn render_human_shows_a_dash_for_a_row_from_an_older_server() {
+        let rows = vec![ProjectRow {
+            workspace_id: None,
+            workspace_name: "default".to_owned(),
+            project_id: None,
+            project_name: "legacy".to_owned(),
+            page_count: 1,
+            last_updated: None,
+        }];
+        let out = render_human(&rows);
+        let data_line = out.lines().nth(1).expect("one data line");
+        assert!(data_line.contains("legacy"), "{data_line}");
+        assert!(
+            data_line.matches(" - ").count() >= 1,
+            "a missing id renders as a dash, not an empty column: {data_line}"
+        );
     }
 
     #[test]

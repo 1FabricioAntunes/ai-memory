@@ -1667,8 +1667,15 @@ pub struct BriefPageBody {
 /// Returned by [`ReaderPool::list_projects_with_stats`].
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSummary {
+    /// Id of the workspace, as the stable half of the scope coordinate. (#1208)
+    pub workspace_id: String,
     /// Name of the workspace.
     pub workspace_name: String,
+    /// Id of the project, as the stable coordinate an operator can hand to an
+    /// id-targeted admin operation. Names are not stable -- a legacy twin row
+    /// can shadow another project's `legacy_name` -- so this is what makes a
+    /// `list-projects` row unambiguous. (#1208)
+    pub project_id: String,
     /// Name of the project within the workspace.
     pub project_name: String,
     /// Number of `is_latest = 1` pages.
@@ -8762,7 +8769,9 @@ impl ReaderPool {
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
             let mut stmt = conn.prepare(&format!(
-                "SELECT w.name AS workspace_name, \
+                "SELECT w.id AS workspace_id, \
+                        w.name AS workspace_name, \
+                        p.id AS project_id, \
                         p.name AS project_name, \
                         COUNT(pg.id) AS page_count, \
                         MAX(pg.updated_at) AS last_updated_us \
@@ -8774,20 +8783,40 @@ impl ReaderPool {
                  ORDER BY last_updated_us DESC NULLS LAST"
             ))?;
             let rows = stmt.query_map(params![workspace], |row| {
-                let workspace_name: String = row.get(0)?;
-                let project_name: String = row.get(1)?;
-                let page_count: i64 = row.get(2)?;
-                let last_updated_us: Option<i64> = row.get(3)?;
-                Ok((workspace_name, project_name, page_count, last_updated_us))
+                let workspace_id: Vec<u8> = row.get(0)?;
+                let workspace_name: String = row.get(1)?;
+                let project_id: Vec<u8> = row.get(2)?;
+                let project_name: String = row.get(3)?;
+                let page_count: i64 = row.get(4)?;
+                let last_updated_us: Option<i64> = row.get(5)?;
+                Ok((
+                    workspace_id,
+                    workspace_name,
+                    project_id,
+                    project_name,
+                    page_count,
+                    last_updated_us,
+                ))
             })?;
             let mut out = Vec::new();
             for r in rows {
-                let (workspace_name, project_name, page_count, last_updated_us) = r?;
+                let (
+                    workspace_id,
+                    workspace_name,
+                    project_id,
+                    project_name,
+                    page_count,
+                    last_updated_us,
+                ) = r?;
+                let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
+                let project_id = ProjectId::from_slice(&project_id)?;
                 let last_updated = last_updated_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
                 out.push(ProjectSummary {
+                    workspace_id: workspace_id.to_string(),
                     workspace_name,
+                    project_id: project_id.to_string(),
                     project_name,
                     page_count: u64::try_from(page_count).unwrap_or(0),
                     last_updated,

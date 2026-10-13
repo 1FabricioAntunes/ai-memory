@@ -107,6 +107,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`), summed over `scopes`.
   Streams that did not run are left out, and a query without `explain` reads
   no clock for them.
+- Added a Grok Build CLI first-turn handoff rule. `install-hooks --agent grok
+  --apply` and `install-skills --scope global --agent grok` write
+  `$GROK_HOME/rules/ai-memory-handoff.md` (into the Grok home the hook file
+  was written to), which has the model call `memory_handoff_list` as its first
+  tool, through `use_tool` with the qualified key
+  `ai-memory__memory_handoff_list`, before reading any file. Grok discards
+  SessionStart stdout, so that call is what lets the first PostToolUse claim
+  the baton through GET `/handoff`. The rule corrects `workspace` and
+  `project` from the marker or git remote when the first list is empty or
+  answers with a scope error, and treats the handoff PostToolUse claimed as
+  authoritative. A same-name file without the managed marker is kept unless
+  `--force`; `uninstall --only hooks` or `--only skills` removes the managed
+  rule. (#1228)
 - Added the end reason to session-end observations. When a harness's
   `SessionEnd` payload carries a `reason` (Claude Code sends `clear`,
   `logout`, `prompt_input_exit` or `other`), its first line is stored,
@@ -314,6 +327,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is answered with 202 and counted as a policy drop in `/hook` and
   `/hook/batch`, before it is sanitized, rate-limited or stored. The lists
   apply to every project on the server. (#1241)
+- Added `--project-id` to `purge-project`, `rename-project` and
+  `move-project` (and `project_id` to their admin endpoints), as an
+  alternative to the project name. A legacy twin row whose name collides with
+  another project's `legacy_name` (the empty leftover an older migration
+  leaves behind) was refused as ambiguous by name, so it could not be purged
+  or renamed. The id is looked up inside the named workspace: sending both or
+  neither is a 400, a malformed UUID is a 400, and an id that names no project
+  in that workspace is a 404. `list-projects` now prints each project's id so
+  an operator can copy it, and `GET /api/v1/projects` rows carry
+  `workspace_id` and `project_id` (hidden with the row for a restricted
+  project). (#1208, #1226)
+- Added `ai-memory project init`, which creates a `.ai-memory.toml` marker at
+  the current worktree root (or the current directory outside Git) after
+  asking for `workspace` and `project`. The defaults are the scope the CLI and
+  hooks already resolve for the checkout, so accepting them keeps the memory
+  where it is. It writes only those two keys, needs an interactive terminal,
+  and never overwrites an existing marker. (#1227)
 
 ### Changed
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or

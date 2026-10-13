@@ -816,7 +816,12 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::Grok => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)?;
+                let hook_file = match &args.config_file {
+                    Some(path) => path.clone(),
+                    None => grok_hooks_path()?,
+                };
+                crate::commands::install_skills::install_grok_companions_after_hooks(&hook_file)
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
@@ -6296,8 +6301,10 @@ fn render_grok(
         );
     }
     println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
-    println!("#       but handoff injection does not. Recover a prior session's");
-    println!("#       handoff via the MCP `memory_handoff_accept` tool.");
+    println!("#       but that event does not inject the handoff. The first");
+    println!("#       PostToolUse injects additionalContext. --apply also writes");
+    println!("#       $GROK_HOME/rules/ai-memory-handoff.md so the first turn");
+    println!("#       calls memory_handoff_list (PostToolUse then claims it).");
     println!();
     println!("{serialized}");
     Ok(())

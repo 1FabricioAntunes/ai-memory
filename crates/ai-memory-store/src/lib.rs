@@ -4615,6 +4615,86 @@ mod tests {
         assert!(s.last_updated.is_some());
     }
 
+    /// #1208: a project id is an address, so it must be exposed exactly where
+    /// the name is -- no wider. Boundary row 9's rule is that a restricted
+    /// project is hidden from a caller without a grant, and this pins that the
+    /// new id column inherits that rule rather than bypassing it. The filter is
+    /// on the row, so a restricted row is absent entirely; the control proves
+    /// the id IS returned once the caller may see the row, so a blanket deny
+    /// would not pass for a working guard.
+    #[tokio::test]
+    async fn list_projects_with_stats_hides_a_restricted_projects_id_from_an_ungranted_viewer() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let open = store
+            .writer
+            .get_or_create_project(ws, "open-project", None)
+            .await
+            .unwrap();
+        let secret = store
+            .writer
+            .get_or_create_project(ws, "secret-project", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(secret, crate::AccessMode::Restricted)
+            .await
+            .unwrap();
+
+        let outsider = ai_memory_core::UserId::new();
+
+        // Adversarial: the ungranted viewer sees neither the restricted
+        // project's name NOR its id -- the id must not be a side channel
+        // around the name-hiding rule.
+        let visible = store
+            .reader
+            .list_projects_with_stats(Some(outsider))
+            .await
+            .unwrap();
+        assert!(
+            visible.iter().any(|s| s.project_name == "open-project"),
+            "the open project (and its id) must still be listed: {visible:?}"
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|s| s.project_id == secret.to_string())
+                .count(),
+            0,
+            "a restricted project's id must not leak to an ungranted viewer: {visible:?}"
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|s| s.project_name == "secret-project")
+                .count(),
+            0,
+            "and neither may its name: {visible:?}"
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .find(|s| s.project_name == "open-project")
+                .map(|s| s.project_id.as_str()),
+            Some(open.to_string().as_str()),
+            "the visible row still carries its own id: {visible:?}"
+        );
+
+        // Control: the operator (no viewer filter) sees both, ids included.
+        let all = store.reader.list_projects_with_stats(None).await.unwrap();
+        assert_eq!(all.len(), 2, "the operator surface lists both: {all:?}");
+        assert!(
+            all.iter().any(|s| s.project_id == secret.to_string()),
+            "the operator may see the restricted id: {all:?}"
+        );
+    }
+
     #[tokio::test]
     async fn list_pages_returns_latest_pages_for_project() {
         let tmp = TempDir::new().unwrap();

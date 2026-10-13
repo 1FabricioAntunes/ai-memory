@@ -2017,6 +2017,92 @@ async fn lookup_ws_no_create(
         .map_err(scope_err)
 }
 
+/// Resolve the `(workspace_id, project_id)` pair for an admin operation from
+/// either a project name (the historic path) or a project id (the new
+/// `#1208` path). Exactly one of `project_name` and `project_id` must be
+/// `Some`; sending both or neither is a 400. When `project_id` is `Some`,
+/// the workspace is resolved by name (still 404 if absent) and the project
+/// is looked up by id within the workspace (404 on miss, so a foreign-scope
+/// id is correctly refused). The bad-UUID case is a 400, mirroring how
+/// `lookup_ws_proj_no_create` already maps unparseable names to 400.
+///
+/// Returns the project's stored name with the ids, so labels, admission
+/// contexts and move destinations never fall back to the UUID: a failed name
+/// read is a 500, not a guess.
+async fn resolve_target_for_admin(
+    state: &AdminState,
+    workspace: &str,
+    project_name: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<(WorkspaceId, ProjectId, String), (StatusCode, Json<serde_json::Value>)> {
+    let (ws_id, proj_id) =
+        resolve_target_ids_for_admin(state, workspace, project_name, project_id).await?;
+    match state.reader.project_name_by_id(ws_id, proj_id).await {
+        Ok(Some(name)) => Ok((ws_id, proj_id, name)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "project not found in workspace" })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+async fn resolve_target_ids_for_admin(
+    state: &AdminState,
+    workspace: &str,
+    project_name: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+    match (project_name, project_id) {
+        (Some(_), Some(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "project and project_id are mutually exclusive"
+            })),
+        )),
+        (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "either project or project_id is required"
+            })),
+        )),
+        (Some(name), None) => lookup_ws_proj_no_create(state, workspace, name).await,
+        (None, Some(id_str)) => {
+            let parsed = match id_str.parse::<ProjectId>() {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("invalid project id: {e}")
+                        })),
+                    ));
+                }
+            };
+            let ws_id = match lookup_ws_no_create(state, workspace).await {
+                Ok(ws) => ws,
+                Err(e) => return Err(e),
+            };
+            match state.reader.project_name_by_id(ws_id, parsed).await {
+                Ok(Some(_)) => Ok((ws_id, parsed)),
+                Ok(None) => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "project not found in workspace"
+                    })),
+                )),
+                Err(e) => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )),
+            }
+        }
+    }
+}
+
 fn with_manifest_warning(
     (status, Json(mut body)): (StatusCode, Json<serde_json::Value>),
     warning: Option<&ai_memory_core::repository_identity::ManifestWarning>,
@@ -4768,7 +4854,16 @@ struct PurgeProjectRequest {
     /// Workspace name. The workspace must already exist; we 404 if absent.
     workspace: String,
     /// Project name. The project must already exist; we 404 if absent.
-    project: String,
+    /// Mutually exclusive with `project_id`; the CLI sends whichever the
+    /// operator chose and leaves the other `None`. (#1208)
+    #[serde(default)]
+    project: Option<String>,
+    /// Project id (UUID string). Bypasses the name/legacy/canonical lookup
+    /// and targets the row directly, so an operator can disambiguate a name
+    /// collision. Server returns 400 on bad UUID parse, 404 on unknown id or
+    /// foreign-scope id. (#1208)
+    #[serde(default)]
+    project_id: Option<String>,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
     confirm: bool,
@@ -4954,13 +5049,19 @@ async fn handle_purge_project(
     }
 
     // Look up workspace and project IDs without auto-creating.
-    let (ws_id, proj_id) =
-        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
+        &state,
+        &req.workspace,
+        req.project.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
 
-    let label = format!("{}/{}", req.workspace, req.project);
+    let label = format!("{}/{}", req.workspace, project_name);
 
     // Admission must run before any destructive work. A reject-policy webhook
     // is allowed to abort the purge while DB rows and files are still intact.
@@ -4973,7 +5074,7 @@ async fn handle_purge_project(
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
     let purge_ctx = AdmissionContext {
         workspace: req.workspace.clone(),
-        project: req.project.clone(),
+        project: project_name.clone(),
         op: AdmissionOp::PurgeProject,
         actor,
         ..Default::default()
@@ -5113,13 +5214,19 @@ async fn purge_project_preview(
     req: &PurgeProjectRequest,
     author_id: Option<ai_memory_core::UserId>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let (ws_id, proj_id) = match lookup_ws_proj_no_create(state, &req.workspace, &req.project).await
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
+        state,
+        &req.workspace,
+        req.project.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
     {
-        Ok(ids) => ids,
+        Ok(target) => target,
         Err(e) => return e,
     };
 
-    let label = format!("{}/{}", req.workspace, req.project);
+    let label = format!("{}/{}", req.workspace, project_name);
 
     let summary = match state
         .writer
@@ -5745,8 +5852,16 @@ async fn delete_workspace_preview(
 struct RenameProjectRequest {
     /// Workspace name (must exist; we don't auto-create on rename).
     workspace: String,
-    /// Current project name.
-    from: String,
+    /// Current project name. Mutually exclusive with `project_id`; the CLI
+    /// sends whichever the operator chose and leaves the other `None`.
+    /// (#1208)
+    #[serde(default)]
+    from: Option<String>,
+    /// Project id (UUID string). Bypasses the name/legacy/canonical lookup
+    /// and targets the row directly. Same contract as
+    /// `PurgeProjectRequest::project_id`. (#1208)
+    #[serde(default)]
+    project_id: Option<String>,
     /// New project name. Must be non-empty, no slashes.
     to: String,
 }
@@ -5778,8 +5893,15 @@ async fn handle_rename_project(
 ) -> impl IntoResponse {
     let author_id = author_ext.map(|axum::Extension(u)| u);
     // Look up workspace + source project; 404 if either is absent.
-    let (ws_id, proj_id) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.from).await {
-        Ok(ids) => ids,
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
+        &state,
+        &req.workspace,
+        req.from.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -5848,7 +5970,7 @@ async fn handle_rename_project(
     };
     let summary = RenameProjectSummary {
         workspace: req.workspace.clone(),
-        from: req.from.clone(),
+        from: project_name.clone(),
         to: req.to.clone(),
         pages,
         checkpoint,
@@ -5870,7 +5992,14 @@ struct MoveProjectRequest {
     /// Source workspace. Must already exist; we 404 if absent.
     from_workspace: String,
     /// Project name to move. Must already exist in `from_workspace`; 404 if absent.
-    project: String,
+    /// Mutually exclusive with `project_id`; the CLI sends whichever the
+    /// operator chose and leaves the other `None`. (#1208)
+    #[serde(default)]
+    project: Option<String>,
+    /// Project id (UUID string) in the source workspace. Bypasses the
+    /// name/legacy/canonical lookup and targets the row directly. (#1208)
+    #[serde(default)]
+    project_id: Option<String>,
     /// Destination workspace. Auto-created if absent.
     to_workspace: String,
     /// Mandatory confirmation flag. The move PURGES the source after
@@ -5992,6 +6121,7 @@ type MoveErr = (StatusCode, Json<serde_json::Value>);
 async fn true_move_project(
     state: &Arc<AdminState>,
     req: &MoveProjectRequest,
+    project_name: &str,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
     pre_checkpoint: Option<String>,
@@ -6035,9 +6165,9 @@ async fn true_move_project(
 
     let move_ctx = AdmissionContext {
         workspace: req.from_workspace.clone(),
-        project: req.project.clone(),
+        project: project_name.to_string(),
         destination_workspace: Some(req.to_workspace.clone()),
-        destination_project: Some(req.project.clone()),
+        destination_project: Some(project_name.to_string()),
         op: AdmissionOp::MoveProject,
         actor,
         ..Default::default()
@@ -6087,13 +6217,13 @@ async fn true_move_project(
         &state.wiki,
         format!(
             "move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            req.from_workspace, project_name, req.to_workspace, project_name
         ),
     );
 
     let report = MoveProjectReport {
-        from: format!("{}/{}", req.from_workspace, req.project),
-        to: format!("{}/{}", req.to_workspace, req.project),
+        from: format!("{}/{}", req.from_workspace, project_name),
+        to: format!("{}/{}", req.to_workspace, project_name),
         merged_into_existing: false,
         moved_via: "true-move",
         pages_copied: summary.pages_moved,
@@ -6314,9 +6444,10 @@ async fn move_project_core(
     // A private profile is found as `default/_profile.<user id>`; moving it to
     // another workspace would orphan it. (A workspace `_profile` may move with
     // its workspace: it lands in, or merges into, the target's own profile.)
-    if req
-        .project
-        .starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX)
+    // Checked on the requested NAME first so a nonexistent profile project is
+    // still refused as 422 rather than surfacing the lookup's 404.
+    if let Some(name) = req.project.as_deref()
+        && name.starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX)
     {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -6327,8 +6458,28 @@ async fn move_project_core(
     }
 
     // Resolve the SOURCE without auto-creating — 404 on a typo.
-    let (src_ws, src_proj) =
-        lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
+    let (src_ws, src_proj, project_name) = match resolve_target_for_admin(
+        state,
+        &req.from_workspace,
+        req.project.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return Err(MoveErr::from(e)),
+    };
+
+    // Same guard on the RESOLVED name, so the `project_id` path (which has no
+    // name to inspect up front) is refused identically.
+    if project_name.starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "a private cross-project profile stays in the default workspace and cannot be moved"
+            })),
+        ));
+    }
 
     // Live-session guard: refuse to move the project the hook router is
     // currently writing to. A live session's next observation/log would carry
@@ -6342,7 +6493,7 @@ async fn move_project_core(
                 "error": format!(
                     "{}/{} is the active session's project; a live move risks stale-cache writes. \
                      Re-run with force=true to proceed.",
-                    req.from_workspace, req.project
+                    req.from_workspace, project_name
                 )
             })),
         ));
@@ -6351,7 +6502,7 @@ async fn move_project_core(
     // Detect MERGE: does the destination workspace already hold a same-named
     // project? (find_workspace may be None when the dest ws doesn't exist yet.)
     let merged_into_existing =
-        match lookup_existing_scope(&state.reader, &req.to_workspace, &req.project).await {
+        match lookup_existing_scope(&state.reader, &req.to_workspace, &project_name).await {
             Ok(_) => true,
             Err(error) if error.is_not_found() => false,
             Err(error) => return Err(scope_err(error)),
@@ -6361,7 +6512,7 @@ async fn move_project_core(
         &state.wiki,
         format!(
             "pre-move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            req.from_workspace, project_name, req.to_workspace, project_name
         ),
     )?;
 
@@ -6374,19 +6525,29 @@ async fn move_project_core(
     // case, where two project_ids can't be re-stamped into one
     // (UNIQUE(workspace_id, name) collision).
     if !merged_into_existing {
-        return true_move_project(state, req, src_ws, src_proj, pre_checkpoint, actor).await;
+        return true_move_project(
+            state,
+            req,
+            &project_name,
+            src_ws,
+            src_proj,
+            pre_checkpoint,
+            actor,
+        )
+        .await;
     }
 
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let destination = create_ws_proj(state, &req.to_workspace, &req.project).await?;
+    let destination = create_ws_proj(state, &req.to_workspace, &project_name).await?;
     let (dst_ws, dst_proj) = destination.scope.as_tuple();
 
     let warning = destination.manifest_warning;
     copy_purge_merge(
         state,
         req,
+        &project_name,
         src_ws,
         src_proj,
         dst_ws,
@@ -7307,9 +7468,18 @@ struct PreparedSourcePage {
 /// its path collides with a different page at the destination. Both
 /// the `Block` pre-check and the copy loop drive off the returned
 /// vector, so each page is read at most once.
+///
+/// The argument list mirrors one prepared row: the request (for its
+/// workspace name), the resolved `project_name` (which may differ from
+/// `req.project` when the operator targeted `project_id` instead), the
+/// source scope to read from, and the destination scope to compare
+/// against. Splitting it into a struct would only move the same fields
+/// one level down. (#1208)
+#[allow(clippy::too_many_arguments)]
 async fn prepare_source_pages(
     state: &AdminState,
     req: &MoveProjectRequest,
+    project_name: &str,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
     dst_ws: WorkspaceId,
@@ -7334,7 +7504,10 @@ async fn prepare_source_pages(
         };
         let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
         let pinned = matches!(
-            state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
+            state
+                .reader
+                .page_meta(&req.from_workspace, project_name, &s.path)
+                .await,
             Ok(Some(ref m)) if m.pinned
         );
         let md = state.wiki.read_page(src_ws, src_proj, &path).ok();
@@ -7381,6 +7554,7 @@ async fn prepare_source_pages(
 async fn copy_purge_merge(
     state: &AdminState,
     req: &MoveProjectRequest,
+    project_name: &str,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
     dst_ws: WorkspaceId,
@@ -7392,7 +7566,7 @@ async fn copy_purge_merge(
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
         .reader
-        .list_pages(&req.from_workspace, &req.project)
+        .list_pages(&req.from_workspace, project_name)
         .await
     {
         Ok(s) => s,
@@ -7402,8 +7576,17 @@ async fn copy_purge_merge(
     // Single pass over the source: load each page's metadata + body
     // AND classify the destination conflict, so the block pre-check
     // and the copy loop don't re-query the same rows.
-    let prepared =
-        prepare_source_pages(state, req, src_ws, src_proj, dst_ws, dst_proj, &summaries).await;
+    let prepared = prepare_source_pages(
+        state,
+        req,
+        project_name,
+        src_ws,
+        src_proj,
+        dst_ws,
+        dst_proj,
+        &summaries,
+    )
+    .await;
 
     // Under the default `block` policy, abort the WHOLE move now —
     // before anything is copied — so the source stays intact and the
@@ -7601,12 +7784,12 @@ async fn copy_purge_merge(
             &state.wiki,
             format!(
                 "move-project-partial {}/{} -> {}/{}",
-                req.from_workspace, req.project, req.to_workspace, req.project
+                req.from_workspace, project_name, req.to_workspace, project_name
             ),
         );
         let report = MoveProjectReport {
-            from: format!("{}/{}", req.from_workspace, req.project),
-            to: format!("{}/{}", req.to_workspace, req.project),
+            from: format!("{}/{}", req.from_workspace, project_name),
+            to: format!("{}/{}", req.to_workspace, project_name),
             // copy_purge_merge is only reached from the merge branch
             // of handle_move_project; the destination project pre-existed.
             merged_into_existing: true,
@@ -7636,10 +7819,10 @@ async fn copy_purge_merge(
     // source is intact (mirrors `handle_purge_project`'s ordering). The
     // previous version called `Wiki::purge_project` AFTER `writer.purge_project`,
     // which ran admit AFTER the rows were gone — reject came too late.
-    let label = format!("{}/{}", req.from_workspace, req.project);
+    let label = format!("{}/{}", req.from_workspace, project_name);
     let purge_ctx = AdmissionContext {
         workspace: req.from_workspace.clone(),
-        project: req.project.clone(),
+        project: project_name.to_string(),
         op: AdmissionOp::PurgeProject,
         actor,
         ..Default::default()
@@ -7689,7 +7872,7 @@ async fn copy_purge_merge(
                          move-project --force cannot delete a live managed \
                          workstream during a copy-purge merge; finish or cancel \
                          the managed run, then retry.",
-                        req.to_workspace, req.project,
+                        req.to_workspace, project_name,
                     )
                 })),
             ));
@@ -7732,13 +7915,13 @@ async fn copy_purge_merge(
         &state.wiki,
         format!(
             "move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            req.from_workspace, project_name, req.to_workspace, project_name
         ),
     );
 
     let report = MoveProjectReport {
         from: label,
-        to: format!("{}/{}", req.to_workspace, req.project),
+        to: format!("{}/{}", req.to_workspace, project_name),
         // copy_purge_merge is only reached from the merge branch.
         merged_into_existing: true,
         moved_via: "copy-purge",
@@ -7858,7 +8041,8 @@ async fn handle_merge_workspace(
     for p in &projects {
         let move_req = MoveProjectRequest {
             from_workspace: req.from.clone(),
-            project: p.project_name.clone(),
+            project: Some(p.project_name.clone()),
+            project_id: None,
             to_workspace: req.to.clone(),
             confirm: true,
             force: req.force,
