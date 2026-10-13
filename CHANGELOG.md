@@ -392,6 +392,10 @@ and [0.x](docs/changelog/0.x.md).
   `companions/ai-memory-ts/README.md` and `docs/design-client-sdk.md`. (#1165)
 
 ### Changed
+- Documented the 2.x to 3.0 upgrade in `docs/upgrading-to-3.0.md`: what
+  changes, what replaces the removed token commands, the backup, upgrade and
+  check steps, and how to roll back by restoring the backup with the 2.x
+  binary. README, `docs/install.md` and `docs/MIGRATION-2.0.md` link to it.
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or
   `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
   FTS5 alone, so it returns the same order as `memory_query`, and `rank` is

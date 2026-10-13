@@ -3305,6 +3305,13 @@ will refuse to open that data dir (it fails closed rather than risk
 corruption), so take a `ai-memory backup` before upgrading if you might need
 to roll back to the previous version.
 
+### Upgrading to 3.0
+
+3.0 removes the 1.x `user add`, `user expire`, `user revive` and
+`user rotate-token` commands; tokens they issued keep working as API keys.
+[`upgrading-to-3.0.md`](upgrading-to-3.0.md) covers what changed, the upgrade
+steps and how to roll back.
+
 ### Upgrading to 2.3.0
 
 2.3.0 is a normal forward upgrade (the only new migration, `V64`, just adds the

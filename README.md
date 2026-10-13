@@ -375,6 +375,8 @@ refresh); see
 [`docs/install.md#keeping-ai-memory-up-to-date`](docs/install.md#keeping-ai-memory-up-to-date).
 The same native upgrade path covers Windows x86_64 zip installs under a
 writable prefix (see [`docs/windows.md`](docs/windows.md) Scenario C).
+Upgrading a 2.x install of any kind to 3.0? Read
+[`docs/upgrading-to-3.0.md`](docs/upgrading-to-3.0.md) first.
 
 Wiring another agent is the same two commands with a different name:
 `--client codex`, `--agent codex`, and so on for every row of the support
@@ -626,6 +628,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`DATA_HANDLING.md`](DATA_HANDLING.md) | **Data-flow reference for security/legal review.** What's stored, what's local-only, the two opt-in external paths, and how deletion/retention work. |
 | [`docs/sso.md`](docs/sso.md) | Enterprise identity: the OIDC device-auth flow, its scope, and how to front the server with an OIDC-aware gateway. |
 | [`docs/airgapped-install.md`](docs/airgapped-install.md) | Offline/air-gapped install: self-contained build, checksum-verified release binaries, and offline local embedding models. |
+| [`docs/upgrading-to-3.0.md`](docs/upgrading-to-3.0.md) | Upgrading a 2.x install to 3.0: what changed, the removed token commands and their replacements, upgrade steps, and rollback. |
 | [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) | Upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore. |
 | [`docs/benchmarks/`](docs/benchmarks/README.md) | Published retrieval-quality numbers with provenance, reproducible from the in-repo harness. |
 | [`docs/okf.md`](docs/okf.md) | The wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping. |
