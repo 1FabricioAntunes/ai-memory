@@ -9,12 +9,12 @@
     {
       "name": "ai-memory",
       "description": "Long-term memory across sessions and harnesses.",
-      "version": "2.6.6",
+      "version": "2.6.7",
       "source": {
         "source": "git-subdir",
         "url": "https://github.com/akitaonrails/ai-memory.git",
         "path": "plugins/claude-code",
-        "ref": "v2.6.6"
+        "ref": "v2.6.7"
       }
     }
   ]
