@@ -1735,6 +1735,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::Duration;
 
     /// Answers `systemctl`/`launchctl` from a script and records each call.
@@ -1766,6 +1767,7 @@ mod tests {
     }
 
     /// A unit `setup` rendered, written where `uninstall` finds it.
+    #[cfg(unix)]
     fn setup_unit(root: &Path) -> (ServiceManager, user_service::Removal) {
         let manager = ServiceManager::SystemdUser;
         let unit = user_service::render(

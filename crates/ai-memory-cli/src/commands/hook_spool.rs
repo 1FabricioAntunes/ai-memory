@@ -2619,7 +2619,9 @@ mod tests {
         );
         let started = Instant::now();
         enqueue(&spool, &entry).unwrap();
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // The guard is against blocking on the held lock, which would hang;
+        // the bound leaves room for fsync on a loaded CI disk.
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(spool_len(&spool), 1, "content is retained for recovery");
     }
 
