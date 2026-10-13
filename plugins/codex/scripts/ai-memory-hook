@@ -28,9 +28,14 @@ reply_without_binary() {
 # Other harnesses can read the Claude Code plugin through their Claude
 # fallbacks. Attribute the event to the harness that really ran it, or stay
 # out of the way when ai-memory has no agent for it.
+# Muse Code sets CLAUDE_PLUGIN_ROOT for the Claude plugins it loads, so it is
+# told apart by the MUSE_PLUGIN_ID it adds for plugin hooks, next to the
+# MUSE_SESSION_ID every Muse hook gets.
 if [ "$agent" = "claude-code" ]; then
     if [ -n "${DROID_PLUGIN_ROOT:-}" ]; then
         agent="droid"
+    elif [ -n "${MUSE_PLUGIN_ID:-}" ] && [ -n "${MUSE_SESSION_ID:-}" ]; then
+        agent="muse"
     elif [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
         if [ -n "${PLUGIN_ROOT:-}" ]; then
             agent="codex"

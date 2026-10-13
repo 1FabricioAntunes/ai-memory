@@ -21,7 +21,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::install_hooks::{self, HooksFileShape};
-use super::render_shared::{CLAUDE_CODE_EVENTS, DROID_EVENTS};
+use super::render_shared::{CLAUDE_CODE_EVENTS, DROID_EVENTS, MUSE_EVENTS};
 
 /// The environment variable the plugin launcher sets.
 pub(crate) const HOOK_ORIGIN_ENV: &str = "AI_MEMORY_HOOK_ORIGIN";
@@ -36,6 +36,10 @@ pub(crate) enum PluginOrigin {
     /// The Claude Code plugin loaded by Factory Droid through its Claude
     /// plugin compatibility (the launcher re-attributes it to `droid`).
     Droid,
+    /// The Claude Code plugin loaded by Meta Muse Code, which reads
+    /// `.claude-plugin/plugin.json` plugins (the launcher re-attributes it to
+    /// `muse`).
+    Muse,
 }
 
 impl PluginOrigin {
@@ -46,6 +50,7 @@ impl PluginOrigin {
             "claude-code-plugin" => Some(Self::ClaudeCode),
             "codex-plugin" => Some(Self::Codex),
             "droid-plugin" => Some(Self::Droid),
+            "muse-plugin" => Some(Self::Muse),
             _ => None,
         }
     }
@@ -68,7 +73,10 @@ pub(crate) fn drops_plugin_event(
         return true;
     }
     let Some(name) = settings_event_name(origin, event) else {
-        return false;
+        // Muse's subagent events come from its built-in reminder observers,
+        // each under its own session id, every turn; `install-hooks --agent
+        // muse` leaves them out, and so does the plugin.
+        return origin == PluginOrigin::Muse;
     };
     settings_files
         .iter()
@@ -92,6 +100,12 @@ pub(crate) fn drops_plugin_event(
 /// exists; otherwise the `hooks` key of `~/.factory/settings.json`, which
 /// Droid reads only while `hooks.json` is absent. Checking a file Droid
 /// ignores could drop the plugin copy of an event nothing else delivers.
+///
+/// Muse: the `hooks` key of `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`,
+/// the one file `install-hooks --agent muse` writes. Muse runs hooks with a
+/// cleared environment (`HOME`, `PATH`, `PWD` and its own `MUSE_*`), so an
+/// `XDG_CONFIG_HOME` Muse itself honoured is usually not visible here and the
+/// default location is checked; the plugin copy is then kept, never lost.
 pub(crate) fn settings_files_for(
     origin: PluginOrigin,
     cwd: Option<&str>,
@@ -138,6 +152,16 @@ pub(crate) fn settings_files_for(
                 )]
             }
         }
+        PluginOrigin::Muse => {
+            let home = lookup("AI_MEMORY_HOME")
+                .filter(|home| !home.trim().is_empty())
+                .map(PathBuf::from)
+                .or_else(super::path_util::home_dir);
+            let xdg = lookup("XDG_CONFIG_HOME").map(std::ffi::OsString::from);
+            super::install_mcp::muse_settings_path_in(xdg, home)
+                .map(|settings| vec![(settings, HooksFileShape::HooksKey)])
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -150,6 +174,10 @@ fn settings_event_name(origin: PluginOrigin, event: &str) -> Option<&'static str
             .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
             .map(|(name, _)| *name),
         PluginOrigin::Droid => DROID_EVENTS
+            .iter()
+            .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
+            .map(|(name, _)| *name),
+        PluginOrigin::Muse => MUSE_EVENTS
             .iter()
             .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
             .map(|(name, _)| *name),
@@ -211,6 +239,10 @@ mod tests {
         assert_eq!(
             PluginOrigin::from_env(lookup(&[(HOOK_ORIGIN_ENV, "droid-plugin")])),
             Some(PluginOrigin::Droid)
+        );
+        assert_eq!(
+            PluginOrigin::from_env(lookup(&[(HOOK_ORIGIN_ENV, "muse-plugin")])),
+            Some(PluginOrigin::Muse)
         );
         for other in ["", "claude-code", "cursor-plugin", "settings"] {
             assert_eq!(
@@ -400,6 +432,88 @@ mod tests {
         ));
         assert!(!drops_plugin_event(
             PluginOrigin::Droid,
+            "user-prompt-submit",
+            Some("/work/repo"),
+            &[]
+        ));
+    }
+
+    const MUSE_SETTINGS: &str = r#"{"schema_version":1,"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/ai-memory hook --event session-start --agent muse --server-url http://127.0.0.1:49374","timeout":30}]}],"Stop":[{"matcher":"write_file","hooks":[{"type":"command","command":"/usr/bin/ai-memory hook --event stop --agent muse --server-url http://127.0.0.1:49374"}]}]}}"#;
+
+    fn muse_drops(home: &Path, xdg: Option<&Path>, event: &str) -> bool {
+        let home = home.to_string_lossy().into_owned();
+        let xdg = xdg.map(|dir| dir.to_string_lossy().into_owned());
+        let mut pairs = vec![("AI_MEMORY_HOME", home.as_str())];
+        if let Some(xdg) = &xdg {
+            pairs.push(("XDG_CONFIG_HOME", xdg.as_str()));
+        }
+        let files = settings_files_for(PluginOrigin::Muse, Some("/work/repo"), lookup(&pairs));
+        drops_plugin_event(PluginOrigin::Muse, event, Some("/work/repo"), &files)
+    }
+
+    /// Adversarial: Muse running the Claude Code plugin next to an
+    /// `install-hooks --agent muse` install delivers each event twice unless
+    /// the plugin copy is dropped. Only a catch-all matcher counts: a hook
+    /// narrowed to one tool does not deliver every occurrence. Controls: no
+    /// Muse settings at all, and an event the settings do not wire, keep the
+    /// plugin copy. The plugin's subagent events are always dropped, as
+    /// `install-hooks --agent muse` never wires them.
+    #[test]
+    fn muse_plugin_copy_is_dropped_when_muse_settings_hooks_deliver_the_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let muse = temp.path().join(".config").join("muse");
+        std::fs::create_dir_all(&muse).unwrap();
+        assert!(
+            !muse_drops(temp.path(), None, "session-start"),
+            "nothing installed"
+        );
+
+        std::fs::write(muse.join("settings.json"), MUSE_SETTINGS).unwrap();
+        assert!(muse_drops(temp.path(), None, "session-start"));
+        assert!(
+            !muse_drops(temp.path(), None, "stop"),
+            "a Stop hook narrowed by a matcher does not deliver every event"
+        );
+        assert!(
+            !muse_drops(temp.path(), None, "user-prompt-submit"),
+            "an event settings.json does not wire stays with the plugin"
+        );
+        for event in ["subagent-start", "subagent-stop"] {
+            assert!(muse_drops(temp.path(), None, event), "{event}");
+        }
+        assert!(
+            !drops_plugin_event(
+                PluginOrigin::ClaudeCode,
+                "subagent-start",
+                Some("/work/repo"),
+                &[]
+            ),
+            "control: Claude Code keeps its subagent events"
+        );
+    }
+
+    /// When the hook can see `XDG_CONFIG_HOME`, the settings file under it is
+    /// the one checked, and the default location no longer counts.
+    #[test]
+    fn muse_settings_follow_a_visible_xdg_config_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let xdg = temp.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("muse")).unwrap();
+        std::fs::write(xdg.join("muse").join("settings.json"), MUSE_SETTINGS).unwrap();
+        assert!(muse_drops(temp.path(), Some(&xdg), "session-start"));
+        assert!(!muse_drops(temp.path(), None, "session-start"));
+    }
+
+    #[test]
+    fn muse_plugin_skips_folderless_sessions() {
+        assert!(drops_plugin_event(
+            PluginOrigin::Muse,
+            "user-prompt-submit",
+            None,
+            &[]
+        ));
+        assert!(!drops_plugin_event(
+            PluginOrigin::Muse,
             "user-prompt-submit",
             Some("/work/repo"),
             &[]

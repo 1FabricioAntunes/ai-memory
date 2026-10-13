@@ -401,7 +401,15 @@ our repository would install the Claude plugin and send events tagged
   `~/.factory/settings.json`). Cursor is not remapped: when Cursor runs Claude
   hooks the event already reaches the existing #721 path as `claude-code`
   with `cursor_version`, and whether Cursor runs *plugin* hooks at all is
-  one of the Cursor unknowns;
+  one of the Cursor unknowns. *Shipped:* Meta Muse Code sets
+  `CLAUDE_PLUGIN_ROOT` for the Claude plugins it loads, so it is told apart
+  by `MUSE_PLUGIN_ID` together with `MUSE_SESSION_ID` (both seen in a Muse
+  Code 1.4.7 plugin hook) → `muse`, with `AI_MEMORY_HOOK_ORIGIN=muse-plugin`,
+  the folderless skip, de-duplication against the `hooks` key of
+  `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, and the plugin's
+  subagent events dropped. Muse Code 1.4.7 refuses to install the published
+  plugin because its `.mcp.json` uses `${user_config.*}` placeholders, so this
+  path is exercised only with a copy that has no `.mcp.json`;
 - we ship a native catalog for each harness we support, so the fallback is
   never used.
 

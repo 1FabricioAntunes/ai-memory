@@ -227,6 +227,9 @@ mod launcher {
                 .env_remove("CLAUDE_PROJECT_DIR")
                 .env_remove("PLUGIN_ROOT")
                 .env_remove("DROID_PLUGIN_ROOT")
+                .env_remove("MUSE_PLUGIN_ID")
+                .env_remove("MUSE_SESSION_ID")
+                .env_remove("XDG_CONFIG_HOME")
                 .env("RUST_LOG", "off")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -554,6 +557,77 @@ mod launcher {
         assert_eq!(sb.spooled().len(), 2, "folderless Droid session");
     }
 
+    /// Front door 4 for Muse Code (adversarial): Muse loads the Claude Code
+    /// plugin with `CLAUDE_PLUGIN_ROOT` set and adds `MUSE_PLUGIN_ID` and
+    /// `MUSE_SESSION_ID`, and the launcher re-attributes it to `muse`. With
+    /// the `install-hooks --agent muse` hook for the same event under the
+    /// `hooks` key of `~/.config/muse/settings.json` the plugin copy is
+    /// dropped. Controls: no Muse hooks keeps it, and so does a Claude
+    /// settings hook, which Muse never runs; an unwired event stays with the
+    /// plugin. The plugin's subagent events and a folderless session are
+    /// never captured.
+    #[test]
+    fn a_muse_hook_for_the_same_event_drops_the_muse_plugin_copy() {
+        let sb = Sandbox::new();
+        let muse = [
+            ("MUSE_PLUGIN_ID", "ai-memory"),
+            ("MUSE_SESSION_ID", "01a13669-dc61-7a72-b5ec-ad2f300ffd26"),
+        ];
+
+        sb.settings_hook(
+            &sb.claude.join("settings.json"),
+            "UserPromptSubmit",
+            "user-prompt-submit",
+        );
+        sb.launch("user-prompt-submit", &sb.prompt(), &muse);
+        assert_eq!(sb.spooled().len(), 1, "control: no Muse hook");
+        assert!(
+            sb.spooled()[0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("agent=muse")
+        );
+
+        let settings = sb.home.join(".config").join("muse");
+        std::fs::create_dir_all(&settings).unwrap();
+        let command = format!(
+            "{BIN} hook --event user-prompt-submit --agent muse --server-url {}",
+            sb.server
+        );
+        std::fs::write(
+            settings.join("settings.json"),
+            json!({
+                "schema_version": 1,
+                "hooks": {"UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": command, "timeout": 30}]}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        sb.launch("user-prompt-submit", &sb.prompt(), &muse);
+        assert_eq!(
+            sb.spooled().len(),
+            1,
+            "Muse settings.json: plugin copy dropped"
+        );
+
+        sb.launch("post-tool-use", &sb.read_tool("README.md"), &muse);
+        assert_eq!(
+            sb.spooled().len(),
+            2,
+            "an unwired event stays with the plugin"
+        );
+
+        sb.launch("subagent-start", &sb.prompt(), &muse);
+        assert_eq!(sb.spooled().len(), 2, "Muse subagent events are dropped");
+
+        sb.launch(
+            "user-prompt-submit",
+            &json!({"session_id": "s", "prompt": "no cwd"}),
+            &muse,
+        );
+        assert_eq!(sb.spooled().len(), 2, "folderless Muse session");
+    }
+
     /// The committed hooks.json command still works when the launcher lost
     /// its exec bit (a desktop zip upload, a Windows checkout): Claude Code
     /// runs the command line through a shell, and it starts the launcher
@@ -591,6 +665,9 @@ mod launcher {
             .env_remove("CLAUDE_PROJECT_DIR")
             .env_remove("PLUGIN_ROOT")
             .env_remove("DROID_PLUGIN_ROOT")
+            .env_remove("MUSE_PLUGIN_ID")
+            .env_remove("MUSE_SESSION_ID")
+            .env_remove("XDG_CONFIG_HOME")
             .env("RUST_LOG", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -662,6 +739,14 @@ mod launcher {
             &sb.prompt(),
             &[("CLAUDE_PLUGIN_ROOT", ""), ("PLUGIN_ROOT", &root)],
         );
+        sb.launch(
+            "user-prompt-submit",
+            &sb.prompt(),
+            &[
+                ("MUSE_PLUGIN_ID", "ai-memory"),
+                ("MUSE_SESSION_ID", "01a13669-dc61-7a72-b5ec-ad2f300ffd26"),
+            ],
+        );
         let out = sb.launch(
             "user-prompt-submit",
             &sb.prompt(),
@@ -680,6 +765,6 @@ mod launcher {
             })
             .collect();
         agents.sort();
-        assert_eq!(agents, vec!["codex", "droid"]);
+        assert_eq!(agents, vec!["codex", "droid", "muse"]);
     }
 }

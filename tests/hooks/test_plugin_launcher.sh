@@ -176,6 +176,19 @@ rm -f "$TMP/home/.local/bin/ai-memory"
 printf '{}' | run_launcher DROID_PLUGIN_ROOT="$TMP" CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
     CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$STUB_DIR/ai-memory" sh "$LAUNCHER" claude-code stop >/dev/null
 assert_eq "Droid is attributed to droid" "droid" "$(sed -n 5p "$TMP/argv")"
+# Muse Code loads the Claude plugin with CLAUDE_PLUGIN_ROOT set and adds
+# MUSE_PLUGIN_ID beside the MUSE_SESSION_ID every Muse hook gets.
+printf '{}' | run_launcher MUSE_PLUGIN_ID="ai-memory" MUSE_SESSION_ID="01a13669-dc61-7a72-b5ec-ad2f300ffd26" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
+    CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$STUB_DIR/ai-memory" sh "$LAUNCHER" claude-code stop >/dev/null
+assert_eq "Muse is attributed to muse" "muse" "$(sed -n 5p "$TMP/argv")"
+assert_eq "the Muse copy marks its origin" "muse-plugin" "$(cat "$TMP/origin")"
+# A Claude Code started from a Muse shell may inherit MUSE_SESSION_ID; without
+# MUSE_PLUGIN_ID its events stay Claude Code's.
+printf '{}' | run_launcher MUSE_SESSION_ID="01a13669-dc61-7a72-b5ec-ad2f300ffd26" \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
+    CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$STUB_DIR/ai-memory" sh "$LAUNCHER" claude-code stop >/dev/null
+assert_eq "an inherited MUSE_SESSION_ID alone stays claude-code" "claude-code" "$(sed -n 5p "$TMP/argv")"
 printf '{}' | run_launcher PLUGIN_ROOT="$TMP" \
     CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$STUB_DIR/ai-memory" sh "$LAUNCHER" claude-code stop >/dev/null
 assert_eq "Codex reading the Claude plugin is attributed to codex" "codex" "$(sed -n 5p "$TMP/argv")"
