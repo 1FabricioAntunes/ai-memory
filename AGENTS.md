@@ -301,8 +301,14 @@ covers the same tests, slower, no tiers.
 
 - **All.** `target/` grows without bound: every edit to a shared crate leaves
   the previous copy of each 100-180 MB test binary behind (seen at 157 GiB).
-  `cargo install cargo-sweep --locked` once, then `cargo sweep --time 7`
-  weekly. Give rust-analyzer its own target dir
+  Run `cargo clean` in the checkout you build in when it grows (weekly is
+  plenty; the next build takes a few minutes). For stale worktrees and extra
+  `CARGO_TARGET_DIR`s, `cargo install cargo-clean-all --locked` once, then
+  `cargo clean-all --keep-days 7 <dir>` lists every target directory under
+  `<dir>` not built in the last week and deletes them after you confirm. It
+  removes whole target directories, so it never trims the one you are
+  actively building. (`cargo-sweep`, which this note used to recommend, is
+  unmaintained.) Give rust-analyzer its own target dir
   (`rust-analyzer.cargo.targetDir = true`) so a save-triggered check never
   holds the lock a `cargo t` is waiting on.
 - **macOS.** `SSL_CERT_FILE=/etc/ssl/cert.pem cargo t` stops reqwest
@@ -643,7 +649,8 @@ Additional boundary rules:
   `cargo clean` (and `cargo clean` in each release worktree / extra target dir
   you created, then remove finished `git worktree`s). This is a mandatory
   post-release cleanup step, not optional housekeeping — treat it like the tap
-  bump above. During normal development, `cargo sweep --time 7` weekly is the
+  bump above. During normal development, the weekly `cargo clean` and
+  `cargo clean-all --keep-days 7` described under Platform notes are the
   lighter-touch equivalent.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.
