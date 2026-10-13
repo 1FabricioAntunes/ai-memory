@@ -70,7 +70,10 @@ const RECOVERY_DIR: &str = ".recovery";
 const RECOVERY_MATCH_FILE: &str = ".active";
 const RECOVERY_COMPLETED_FILE: &str = ".completed";
 const SPOOL_CAPACITY_LOCK_FILE: &str = ".capacity.lock";
-const SPOOL_COORD_LOCK_WAIT: Duration = Duration::from_millis(5);
+/// How long an enqueue waits for another enqueuer's capacity check. Bounded
+/// well inside the hook's ~200 ms budget; past it the event is spooled anyway
+/// (the cap is a soft bound), never discarded.
+const SPOOL_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(50);
 const MAX_SPOOL_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 const RECOVERY_TOMBSTONE_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_TOMBSTONES: usize = 512;
@@ -291,6 +294,10 @@ pub fn enqueue_with_config(
     let final_path = spool.join(&name);
     let bytes = serde_json::to_vec(entry)?;
     write_private(&tmp, &bytes)?;
+    // The capacity lock only serializes concurrent count-then-rename checks
+    // so a burst cannot overshoot the cap. If another enqueuer holds it past
+    // the wait, count without it: the worst case is a few entries over a soft
+    // cap, where giving up here silently lost a captured event.
     let capacity_lock = open_spool_capacity_lock(spool)?;
     let started = Instant::now();
     loop {
@@ -298,14 +305,11 @@ pub fn enqueue_with_config(
             Ok(()) => break,
             Err(error)
                 if is_drain_lock_busy_error(&error)
-                    && started.elapsed() < SPOOL_COORD_LOCK_WAIT =>
+                    && started.elapsed() < SPOOL_CAPACITY_LOCK_WAIT =>
             {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Err(error) if is_drain_lock_busy_error(&error) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Ok(());
-            }
+            Err(error) if is_drain_lock_busy_error(&error) => break,
             Err(error) => return Err(error),
         }
     }
@@ -2617,6 +2621,42 @@ mod tests {
         enqueue(&spool, &entry).unwrap();
         assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(spool_len(&spool), 1, "content is retained for recovery");
+    }
+
+    #[test]
+    fn enqueue_keeps_the_event_when_the_capacity_lock_stays_held() {
+        // Another enqueuer stuck holding the capacity lock past the wait used
+        // to make this one delete its temp file and return Ok: a silent loss.
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let lock = open_spool_capacity_lock(&spool).unwrap();
+        lock.lock_exclusive().unwrap();
+        let entry = entry_for(
+            "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code".into(),
+            r#"{"session_id":"native-1","prompt":"contended"}"#.into(),
+            None,
+            false,
+        );
+        let started = Instant::now();
+        enqueue(&spool, &entry).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= SPOOL_CAPACITY_LOCK_WAIT,
+            "waits for the holder first"
+        );
+        // Generous for loaded CI and Windows sleep granularity; the point is
+        // that the wait is bounded, not an exact figure.
+        assert!(elapsed < Duration::from_secs(1), "the wait is bounded");
+        assert_eq!(spool_len(&spool), 1, "the contended event is spooled");
+
+        // A holder that lets go inside the wait is simply waited out.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(lock);
+        });
+        enqueue(&spool, &entry).unwrap();
+        releaser.join().unwrap();
+        assert_eq!(spool_len(&spool), 2);
     }
 
     #[test]
