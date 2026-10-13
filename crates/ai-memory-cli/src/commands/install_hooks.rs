@@ -55,7 +55,7 @@ pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
 /// The env value comes in as a parameter so tests can exercise both
 /// branches without mutating process env (mirrors
 /// `install_mcp::kimi_code_home`).
-fn claude_settings_path_in(
+pub(crate) fn claude_settings_path_in(
     env_override: Option<std::ffi::OsString>,
 ) -> anyhow::Result<std::path::PathBuf> {
     if let Some(dir) = crate::commands::path_util::claude_config_dir(env_override) {
@@ -179,6 +179,37 @@ pub(crate) fn settings_file_carries_ai_memory_hooks(path: &Path) -> bool {
     fs::read_to_string(path)
         .ok()
         .is_some_and(|content| settings_carry_ai_memory_hooks(&content))
+}
+
+/// Read bound for [`settings_file_carries_ai_memory_hook_for_event`]: it runs on the hook hot path, so a runaway
+/// settings file costs at most this much.
+const MAX_PLUGIN_DEDUP_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Whether the Claude-shaped settings file at `path` registers an ai-memory
+/// hook for `event` (`SessionStart`, ...). The Claude Code plugin's copy of
+/// an event is dropped only when a settings hook delivers that same event, so
+/// an older install that wires fewer events still gets the rest from the
+/// plugin. A missing, unreadable or malformed file registers nothing.
+pub(crate) fn settings_file_carries_ai_memory_hook_for_event(path: &Path, event: &str) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut raw = String::new();
+    if file
+        .take(MAX_PLUGIN_DEDUP_SETTINGS_BYTES)
+        .read_to_string(&mut raw)
+        .is_err()
+    {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .as_ref()
+        .and_then(ai_memory_claude_hooks)
+        .and_then(|hooks| hooks.get(event))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry))
 }
 
 /// Re-copy the Claude Code hook scripts into the stable staging dir the

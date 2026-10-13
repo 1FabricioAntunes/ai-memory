@@ -26,6 +26,7 @@ pub(crate) fn is_scope_ambiguous(error: &anyhow::Error) -> bool {
         })
 }
 
+pub(crate) mod agent_plugins;
 pub(crate) mod agentmemory_residue;
 pub mod api_key;
 pub mod apply_shared;
@@ -75,6 +76,7 @@ pub mod openclaw_plugin;
 pub mod opencode_dialect;
 pub mod path_util;
 pub mod pending_writes;
+pub(crate) mod plugin_origin;
 pub mod profile;
 pub mod project;
 pub mod project_init;
@@ -88,6 +90,7 @@ pub mod recovery;
 pub mod reindex;
 pub mod rename_project;
 pub mod rename_workstream;
+pub mod render_plugins;
 pub mod render_shared;
 pub mod reorg;
 pub mod repair_backfill_timestamps;

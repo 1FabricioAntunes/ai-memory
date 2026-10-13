@@ -148,6 +148,14 @@ fn install_crypto_provider() -> Result<()> {
     Ok(())
 }
 
+/// The base URL the bridge connects to. An empty `--server-url` counts as
+/// not given: the Claude Code plugin passes its unset `server_url` option
+/// through as "", and the install's configured server then applies.
+fn bridge_base_url<'a>(flag: Option<&'a str>, configured: &'a str) -> &'a str {
+    flag.filter(|url| !url.trim().is_empty())
+        .unwrap_or(configured)
+}
+
 /// Run the stdio bridge, session-aware or session-less (see the module docs).
 ///
 /// # Errors
@@ -160,11 +168,10 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         config.runtime_env.claude_code_session_id(),
         args.no_session_id,
     )?;
-    let server_url = args
-        .server_url
-        .as_deref()
-        .map(mcp_server_url_from_base)
-        .unwrap_or_else(|| mcp_server_url_from_base(&config.server_url));
+    let server_url = mcp_server_url_from_base(bridge_base_url(
+        args.server_url.as_deref(),
+        &config.server_url,
+    ));
     let transport = StreamableHttpClientTransport::from_config(upstream_config(
         &server_url,
         session_id,
@@ -224,6 +231,19 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The plugin's `.mcp.json` passes an unset option as "": that must reach
+    /// the configured server, while a real flag value still wins.
+    #[test]
+    fn empty_server_url_flag_falls_back_to_the_configured_server() {
+        let configured = "https://memory.example";
+        assert_eq!(super::bridge_base_url(None, configured), configured);
+        assert_eq!(super::bridge_base_url(Some(""), configured), configured);
+        assert_eq!(super::bridge_base_url(Some("  "), configured), configured);
+        assert_eq!(
+            super::bridge_base_url(Some("http://127.0.0.1:5"), configured),
+            "http://127.0.0.1:5"
+        );
+    }
 
     /// Building the transport must never depend on a caller having installed
     /// a provider first. reqwest 0.13 under `rustls-no-provider` **panics**

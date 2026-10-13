@@ -215,6 +215,17 @@ variables and how to verify the script before running it are in
 An AI agent installing ai-memory for you can follow
 [`INSTALL_FOR_AGENTS.md`](INSTALL_FOR_AGENTS.md).
 
+Claude Code and Codex users can wire their agent as a marketplace plugin
+instead (the binary is still installed as above):
+
+```bash
+claude plugin marketplace add akitaonrails/ai-memory && claude plugin install ai-memory@ai-memory
+codex plugin marketplace add akitaonrails/ai-memory && codex plugin add ai-memory@ai-memory
+```
+
+Codex then asks you to trust the hooks in `/hooks`. See
+[Marketplace plugins](docs/install.md#marketplace-plugins).
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install
