@@ -4,8 +4,10 @@
 # the operator's own terminal, not a credential.
 #
 # `display_session_id` is the one helper that renders a session id for
-# terminal output (the CLI's, and the importer's copy, since the importer is
-# a separate workspace that cannot call the CLI); declaring its return value
+# terminal output (the CLI's, and the companions' copy in the
+# `ai-memory-client` library crate, since the companions are a separate
+# workspace that cannot call the CLI; a model path in a binary-only crate does
+# not resolve); declaring its return value
 # a log barrier clears those alerts while a real secret (an `api_key`, a
 # token) logged anywhere else is still reported. Route any new session-id
 # output through it rather than adding more rows here.
@@ -23,4 +25,4 @@ extensions:
     data:
       - ["ai_memory_cli::commands::run::display_session_id", "ReturnValue", "log-injection", "manual"]
       - ["ai_memory_cli::commands::user::display_username", "ReturnValue", "log-injection", "manual"]
-      - ["ai_memory_importer::agentmemory::display_session_id", "ReturnValue", "log-injection", "manual"]
+      - ["ai_memory_client::display_session_id", "ReturnValue", "log-injection", "manual"]

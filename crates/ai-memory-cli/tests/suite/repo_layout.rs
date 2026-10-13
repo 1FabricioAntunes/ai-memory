@@ -115,6 +115,10 @@ fn codeql_model_targets_exist() {
             "ai_memory_importer",
             repo_root.join("companions/ai-memory-importer/src"),
         ),
+        (
+            "ai_memory_client",
+            repo_root.join("companions/ai-memory-client/src"),
+        ),
     ];
     let models_dir = repo_root.join(".github/codeql/extensions/ai-memory-models/models");
     let mut targets = 0;
@@ -136,8 +140,14 @@ fn codeql_model_targets_exist() {
             segments.remove(0);
             let function = segments.pop().expect("a path names a function");
             let module = segments.join("/");
-            // A module is either `name.rs` or `name/mod.rs`.
-            let source = [format!("{module}.rs"), format!("{module}/mod.rs")]
+            // A crate-root function lives in `lib.rs`; a module is either
+            // `name.rs` or `name/mod.rs`.
+            let candidates = if module.is_empty() {
+                vec!["lib.rs".to_string()]
+            } else {
+                vec![format!("{module}.rs"), format!("{module}/mod.rs")]
+            };
+            let source = candidates
                 .iter()
                 .find_map(|file| fs::read_to_string(src.join(file)).ok())
                 .unwrap_or_default();

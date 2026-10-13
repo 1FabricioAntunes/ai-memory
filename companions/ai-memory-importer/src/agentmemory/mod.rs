@@ -140,20 +140,7 @@ pub(crate) fn validate_id(id: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render an agentmemory session id for terminal output, bounded so a long
-/// id cannot flood the report. CodeQL's sensitive-data heuristic reads any
-/// `session_id` name as account information; this is the one function its
-/// `rust/cleartext-logging` barrier model names
-/// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`),
-/// so print every session id through it.
-pub(crate) fn display_session_id(value: &str) -> String {
-    const MAX_CHARS: usize = 64;
-    let mut output = value.chars().take(MAX_CHARS).collect::<String>();
-    if value.chars().count() > MAX_CHARS {
-        output.push_str("...");
-    }
-    output
-}
+pub(crate) use ai_memory_client::display_session_id;
 
 /// ai-memory `kind` and `tier` for an agentmemory memory `type`.
 pub(crate) fn memory_kind_tier(memory_type: &str) -> (&'static str, &'static str) {
