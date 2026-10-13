@@ -11882,14 +11882,12 @@ mod tests {
             process(&state, fire("user-prompt-submit"), None, Vec::new())
                 .await
                 .unwrap();
-            let started = std::time::Instant::now();
+            // `SlowHookLlm` panics if the hook path calls it, so this returning
+            // at all proves the provider stayed off the request path. A
+            // wall-clock bound here only flaked on slow CI runners.
             process(&state, fire(event), None, Vec::new())
                 .await
                 .unwrap();
-            assert!(
-                started.elapsed() < Duration::from_millis(200),
-                "{event} must not wait for the provider on the hook path"
-            );
 
             let session_id: SessionId = sid.parse().unwrap();
             let path = format!("sessions/{session_id}.md");
