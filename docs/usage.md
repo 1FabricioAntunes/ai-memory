@@ -575,8 +575,9 @@ With no bearer token configured on loopback (an install from before 3.0 that
 never ran `ai-memory auth enable`), the built-in wiki remains anonymous. A
 fresh install has a bearer token and no human accounts, so a browser gets a
 Basic sign-in prompt: any username, and the contents of
-`<data_dir>/auth-tokens/default` as the password. That GET-only browser path
-then keeps an HttpOnly `ai_memory_auth` cookie, and it stops immediately after
+`<data_dir>/auth-tokens/default` as the password. The browser resends those
+credentials itself, so no cookie holds the token. That GET-only browser path
+stops immediately after
 a human password or completed bootstrap exists. For human-authenticated
 administration, create the first root account ([first-time
 root](install.md#first-time-root-greenfield)) and serve the compiled admin SPA

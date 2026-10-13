@@ -695,7 +695,7 @@ browser compatibility path:
 | Web session | `ai_memory_session` cookie + CSRF | `/auth/me`, `/admin/*`, `/api/v1/*` by `AuthLevel`; never `/mcp` or hooks |
 | Recovery | `POST /auth/recovery` body | Root password reset; no session |
 | API key | `Authorization: Bearer` (`aim_`, the root bearer from `AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token` or `[auth].bearer_token_file`, or external `amk_`) | Machine APIs; never a web session |
-| Browser token sign-in (no human accounts yet) | HTTP Basic with the root bearer as the password, then HttpOnly `ai_memory_auth` cookie | GET-only browser routes until any human password or completed bootstrap exists; never machine routes. A fresh install has no human accounts, so this is how a browser reaches `/web` there: the 401 carries a Basic challenge, which the HTML login redirect lets through |
+| Browser token sign-in (no human accounts yet) | HTTP Basic with the root bearer as the password, resent by the browser on each request (no cookie is set; an `ai_memory_auth` cookie an older build set is still accepted) | GET-only browser routes until any human password or completed bootstrap exists; never machine routes. A fresh install has no human accounts, so this is how a browser reaches `/web` there: the 401 carries a Basic challenge, which the HTML login redirect lets through |
 
 The deprecated Basic/cookie path stops immediately when human auth becomes
 active; restart is not required. `/web` SPA HTML is public static; the builtin

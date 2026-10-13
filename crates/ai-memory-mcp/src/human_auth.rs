@@ -391,14 +391,8 @@ fn legacy_basic_password(headers: &HeaderMap) -> Option<String> {
     Some(password.to_string())
 }
 
-fn legacy_browser_credential(headers: &HeaderMap) -> Option<(String, bool)> {
-    legacy_basic_password(headers)
-        .map(|token| (token, true))
-        .or_else(|| cookie_value(headers, LEGACY_AUTH_COOKIE).map(|token| (token, false)))
-}
-
-fn legacy_cookie(token: &str, secure: bool) -> String {
-    set_cookie(LEGACY_AUTH_COOKIE, token, true, 2_592_000, secure)
+fn legacy_browser_credential(headers: &HeaderMap) -> Option<String> {
+    legacy_basic_password(headers).or_else(|| cookie_value(headers, LEGACY_AUTH_COOKIE))
 }
 
 fn unauthorized_legacy_browser() -> Response {
@@ -1083,21 +1077,18 @@ pub async fn require_dual_auth(
         if req.method() != Method::GET {
             return crate::auth::unauthorized_bearer();
         }
-        let had_legacy_cookie = cookie_value(req.headers(), LEGACY_AUTH_COOKIE).is_some();
-        let Some((provided, from_basic)) = legacy_browser_credential(req.headers()) else {
+        // A Basic sign-in mints no cookie: the browser resends the cached
+        // Basic credentials on every same-origin request by itself, and a
+        // persistent cookie would park the raw root bearer on disk for 30
+        // days, sent over plain HTTP off loopback. A cookie an older build
+        // set is still accepted until human auth retires it.
+        let Some(provided) = legacy_browser_credential(req.headers()) else {
             return unauthorized_legacy_browser();
         };
         match crate::auth::authenticate_token(&state, &mut req, &provided, false).await {
             Ok(crate::auth::BearerAuth::Authenticated) => {
                 req.extensions_mut().insert(state.clone());
-                let mut response = next.run(req).await;
-                if from_basic
-                    && !had_legacy_cookie
-                    && let Ok(cookie) = legacy_cookie(&provided, state.secure_cookie()).parse()
-                {
-                    response.headers_mut().append(header::SET_COOKIE, cookie);
-                }
-                return response;
+                return next.run(req).await;
             }
             Err(response) => return response,
             Ok(crate::auth::BearerAuth::Absent | crate::auth::BearerAuth::Rejected) => {
@@ -1564,6 +1555,54 @@ mod tests {
         (tmp, state, writer)
     }
 
+    /// A fresh bearer-only server signs a browser in through Basic. That
+    /// sign-in must not park the root bearer in a cookie: none was needed
+    /// (the browser resends Basic itself), and the old 30-day cookie held the
+    /// raw token, `Secure` only when `secure_cookie` was on. Control: the
+    /// Basic GET is still served, and the bearer still authenticates.
+    #[tokio::test]
+    async fn a_basic_sign_in_mints_no_cookie_holding_the_root_bearer() {
+        let (_tmp, state, _writer) = legacy_transition_fixture().await;
+        let router = dual_router(state);
+
+        let basic = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", legacy_basic("legacy-root-token"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(basic.status(), StatusCode::OK, "Basic sign-in is served");
+        for value in basic.headers().get_all(header::SET_COOKIE) {
+            let value = value.to_str().unwrap();
+            assert!(
+                !value.contains("legacy-root-token"),
+                "no cookie may carry the root bearer: {value}"
+            );
+        }
+        assert!(set_cookie_value(basic.headers(), LEGACY_AUTH_COOKIE).is_none());
+
+        let bearer = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", "Bearer legacy-root-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bearer.status(),
+            StatusCode::OK,
+            "the bearer API still works"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_browser_credentials_stop_when_human_bootstrap_completes() {
         let (_tmp, state, writer) = legacy_transition_fixture().await;
@@ -1581,8 +1620,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(basic.status(), StatusCode::OK);
-        let legacy_cookie = set_cookie_value(basic.headers(), LEGACY_AUTH_COOKIE)
-            .expect("successful Basic auth must persist the legacy browser cookie");
+        // A cookie an older build minted still works until bootstrap.
+        let legacy_cookie = "legacy-root-token";
 
         let cookie = router
             .clone()

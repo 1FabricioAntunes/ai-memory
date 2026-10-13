@@ -600,8 +600,9 @@ If you're upgrading a machine-bearer-only install:
   token that was expired before the upgrade stays refused. Add people with
   `user add-human` and machine credentials with `api-key add`.
 - Before any human password or completed bootstrap exists, GET-only browser
-  routes continue to accept the root bearer through HTTP Basic and the
-  HttpOnly `ai_memory_auth` cookie. Human activation disables that path
+  routes continue to accept the root bearer through HTTP Basic, and an
+  HttpOnly `ai_memory_auth` cookie an older build set (a Basic sign-in no
+  longer sets one). Human activation disables that path
   immediately, without a restart. Machine routes remain Bearer-only.
 - Native API credentials require `[auth].token_pepper`. Human user creation,
   password reset, disable/enable, and session login do not create or depend
