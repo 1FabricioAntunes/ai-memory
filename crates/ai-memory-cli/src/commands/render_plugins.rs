@@ -181,7 +181,8 @@ fn claude_code_plugin(version: &str) -> Vec<PluginFile> {
             ),
             "ai_memory_bin": option(
                 "ai-memory executable",
-                "Path to the ai-memory binary, only needed when it is not on PATH.",
+                "Absolute path to the ai-memory binary, only needed when it is not on PATH. A \
+                 relative path is ignored.",
                 "ai-memory",
             ),
             "data_dir": option(

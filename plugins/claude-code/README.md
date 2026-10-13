@@ -68,7 +68,7 @@ with `/plugin configure ai-memory@ai-memory`.
 | Option | Default | Use |
 | --- | --- | --- |
 | `server_url` | empty | Empty uses the `server_url` from your ai-memory config. Set it only to point this plugin elsewhere. |
-| `ai_memory_bin` | `ai-memory` | Path to the binary when it is not on `PATH`. |
+| `ai_memory_bin` | `ai-memory` | Absolute path to the binary when it is not on `PATH`. A relative path is ignored: it would resolve inside the checkout. |
 | `data_dir` | empty | Only for an install with a non-default data directory. |
 
 There is no token option. Hooks and the MCP bridge use the credentials the

@@ -27,7 +27,7 @@
     "ai_memory_bin": {
       "type": "string",
       "title": "ai-memory executable",
-      "description": "Path to the ai-memory binary, only needed when it is not on PATH.",
+      "description": "Absolute path to the ai-memory binary, only needed when it is not on PATH. A relative path is ignored.",
       "default": "ai-memory"
     },
     "data_dir": {

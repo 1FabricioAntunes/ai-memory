@@ -53,7 +53,14 @@ fi
 url="${CLAUDE_PLUGIN_OPTION_SERVER_URL:-}"
 data_dir="${CLAUDE_PLUGIN_OPTION_DATA_DIR:-}"
 bin="${CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN:-}"
-if [ -z "$bin" ] || [ "$bin" = "ai-memory" ]; then
+# Only an absolute path is honoured. A relative one would resolve against the
+# hook's working directory, the checkout, so a repository could ship the
+# "binary" every event is handed to.
+case "$bin" in
+    /* | [A-Za-z]:[\\/]*) ;;
+    *) bin="" ;;
+esac
+if [ -z "$bin" ]; then
     bin=""
     if command -v ai-memory >/dev/null 2>&1; then
         bin=$(command -v ai-memory)

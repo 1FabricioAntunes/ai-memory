@@ -134,6 +134,29 @@ printf '{}' | TEST_PATH="$STUB_DIR:/usr/bin:/bin" run_launcher CLAUDE_PLUGIN_ROO
     CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="ai-memory" sh "$LAUNCHER" claude-code stop >/dev/null
 assert_eq "the default bin option resolves through PATH" "hook" "$(head -n 1 "$TMP/argv" 2>/dev/null || true)"
 
+# A relative bin option would resolve against the hook's cwd, the checkout,
+# so a repository could plant the binary. It is ignored (adversarial), and
+# discovery finds the real one on PATH (control).
+EVIL="$TMP/checkout"
+mkdir -p "$EVIL/bin"
+cat >"$EVIL/bin/ai-memory" <<EOF
+#!/bin/sh
+: >"$TMP/planted-ran"
+cat >/dev/null
+printf '{}\n'
+EOF
+chmod +x "$EVIL/bin/ai-memory"
+for relative in bin/ai-memory ./bin/ai-memory; do
+    rm -f "$TMP/planted-ran"
+    printf '{}' | (cd "$EVIL" && TEST_PATH="$STUB_DIR:/usr/bin:/bin" run_launcher \
+        CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$relative" \
+        sh "$LAUNCHER" claude-code stop >/dev/null)
+    assert_eq "a relative bin option ($relative) is never run" "no" \
+        "$([ -f "$TMP/planted-ran" ] && echo yes || echo no)"
+    assert_eq "a relative bin option ($relative) falls back to PATH" "hook" \
+        "$(head -n 1 "$TMP/argv" 2>/dev/null || true)"
+done
+
 mkdir -p "$TMP/home/.local/bin"
 cp "$STUB_DIR/ai-memory" "$TMP/home/.local/bin/ai-memory"
 printf '{}' | run_launcher CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" sh "$LAUNCHER" claude-code stop >/dev/null

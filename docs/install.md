@@ -211,7 +211,7 @@ configure ai-memory@ai-memory`:
 | Option | Default | Use |
 | --- | --- | --- |
 | `server_url` | empty | Empty uses the `server_url` from your ai-memory config, so the plugin and the CLI never disagree (the launcher omits `--server-url`). Set it only to point this plugin elsewhere. |
-| `ai_memory_bin` | `ai-memory` | Path to the binary when it is not on the `PATH` the app sees. The launcher also tries `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`. |
+| `ai_memory_bin` | `ai-memory` | Absolute path to the binary when it is not on the `PATH` the app sees; a relative path is ignored, since it would resolve inside the checkout. The launcher also tries `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`. |
 | `data_dir` | empty | Only for an install with a non-default data directory. |
 
 - Claude Code does not auto-update a third-party marketplace
