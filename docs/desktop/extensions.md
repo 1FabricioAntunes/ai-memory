@@ -2,7 +2,9 @@
 
 > Can an ai-memory extension in each app's marketplace do what an installer
 > cannot? Sourced from current official docs and, for Codex, its source.
-> The resulting design proposal is RFC #1166.
+> The resulting design proposal is RFC #1166; the implementation design,
+> re-verified on 2026-10-13, is
+> [`design-marketplace-plugins.md`](../design-marketplace-plugins.md).
 
 ## Claude (one plugin format, three surfaces)
 

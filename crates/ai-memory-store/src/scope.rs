@@ -1596,16 +1596,18 @@ mod tests {
         assert_eq!(written.scope.project_id, secret);
     }
 
-    async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {
+    async fn user_named(store: &Store, username: &str) -> UserId {
         store
             .writer
-            .create_user(
+            .create_human_user(
                 NewUser {
                     username: username.to_owned(),
                     name: None,
                     email: None,
                 },
-                [byte; crate::TOKEN_HASH_LEN],
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
             .await
             .unwrap()
@@ -1630,8 +1632,8 @@ mod tests {
             .get_or_create_project(ws, "client-work", None)
             .await
             .unwrap();
-        let alice = user_named(store, "alice", 1).await;
-        let bob = user_named(store, "bob", 2).await;
+        let alice = user_named(store, "alice").await;
+        let bob = user_named(store, "bob").await;
         (ws, project, alice, bob)
     }
 

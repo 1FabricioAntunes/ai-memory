@@ -180,6 +180,12 @@ the fast native hook path **without** installing a Rust toolchain or
 Docker. Each tagged release publishes
 `ai-memory-windows-x86_64.zip` (see the repo's Releases page).
 
+`install.sh` does not cover native Windows. `ai-memory setup` runs here, but it
+has no service step on Windows: it initialises the data dir and wires your
+agents, and says so when it skips the service. Start the server yourself, or
+register it with Scenario E. Inside WSL2 the Linux `install.sh` and `setup`
+path works unchanged.
+
 ```powershell
 # First-time install: download + extract into your user data dir (any stable
 # path works; the native hook exec-form command is rendered from wherever

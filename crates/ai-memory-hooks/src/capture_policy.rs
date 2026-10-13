@@ -154,13 +154,14 @@ impl ToolOutcome {
     }
 }
 
-/// Extracts only the closed, fixture-backed metadata schemas used for tool
-/// observations. It intentionally does not reuse broad envelope fallbacks.
-pub(crate) fn tool_observation_metadata(
-    agent: AgentKind,
-    raw: &Value,
-    require_input: bool,
-) -> Option<ToolObservationMetadata> {
+/// The raw tool name and tool-call id of a tool payload, per agent.
+///
+/// Both the tool observation metadata and the server-side drop list (#1241)
+/// read these fields, so they share one mapping: an agent added here is
+/// filterable by the drop list without a second field table to keep in step.
+/// `None` when the agent has no closed tool-payload shape or the payload lacks
+/// the name; the id is independently optional.
+pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str, Option<&str>)> {
     let object = raw.as_object()?;
     let (name, id) = match agent {
         // ZCode tool payloads carry Claude Code's snake_case aliases
@@ -178,6 +179,8 @@ pub(crate) fn tool_observation_metadata(
         // if absent.
         // Cursor's own hooks and its copies of the Claude Code hooks carry
         // `tool_name`/`tool_input`/`tool_use_id` (captured live, Cursor 3.24.9).
+        // Meta Muse Code sends the same three fields, `tool_use_id` being the
+        // provider's call id (`call_…`, captured offline on Muse Code 1.4.7).
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
@@ -185,7 +188,8 @@ pub(crate) fn tool_observation_metadata(
         | AgentKind::Grok
         | AgentKind::Grizzybot
         | AgentKind::Zcode
-        | AgentKind::CopilotCli => (
+        | AgentKind::CopilotCli
+        | AgentKind::Muse => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -216,8 +220,25 @@ pub(crate) fn tool_observation_metadata(
         // no tool-call id is documented. Unknown payload shapes fail safe to
         // metadata-only under an active policy.
         AgentKind::Pool => (object.get("tool_name")?.as_str()?, None),
+        // Factory Droid sends Claude Code's `tool_name` + `tool_input` but no
+        // tool-call id at all: Droid tracks its call ids internally and none
+        // reaches a hook payload (verified against the 0.240.0 tool schemas,
+        // #1240).
+        AgentKind::Droid => (object.get("tool_name")?.as_str()?, None),
         _ => return None,
     };
+    Some((name, id))
+}
+
+/// Extracts only the closed, fixture-backed metadata schemas used for tool
+/// observations. It intentionally does not reuse broad envelope fallbacks.
+pub(crate) fn tool_observation_metadata(
+    agent: AgentKind,
+    raw: &Value,
+    require_input: bool,
+) -> Option<ToolObservationMetadata> {
+    let (name, id) = tool_payload_fields(agent, raw)?;
+    let object = raw.as_object()?;
     // PreToolUse needs a proven input shape. PostToolUse deliberately does
     // not: established adapters commonly omit inputs from their response.
     let has_args = !require_input
@@ -238,6 +259,8 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Zcode
                             | AgentKind::CopilotCli
                             | AgentKind::Grizzybot
+                            | AgentKind::Droid
+                            | AgentKind::Muse
                     ) {
                         "tool_input"
                     } else {
@@ -282,7 +305,10 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // (live-captured, #512). `exitCode` is deliberately not mapped to
         // Success: the same `tool_response` object carries `timedOut` /
         // `interrupted`, so exit code alone does not prove success.
-        AgentKind::Zcode
+        // Meta Muse Code's `PostToolUseFailure` has the same `error` string
+        // (captured offline on Muse Code 1.4.7); its `PostToolUse` proves no
+        // outcome.
+        AgentKind::Zcode | AgentKind::Muse
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -1073,7 +1099,11 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Zcode
         // GitHub Copilot CLI, PascalCase-configured for the Claude-compatible
         // payload shape (#1040).
-        | AgentKind::CopilotCli => object
+        | AgentKind::CopilotCli
+        // Factory Droid's hooks send the same Claude Code shape (#1240).
+        | AgentKind::Droid
+        // Meta Muse Code too, with its own tool names (Muse Code 1.4.7).
+        | AgentKind::Muse => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -1088,19 +1118,36 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     };
     let family = agent_family(agent, name);
     let paths = (family == ToolFamily::File)
-        .then(|| args.and_then(|value| extract_paths(name, value)))
+        .then(|| {
+            args.and_then(|value| {
+                if agent == AgentKind::Muse
+                    && MUSE_MEMORY_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str())
+                {
+                    muse_memory_paths(value)
+                } else {
+                    extract_paths(name, value)
+                }
+            })
+        })
         .flatten();
     let command = (family == ToolFamily::NonFile)
         .then(|| args.and_then(shell_command))
         .flatten();
     let search_paths = (family == ToolFamily::SearchList)
-        .then(|| args.and_then(|value| direct_paths(value.as_object()?)))
+        .then(|| args.and_then(|value| search_direct_paths(agent, value.as_object()?)))
         .flatten();
     let search_scope = (family == ToolFamily::SearchList)
-        .then(|| search_scope(name, args))
+        .then(|| search_scope(agent, name, args))
         .flatten();
+    // Droid's `ApplyPatch` takes the same envelope in `input` as Codex's
+    // `apply_patch`.
+    let patch_name = if agent == AgentKind::Droid && name.eq_ignore_ascii_case("applypatch") {
+        "apply_patch"
+    } else {
+        name
+    };
     let patch_paths = (family == ToolFamily::File && paths.is_none())
-        .then(|| args.and_then(|value| patch_paths(name, value)))
+        .then(|| args.and_then(|value| patch_paths(patch_name, value)))
         .flatten();
     // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
     // when given, Gemini CLI `run_shell_command` in `dir_path` (`directory`
@@ -1152,7 +1199,10 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         search_scope,
         patch_paths,
         globs: name.eq_ignore_ascii_case("read_many_files"),
-        output_reader: reads_earlier_output(name),
+        // Muse's `bash_input` writes to a shell an earlier `bash` call
+        // started and returns what it printed, like Codex `write_stdin`.
+        output_reader: reads_earlier_output(name)
+            || (agent == AgentKind::Muse && name.eq_ignore_ascii_case("bash_input")),
         powershell: name.eq_ignore_ascii_case("powershell"),
         inline_code: family == ToolFamily::NonFile
             && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
@@ -1171,6 +1221,31 @@ fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
         match name.to_ascii_lowercase().as_str() {
             "view" | "create" | "str_replace_editor" => return ToolFamily::File,
             "rg" => return ToolFamily::SearchList,
+            _ => {}
+        }
+    }
+    if agent == AgentKind::Muse {
+        // Meta Muse Code's memory tools name a markdown file in `path`
+        // (resolved by [`muse_memory_paths`]) and `monitor` runs a `command`
+        // and streams its output (Muse Code 1.4.7). `bash_input`, which
+        // drives a running `bash`, stays unknown like the other output
+        // readers. `read_file`, `write_file`, `edit_file`,
+        // `search`, `bash`, `web_fetch` and `web_search` carry shared names.
+        let lower = name.to_ascii_lowercase();
+        if MUSE_MEMORY_TOOL_NAMES.contains(&lower.as_str()) {
+            return ToolFamily::File;
+        }
+        if lower == "monitor" {
+            return ToolFamily::NonFile;
+        }
+    }
+    if agent == AgentKind::Droid {
+        // Factory Droid writes a new file with `Create` and applies a
+        // Codex-style patch envelope with `ApplyPatch` (0.240.0 tool
+        // schemas, #1240). Its `Read`, `Edit`, `LS`, `Grep`, `Glob` and
+        // `Execute` already carry shared names.
+        match name.to_ascii_lowercase().as_str() {
+            "create" | "applypatch" => return ToolFamily::File,
             _ => {}
         }
     }
@@ -1687,7 +1762,7 @@ struct SearchScope {
 /// grep `pattern` is a regular expression, not a path, and is left out.
 /// `None` when one of them is present but not a string (or, for a filter, a
 /// list of strings).
-fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
+fn search_scope(agent: AgentKind, name: &str, args: Option<&Value>) -> Option<SearchScope> {
     let object = match args {
         None | Some(Value::Null) => return Some(SearchScope::default()),
         Some(value) => value.as_object()?,
@@ -1710,6 +1785,13 @@ fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
             scope.roots.push(value.as_str()?.to_owned());
         }
     }
+    if agent == AgentKind::Droid {
+        for key in DROID_SEARCH_ROOT_KEYS {
+            if let Some(value) = object.get(key) {
+                scope.roots.push(value.as_str()?.to_owned());
+            }
+        }
+    }
     let glob_tool = matches!(
         name.to_ascii_lowercase().as_str(),
         "glob" | "find" | "find_by_name"
@@ -1727,7 +1809,14 @@ fn search_scope(name: &str, args: Option<&Value>) -> Option<SearchScope> {
     } else {
         &["glob", "include", "file_pattern", "file_glob", "Includes"]
     };
-    for key in pattern_keys {
+    // Droid's `Glob` takes `patterns` (a string or a list) and its `Grep`
+    // filters files with `glob_pattern`; `excludePatterns` only narrows.
+    let droid_pattern_keys: &[&str] = match agent {
+        AgentKind::Droid if glob_tool => &["patterns", "glob_pattern"],
+        AgentKind::Droid => &["glob_pattern"],
+        _ => &[],
+    };
+    for key in pattern_keys.iter().chain(droid_pattern_keys) {
         match object.get(*key) {
             None => {}
             Some(Value::String(pattern)) => scope.patterns.push(pattern.clone()),
@@ -2190,6 +2279,59 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
         }
         for value in values.as_array()? {
             paths.push(value.as_str()?.to_owned());
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Meta Muse Code's memory tools (Muse Code 1.4.7).
+const MUSE_MEMORY_TOOL_NAMES: [&str; 3] = ["read_memory", "add_memory", "edit_memory"];
+
+/// The file a Muse memory tool touches. Its `path` is relative to the memory
+/// directory of its `scope`, not to the working directory: the `project`
+/// scope is `<repo>/.agents/memory`, committed with the repository, so the
+/// path is placed there. The `personal` and `personal_project` scopes (the
+/// default) live in Muse's own data directory outside the repository, which
+/// no candidate here can name, so they yield `None` and fail closed to
+/// metadata-only under an active marker.
+fn muse_memory_paths(args: &Value) -> Option<Vec<String>> {
+    let object = args.as_object()?;
+    if object.get("scope").and_then(Value::as_str) != Some("project") {
+        return None;
+    }
+    let path = object.get("path")?.as_str()?;
+    if path.trim().is_empty() || path.chars().count() > MAX_CANDIDATE_PATH_CHARS {
+        return None;
+    }
+    if is_absolute(path) {
+        return Some(vec![path.to_owned()]);
+    }
+    Some(vec![format!(".agents/memory/{path}")])
+}
+
+/// Directory arguments of Factory Droid's search/list tools: `LS` lists
+/// `directory_path` and `Glob` searches below `folder` (#1240).
+const DROID_SEARCH_ROOT_KEYS: [&str; 2] = ["directory_path", "folder"];
+
+/// A search/list tool's explicit directory or file arguments: the shared
+/// single-path fields, plus [`DROID_SEARCH_ROOT_KEYS`] for Droid.
+fn search_direct_paths(agent: AgentKind, object: &Map<String, Value>) -> Option<Vec<String>> {
+    let mut paths = match direct_paths(object) {
+        Some(paths) => paths,
+        // A shared field that is present but unreadable stays unreadable.
+        None if object
+            .keys()
+            .any(|key| DIRECT_PATH_KEYS.contains(&key.as_str()) || key == "paths") =>
+        {
+            return None;
+        }
+        None => Vec::new(),
+    };
+    if agent == AgentKind::Droid {
+        for key in DROID_SEARCH_ROOT_KEYS {
+            if let Some(value) = object.get(key) {
+                paths.push(value.as_str()?.to_owned());
+            }
         }
     }
     (!paths.is_empty()).then_some(paths)
@@ -4430,6 +4572,8 @@ mod tests {
             AgentKind::Grizzybot,
             AgentKind::Zcode,
             AgentKind::CopilotCli,
+            AgentKind::Droid,
+            AgentKind::Muse,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -4561,6 +4705,494 @@ mod tests {
             ExtractionState::UnsupportedSchema
         );
         assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    /// Factory Droid's tool calls, in the 0.240.0 tool schemas (#1240): each
+    /// file tool naming an ignored path is dropped or stripped while a control
+    /// path is kept, search/list tools drop under an active marker, and
+    /// `Execute` is matched like any shell. The same payloads under
+    /// `AgentKind::Other` stay unrecognized and keep their output, which is
+    /// what the Droid mapping changes.
+    #[test]
+    fn droid_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "droid-session",
+                "transcript_path": "/home/u/.factory/sessions/s.jsonl",
+                "cwd": "/repo",
+                "permission_mode": "auto-low",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_response": {"success": true},
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        let file_tools = [
+            (
+                "Read",
+                json!({"file_path": "docs/adr/1.md", "offset": 0, "limit": 20}),
+            ),
+            (
+                "Create",
+                json!({"file_path": "/repo/docs/adr/2.md", "content": "secret"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path": "docs/adr/1.md", "old_str": "a", "new_str": "b", "change_all": false}),
+            ),
+        ];
+        for (name, input) in file_tools {
+            let excluded = disposition(AgentKind::Droid, &call(name, input.clone()));
+            assert_eq!(excluded.tool_family(), ToolFamily::File, "{name}");
+            assert_eq!(excluded.disposition(), CaptureDisposition::Drop, "{name}");
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the Droid mapping the call is not recognized"
+            );
+            let mut control = input;
+            control["file_path"] = json!("src/lib.rs");
+            let kept = disposition(AgentKind::Droid, &call(name, control));
+            assert_eq!(
+                kept.disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+
+        // `ApplyPatch` names its files only inside the patch text, like Codex
+        // `apply_patch`: under an active marker that fails closed to
+        // metadata-only, and the patch headers locate the call for the
+        // cross-checkout marker lookup.
+        let patch = |path: &str| {
+            call(
+                "ApplyPatch",
+                json!({"input": format!("*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch")}),
+            )
+        };
+        let excluded = disposition(AgentKind::Droid, &patch("docs/adr/1.md"));
+        assert_eq!(excluded.tool_family(), ToolFamily::File);
+        assert_eq!(excluded.disposition(), CaptureDisposition::MetadataOnly);
+        let codex = tool_call_payload(
+            AgentKind::Codex,
+            "apply_patch",
+            Some(
+                &json!({"input": "*** Begin Patch\n*** Update File: docs/adr/1.md\n*** End Patch"}),
+            ),
+            None,
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Codex, &codex, "/repo")
+                .protocol()
+                .disposition(),
+            excluded.disposition(),
+            "ApplyPatch is decided like Codex apply_patch"
+        );
+        assert_eq!(
+            disposition(AgentKind::Other, &patch("docs/adr/1.md")).disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            capture_lookup_locations(AgentKind::Droid, &patch("../other/x.rs"), "/repo", None),
+            Some(vec!["/other/x.rs".to_owned()])
+        );
+        assert_eq!(
+            CapturePolicy::inactive()
+                .inspect(AgentKind::Droid, &patch("docs/adr/1.md"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "control: no marker keeps the patch"
+        );
+
+        for (name, input) in [
+            ("LS", json!({"directory_path": "docs/adr"})),
+            ("Grep", json!({"pattern": "KEY", "path": "docs/adr"})),
+            (
+                "Glob",
+                json!({"patterns": ["docs/adr/*.md"], "folder": "/repo"}),
+            ),
+        ] {
+            let decision = disposition(AgentKind::Droid, &call(name, input.clone()));
+            assert_eq!(decision.tool_family(), ToolFamily::SearchList, "{name}");
+            assert_eq!(decision.disposition(), CaptureDisposition::Drop, "{name}");
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the Droid mapping the call is not recognized"
+            );
+        }
+        // Droid's directory and glob arguments locate the call in another
+        // checkout.
+        let elsewhere = |name: &str, input: Value| {
+            capture_lookup_locations(AgentKind::Droid, &call(name, input), "/repo", None)
+        };
+        assert_eq!(
+            elsewhere("LS", json!({"directory_path": "/other/docs"})),
+            Some(vec!["/other/docs".to_owned()])
+        );
+        assert_eq!(
+            elsewhere("Glob", json!({"patterns": "src/*.rs", "folder": "/other"})),
+            Some(vec!["/other".to_owned(), "/other/src/*.rs".to_owned()])
+        );
+        assert_eq!(
+            elsewhere(
+                "Grep",
+                json!({"pattern": "KEY", "path": "/other", "glob_pattern": "a/*.env"})
+            ),
+            Some(vec!["/other".to_owned(), "/other/a/*.env".to_owned()])
+        );
+        assert_eq!(
+            absolute_tool_location_paths(
+                AgentKind::Droid,
+                &call("LS", json!({"directory_path": "/other/docs"})),
+                "/repo"
+            ),
+            Some(vec!["/other/docs".to_owned()])
+        );
+
+        let shell =
+            |command: &str| call("Execute", json!({"command": command, "riskLevel": "low"}));
+        let excluded = disposition(AgentKind::Droid, &shell("cat docs/adr/1.md"));
+        assert_eq!(excluded.tool_family(), ToolFamily::NonFile);
+        assert_eq!(excluded.disposition(), CaptureDisposition::Drop);
+        assert_eq!(
+            disposition(AgentKind::Droid, &shell("cat src/lib.rs")).disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(AgentKind::Other, &shell("cat docs/adr/1.md")).disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
+    /// Droid hook payloads carry no tool-call id, so the drop list and the
+    /// observation metadata read the tool name alone (#1240).
+    #[test]
+    fn droid_tool_payload_fields_have_no_call_id() {
+        let raw = json!({
+            "tool_name": "Execute",
+            "tool_input": {"command": "ls"},
+            "tool_use_id": "would-be-ignored"
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Droid, &raw),
+            Some(("Execute", None))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Droid, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id, None);
+        let no_input = json!({"tool_name": "Read"});
+        assert!(tool_observation_metadata(AgentKind::Droid, &no_input, true).is_none());
+        assert!(tool_observation_metadata(AgentKind::Droid, &no_input, false).is_some());
+        for (tool, expected) in [
+            ("Read", ToolFamily::File),
+            ("Create", ToolFamily::File),
+            ("Edit", ToolFamily::File),
+            ("ApplyPatch", ToolFamily::File),
+            ("LS", ToolFamily::SearchList),
+            ("Grep", ToolFamily::SearchList),
+            ("Glob", ToolFamily::SearchList),
+            ("Execute", ToolFamily::NonFile),
+        ] {
+            assert_eq!(agent_family(AgentKind::Droid, tool), expected, "{tool}");
+        }
+        // The Droid-only names keep their classification for other agents.
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "ApplyPatch"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "Create"),
+            ToolFamily::Unknown
+        );
+    }
+
+    /// Meta Muse Code's tool calls, in the shapes captured offline from Muse
+    /// Code 1.4.7 hooks: `tool_input.path` is relative as the model wrote it
+    /// and resolves lexically against `cwd`. Each file tool naming an ignored
+    /// path, relative or absolute, is dropped while a control path is kept;
+    /// `search` drops under an active marker; `bash` and `monitor` are matched
+    /// like any shell from their `workdir`; `bash_input` reads back an earlier
+    /// command's output. The same payloads under `AgentKind::Other` stay
+    /// unrecognized and keep their output, which is what the Muse mapping
+    /// changes.
+    #[test]
+    fn muse_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into(), ".agents/memory/secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+                "transcript_path": null,
+                "cwd": "/repo",
+                "model": "muse-wonder-1.0",
+                "model_provider": "meta",
+                "permission_mode": "bypassPermissions",
+                "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "call_30a33793ad9c",
+                "tool_response": {"filePath": "/repo/x", "structuredPatch": []},
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        let file_tools = [
+            ("read_file", json!({"path": "docs/adr/1.md"})),
+            (
+                "read_file",
+                json!({"path": "/repo/docs/adr/1.md", "offset": 1}),
+            ),
+            (
+                "write_file",
+                json!({"path": "docs/adr/2.md", "content": "secret"}),
+            ),
+            (
+                "write_file",
+                json!({"path": "/repo/docs/adr/2.md", "content": "secret"}),
+            ),
+            (
+                "edit_file",
+                json!({"path": "docs/adr/1.md", "find": "a", "replace": "b"}),
+            ),
+            (
+                "edit_file",
+                json!({"path": "/repo/docs/adr/1.md", "find": "a", "replace": "b"}),
+            ),
+            (
+                "add_memory",
+                json!({"path": "secret/n.md", "scope": "project", "content": "x"}),
+            ),
+            (
+                "edit_memory",
+                json!({"path": "secret/n.md", "scope": "project", "old_str": "a", "new_str": "b"}),
+            ),
+            (
+                "read_memory",
+                json!({"path": "secret/n.md", "scope": "project"}),
+            ),
+        ];
+        for (name, input) in file_tools {
+            let excluded = disposition(AgentKind::Muse, &call(name, input.clone()));
+            assert_eq!(excluded.tool_family(), ToolFamily::File, "{name} {input}");
+            assert_eq!(
+                excluded.disposition(),
+                CaptureDisposition::Drop,
+                "{name} {input}"
+            );
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the Muse mapping the call is not recognized"
+            );
+            let mut control = input;
+            control["path"] = json!("src/lib.rs");
+            let kept = disposition(AgentKind::Muse, &call(name, control));
+            assert_eq!(
+                kept.disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+        // A memory path is relative to its scope's directory, not to `cwd`:
+        // `docs/adr/1.md` in the project scope is `.agents/memory/docs/adr/1.md`.
+        assert_eq!(
+            disposition(
+                AgentKind::Muse,
+                &call(
+                    "read_memory",
+                    json!({"path": "docs/adr/1.md", "scope": "project"})
+                )
+            )
+            .disposition(),
+            CaptureDisposition::Keep
+        );
+        // The personal scopes live outside the repository, where no candidate
+        // reaches, so they fail closed under an active marker.
+        for scope in [json!("personal"), json!("personal_project"), Value::Null] {
+            let decision = disposition(
+                AgentKind::Muse,
+                &call("add_memory", json!({"path": "n.md", "scope": scope})),
+            );
+            assert_eq!(decision.tool_family(), ToolFamily::File, "{scope}");
+            assert_eq!(
+                decision.disposition(),
+                CaptureDisposition::MetadataOnly,
+                "{scope}"
+            );
+            assert_eq!(
+                CapturePolicy::inactive()
+                    .inspect(
+                        AgentKind::Muse,
+                        &call("add_memory", json!({"path": "n.md", "scope": scope})),
+                        "/repo"
+                    )
+                    .protocol()
+                    .disposition(),
+                CaptureDisposition::Keep,
+                "control: no marker keeps the memory call"
+            );
+        }
+
+        // `apply_patch` (the `openai-apply-patch` preset) carries a Codex
+        // envelope in `patch`.
+        let patch = |path: &str| {
+            call(
+                "apply_patch",
+                json!({"patch": format!("*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch")}),
+            )
+        };
+        let excluded = disposition(AgentKind::Muse, &patch("docs/adr/1.md"));
+        assert_eq!(excluded.tool_family(), ToolFamily::File);
+        assert_eq!(excluded.disposition(), CaptureDisposition::MetadataOnly);
+        assert_eq!(
+            capture_lookup_locations(AgentKind::Muse, &patch("../other/x.rs"), "/repo", None),
+            Some(vec!["/other/x.rs".to_owned()])
+        );
+
+        // `search` names globs in `paths` and filters with `glob`.
+        let search = call("search", json!({"pattern": "beta", "paths": ["*.txt"]}));
+        let decision = disposition(AgentKind::Muse, &search);
+        assert_eq!(decision.tool_family(), ToolFamily::SearchList);
+        assert_eq!(decision.disposition(), CaptureDisposition::Drop);
+        assert_eq!(
+            capture_lookup_locations(
+                AgentKind::Muse,
+                &call(
+                    "search",
+                    json!({"pattern": "KEY", "paths": ["/other"], "glob": "a/*.env"})
+                ),
+                "/repo",
+                None
+            ),
+            Some(vec!["/other".to_owned(), "/other/a/*.env".to_owned()])
+        );
+
+        let shell = |name: &str, command: &str, workdir: &str| {
+            call(
+                name,
+                json!({"command": command, "description": "x", "workdir": workdir}),
+            )
+        };
+        for name in ["bash", "monitor"] {
+            let excluded = disposition(AgentKind::Muse, &shell(name, "cat adr/1.md", "/repo/docs"));
+            assert_eq!(excluded.tool_family(), ToolFamily::NonFile, "{name}");
+            assert_eq!(excluded.disposition(), CaptureDisposition::Drop, "{name}");
+            assert_eq!(
+                disposition(AgentKind::Muse, &shell(name, "cat notes.txt", "/repo")).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+        assert_eq!(
+            disposition(
+                AgentKind::Other,
+                &shell("monitor", "cat adr/1.md", "/repo/docs")
+            )
+            .disposition(),
+            CaptureDisposition::Keep,
+            "monitor: without the Muse mapping the call is not recognized"
+        );
+        let input = call("bash_input", json!({"session_id": "exec-1", "chars": "q"}));
+        assert_eq!(
+            disposition(AgentKind::Muse, &input).disposition(),
+            CaptureDisposition::MetadataOnly,
+            "bash_input reads back an earlier command's output"
+        );
+        assert_eq!(
+            CapturePolicy::inactive()
+                .inspect(AgentKind::Muse, &input, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(AgentKind::Other, &input).disposition(),
+            CaptureDisposition::Keep
+        );
+    }
+
+    /// Muse hook payloads carry the provider call id in `tool_use_id`, so the
+    /// drop list and the observation metadata read both fields, and a
+    /// `PostToolUseFailure` `error` proves an error outcome.
+    #[test]
+    fn muse_tool_payload_fields_carry_the_call_id() {
+        let raw = json!({
+            "tool_name": "write_file",
+            "tool_input": {"path": "notes.txt", "content": "alpha\n"},
+            "tool_use_id": "call_30a33793ad9c"
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Muse, &raw),
+            Some(("write_file", Some("call_30a33793ad9c")))
+        );
+        assert_eq!(tool_payload_fields(AgentKind::Other, &raw), None);
+        let metadata = tool_observation_metadata(AgentKind::Muse, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call_30a33793ad9c"));
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::Muse, &no_input, true).is_none());
+        assert!(tool_observation_metadata(AgentKind::Muse, &no_input, false).is_some());
+        let failure = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "read_file",
+            "tool_input": {"path": "missing.txt"},
+            "tool_use_id": "call_a2a05a20bbb2",
+            "error": "tool failed: No such file or directory (os error 2)",
+            "is_interrupt": false,
+            "duration_ms": 0
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Muse, &failure),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Muse, &raw),
+            ToolOutcome::Unknown
+        );
+        for (tool, expected) in [
+            ("read_file", ToolFamily::File),
+            ("write_file", ToolFamily::File),
+            ("edit_file", ToolFamily::File),
+            ("apply_patch", ToolFamily::File),
+            ("read_memory", ToolFamily::File),
+            ("add_memory", ToolFamily::File),
+            ("edit_memory", ToolFamily::File),
+            ("search", ToolFamily::SearchList),
+            ("bash", ToolFamily::NonFile),
+            ("shell", ToolFamily::NonFile),
+            ("monitor", ToolFamily::NonFile),
+            ("bash_input", ToolFamily::Unknown),
+            ("web_fetch", ToolFamily::NonFile),
+            ("web_search", ToolFamily::NonFile),
+        ] {
+            assert_eq!(agent_family(AgentKind::Muse, tool), expected, "{tool}");
+        }
+        // The Muse-only names keep their classification for other agents.
+        for tool in ["add_memory", "monitor"] {
+            assert_eq!(
+                agent_family(AgentKind::ClaudeCode, tool),
+                ToolFamily::Unknown,
+                "{tool}"
+            );
+        }
     }
 
     #[test]

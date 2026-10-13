@@ -8,6 +8,7 @@
 //! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/metrics`        — content-free Prometheus counters and latency histograms.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
 //! - `GET  /admin/project-coordinate` — read-only exact/compatibility diagnosis.
 //! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent
@@ -130,6 +131,9 @@ pub struct AdminState {
     /// Shared hook-ingestion counters, written by the hook path and read
     /// here for status reporting.
     pub ingest_metrics: std::sync::Arc<ai_memory_core::IngestMetrics>,
+    /// The MCP server's own counters ([`crate::AiMemoryServer::mcp_metrics`]),
+    /// read by `GET /admin/metrics`. A fresh instance reports zeros.
+    pub mcp_metrics: std::sync::Arc<crate::McpMetrics>,
     /// Retention-decay parameters forwarded from server config.
     pub decay_params: DecayParams,
     /// Lower edge of `memory_lint`'s A5 zero-LLM contradiction-similarity
@@ -584,6 +588,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/metrics`
 /// - `GET  /admin/projects`
 /// - `GET  /admin/project-coordinate`
 /// - `GET  /admin/open-sessions`
@@ -666,6 +671,7 @@ pub fn admin_router_with_sweep_tuning(
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/metrics", get(handle_metrics))
         .route("/admin/projects", get(handle_list_projects))
         .route("/admin/project-coordinate", get(handle_project_coordinate))
         .route("/admin/open-sessions", get(handle_open_sessions))
@@ -705,18 +711,9 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page));
     let users = Router::new()
-        .route(
-            "/admin/users",
-            get(handle_list_users).post(handle_create_user),
-        )
+        .route("/admin/users", get(handle_list_users))
         .route("/admin/human-users", post(handle_create_human_user))
         .route("/admin/users/{username}", patch(handle_patch_user))
-        .route("/admin/users/{username}/expire", post(handle_expire_user))
-        .route("/admin/users/{username}/revive", post(handle_revive_user))
-        .route(
-            "/admin/users/{username}/rotate-token",
-            post(handle_rotate_user_token),
-        )
         .route(
             "/admin/users/{username}/reset-password",
             post(handle_reset_password),
@@ -1225,6 +1222,21 @@ async fn handle_audit_log(
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
+}
+
+/// Handler for `GET /admin/metrics`: process counters and latency
+/// histograms in the Prometheus text format. Root-only on a multi-user server
+/// through the same gate as every `/admin/*` route. Content-free by
+/// construction: see [`crate::metrics`].
+async fn handle_metrics(State(state): State<Arc<AdminState>>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            crate::metrics::PROMETHEUS_CONTENT_TYPE,
+        )],
+        crate::metrics::render_prometheus(&state.ingest_metrics, &state.mcp_metrics),
+    )
+        .into_response()
 }
 
 /// JSON response body for `GET /admin/status`. The CLI's `status`
@@ -1994,6 +2006,92 @@ async fn lookup_ws_no_create(
     lookup_existing_workspace(&state.reader, workspace)
         .await
         .map_err(scope_err)
+}
+
+/// Resolve the `(workspace_id, project_id)` pair for an admin operation from
+/// either a project name (the historic path) or a project id (the new
+/// `#1208` path). Exactly one of `project_name` and `project_id` must be
+/// `Some`; sending both or neither is a 400. When `project_id` is `Some`,
+/// the workspace is resolved by name (still 404 if absent) and the project
+/// is looked up by id within the workspace (404 on miss, so a foreign-scope
+/// id is correctly refused). The bad-UUID case is a 400, mirroring how
+/// `lookup_ws_proj_no_create` already maps unparseable names to 400.
+///
+/// Returns the project's stored name with the ids, so labels, admission
+/// contexts and move destinations never fall back to the UUID: a failed name
+/// read is a 500, not a guess.
+async fn resolve_target_for_admin(
+    state: &AdminState,
+    workspace: &str,
+    project_name: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<(WorkspaceId, ProjectId, String), (StatusCode, Json<serde_json::Value>)> {
+    let (ws_id, proj_id) =
+        resolve_target_ids_for_admin(state, workspace, project_name, project_id).await?;
+    match state.reader.project_name_by_id(ws_id, proj_id).await {
+        Ok(Some(name)) => Ok((ws_id, proj_id, name)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "project not found in workspace" })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+async fn resolve_target_ids_for_admin(
+    state: &AdminState,
+    workspace: &str,
+    project_name: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+    match (project_name, project_id) {
+        (Some(_), Some(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "project and project_id are mutually exclusive"
+            })),
+        )),
+        (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "either project or project_id is required"
+            })),
+        )),
+        (Some(name), None) => lookup_ws_proj_no_create(state, workspace, name).await,
+        (None, Some(id_str)) => {
+            let parsed = match id_str.parse::<ProjectId>() {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("invalid project id: {e}")
+                        })),
+                    ));
+                }
+            };
+            let ws_id = match lookup_ws_no_create(state, workspace).await {
+                Ok(ws) => ws,
+                Err(e) => return Err(e),
+            };
+            match state.reader.project_name_by_id(ws_id, parsed).await {
+                Ok(Some(_)) => Ok((ws_id, parsed)),
+                Ok(None) => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "project not found in workspace"
+                    })),
+                )),
+                Err(e) => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )),
+            }
+        }
+    }
 }
 
 fn with_manifest_warning(
@@ -4747,7 +4845,16 @@ struct PurgeProjectRequest {
     /// Workspace name. The workspace must already exist; we 404 if absent.
     workspace: String,
     /// Project name. The project must already exist; we 404 if absent.
-    project: String,
+    /// Mutually exclusive with `project_id`; the CLI sends whichever the
+    /// operator chose and leaves the other `None`. (#1208)
+    #[serde(default)]
+    project: Option<String>,
+    /// Project id (UUID string). Bypasses the name/legacy/canonical lookup
+    /// and targets the row directly, so an operator can disambiguate a name
+    /// collision. Server returns 400 on bad UUID parse, 404 on unknown id or
+    /// foreign-scope id. (#1208)
+    #[serde(default)]
+    project_id: Option<String>,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
     confirm: bool,
@@ -4933,13 +5040,19 @@ async fn handle_purge_project(
     }
 
     // Look up workspace and project IDs without auto-creating.
-    let (ws_id, proj_id) =
-        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
+        &state,
+        &req.workspace,
+        req.project.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
 
-    let label = format!("{}/{}", req.workspace, req.project);
+    let label = format!("{}/{}", req.workspace, project_name);
 
     // Admission must run before any destructive work. A reject-policy webhook
     // is allowed to abort the purge while DB rows and files are still intact.
@@ -4952,7 +5065,7 @@ async fn handle_purge_project(
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
     let purge_ctx = AdmissionContext {
         workspace: req.workspace.clone(),
-        project: req.project.clone(),
+        project: project_name.clone(),
         op: AdmissionOp::PurgeProject,
         actor,
         ..Default::default()
@@ -5092,13 +5205,19 @@ async fn purge_project_preview(
     req: &PurgeProjectRequest,
     author_id: Option<ai_memory_core::UserId>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let (ws_id, proj_id) = match lookup_ws_proj_no_create(state, &req.workspace, &req.project).await
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
+        state,
+        &req.workspace,
+        req.project.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
     {
-        Ok(ids) => ids,
+        Ok(target) => target,
         Err(e) => return e,
     };
 
-    let label = format!("{}/{}", req.workspace, req.project);
+    let label = format!("{}/{}", req.workspace, project_name);
 
     let summary = match state
         .writer
@@ -5724,8 +5843,16 @@ async fn delete_workspace_preview(
 struct RenameProjectRequest {
     /// Workspace name (must exist; we don't auto-create on rename).
     workspace: String,
-    /// Current project name.
-    from: String,
+    /// Current project name. Mutually exclusive with `project_id`; the CLI
+    /// sends whichever the operator chose and leaves the other `None`.
+    /// (#1208)
+    #[serde(default)]
+    from: Option<String>,
+    /// Project id (UUID string). Bypasses the name/legacy/canonical lookup
+    /// and targets the row directly. Same contract as
+    /// `PurgeProjectRequest::project_id`. (#1208)
+    #[serde(default)]
+    project_id: Option<String>,
     /// New project name. Must be non-empty, no slashes.
     to: String,
 }
@@ -5757,8 +5884,15 @@ async fn handle_rename_project(
 ) -> impl IntoResponse {
     let author_id = author_ext.map(|axum::Extension(u)| u);
     // Look up workspace + source project; 404 if either is absent.
-    let (ws_id, proj_id) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.from).await {
-        Ok(ids) => ids,
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
+        &state,
+        &req.workspace,
+        req.from.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok(target) => target,
         Err(e) => return e,
     };
 
@@ -5827,7 +5961,7 @@ async fn handle_rename_project(
     };
     let summary = RenameProjectSummary {
         workspace: req.workspace.clone(),
-        from: req.from.clone(),
+        from: project_name.clone(),
         to: req.to.clone(),
         pages,
         checkpoint,
@@ -5849,7 +5983,14 @@ struct MoveProjectRequest {
     /// Source workspace. Must already exist; we 404 if absent.
     from_workspace: String,
     /// Project name to move. Must already exist in `from_workspace`; 404 if absent.
-    project: String,
+    /// Mutually exclusive with `project_id`; the CLI sends whichever the
+    /// operator chose and leaves the other `None`. (#1208)
+    #[serde(default)]
+    project: Option<String>,
+    /// Project id (UUID string) in the source workspace. Bypasses the
+    /// name/legacy/canonical lookup and targets the row directly. (#1208)
+    #[serde(default)]
+    project_id: Option<String>,
     /// Destination workspace. Auto-created if absent.
     to_workspace: String,
     /// Mandatory confirmation flag. The move PURGES the source after
@@ -5971,6 +6112,7 @@ type MoveErr = (StatusCode, Json<serde_json::Value>);
 async fn true_move_project(
     state: &Arc<AdminState>,
     req: &MoveProjectRequest,
+    project_name: &str,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
     pre_checkpoint: Option<String>,
@@ -6014,9 +6156,9 @@ async fn true_move_project(
 
     let move_ctx = AdmissionContext {
         workspace: req.from_workspace.clone(),
-        project: req.project.clone(),
+        project: project_name.to_string(),
         destination_workspace: Some(req.to_workspace.clone()),
-        destination_project: Some(req.project.clone()),
+        destination_project: Some(project_name.to_string()),
         op: AdmissionOp::MoveProject,
         actor,
         ..Default::default()
@@ -6066,13 +6208,13 @@ async fn true_move_project(
         &state.wiki,
         format!(
             "move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            req.from_workspace, project_name, req.to_workspace, project_name
         ),
     );
 
     let report = MoveProjectReport {
-        from: format!("{}/{}", req.from_workspace, req.project),
-        to: format!("{}/{}", req.to_workspace, req.project),
+        from: format!("{}/{}", req.from_workspace, project_name),
+        to: format!("{}/{}", req.to_workspace, project_name),
         merged_into_existing: false,
         moved_via: "true-move",
         pages_copied: summary.pages_moved,
@@ -6293,9 +6435,10 @@ async fn move_project_core(
     // A private profile is found as `default/_profile.<user id>`; moving it to
     // another workspace would orphan it. (A workspace `_profile` may move with
     // its workspace: it lands in, or merges into, the target's own profile.)
-    if req
-        .project
-        .starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX)
+    // Checked on the requested NAME first so a nonexistent profile project is
+    // still refused as 422 rather than surfacing the lookup's 404.
+    if let Some(name) = req.project.as_deref()
+        && name.starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX)
     {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -6306,8 +6449,28 @@ async fn move_project_core(
     }
 
     // Resolve the SOURCE without auto-creating — 404 on a typo.
-    let (src_ws, src_proj) =
-        lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
+    let (src_ws, src_proj, project_name) = match resolve_target_for_admin(
+        state,
+        &req.from_workspace,
+        req.project.as_deref(),
+        req.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return Err(MoveErr::from(e)),
+    };
+
+    // Same guard on the RESOLVED name, so the `project_id` path (which has no
+    // name to inspect up front) is refused identically.
+    if project_name.starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "a private cross-project profile stays in the default workspace and cannot be moved"
+            })),
+        ));
+    }
 
     // Live-session guard: refuse to move the project the hook router is
     // currently writing to. A live session's next observation/log would carry
@@ -6321,7 +6484,7 @@ async fn move_project_core(
                 "error": format!(
                     "{}/{} is the active session's project; a live move risks stale-cache writes. \
                      Re-run with force=true to proceed.",
-                    req.from_workspace, req.project
+                    req.from_workspace, project_name
                 )
             })),
         ));
@@ -6330,7 +6493,7 @@ async fn move_project_core(
     // Detect MERGE: does the destination workspace already hold a same-named
     // project? (find_workspace may be None when the dest ws doesn't exist yet.)
     let merged_into_existing =
-        match lookup_existing_scope(&state.reader, &req.to_workspace, &req.project).await {
+        match lookup_existing_scope(&state.reader, &req.to_workspace, &project_name).await {
             Ok(_) => true,
             Err(error) if error.is_not_found() => false,
             Err(error) => return Err(scope_err(error)),
@@ -6340,7 +6503,7 @@ async fn move_project_core(
         &state.wiki,
         format!(
             "pre-move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            req.from_workspace, project_name, req.to_workspace, project_name
         ),
     )?;
 
@@ -6353,19 +6516,29 @@ async fn move_project_core(
     // case, where two project_ids can't be re-stamped into one
     // (UNIQUE(workspace_id, name) collision).
     if !merged_into_existing {
-        return true_move_project(state, req, src_ws, src_proj, pre_checkpoint, actor).await;
+        return true_move_project(
+            state,
+            req,
+            &project_name,
+            src_ws,
+            src_proj,
+            pre_checkpoint,
+            actor,
+        )
+        .await;
     }
 
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let destination = create_ws_proj(state, &req.to_workspace, &req.project).await?;
+    let destination = create_ws_proj(state, &req.to_workspace, &project_name).await?;
     let (dst_ws, dst_proj) = destination.scope.as_tuple();
 
     let warning = destination.manifest_warning;
     copy_purge_merge(
         state,
         req,
+        &project_name,
         src_ws,
         src_proj,
         dst_ws,
@@ -7286,9 +7459,18 @@ struct PreparedSourcePage {
 /// its path collides with a different page at the destination. Both
 /// the `Block` pre-check and the copy loop drive off the returned
 /// vector, so each page is read at most once.
+///
+/// The argument list mirrors one prepared row: the request (for its
+/// workspace name), the resolved `project_name` (which may differ from
+/// `req.project` when the operator targeted `project_id` instead), the
+/// source scope to read from, and the destination scope to compare
+/// against. Splitting it into a struct would only move the same fields
+/// one level down. (#1208)
+#[allow(clippy::too_many_arguments)]
 async fn prepare_source_pages(
     state: &AdminState,
     req: &MoveProjectRequest,
+    project_name: &str,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
     dst_ws: WorkspaceId,
@@ -7313,7 +7495,10 @@ async fn prepare_source_pages(
         };
         let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
         let pinned = matches!(
-            state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
+            state
+                .reader
+                .page_meta(&req.from_workspace, project_name, &s.path)
+                .await,
             Ok(Some(ref m)) if m.pinned
         );
         let md = state.wiki.read_page(src_ws, src_proj, &path).ok();
@@ -7360,6 +7545,7 @@ async fn prepare_source_pages(
 async fn copy_purge_merge(
     state: &AdminState,
     req: &MoveProjectRequest,
+    project_name: &str,
     src_ws: WorkspaceId,
     src_proj: ProjectId,
     dst_ws: WorkspaceId,
@@ -7371,7 +7557,7 @@ async fn copy_purge_merge(
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
         .reader
-        .list_pages(&req.from_workspace, &req.project)
+        .list_pages(&req.from_workspace, project_name)
         .await
     {
         Ok(s) => s,
@@ -7381,8 +7567,17 @@ async fn copy_purge_merge(
     // Single pass over the source: load each page's metadata + body
     // AND classify the destination conflict, so the block pre-check
     // and the copy loop don't re-query the same rows.
-    let prepared =
-        prepare_source_pages(state, req, src_ws, src_proj, dst_ws, dst_proj, &summaries).await;
+    let prepared = prepare_source_pages(
+        state,
+        req,
+        project_name,
+        src_ws,
+        src_proj,
+        dst_ws,
+        dst_proj,
+        &summaries,
+    )
+    .await;
 
     // Under the default `block` policy, abort the WHOLE move now —
     // before anything is copied — so the source stays intact and the
@@ -7580,12 +7775,12 @@ async fn copy_purge_merge(
             &state.wiki,
             format!(
                 "move-project-partial {}/{} -> {}/{}",
-                req.from_workspace, req.project, req.to_workspace, req.project
+                req.from_workspace, project_name, req.to_workspace, project_name
             ),
         );
         let report = MoveProjectReport {
-            from: format!("{}/{}", req.from_workspace, req.project),
-            to: format!("{}/{}", req.to_workspace, req.project),
+            from: format!("{}/{}", req.from_workspace, project_name),
+            to: format!("{}/{}", req.to_workspace, project_name),
             // copy_purge_merge is only reached from the merge branch
             // of handle_move_project; the destination project pre-existed.
             merged_into_existing: true,
@@ -7615,10 +7810,10 @@ async fn copy_purge_merge(
     // source is intact (mirrors `handle_purge_project`'s ordering). The
     // previous version called `Wiki::purge_project` AFTER `writer.purge_project`,
     // which ran admit AFTER the rows were gone — reject came too late.
-    let label = format!("{}/{}", req.from_workspace, req.project);
+    let label = format!("{}/{}", req.from_workspace, project_name);
     let purge_ctx = AdmissionContext {
         workspace: req.from_workspace.clone(),
-        project: req.project.clone(),
+        project: project_name.to_string(),
         op: AdmissionOp::PurgeProject,
         actor,
         ..Default::default()
@@ -7668,7 +7863,7 @@ async fn copy_purge_merge(
                          move-project --force cannot delete a live managed \
                          workstream during a copy-purge merge; finish or cancel \
                          the managed run, then retry.",
-                        req.to_workspace, req.project,
+                        req.to_workspace, project_name,
                     )
                 })),
             ));
@@ -7711,13 +7906,13 @@ async fn copy_purge_merge(
         &state.wiki,
         format!(
             "move-project {}/{} -> {}/{}",
-            req.from_workspace, req.project, req.to_workspace, req.project
+            req.from_workspace, project_name, req.to_workspace, project_name
         ),
     );
 
     let report = MoveProjectReport {
         from: label,
-        to: format!("{}/{}", req.to_workspace, req.project),
+        to: format!("{}/{}", req.to_workspace, project_name),
         // copy_purge_merge is only reached from the merge branch.
         merged_into_existing: true,
         moved_via: "copy-purge",
@@ -7837,7 +8032,8 @@ async fn handle_merge_workspace(
     for p in &projects {
         let move_req = MoveProjectRequest {
             from_workspace: req.from.clone(),
-            project: p.project_name.clone(),
+            project: Some(p.project_name.clone()),
+            project_id: None,
             to_workspace: req.to.clone(),
             confirm: true,
             force: req.force,
@@ -7996,6 +8192,17 @@ async fn handle_write_page(
         (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+    ai_memory_core::page::ensure_profile_metadata_placement(
+        &metadata,
+        &path,
+        ai_memory_core::profile::is_reserved_scope_project(req.project.trim()),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
 
@@ -8239,12 +8446,6 @@ struct CreateApiCredentialRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct UserWithTokenResponse {
-    user: ai_memory_core::User,
-    token: String,
-}
-
-#[derive(Debug, Serialize)]
 struct UserWithPasswordResponse {
     user: ai_memory_core::User,
     temporary_password: String,
@@ -8381,44 +8582,6 @@ async fn create_human_user_response(
     ))
 }
 
-async fn handle_create_user(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
-    Json(req): Json<CreateUserRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    if req.role.is_some() {
-        return create_human_user_response(&state, auth, req).await;
-    }
-    let pepper = require_pepper(&state)?;
-    let mut new_user = ai_memory_core::NewUser {
-        username: req.username,
-        name: req.name,
-        email: req.email,
-    };
-    new_user
-        .validate()
-        .map_err(|e| validation_error(e.to_string()))?;
-    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
-    let token_hash = ai_memory_store::hash_token(&token, pepper);
-    let user_id = state
-        .writer
-        .create_user(new_user, token_hash)
-        .await
-        .map_err(map_user_store_err)?;
-    let user = state
-        .reader
-        .find_user_by_id(user_id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("created user vanished from store".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
-    ))
-}
-
 async fn handle_create_human_user(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -8442,87 +8605,6 @@ async fn handle_list_users(
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserListResponse { users }).unwrap_or_default()),
-    ))
-}
-
-async fn handle_expire_user(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    let user = lookup_user_by_username(&state, &username).await?;
-    state
-        .writer
-        .expire_user_token(user.id)
-        .await
-        .map_err(map_user_store_err)?;
-    let user = state
-        .reader
-        .find_user_by_id(user.id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after token expiry".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
-    ))
-}
-
-async fn handle_revive_user(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    let user = lookup_user_by_username(&state, &username).await?;
-    state
-        .writer
-        .revive_user_token(user.id)
-        .await
-        .map_err(map_user_store_err)?;
-    let user = state
-        .reader
-        .find_user_by_id(user.id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after token revival".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
-    ))
-}
-
-async fn handle_rotate_user_token(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    let pepper = require_pepper(&state)?;
-    let user = lookup_user_by_username(&state, &username).await?;
-    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
-    let token_hash = ai_memory_store::hash_token(&token, pepper);
-    let updated = state
-        .writer
-        .rotate_user_token(user.id, token_hash)
-        .await
-        .map_err(map_user_store_err)?;
-    if !updated {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "user vanished mid-rotation" })),
-        ));
-    }
-    let user = state
-        .reader
-        .find_user_by_id(user.id)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after token rotation".to_string()))?;
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
     ))
 }
 
@@ -9319,6 +9401,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9388,6 +9471,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9515,6 +9599,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9753,6 +9838,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9950,6 +10036,7 @@ mod tests {
 
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -10173,6 +10260,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -10740,6 +10828,7 @@ mod tests {
     ) -> AdminState {
         AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -12546,6 +12635,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -12658,6 +12748,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -12763,6 +12854,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -12874,6 +12966,7 @@ mod tests {
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -13424,6 +13517,7 @@ mod tests {
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -13477,12 +13571,22 @@ mod tests {
     /// compare. Configured `root_token` is AuthLevel::Root; a DB native key
     /// authenticates as AuthLevel::User even when `users.role` is root.
     fn user_admin_dual_auth_router(root_token: &'static str) -> (TempDir, Router) {
+        let (tmp, _store, router) = user_admin_dual_auth_router_with_store(root_token);
+        (tmp, router)
+    }
+
+    /// [`user_admin_dual_auth_router`] plus the store behind it, for tests
+    /// that seed rows the HTTP surface can no longer create.
+    fn user_admin_dual_auth_router_with_store(
+        root_token: &'static str,
+    ) -> (TempDir, Store, Router) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -13515,7 +13619,7 @@ mod tests {
             auth_state,
             crate::human_auth::require_dual_auth,
         ));
-        (tmp, router)
+        (tmp, store, router)
     }
 
     async fn post_disable_user(
@@ -13549,26 +13653,6 @@ mod tests {
                 Request::builder()
                     .method("PATCH")
                     .uri(format!("/admin/users/{username}"))
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {root_token}"))
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn post_create_user(
-        router: &Router,
-        root_token: &str,
-        body: serde_json::Value,
-    ) -> axum::http::Response<Body> {
-        router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users")
                     .header("content-type", "application/json")
                     .header("authorization", format!("Bearer {root_token}"))
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -13647,6 +13731,7 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/metrics", serde_json::Value::Null),
             (
                 "GET",
                 "/admin/project-coordinate?workspace=default&project=scratch",
@@ -13794,20 +13879,8 @@ mod tests {
             ("GET", "/admin/users", serde_json::Value::Null),
             (
                 "POST",
-                "/admin/users",
-                serde_json::json!({"username": "alice"}),
-            ),
-            (
-                "POST",
                 "/admin/human-users",
                 serde_json::json!({"username": "human"}),
-            ),
-            ("POST", "/admin/users/alice/expire", serde_json::Value::Null),
-            ("POST", "/admin/users/alice/revive", serde_json::Value::Null),
-            (
-                "POST",
-                "/admin/users/alice/rotate-token",
-                serde_json::Value::Null,
             ),
             (
                 "POST",
@@ -13822,7 +13895,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_db_user_tier() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -13856,7 +13929,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -13898,7 +13971,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_purge_project_dry_run_rejects_db_user_and_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -13983,7 +14056,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_purge_session_dry_run_rejects_db_user_and_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14066,7 +14139,7 @@ mod tests {
     #[tokio::test]
     async fn multiuser_delete_workspace_dry_run_rejects_db_user_and_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        post_create_user(
+        post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14155,6 +14228,23 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/admin/metrics")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            crate::metrics::PROMETHEUS_CONTENT_TYPE
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/admin/activity/by-client?since_days=7")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
@@ -14188,6 +14278,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -14260,7 +14351,7 @@ mod tests {
             .unwrap();
         assert_eq!(anonymous_before.status(), StatusCode::OK);
 
-        let create = post_create_user(
+        let create = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14322,6 +14413,7 @@ mod tests {
             ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: missing_db_reader,
             wiki,
@@ -14406,33 +14498,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_user_happy_path_returns_token_once() {
-        let (_tmp, router) = user_admin_test_router("root-token");
-        let resp = post_create_user(
-            &router,
-            "root-token",
-            serde_json::json!({
-                "username": "alice",
-                "name": "Alice Smith",
-                "email": "Alice@Example.com"
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["user"]["username"], "alice");
-        // Email was normalised to lowercase by NewUser::validate.
-        assert_eq!(json["user"]["email"], "alice@example.com");
-        assert_eq!(json["user"]["name"], "Alice Smith");
-        // Plaintext token is surfaced exactly once.
-        let token = json["token"].as_str().unwrap();
-        assert_eq!(token.len(), 43);
-        assert!(json["user"]["token_expired_at"].is_null());
-        assert!(json.get("temporary_password").is_none());
-    }
-
-    #[tokio::test]
     async fn create_human_user_is_additive_and_returns_temporary_password_once() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let resp = post_create_human_user(
@@ -14453,98 +14518,247 @@ mod tests {
         assert!(json.get("token").is_none());
     }
 
-    #[tokio::test]
-    async fn deprecated_user_token_routes_drive_the_legacy_api_credential() {
-        let (_tmp, router) = user_admin_dual_auth_router("root-token");
-        let create = post_create_user(
-            &router,
+    const LEGACY_TEST_PEPPER: &str = "test-pepper-admin";
+
+    /// What a 2.x `user add` left behind once V55 copied it: a user without a
+    /// password and a `legacy-user-token` credential whose id is the user id
+    /// and whose secret has no `aim_` prefix.
+    async fn seed_legacy_token_user(
+        store: &Store,
+        username: &str,
+        secret: &str,
+    ) -> ai_memory_core::UserId {
+        let user_id = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: username.to_string(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let pepper = ai_memory_store::TokenPepper::new(LEGACY_TEST_PEPPER);
+        store
+            .writer
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::from_slice(user_id.as_bytes()).unwrap(),
+                user_id,
+                "legacy-user-token".to_string(),
+                ai_memory_store::hash_token(secret, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+        user_id
+    }
+
+    async fn issue_api_key(router: &Router, username: &str) -> String {
+        let created = post_create_human_user(
+            router,
             "root-token",
-            serde_json::json!({"username": "alice"}),
+            serde_json::json!({ "username": username }),
         )
         .await;
-        assert_eq!(create.status(), StatusCode::OK);
-        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let original = json["token"].as_str().unwrap().to_string();
+        assert_eq!(created.status(), StatusCode::OK);
+        let (status, json) = admin_call(
+            router,
+            "POST",
+            "/admin/api-credentials",
+            "root-token",
+            Some(serde_json::json!({ "username": username, "label": "cli" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        json["token"].as_str().unwrap().to_string()
+    }
+
+    /// 3.0 removed the 1.x token-management endpoints. None of them may come
+    /// back for any tier: root gets a routing miss, the other tiers never get
+    /// past it either, and nothing about the users or their credentials
+    /// changes.
+    #[tokio::test]
+    async fn removed_legacy_token_routes_are_gone_for_every_tier() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let legacy = "q0N2v1d8kQd3m6Q7e9x4Zb1a2c3d4e5f6g7h8i9j0kL";
+        seed_legacy_token_user(&store, "alice", legacy).await;
+        let db_user = issue_api_key(&router, "bob").await;
+
+        let removed = [
+            (
+                "/admin/users",
+                Some(serde_json::json!({ "username": "mallory" })),
+            ),
+            ("/admin/users/alice/expire", None),
+            ("/admin/users/alice/revive", None),
+            ("/admin/users/alice/rotate-token", None),
+        ];
+        for (uri, body) in removed {
+            for bearer in [
+                Some("root-token"),
+                Some(db_user.as_str()),
+                Some(legacy),
+                None,
+            ] {
+                let mut builder = Request::builder().method("POST").uri(uri);
+                if let Some(token) = bearer {
+                    builder = builder.header("authorization", format!("Bearer {token}"));
+                }
+                let request_body = match &body {
+                    Some(json) => {
+                        builder = builder.header("content-type", "application/json");
+                        Body::from(serde_json::to_vec(json).unwrap())
+                    }
+                    None => Body::empty(),
+                };
+                let status = router
+                    .clone()
+                    .oneshot(builder.body(request_body).unwrap())
+                    .await
+                    .unwrap()
+                    .status();
+                let tier = match bearer {
+                    Some("root-token") => "root",
+                    Some(token) if token == legacy => "legacy token",
+                    Some(_) => "DB user",
+                    None => "anonymous",
+                };
+                // Root passes every gate and meets the routing miss itself:
+                // 405 where GET /admin/users still owns the path, 404 for the
+                // rest. Anonymous stops at authentication. On the shared
+                // /admin/users path the root gate answers other tiers first.
+                let expected = match (tier, uri) {
+                    ("anonymous", _) => StatusCode::UNAUTHORIZED,
+                    ("root", "/admin/users") => StatusCode::METHOD_NOT_ALLOWED,
+                    (_, "/admin/users") => StatusCode::FORBIDDEN,
+                    _ => StatusCode::NOT_FOUND,
+                };
+                assert_eq!(
+                    status, expected,
+                    "POST {uri} as {tier} must not reach a handler"
+                );
+            }
+        }
+
+        let (status, json) = admin_call(&router, "GET", "/admin/users", "root-token", None).await;
+        assert_eq!(status, StatusCode::OK, "GET /admin/users stays mounted");
+        let names: Vec<&str> = json["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["username"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["alice", "bob"], "no user may be created");
+        let (_, json) =
+            admin_call(&router, "GET", "/admin/api-credentials", "root-token", None).await;
+        for credential in json["credentials"].as_array().unwrap() {
+            assert!(
+                credential.get("revoked_at").is_none(),
+                "no credential may be expired: {credential}"
+            );
+        }
         assert_eq!(
-            user_token_admin_status(&router, &original).await,
+            user_token_admin_status(&router, legacy).await,
             StatusCode::FORBIDDEN,
-            "active legacy token must authenticate as a non-root DB user"
-        );
-
-        let expire = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users/alice/expire")
-                    .header("authorization", "Bearer root-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(expire.status(), StatusCode::OK);
-        assert_eq!(
-            user_token_admin_status(&router, &original).await,
-            StatusCode::UNAUTHORIZED
-        );
-
-        let revive = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users/alice/revive")
-                    .header("authorization", "Bearer root-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(revive.status(), StatusCode::OK);
-        assert_eq!(
-            user_token_admin_status(&router, &original).await,
-            StatusCode::FORBIDDEN
-        );
-
-        let rotate = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/users/alice/rotate-token")
-                    .header("authorization", "Bearer root-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(rotate.status(), StatusCode::OK);
-        let body = to_bytes(rotate.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let rotated = json["token"].as_str().unwrap();
-        assert_ne!(rotated, original);
-        assert_eq!(
-            user_token_admin_status(&router, &original).await,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            user_token_admin_status(&router, rotated).await,
-            StatusCode::FORBIDDEN
+            "the legacy token must still authenticate"
         );
     }
 
+    /// A token issued by the removed 1.x `user add` is an ordinary API key in
+    /// 3.0: it authenticates as its non-root user, an expired one stays
+    /// refused, and `api-key list|rotate|revoke` manage it.
+    #[tokio::test]
+    async fn legacy_user_token_is_managed_as_an_api_key() {
+        let (_tmp, store, router) = user_admin_dual_auth_router_with_store("root-token");
+        let active = "Lw7u0Qe1r2t3y4u5i6o7p8a9s0d1f2g3h4j5k6l7z8x";
+        let expired = "Mx8v1Rf2t3g4y5h6u7j8i9k0o1l2p3a4s5d6f7g8h9j";
+        let alice = seed_legacy_token_user(&store, "alice", active).await;
+        let carol = seed_legacy_token_user(&store, "carol", expired).await;
+        // 2.x `user expire` reached `api_credentials.revoked_at` through the
+        // V55 mirror; that is the state an expired token arrives in.
+        store
+            .writer
+            .revoke_api_credential(
+                ai_memory_core::ApiCredentialId::from_slice(carol.as_bytes()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            user_token_admin_status(&router, active).await,
+            StatusCode::FORBIDDEN,
+            "an active legacy token authenticates as a non-root DB user"
+        );
+        assert_eq!(
+            user_token_admin_status(&router, expired).await,
+            StatusCode::UNAUTHORIZED,
+            "an expired legacy token stays refused"
+        );
+
+        let (status, json) =
+            admin_call(&router, "GET", "/admin/api-credentials", "root-token", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = json["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == alice.to_string())
+            .cloned()
+            .expect("api-key list shows the legacy credential");
+        assert_eq!(listed["label"], "legacy-user-token");
+        assert_eq!(listed["user_id"], alice.to_string());
+        assert!(listed.get("revoked_at").is_none());
+
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            &format!("/admin/api-credentials/{alice}/rotate"),
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rotated = json["token"].as_str().unwrap().to_string();
+        assert!(rotated.starts_with("aim_"));
+        assert_eq!(
+            user_token_admin_status(&router, active).await,
+            StatusCode::UNAUTHORIZED,
+            "rotation retires the legacy secret"
+        );
+        assert_eq!(
+            user_token_admin_status(&router, &rotated).await,
+            StatusCode::FORBIDDEN
+        );
+
+        let (status, _) = admin_call(
+            &router,
+            "POST",
+            &format!("/admin/api-credentials/{alice}/revoke"),
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            user_token_admin_status(&router, &rotated).await,
+            StatusCode::UNAUTHORIZED,
+            "a revoked credential is refused"
+        );
+    }
     #[tokio::test]
     async fn create_user_rejects_duplicate_username_with_409() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
         )
         .await;
-        let resp = post_create_user(
+        let resp = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14556,7 +14770,7 @@ mod tests {
     #[tokio::test]
     async fn create_user_rejects_invalid_email_with_400() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let resp = post_create_user(
+        let resp = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice", "email": "not-an-email"}),
@@ -14573,7 +14787,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users")
+                    .uri("/admin/human-users")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({"username": "alice"})).unwrap(),
@@ -14588,7 +14802,7 @@ mod tests {
     #[tokio::test]
     async fn create_user_as_user_tier_returns_403() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let resp = post_create_user(
+        let resp = post_create_human_user(
             &router,
             "not-the-root-token",
             serde_json::json!({"username": "alice"}),
@@ -14602,7 +14816,8 @@ mod tests {
         let (_tmp, router) = user_admin_test_router("root-token");
         for n in ["alice", "bob", "carol"] {
             let _ =
-                post_create_user(&router, "root-token", serde_json::json!({"username": n})).await;
+                post_create_human_user(&router, "root-token", serde_json::json!({"username": n}))
+                    .await;
         }
         let resp = router
             .oneshot(
@@ -14634,7 +14849,7 @@ mod tests {
     #[tokio::test]
     async fn disable_then_enable_round_trips() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14709,7 +14924,7 @@ mod tests {
     #[tokio::test]
     async fn grants_can_be_issued_changed_listed_and_revoked_by_root() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14939,7 +15154,7 @@ mod tests {
     #[tokio::test]
     async fn purging_a_project_takes_its_grants() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -14972,7 +15187,7 @@ mod tests {
     #[tokio::test]
     async fn a_merging_move_does_not_carry_grants_to_the_destination() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15002,7 +15217,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_a_workspace_takes_its_grants() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15111,7 +15326,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_api_credential_issues_a_distinct_secret() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let _ = post_create_user(
+        let _ = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
@@ -15171,6 +15386,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -15242,7 +15458,7 @@ mod tests {
     #[tokio::test]
     async fn patch_demotion_of_last_recoverable_root_returns_409() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let created = post_create_user(
+        let created = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "keeper", "role": "root"}),
@@ -15276,7 +15492,7 @@ mod tests {
     #[tokio::test]
     async fn disable_of_last_recoverable_root_returns_409() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let created = post_create_user(
+        let created = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "keeper", "role": "root"}),
@@ -15301,7 +15517,7 @@ mod tests {
     async fn concurrent_root_removals_leave_one_recoverable_root() {
         let (_tmp, router) = user_admin_test_router("root-token");
         for name in ["alice", "bob"] {
-            let created = post_create_user(
+            let created = post_create_human_user(
                 &router,
                 "root-token",
                 serde_json::json!({"username": name, "role": "root"}),
@@ -15364,7 +15580,7 @@ mod tests {
     #[tokio::test]
     async fn native_api_token_for_root_role_user_cannot_manage_users() {
         let (_tmp, router) = user_admin_dual_auth_router("root-token");
-        let created = post_create_user(
+        let created = post_create_human_user(
             &router,
             "root-token",
             serde_json::json!({"username": "boss", "role": "root"}),

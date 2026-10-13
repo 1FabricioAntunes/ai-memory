@@ -1,5 +1,12 @@
 # agentmemory - Research Report
 
+> **Snapshot as of 2026-05-21; superseded in part.** Kept as history. As of
+> 2026-10-10 (v0.9.30) agentmemory has 54 MCP tools, all visible by default,
+> and 138 REST endpoints; auth is on by default; the iii engine is a public
+> repository under Apache-2.0 and Elastic License 2.0. Its LongMemEval-S
+> figure (95.2% `recall_any@5`) is measured on whole raw sessions with the
+> reranker disabled.
+>
 > **Follow-up:** the September 2026 landscape refresh (how this project
 > evolved, what the field looks like now, and what we concluded) is in
 > [`research-2026-landscape.md`](research-2026-landscape.md).

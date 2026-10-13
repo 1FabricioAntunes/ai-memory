@@ -78,10 +78,33 @@ def archive(major, root):
     body = "\n\n".join(s for _, s in moved)
     target.write_text(head + "\n" + body + "\n\n" + "\n".join(moved_links) + "\n")
 
-    out = preamble.rstrip("\n") + "\n\n" + "\n\n".join(s for _, s in kept)
+    out = with_archive_note(preamble, root).rstrip("\n") + "\n\n" + "\n\n".join(s for _, s in kept)
     changelog.write_text(out + "\n\n" + "\n".join(kept_links) + "\n")
     print(f"changelog: moved {len(moved)} {major}.x sections to {target.relative_to(root)}")
     return 0
+
+
+ARCHIVE_NOTE = re.compile(r"This file holds the current major line\..*?(?:\n\n|\Z)", re.S)
+
+
+def with_archive_note(preamble, root):
+    """Rewrite the preamble's archive note to list every archived major line."""
+    majors = sorted(
+        (int(p.name.split(".")[0]) for p in (root / ARCHIVE_DIR).glob("*.x.md")
+         if p.name.split(".")[0].isdigit()),
+        reverse=True,
+    )
+    if not majors:
+        return preamble
+    links = [f"[{m}.x]({ARCHIVE_DIR}/{m}.x.md)" for m in majors]
+    listed = links[0] if len(links) == 1 else ", ".join(links[:-1]) + " and " + links[-1]
+    note = (
+        "This file holds the current major line. Earlier lines are archived per major\n"
+        f"version in [`{ARCHIVE_DIR}/`]({ARCHIVE_DIR}/):\n{listed}.\n\n"
+    )
+    if ARCHIVE_NOTE.search(preamble):
+        return ARCHIVE_NOTE.sub(lambda _: note, preamble, count=1)
+    return preamble.rstrip("\n") + "\n\n" + note
 
 
 def git_show(ref, path, root):

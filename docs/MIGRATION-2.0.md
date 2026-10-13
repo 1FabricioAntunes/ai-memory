@@ -1,5 +1,7 @@
 # Upgrading to 2.0
 
+Upgrading a 2.x install to 3.0? See [Upgrading to 3.0](upgrading-to-3.0.md).
+
 2.0 changes the wiki's on-disk format to the [Open Knowledge Format
 v0.2](okf.md). The upgrade is automatic, runs only after a backup succeeds,
 and is reversible. This page describes what happens and how to go back.

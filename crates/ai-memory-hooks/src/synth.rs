@@ -286,6 +286,19 @@ fn session_summary(tally: &SessionTally<'_>) -> String {
         parts.push(format!("over {spent}"));
     }
 
+    // The harness's own word for why the session ended (#1225), when the
+    // SessionEnd observation carried one. Display-bounded: a summary line
+    // is no place for a long free-text field.
+    if let Some(reason) = tally
+        .end
+        .and_then(|end| end.body.strip_prefix("reason: "))
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        let shown: String = reason.chars().take(60).collect();
+        parts.push(format!("ended ({shown})"));
+    }
+
     if parts.is_empty() {
         return String::new();
     }
@@ -545,6 +558,45 @@ mod tests {
         assert_eq!(
             session_summary(&tally_session(&observations)),
             "2 prompts, 3 completed tool calls across Bash and Edit, over 18m."
+        );
+    }
+
+    /// #1225: the harness's end reason, when captured, closes the summary;
+    /// a long one is display-bounded.
+    #[test]
+    fn the_summary_states_why_the_session_ended() {
+        let end = |body: &str| {
+            let mut o = obs_at(
+                ObservationKind::SessionEnd,
+                "session",
+                "2026-08-24T10:05:00Z",
+            );
+            o.body = body.into();
+            o
+        };
+        let start = obs_at(
+            ObservationKind::SessionStart,
+            "session",
+            "2026-08-24T10:00:00Z",
+        );
+        let prompt = obs(ObservationKind::UserPrompt, "ship it");
+        assert_eq!(
+            session_summary(&tally_session(&[
+                start.clone(),
+                prompt.clone(),
+                end("reason: logout")
+            ])),
+            "1 prompt, over 5m, ended (logout)."
+        );
+        assert_eq!(
+            session_summary(&tally_session(&[start.clone(), prompt.clone(), end("")])),
+            "1 prompt, over 5m."
+        );
+        let long = format!("reason: {}", "x".repeat(200));
+        let summary = session_summary(&tally_session(&[start, prompt, end(&long)]));
+        assert!(
+            summary.ends_with(&format!("ended ({}).", "x".repeat(60))),
+            "{summary}"
         );
     }
 

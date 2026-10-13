@@ -142,9 +142,12 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Kiro CLI | Supported |
 | Pool | Hooks-only |
 | GitHub Copilot CLI | Supported |
+| Factory Droid | Supported |
+| Meta Muse Code | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
-| Muse Code | MCP-only |
+| DeepSeek Harness (DSH) | MCP-only |
+| Prime Agent | MCP-only |
 | Hermes Agent | Supported |
 | GrizzyBot | Supported |
 | LLM/auth providers | Supported |
@@ -162,12 +165,12 @@ carries over from each tool and what you gain:
 
 | Coming from… | What's similar | What you gain |
 |---|---|---|
-| **Mem0 / fact extractors** (LangMem) | Automatic per-turn capture | Memory compiles into readable **pages** you own and edit, not opaque fact rows; retrieval fuses FTS + entity + graph (+ optional vectors), not vector-only |
+| **Mem0 / fact extractors** (LangMem) | Automatic per-turn capture | Memory compiles into readable **pages** you own and edit, not opaque fact rows; retrieval fuses FTS + entity + graph (+ local vectors) with no cloud API key |
 | **Zep / Graphiti** (temporal KG) | Temporal reasoning, typed relations | Bi-temporal-lite (`as_of`, version-filtered search) and typed edges without standing up a graph database, in one binary |
-| **mcp-memory-service** (closest sibling) | SQLite + local embeddings, hook capture, typed edges, honest numbers, and, on 2.4, per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access reinforcement, and contradiction flagging | Human-editable markdown **pages** instead of fact-rows, cross-agent claim-once handoffs, and the same aging machinery done **zero-LLM by default, reversibly** (supersede-not-delete + `restore-page`), and **off by default** |
-| **basic-memory** (file-first sibling) | Markdown-on-disk as the source of truth | Automatic lifecycle capture and a derived FTS/entity/graph index on top, cross-agent handoffs, and multi-user sharing built in |
+| **mcp-memory-service** (fact rows, SQLite) | SQLite + local embeddings, hook capture, typed edges, honest numbers, and, on 2.4, per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access reinforcement, and contradiction flagging | Human-editable markdown **pages** instead of fact-rows, cross-agent claim-once handoffs, and the same aging machinery done **zero-LLM by default, reversibly** (supersede-not-delete + `restore-page`), and **off by default** |
+| **basic-memory** (file-first markdown) | Markdown-on-disk as the source of truth | Automatic lifecycle capture and a derived FTS/entity/graph index on top, cross-agent handoffs, and multi-user sharing built in |
 | **Claude Code built-in memory** | "Remember my project" convenience, zero setup | Synced across machines and agents, searchable, team-capable, and captures tool lifecycle, unlike a per-laptop `MEMORY.md` |
-| **Hindsight / OpenViking** (hosted, LLM-required) | Living pages / document memory with a background consolidation loop, plus, on 2.4, belief-strength confidence plus an opt-in LLM "dream" rewrite of cold clusters | A self-contained binary that runs zero-LLM by default and keeps memory in files you own; per-project team sharing instead of strict per-bank isolation; the dream/belief features are **opt-in, off by default, and never delete a source** (vs a mandatory LLM loop) |
+| **Hindsight / OpenViking** (LLM or VLM in the loop) | Living pages / document memory with a background consolidation loop, plus, on 2.4, belief-strength confidence plus an opt-in LLM "dream" rewrite of cold clusters | A self-contained binary that runs zero-LLM by default and keeps memory in markdown files that are the source of truth, not a mirror; claim-once handoffs; the dream/belief features are **opt-in, off by default, and never delete a source** (vs a mandatory LLM loop) |
 | **Supermemory / LiquidLM** (hosted memory API) | A managed second brain with automatic ingestion | Git-versioned markdown you own, no required API spend, offline operation, and per-project team sharing; ai-memory remembers *this repo*, not a general vault |
 
 Across all of these, ai-memory gives you files you own (git-backed markdown),
@@ -194,6 +197,37 @@ The full comparison, covering where each approach wins, where ai-memory
 differs, and the published benchmark, is in [How ai-memory compares](docs/comparison.md).
 
 ## Quick start
+
+### Linux and macOS (two commands, no root)
+
+```bash
+curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh
+ai-memory setup
+```
+
+`install.sh` downloads the release for your OS and CPU, checks it against the
+release's published SHA-256 checksum (it refuses to install without a match),
+and links `~/.local/bin/ai-memory`. `ai-memory setup` then creates the data
+directory with a bearer token in an owner-only file, starts a per-user service
+(systemd `--user` or a launchd LaunchAgent), and wires MCP, hooks and Agent
+Skills for every agent it finds, or the ones you name with `--agent`. It shows
+the plan and asks first; `--yes` skips the question, and running it again
+changes nothing. Restart your agents afterwards. Details, the environment
+variables and how to verify the script before running it are in
+[`docs/install.md`](docs/install.md#one-step-native-install-installsh--ai-memory-setup).
+An AI agent installing ai-memory for you can follow
+[`INSTALL_FOR_AGENTS.md`](INSTALL_FOR_AGENTS.md).
+
+Claude Code and Codex users can wire their agent as a marketplace plugin
+instead (the binary is still installed as above):
+
+```bash
+claude plugin marketplace add akitaonrails/ai-memory && claude plugin install ai-memory@ai-memory
+codex plugin marketplace add akitaonrails/ai-memory && codex plugin add ai-memory@ai-memory
+```
+
+Codex then asks you to trust the hooks in `/hooks`. See
+[Marketplace plugins](docs/install.md#marketplace-plugins).
 
 ### Arch Linux (AUR)
 
@@ -251,8 +285,9 @@ open "companions/ai-memory-macos/dist/AI Memory.app"
 ```
 
 Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
-from the menu extra (no Dock icon). When the status item is green, wire an
-agent with the bundled binary:
+from the menu extra (no Dock icon). The app reads the bearer token `init`
+wrote into its data dir, so the status item turns green on its own. Then wire
+an agent with the bundled binary:
 
 ```bash
 BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
@@ -273,10 +308,11 @@ The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
 without `--platform linux/amd64` emulation.
 
-The default quick-start has **no authentication**. The server binds
-to loopback only, so on a single-user laptop nothing else can reach
-it. Adding a bearer token is a one-line change once you're ready to
-expose the server on the LAN; see [Security](#security) below.
+The Docker quick-start below has **no authentication**: the container never
+runs `init`, so it starts without a token. The server binds to loopback only,
+so nothing outside the machine can reach it, but local processes and browser
+pages can. Native installs that run `ai-memory init` get a bearer token by
+default; see [Security](#security) below for that and for adding a token here.
 
 ```bash
 # 1. Install the ai-memory CLI wrapper (a small shell script that
@@ -322,7 +358,7 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
 #    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent opencode2`, `--agent gemini-cli`,
-#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent omp`,
+#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent droid`, `--agent muse`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
 #    for additional agents; full list in docs/install.md.
@@ -353,6 +389,8 @@ refresh); see
 [`docs/install.md#keeping-ai-memory-up-to-date`](docs/install.md#keeping-ai-memory-up-to-date).
 The same native upgrade path covers Windows x86_64 zip installs under a
 writable prefix (see [`docs/windows.md`](docs/windows.md) Scenario C).
+Upgrading a 2.x install of any kind to 3.0? Read
+[`docs/upgrading-to-3.0.md`](docs/upgrading-to-3.0.md) first.
 
 Wiring another agent is the same two commands with a different name:
 `--client codex`, `--agent codex`, and so on for every row of the support
@@ -375,9 +413,9 @@ a separate `install-hooks`/`install-mcp` step to forget), it wires the right
 project scope by construction, and it adds cross-harness *session* continuity on
 top of shared memory. Everything is idempotent and one-time per harness and
 config home. If the server is unreachable, `run` warns and launches anyway
-with local capture spooling (see [Degraded offline
-launches](docs/managed-workstreams.md#degraded-offline-launches)); pass
-`--require-server` to fail closed instead.
+with local capture spooling; run `ai-memory recover` after the server returns
+(see [Degraded offline launches](docs/managed-workstreams.md#degraded-offline-launches)).
+Pass `--require-server` to fail closed instead.
 
 ```bash
 ai-memory run claude
@@ -494,7 +532,10 @@ readable wiki pages; the next session starts with a handoff.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
-  the wiki and a JSON API under `/api/v1`.
+  the wiki and a JSON API under `/api/v1`. On a server with a bearer token
+  and no user accounts (every fresh install), the browser asks for a username
+  and password: any username, and the contents of
+  `<data_dir>/auth-tokens/default` as the password.
 - Back up host-side harness configuration with
   `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
   `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only
@@ -517,8 +558,12 @@ data directory, never two.
 
 ## Security
 
-The quick-start default is loopback-only with no auth, so nothing outside
-your machine can reach it. From there, hardening is incremental: a bearer
+The server binds to loopback only by default. A fresh `ai-memory init` also
+mints a root bearer token into the data dir, which the hooks, the CLI and the
+`ai-memory mcp-bridge` stdio bridge read from there; it is never written into
+a harness config. An install created before that default (and the Docker
+quick-start) runs without auth until `ai-memory auth enable`, and
+`ai-memory status` says so. From there, hardening is incremental: a bearer
 token for the LAN, per-user accounts, OIDC device auth for hooks, TLS via
 a reverse proxy. Capture is sanitized at a typed privacy boundary before
 anything is stored, and per-repository `[capture]` rules can exclude
@@ -537,7 +582,7 @@ identity/SSO, and offline-install questions specifically, see
 Optional. Everything works with zero LLM calls; adding a provider
 upgrades session summaries and enables semantic search. Anthropic,
 OpenAI (including OAuth), Codex CLI credential reuse, GitHub Copilot, Gemini,
-OpenCode (Go and Zen), and
+OpenCode (Go and Zen), the Cursor Agent CLI (`cursor`), and
 any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
 for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
 endpoints for embeddings. Configuration lives in
@@ -559,8 +604,9 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 Hooks POST observations to the server. The server serializes writes
 through one SQLite writer, compiles session observations into markdown
 pages, and serves retrieval through FTS5, entity-match and graph-neighbor RRF,
-optional vector RRF, bounded source-authority adjustment, and bounded
-raw-observation fallback for non-global searches.
+optional vector RRF, an observation-evidence stream that lifts a session's
+page when its captured turns match (on by default), bounded source-authority
+adjustment, and bounded raw-observation fallback for non-global searches.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data-flow
 diagram, crate breakdown, schema notes, and invariants.
@@ -596,6 +642,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`DATA_HANDLING.md`](DATA_HANDLING.md) | **Data-flow reference for security/legal review.** What's stored, what's local-only, the two opt-in external paths, and how deletion/retention work. |
 | [`docs/sso.md`](docs/sso.md) | Enterprise identity: the OIDC device-auth flow, its scope, and how to front the server with an OIDC-aware gateway. |
 | [`docs/airgapped-install.md`](docs/airgapped-install.md) | Offline/air-gapped install: self-contained build, checksum-verified release binaries, and offline local embedding models. |
+| [`docs/upgrading-to-3.0.md`](docs/upgrading-to-3.0.md) | Upgrading a 2.x install to 3.0: what changed, the removed token commands and their replacements, upgrade steps, and rollback. |
 | [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) | Upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore. |
 | [`docs/benchmarks/`](docs/benchmarks/README.md) | Published retrieval-quality numbers with provenance, reproducible from the in-repo harness. |
 | [`docs/okf.md`](docs/okf.md) | The wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping. |
@@ -607,7 +654,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
-| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), and [team-wiki export](companions/ai-memory-wikisync). |
+| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), [team-wiki sync](companions/ai-memory-wikisync) and the [TypeScript client SDK](companions/ai-memory-ts). |
 | [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 

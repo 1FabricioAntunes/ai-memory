@@ -33,7 +33,10 @@ pub use markdown::{
 };
 pub use migrations::run_pending as run_wiki_migrations;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
-pub use wiki::{MoveSessionOutcome, PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest};
+pub use wiki::{
+    ConditionalWrite, MoveSessionOutcome, PurgeSessionOutcome, SessionPageFile, Wiki,
+    WritePageRequest,
+};
 
 // Integration tests compile into this crate's test harness instead of a
 // separate binary: every test binary is another link and, on macOS and

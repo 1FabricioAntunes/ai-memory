@@ -78,7 +78,7 @@ install or refresh work.
 If you're about to write a durable project rule ("always X", "never
 Y", "all PRs must ..."), write it in the project's canonical agent instruction file.
 Many projects use CLAUDE.md for Claude Code and
-AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
+AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
 Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
@@ -100,7 +100,7 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
+  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code / Copilot CLI / Muse Code -> `AGENTS.md`),
   uses its Write / Edit tool to replace or append the returned
   `markered_block` while preserving
   non-ai-memory user content, then writes or updates each returned
@@ -143,13 +143,15 @@ Core design:
   compiles session observations into durable wiki pages (Karpathy-style
   "compile, not retrieve").
 - **Retrieval** is FTS5 + lexical entity-match + link-neighbor RRF, with
-  optional vector RRF when an embedding provider is configured, plus bounded
+  optional vector RRF when an embedding provider is configured, an
+  observation-evidence stream over `observations_fts` that votes for session
+  pages (on by default, `[retrieval] observation_stream`), plus bounded
   raw-observation fallback.
 - **LLM is opt-in.** Zero-LLM mode still captures, searches (FTS5), and
   writes rule-based summaries. Providers (Anthropic, Anthropic OAuth,
   OpenAI, OpenAI/Codex OAuth, GitHub Copilot, Gemini, OpenCode,
-  OpenAI-compatible endpoints) enable
-  consolidation, lint, and the auto-improvement loop.
+  OpenAI-compatible endpoints, Cursor Agent CLI) enable consolidation, lint,
+  and the auto-improvement loop.
 - **Per-project isolation by construction**: every row and page is keyed
   by `(workspace_id, project_id, path)`, resolved from the caller's cwd,
   a `.ai-memory.toml` marker file, or explicit scope arguments.
@@ -203,16 +205,25 @@ crates/
 ├── ai-memory-test-support/ shared test helpers (dev-dependency only, no test binary).
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 evals/                     live A/B harness; workspace member, not shipped.
-companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
+companions/ai-memory-importer/  standalone OMC, external-conversation and agentmemory importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
 companions/ai-memory-client/    capture-privacy helpers shared by relay + importer; own workspace.
 companions/ai-memory-relay/     durable external-lifecycle event relay (POST /hook/batch); own workspace.
+companions/ai-memory-wikisync/  team-wiki git sync through the public MCP tools; own workspace.
 companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace member —
                            `swift test --package-path companions/ai-memory-macos`
                            and `./companions/ai-memory-macos/build.sh`.
+companions/ai-memory-ts/        optional TypeScript client SDK (npm, Node 22+); NOT a workspace
+                           member and never shipped with the server.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
+plugins/                   generated Claude Code + Codex marketplace plugins (catalogs in
+                           `.claude-plugin/`, `.agents/plugins/`); edit the templates in
+                           `crates/ai-memory-cli/templates/plugin/` and re-run
+                           `ai-memory render-plugins --out .` — a test fails on drift.
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
+install.sh                 two-command native install, step one (release asset).
+INSTALL_FOR_AGENTS.md      how an AI agent installs ai-memory for its user.
 docker/                    Dockerfile, compose files, TLS proxy templates.
 packaging/                 AUR/RPM/systemd/launchd/sysusers/tmpfiles/env native packaging assets.
 nix/, flake.nix            Nix package + NixOS module.
@@ -286,9 +297,9 @@ covers the same tests, slower, no tiers.
   `static/tailwind.css`; commit the result. CI regenerates it on Linux and
   fails if the committed file is stale, so nothing else needs the download.
 - Run each Cargo companion separately (`ai-memory-client`,
-  `ai-memory-importer`, `ai-memory-relay`, and on `release/3.0`
-  `ai-memory-wikisync`): `cargo fmt --check`, `cargo clippy --locked
-  --all-targets -- -D warnings` and `cargo test --locked`, each with
+  `ai-memory-importer`, `ai-memory-relay` and `ai-memory-wikisync`):
+  `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
+  and `cargo test --locked`, each with
   `--manifest-path companions/<name>/Cargo.toml`. CI also builds the relay
   and runs `uv run --no-project python tests/e2e/external_relay_smoke.py`
   against the real server. Root `--workspace` commands cover none of them.
@@ -296,6 +307,13 @@ covers the same tests, slower, no tiers.
   `swift test --package-path companions/ai-memory-macos`
   (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
   Root `--workspace` commands do not cover it.
+- Run the TypeScript SDK separately, from `companions/ai-memory-ts`:
+  `npm ci --ignore-scripts`, `npm run check` (typecheck, unit tests, schema
+  and generated-docs checks, TypeDoc) and
+  `AI_MEMORY_BIN=../../target/debug/ai-memory npm run test:integration`
+  (real server, schema drift test, examples). npm tooling and its lockfile
+  stay inside that directory; nothing in the core workspace or the server
+  distribution depends on Node.
 
 ### Platform notes
 
@@ -333,9 +351,11 @@ covers the same tests, slower, no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
+  `tests/hooks/test_plugin_launcher.sh`, `tests/install_sh.sh`,
   `tests/e2e/handoff_smoke.sh`, `tests/wrapper_upgrade.sh`,
   `tests/e2e/external_relay_smoke.py`, `scripts/check-native-packaging.sh`,
   `scripts/check-nix-packaging.sh` (Nix flake output),
+  `scripts/onboarding-acceptance.sh` (clean home to first returned memory),
   `scripts/check-changelog-sections.sh` and
   `scripts/check-changelog-frozen.sh origin/<base>`.
 - `.github/workflows/macos-app.yml` builds and tests the Swift companion on
@@ -536,8 +556,10 @@ Additional boundary rules:
 
 ## Security considerations
 
-- **Default posture:** loopback-only bind (`127.0.0.1:49374`), no auth —
-  safe for a single-user machine. Any non-loopback bind should set a
+- **Default posture:** loopback-only bind (`127.0.0.1:49374`). A fresh
+  `ai-memory init` mints a root bearer into `<data_dir>/auth-tokens/default`
+  (`[auth].bearer_token_file`); an install created before that keeps no
+  auth until `ai-memory auth enable`. Any non-loopback bind should set a
   bearer token (`AI_MEMORY_AUTH_TOKEN`) and `AI_MEMORY_ALLOWED_HOSTS`
   (DNS-rebinding guard). TLS is deliberately delegated to a reverse
   proxy (see `docs/https-via-proxy.md`).
@@ -668,7 +690,13 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 23 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 23 (see `docs/ARCHITECTURE.md`). They also
+  update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
+  the schema snapshot (`npm run schema:update`), the wrapper or its
+  classification in `src/coverage.ts`, types, tests and docs. The SDK's
+  schema drift test in CI fails until they do. Changes to the `/api/v1`
+  routes the SDK wraps follow the same rule, enforced by its integration
+  tests.
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys, a new agent harness or LLM
   provider); major = breaking (on-disk format without migration, removed

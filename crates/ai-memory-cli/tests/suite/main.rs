@@ -5,6 +5,7 @@
 //! as the single `suite` target and never builds the sibling files on their own,
 //! so a new file must be declared here (`scripts/check-test-suites.*` enforces it).
 
+mod auth_default_e2e;
 mod autoscope_env;
 mod backfill_dry_run;
 mod backfill_e2e;
@@ -20,11 +21,13 @@ mod external_capture_powershell;
 mod external_capture_ts;
 mod hook_drain;
 mod hook_payload;
+mod install_script;
 mod jail_toggles_e2e;
 mod marker_scope;
 mod message_e2e;
 mod opencode_dialect;
 mod packaging;
+mod plugins;
 mod profile_e2e;
 mod removal;
 mod repo_layout;
@@ -33,6 +36,7 @@ mod routing_skills;
 mod run_offline;
 mod serve_shutdown;
 mod server_profiles;
+mod setup_e2e;
 mod shutdown_signals;
 mod upgrade_e2e;
 mod workstream_provenance;

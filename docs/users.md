@@ -56,8 +56,8 @@ Every HTTP request is resolved to one of four authentication tiers:
 
 | Rung | Trigger | What the request gets |
 |---|---|---|
-| **0 — Anonymous** | No `[auth].bearer_token` set. | Allowed, no identity. Same as pre-multi-user defaults. |
-| **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
+| **0 — Anonymous** | No root bearer configured (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token` or `[auth].bearer_token_file`). | Allowed, no identity. Same as pre-multi-user defaults. A fresh `ai-memory init` skips this rung by minting a root bearer; an older install stays here until `ai-memory auth enable`. |
+| **1 — Root** | Bearer matches the root bearer (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token`, or the token in `[auth].bearer_token_file`). | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
 | **1b — Proxy-asserted user** | Bearer matches the distinct `[auth].actor_proxy_bearer_token`. | Identity is taken from trusted `X-Memory-Actor-*` headers. The request is a **user** unless its OIDC issuer/subject pair exactly matches the configured root pair. Missing or malformed identity is rejected. |
 | **2 — DB user** | Bearer doesn't match root, matches an active `api_credentials.token_hash` (SHA-256 of the secret + `[auth].token_pepper`). Native keys use the `aim_` prefix. | Allowed as **that user** for normal read/write APIs. Native keys always resolve as `AuthLevel::User`, even when the owning identity is `role=root`. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
 | **3 — 401** | Bearer present but matches nothing. | Rejected. This closes the bypass: unknown bearers can't slip through as anonymous. |
@@ -262,6 +262,13 @@ no workspace or project because many MCP-only clients do not provide reliable
 per-call scope. Like every `/admin/*` route, it is root-only when the deployment
 distinguishes operators.
 
+`GET /admin/metrics` exposes the same read/write split as process-lifetime
+totals in Prometheus text format (`ai_memory_mcp_tool_calls_total{kind=...}`),
+next to the hook counters and the `/hook` and `memory_query` latency
+histograms. It carries no client name: a client label is caller-supplied text,
+and no metric label is ever drawn from a request. It is root-only under the same
+rule.
+
 ## Per-operator memory slots
 
 The "absent means shared" rule extends to memory slots, so a single-operator
@@ -445,13 +452,13 @@ alice     Alice Smith  user  must-change
 bob       -            user  active
 carol     -            user  disabled
 dave      -            user  active
-erin      -            user  expired
 ```
 
-An `active` row without a password can be a deprecated 1.x compatibility-token
-identity. Grant human login with `user reset-password`; that does not reveal or
-rotate the machine secret. The list never surfaces passwords, hashes, or API
-secrets.
+An `active` row without a password is an API-only identity, such as a user the
+removed 1.x `user add` created. Its token is an API key now: `ai-memory api-key
+list` shows it with the label `legacy-user-token`. Grant human login with
+`user reset-password`; that does not reveal or rotate the API key. The list
+never surfaces passwords, hashes, or API secrets.
 
 ### 4. Disable human login (without losing attribution history)
 
@@ -577,20 +584,25 @@ If you're upgrading a machine-bearer-only install:
 - **No immediate action is required.** Existing
   `[auth].bearer_token` authentication continues to work as before.
   Configure human bootstrap/recovery only when enabling password login.
-- Migration V52 extends the existing `users` table with human role/password
-  state and creates `web_sessions`; V53 copies every valid legacy
+- Migration V54 extends the existing `users` table with human role/password
+  state and creates `web_sessions`; V55 copies every valid legacy
   `users.token_hash` into `api_credentials` without changing its digest or
-  owner id.
-- Deprecated 1.x `user add`, `user expire`, `user revive`, and
-  `user rotate-token` commands remain available for compatibility. They manage
-  the migrated `legacy-user-token` credential; new automation should use
-  `api-key` commands, and new people should use `user add-human`.
-  The V53 mirror triggers are load-bearing for those shims and remain until the
-  shims are removed in 3.0. Credentials they created keep authenticating after
-  that, as ordinary API keys managed with `api-key`.
+  owner id. The copy is labelled `legacy-user-token`, and its credential id is
+  the user's id.
+- 3.0 removed the 1.x `user add`, `user expire`, `user revive`, and
+  `user rotate-token` commands and their `/admin/users` endpoints (`POST
+  /admin/users` and `POST /admin/users/{name}/expire|revive|rotate-token`).
+  Migration V79 drops the `users.token_hash` and `users.token_expired_at`
+  columns and the V55 triggers that mirrored them into `api_credentials`;
+  nothing else wrote or read them. Tokens those commands issued keep
+  authenticating as ordinary API keys: list them with `api-key list`, replace
+  one with `api-key rotate <id>` and retire one with `api-key revoke <id>`. A
+  token that was expired before the upgrade stays refused. Add people with
+  `user add-human` and machine credentials with `api-key add`.
 - Before any human password or completed bootstrap exists, GET-only browser
-  routes continue to accept the root bearer through HTTP Basic and the
-  HttpOnly `ai_memory_auth` cookie. Human activation disables that path
+  routes continue to accept the root bearer through HTTP Basic, and an
+  HttpOnly `ai_memory_auth` cookie an older build set (a Basic sign-in no
+  longer sets one). Human activation disables that path
   immediately, without a restart. Machine routes remain Bearer-only.
 - Native API credentials require `[auth].token_pepper`. Human user creation,
   password reset, disable/enable, and session login do not create or depend
@@ -647,8 +659,9 @@ into `web_sessions`. The cookie is `HttpOnly`, `SameSite=Strict`,
 hash.
 
 Brownfield `users.token_hash` values were copied losslessly into
-`api_credentials` (same 32-byte digest, label `legacy-user-token`).
-Runtime lookup no longer reads the old columns.
+`api_credentials` (same 32-byte digest, label `legacy-user-token`), and V79
+dropped the old columns. A copied token has no `aim_` prefix; the lookup
+hashes whatever bearer it gets, so it authenticates like any other key.
 
 ## Where attribution shows up
 
@@ -656,7 +669,7 @@ Runtime lookup no longer reads the old columns.
 |---|---|
 | Auth middleware injects `Extension<ActorContext>` on every request | ✓ P1.3 |
 | All `/admin/*` routes gate on `Extension<AuthLevel>::Root` in multi-user mode | ✓ P1.4 |
-| `ai-memory user add-human/list/reset-password/disable/enable/patch`, deprecated `user add/expire/revive/rotate-token`, and `ai-memory api-key add/list/rotate/revoke` | ✓ |
+| `ai-memory user add-human/list/reset-password/disable/enable/patch` and `ai-memory api-key add/list/rotate/revoke` | ✓ |
 | `pages.author_id` populated, frontmatter `last_modified_by` block | ✓ P1.6 |
 | `/api/v1` page responses include `author: { username, name?, email? }` | ✓ P1.7 |
 | ETag invalidation on author change (so caches refresh attribution) | ✓ P1.7 |
@@ -772,9 +785,7 @@ ones who should keep access; nothing is granted automatically.
   multi-user collaboration is a core capability. `pages.author_id` is
   attribution, never a read filter.
 - **Native keys are not passwords.** `user add-human` never issues an `aim_`
-  secret; `api-key add` never issues a login session. The deprecated `user add`
-  command is the exception: it issues one compatibility token backed by the
-  reserved `legacy-user-token` credential. Disable/reset of a human leaves API
+  secret; `api-key add` never issues a login session. Disable/reset of a human leaves API
   credentials untouched, and revoke/rotate of a native key leaves the
   password/session untouched. One identity may hold several native keys with
   distinct labels.

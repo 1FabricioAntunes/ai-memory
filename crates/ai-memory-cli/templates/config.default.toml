@@ -43,6 +43,15 @@ log_level = "info"
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
 
+# Server-side drop list for tool events (#1241): the server acknowledges and
+# discards a matching PreToolUse/PostToolUse event before it is sanitized or
+# stored, whatever the client sends. Applies to every project on this server.
+# At most 64 entries per list, 128 characters each. Example: Claude Code marks
+# plugin tool calls with their own tool-use id prefix.
+# [ingest]
+# drop_tool_use_id_prefixes = ["toolu_plugin_"]
+# drop_tool_names = ["mcp__noisy__poll"]
+
 # Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
 # tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.
 # Generic MCP clients (OpenCode, Cursor) never send that marker yet forward
