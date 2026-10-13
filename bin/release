@@ -169,6 +169,15 @@ path.write_text(new_text)
 print("  moved [Unreleased] entries to [$VERSION] - $TODAY")
 PYEOF
 
+# A new major line keeps CHANGELOG.md to itself: the previous major's
+# sections and compare links move to docs/changelog/<major>.x.md, where they
+# stay frozen (scripts/check-changelog-frozen.sh reads both places).
+if [[ "$VERSION" =~ ^([0-9]+)\.0\.0$ ]] && (( BASH_REMATCH[1] > 0 )); then
+  echo "==> Archiving the $(( BASH_REMATCH[1] - 1 )).x CHANGELOG sections"
+  python3 "$REPO_ROOT/scripts/changelog_sections.py" archive "$(( BASH_REMATCH[1] - 1 ))" --root "$REPO_ROOT"
+  git add "$REPO_ROOT/docs/changelog"
+fi
+
 # ── commit + tag ───────────────────────────────────────────────────────────
 
 echo "==> Committing release files"

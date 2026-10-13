@@ -306,8 +306,14 @@ covers the same tests, slower, no tiers.
 
 - **All.** `target/` grows without bound: every edit to a shared crate leaves
   the previous copy of each 100-180 MB test binary behind (seen at 157 GiB).
-  `cargo install cargo-sweep --locked` once, then `cargo sweep --time 7`
-  weekly. Give rust-analyzer its own target dir
+  Run `cargo clean` in the checkout you build in when it grows (weekly is
+  plenty; the next build takes a few minutes). For stale worktrees and extra
+  `CARGO_TARGET_DIR`s, `cargo install cargo-clean-all --locked` once, then
+  `cargo clean-all --keep-days 7 <dir>` lists every target directory under
+  `<dir>` not built in the last week and deletes them after you confirm. It
+  removes whole target directories, so it never trims the one you are
+  actively building. (`cargo-sweep`, which this note used to recommend, is
+  unmaintained.) Give rust-analyzer its own target dir
   (`rust-analyzer.cargo.targetDir = true`) so a save-triggered check never
   holds the lock a `cargo t` is waiting on.
 - **macOS.** `SSL_CERT_FILE=/etc/ssl/cert.pem cargo t` stops reqwest
@@ -379,6 +385,17 @@ covers the same tests, slower, no tiers.
 - Typed boundaries are load-bearing: IDs, `PagePath`, `AgentKind`,
   sanitization, workspace/project resolution, auth capability, and
   provider dialects are parsed/normalized once and reused.
+- **The core stays Rust-only.** The root workspace and everything the server
+  ships (the binary, its built-in `/web` UI, Docker, native packages) build
+  with Cargo alone: no Node, npm, bundler or JavaScript framework, and no
+  build step outside Cargo (the vendored Tailwind CLI is the one pinned
+  exception, run only to regenerate `static/tailwind.css`). The web UI is
+  server-rendered from askama templates; a page may carry a small inline
+  vanilla script for progressive enhancement, never a framework. A UI or
+  console that needs a JavaScript toolchain belongs in a companion, and
+  another language appears only where its target ecosystem requires it
+  (a TypeScript client SDK, the Swift macOS app, the TS plugins generated for
+  JS-based harnesses), always under `companions/` or as generated output.
 - Keep CLI commands thin: parse args, resolve config once, call typed
   library functions, render output. Provider-specific behavior belongs in
   `ai-memory-llm`, not in CLI/admin handlers.
@@ -567,6 +584,10 @@ Additional boundary rules:
   test-only churn are exempt. CI rejects a duplicated heading
   (`scripts/check-changelog-sections.sh`) and any edit to an already
   released section (`scripts/check-changelog-frozen.sh`).
+  `CHANGELOG.md` holds the current major line; when a new major ships,
+  `bin/release` moves the previous major's sections and compare links to
+  `docs/changelog/<major>.x.md` (`scripts/changelog_sections.py archive`).
+  Archived sections stay frozen, and the frozen check reads both places.
 - **Run the humanizer on new or heavily edited prose.** New documentation,
   and any large rewrite of existing text (a new doc section, a rewritten guide,
   a long CHANGELOG entry, an RFC or design note), goes through the `humanizer`
@@ -636,7 +657,8 @@ Additional boundary rules:
   `cargo clean` (and `cargo clean` in each release worktree / extra target dir
   you created, then remove finished `git worktree`s). This is a mandatory
   post-release cleanup step, not optional housekeeping — treat it like the tap
-  bump above. During normal development, `cargo sweep --time 7` weekly is the
+  bump above. During normal development, the weekly `cargo clean` and
+  `cargo clean-all --keep-days 7` described under Platform notes are the
   lighter-touch equivalent.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.

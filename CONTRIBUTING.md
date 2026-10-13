@@ -120,6 +120,11 @@ checkbox for it. Follow the existing entry style (past-tense summary,
 trailing `([#NNN])` PR/issue reference) and place it under the right
 `### Added` / `### Changed` / `### Fixed` heading.
 
+`CHANGELOG.md` holds the current major line only. Older lines are archived per
+major version in [`docs/changelog/`](docs/changelog/); `bin/release` moves the
+previous major there when it cuts an X.0.0. Released sections are frozen in
+both places, and CI rejects an edit to any of them.
+
 ## Workflow rules (condensed from AGENTS.md)
 
 The full rules are in [`AGENTS.md`](AGENTS.md), the single
@@ -136,6 +141,12 @@ it). Short version:
    milestone requires.
 5. Comments explain *why*, never *what*. No comments that restate the line
    above them.
+6. The core stays Rust-only. The server, its built-in web UI and everything
+   it ships build with Cargo alone: no Node, npm, bundler or JavaScript
+   framework. The web UI is server-rendered from askama templates, with at
+   most a small inline vanilla script for progressive enhancement. A UI that
+   needs a JavaScript toolchain, or a client library for another ecosystem
+   (the TypeScript SDK, the Swift macOS app), belongs under `companions/`.
 
 ## Cross-cutting invariants
 
