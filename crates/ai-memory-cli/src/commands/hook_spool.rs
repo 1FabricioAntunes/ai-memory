@@ -364,7 +364,17 @@ pub enum LockedDrainResult {
 
 /// Try to acquire the single-flight drain lock.
 pub fn acquire_drain_lock(spool: &Path, wait: DrainLockWait) -> std::io::Result<Option<DrainLock>> {
-    std::fs::create_dir_all(spool)?;
+    // A detached drainer that outlives `uninstall --purge-data` (or a test's
+    // temp dir) must not recreate the data dir it was started for; a missing
+    // data dir has nothing queued to drain. The spool dir is created private,
+    // like `enqueue` creates it.
+    if spool.parent().is_some_and(|data_dir| !data_dir.is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the hook spool's data directory no longer exists",
+        ));
+    }
+    create_spool_dir(spool)?;
     let path = spool.join(".drain.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -1912,6 +1922,33 @@ mod tests {
         )
         .await;
         assert_eq!(r, DrainResult::default());
+    }
+
+    #[test]
+    fn drain_lock_never_recreates_a_removed_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("purged");
+        let spool = spool_dir(&data_dir);
+
+        let err = acquire_drain_lock(&spool, DrainLockWait::NoWait)
+            .err()
+            .expect("a drain must not run against a missing data dir");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!data_dir.exists(), "the drain recreated a removed data dir");
+
+        std::fs::create_dir(&data_dir).unwrap();
+        assert!(
+            acquire_drain_lock(&spool, DrainLockWait::NoWait)
+                .unwrap()
+                .is_some(),
+            "a present data dir still gets its spool dir created"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&spool).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "a drain-created spool must be private");
+        }
     }
 
     #[test]

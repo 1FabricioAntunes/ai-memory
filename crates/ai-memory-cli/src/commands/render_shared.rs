@@ -3132,10 +3132,8 @@ check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-cap
         let Some(()) = node_strip_types_available() else {
             return;
         };
-        // `keep()` cancels delete-on-drop: the emitted modules are the
-        // evidence, so they stay on disk for inspection after the run.
-        let temp = tempfile::tempdir().unwrap().keep();
-        eprintln!("capture-owner gate modules retained at {}", temp.display());
+        let guard = tempfile::tempdir().unwrap();
+        let temp = guard.path().to_path_buf();
         const HARNESS: &str = r#"import { closeSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";

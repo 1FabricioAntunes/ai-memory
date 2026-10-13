@@ -1075,9 +1075,10 @@ fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     let body = if let Some(rest) = rest {
         if let Some(end) = rest.find(&close) {
             let yaml = rest[..end].trim_end_matches('\r');
-            let value: serde_yaml::Value =
-                serde_yaml::from_str(yaml).context("parse YAML frontmatter")?;
-            if let Some(map) = value.as_mapping() {
+            let value: serde_json::Value =
+                serde_saphyr::from_str_with_options(yaml, frontmatter_parse_options())
+                    .context("parse YAML frontmatter")?;
+            if let Some(map) = value.as_object() {
                 out.title = yaml_string(map, "title");
                 out.kind = yaml_string(map, "kind");
                 out.tier = yaml_string(map, "tier");
@@ -1098,21 +1099,35 @@ fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     Ok(out)
 }
 
-fn yaml_key(key: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(key.into())
+/// Read frontmatter the way `serde_yaml` 0.9 did, matching the server's
+/// parser: YAML 1.2 booleans (`pinned: yes` stays a string, so not pinned),
+/// `<<` as an ordinary key, and `.inf`/`.nan` kept as text instead of
+/// failing the page.
+fn frontmatter_parse_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+        ignore_binary_tag_for_string: true,
+        reject_non_finite_typeless_float: false,
+        with_snippet: false,
+        budget: serde_saphyr::budget! { max_depth: 128 },
+    }
 }
-fn yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(yaml_key(key))
+
+type YamlMap = serde_json::Map<String, serde_json::Value>;
+
+fn yaml_string(map: &YamlMap, key: &str) -> Option<String> {
+    map.get(key)
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .filter(|s| !s.trim().is_empty())
 }
-fn yaml_bool(map: &serde_yaml::Mapping, key: &str) -> Option<bool> {
-    map.get(yaml_key(key)).and_then(|v| v.as_bool())
+fn yaml_bool(map: &YamlMap, key: &str) -> Option<bool> {
+    map.get(key).and_then(|v| v.as_bool())
 }
-fn yaml_tags(map: &serde_yaml::Mapping) -> Vec<String> {
-    match map.get(yaml_key("tags")) {
-        Some(serde_yaml::Value::Sequence(seq)) => seq
+fn yaml_tags(map: &YamlMap) -> Vec<String> {
+    match map.get("tags") {
+        Some(serde_json::Value::Array(seq)) => seq
             .iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
@@ -1437,6 +1452,18 @@ mod tests {
         assert_eq!(parsed.tags, vec!["a", "b"]);
         assert!(parsed.pinned);
         assert_eq!(parsed.body, "# Body\ntext");
+    }
+
+    /// `serde_yaml` 0.9 read YAML 1.1 words as text, so `pinned: yes` never
+    /// pinned a page and a bare `tags:` word stayed a one-item list.
+    #[test]
+    fn omc_frontmatter_keeps_yaml_1_1_words_as_text() {
+        let parsed = parse_markdown("---\ntitle: yes\npinned: yes\ntags: on\n---\nbody").unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("yes"));
+        assert!(!parsed.pinned);
+        assert_eq!(parsed.tags, vec!["on"]);
+
+        assert!(parse_markdown("---\ntitle: a\ntitle: b\n---\nbody").is_err());
     }
 
     /// A wiki checked out on Windows with `core.autocrlf=true`, or saved
@@ -1965,7 +1992,8 @@ mod tests {
 
     #[test]
     fn sanitized_redaction_markers_survive_utf8_byte_caps_in_bodies_and_titles() {
-        let root = tempdir().unwrap().keep();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
         for (role, cap) in [
             ("user", MAX_USER_MESSAGE_BYTES),
             ("assistant", MAX_EXTENSION_MESSAGE_BYTES),
@@ -1976,7 +2004,7 @@ mod tests {
                 {"role":role, "content":format!("{prefix}abcdefghijklmnop\u{1b}[0m\u{202e}")},
                 {"role":"assistant", "content":format!("{} token=abcdefghijklmnop", "x".repeat(145))}
             ]});
-            let file = write_conversation(&root, source);
+            let file = write_conversation(root, source);
             let plan = plan_external_conversation(&file, "w", DEFAULT_SERVER_URL).unwrap();
             for event in &plan.events {
                 ai_memory_client::check_body(&event.body).unwrap();
