@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.6] - 2026-10-13
+
 ### Fixed
 - Fixed `ai-memory list-projects` failing with `404 Not Found` against a
   server started without `--enable-web` or `--enable-api`, the routes that
@@ -9081,7 +9083,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.6...HEAD
+[2.6.6]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...v2.6.6
 [2.6.5]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
