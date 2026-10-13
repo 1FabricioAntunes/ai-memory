@@ -151,7 +151,7 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
     };
     let home = super::run::native_home(config).context("locating your home directory")?;
     let exe = std::env::current_exe().context("locating the running ai-memory binary")?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = service_exe(&exe, &env);
 
     let written_config = init_config_path(config, config_path);
     let agents = if args.agents.is_empty() {
@@ -244,6 +244,70 @@ fn detect_agents(
             (store.is_dir() || config).then_some(agent)
         });
     dedup(found)
+}
+
+/// The binary path the service unit runs. A package manager's versioned
+/// location (a Homebrew `Cellar/<formula>/<version>` or a `/nix/store` path)
+/// disappears on the next upgrade or `brew cleanup` / garbage collection, so a
+/// unit naming it stops starting. When the running binary lives in one, the
+/// unit names a stable link that resolves to the same file instead: the path
+/// as invoked, an `ai-memory` on `PATH` (`/usr/local/bin`, `~/.nix-profile/bin`,
+/// `/etc/profiles/per-user/<user>/bin`), or Homebrew's `opt/<formula>` and
+/// `bin` links. Without one, the resolved path is kept as before.
+fn service_exe(invoked: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    let Ok(resolved) = std::fs::canonicalize(invoked) else {
+        return invoked.to_path_buf();
+    };
+    if !is_versioned_package_path(&resolved) {
+        return resolved;
+    }
+    let name = resolved.file_name().unwrap_or(invoked.as_os_str());
+    let on_path = env("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    std::iter::once(invoked.to_path_buf())
+        .chain(homebrew_links(&resolved))
+        .chain(on_path)
+        .find(|candidate| {
+            candidate.is_absolute()
+                && !is_versioned_package_path(candidate)
+                && std::fs::canonicalize(candidate).is_ok_and(|target| target == resolved)
+        })
+        .unwrap_or(resolved)
+}
+
+/// Whether `path` sits in a store a package manager replaces per version.
+fn is_versioned_package_path(path: &Path) -> bool {
+    let parts: Vec<_> = path.components().map(|part| part.as_os_str()).collect();
+    parts.windows(2).any(|pair| pair == ["nix", "store"]) || cellar_index(&parts).is_some()
+}
+
+/// The index of a `Cellar` component followed by `<formula>/<version>/...`.
+fn cellar_index(parts: &[&std::ffi::OsStr]) -> Option<usize> {
+    parts
+        .iter()
+        .position(|part| *part == "Cellar")
+        .filter(|index| parts.len() > index + 3)
+}
+
+/// Homebrew's version-independent links to a `<prefix>/Cellar/<formula>/
+/// <version>/<rest>` file: `<prefix>/opt/<formula>/<rest>` (what Homebrew's
+/// own services use) and `<prefix>/<rest>`.
+fn homebrew_links(resolved: &Path) -> Vec<PathBuf> {
+    let parts: Vec<_> = resolved.components().map(|part| part.as_os_str()).collect();
+    let Some(index) = cellar_index(&parts) else {
+        return Vec::new();
+    };
+    let prefix: PathBuf = parts[..index].iter().collect();
+    let rest: PathBuf = parts[index + 3..].iter().collect();
+    vec![
+        prefix.join("opt").join(parts[index + 1]).join(&rest),
+        prefix.join(rest),
+    ]
 }
 
 /// Decide the service step. A server already answering with no unit of ours
@@ -624,6 +688,100 @@ async fn memory_status(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A versioned Homebrew binary is recorded through the `opt/<formula>`
+    /// link that survives `brew upgrade` and `brew cleanup`, falling back to
+    /// the `<prefix>/bin` link; a link to some other binary never wins.
+    #[cfg(unix)]
+    #[test]
+    fn a_cellar_binary_is_recorded_through_its_stable_homebrew_link() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let prefix = std::fs::canonicalize(root.path()).unwrap();
+        let cellar_bin = prefix.join("Cellar/ai-memory/3.0.0/bin");
+        std::fs::create_dir_all(&cellar_bin).unwrap();
+        let real = cellar_bin.join("ai-memory");
+        std::fs::write(&real, "bin").unwrap();
+        let no_env = |_: &str| None;
+
+        // No link at all: the resolved path is all there is.
+        assert_eq!(service_exe(&real, &no_env), real);
+
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        symlink(&real, prefix.join("bin/ai-memory")).unwrap();
+        assert_eq!(service_exe(&real, &no_env), prefix.join("bin/ai-memory"));
+
+        std::fs::create_dir_all(prefix.join("opt")).unwrap();
+        symlink("../Cellar/ai-memory/3.0.0", prefix.join("opt/ai-memory")).unwrap();
+        assert_eq!(
+            service_exe(&real, &no_env),
+            prefix.join("opt/ai-memory/bin/ai-memory")
+        );
+
+        // Control: a stable link that points at another version is refused.
+        let other = tempfile::tempdir().unwrap();
+        let other = std::fs::canonicalize(other.path()).unwrap();
+        let old_bin = other.join("Cellar/ai-memory/2.9.0/bin");
+        std::fs::create_dir_all(&old_bin).unwrap();
+        let old = old_bin.join("ai-memory");
+        std::fs::write(&old, "old").unwrap();
+        std::fs::create_dir_all(other.join("bin")).unwrap();
+        symlink(&real, other.join("bin/ai-memory")).unwrap();
+        assert_eq!(service_exe(&old, &no_env), old);
+    }
+
+    /// A `/nix/store` binary is recorded through the profile link on `PATH`
+    /// that resolves to it, and the path as invoked wins when it is stable.
+    #[cfg(unix)]
+    #[test]
+    fn a_nix_store_binary_is_recorded_through_its_profile_link() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let store_bin = root.join("nix/store/abc123-ai-memory-3.0.0/bin");
+        std::fs::create_dir_all(&store_bin).unwrap();
+        let real = store_bin.join("ai-memory");
+        std::fs::write(&real, "bin").unwrap();
+        let profile_bin = root.join("home/.nix-profile/bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        symlink(&real, profile_bin.join("ai-memory")).unwrap();
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let path = std::env::join_paths([&elsewhere, &store_bin, &profile_bin]).unwrap();
+        let env = move |name: &str| (name == "PATH").then(|| path.clone());
+
+        assert_eq!(service_exe(&real, &env), profile_bin.join("ai-memory"));
+        assert_eq!(service_exe(&real, &|_: &str| None), real);
+
+        let invoked = root.join("invoked");
+        symlink(&real, &invoked).unwrap();
+        assert_eq!(service_exe(&invoked, &env), invoked);
+    }
+
+    /// A binary outside any versioned store keeps the resolved path, as
+    /// before: a `~/.local/bin` install is already stable.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_binary_keeps_its_resolved_path() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let real = root.join(".local/bin/ai-memory");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "bin").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(service_exe(&link, &|_: &str| None), real);
+        assert!(!is_versioned_package_path(Path::new(
+            "/opt/homebrew/bin/ai-memory"
+        )));
+        assert!(!is_versioned_package_path(Path::new("/srv/Cellar/x")));
+        assert!(is_versioned_package_path(Path::new(
+            "/opt/homebrew/Cellar/ai-memory/3.0.0/bin/ai-memory"
+        )));
+        assert!(is_versioned_package_path(Path::new(
+            "/nix/store/abc-ai-memory/bin/ai-memory"
+        )));
+    }
 
     /// An enabled plugin takes an agent's wiring over; a disabled or absent
     /// one, and an agent the plugins do not cover, keep the full plan.

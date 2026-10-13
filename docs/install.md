@@ -109,7 +109,13 @@ the commands a native install otherwise needs one by one:
    `$XDG_CONFIG_HOME`) on Linux, rendered from the packaged user unit, or
    `~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist` on macOS,
    rendered from the packaged LaunchAgent. The unit runs the binary `setup` ran
-   from. The step is skipped when a server already answers at the configured
+   from. When that binary sits in a versioned package location (Homebrew's
+   `Cellar/ai-memory/<version>` or a `/nix/store` path, both gone after an
+   upgrade and `brew cleanup` or garbage collection), the unit names a stable
+   link that resolves to the same file instead: the path as invoked, an
+   `ai-memory` on `PATH` such as `~/.nix-profile/bin/ai-memory`, or Homebrew's
+   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`. With no such link it names
+   the versioned path, and you re-run `setup` after upgrading. The step is skipped when a server already answers at the configured
    URL and no unit of ours exists yet (Docker, a packaged system unit, a
    foreground `serve`), when the configured server is not on this machine,
    with `--no-service`, and on Windows.
