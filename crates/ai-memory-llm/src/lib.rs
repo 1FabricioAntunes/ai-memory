@@ -24,8 +24,10 @@
 //!   plus `responseSchema` (OpenAPI 3 subset; `$ref`s inlined,
 //!   Draft-2020-12 keywords stripped before send).
 //! * **Cursor**: the logged-in `agent` CLI in `--mode ask`. No HTTP client
-//!   and no copied token; `--yolo` is never passed because the prompt is
-//!   captured session text.
+//!   and no copied token; `--yolo` is never passed and the child gets an
+//!   allowlisted environment because the prompt is captured session text.
+//!   The CLI has no schema mode: the schema rides in the prompt, the answer
+//!   is parsed leniently, and serde deserialisation is the only validation.
 //! * **OpenAI-compat** (Ollama, vLLM, LM Studio): we ask for
 //!   `response_format: { type: "json_object" }` when supported,
 //!   otherwise parse the first balanced `{…}` from the text body.
@@ -110,7 +112,9 @@ pub use copilot::{
     GITHUB_ACCESS_TOKEN_URL, GITHUB_COPILOT_CLIENT_ID, GITHUB_COPILOT_TOKEN_URL,
     GITHUB_DEVICE_CODE_URL,
 };
-pub use cursor_agent::{CURSOR_DEFAULT_MODEL, CursorAgentProvider, cursor_executable};
+pub use cursor_agent::{
+    CURSOR_DEFAULT_MODEL, CursorAgentProvider, cursor_child_env, cursor_executable,
+};
 pub use embedding::{
     Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, QueryVector, SyntheticEmbedder, VoyageEmbedder,
     cosine, embed_search_query,

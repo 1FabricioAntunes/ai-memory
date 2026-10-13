@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders,
-    FallbackLlmProvider, LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth,
-    ProviderChoice, ProviderConfig, ReasoningEffort, build_provider, cursor_executable,
+    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, CursorAuth, EmbedderChoice, EmbedderConfig,
+    ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL,
+    ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort, build_provider,
+    cursor_executable,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -673,6 +674,7 @@ pub struct RuntimeEnv {
     codex_home: Option<PathBuf>,
     codex_executable: Option<PathBuf>,
     cursor_executable: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
@@ -715,6 +717,7 @@ impl RuntimeEnv {
             codex_home: env_path("CODEX_HOME"),
             codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
             cursor_executable: env_path("AI_MEMORY_CURSOR_AGENT"),
+            temp_dir: Some(std::env::temp_dir()),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
@@ -2556,9 +2559,7 @@ impl Config {
             AuthRequirement::AnthropicOAuthToken => {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
-            AuthRequirement::CursorCli => ProviderAuth::cursor(cursor_executable(
-                self.runtime_env.cursor_executable.as_deref(),
-            )),
+            AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
         }
     }
 
@@ -2834,6 +2835,20 @@ impl Config {
         resolve_codex_auth_file(self.runtime_env.codex_home.as_deref(), platform_home)
     }
 
+    /// Cursor Agent CLI inputs, from values captured once by [`Config::load`].
+    ///
+    /// The child gets only the allowlisted part of the captured process
+    /// environment. Without a captured temp dir (a test-built config) the
+    /// root is empty and the provider refuses to run instead of writing the
+    /// prompt under its cwd.
+    fn cursor_auth(&self) -> CursorAuth {
+        CursorAuth::new(
+            cursor_executable(self.runtime_env.cursor_executable.as_deref()),
+            self.runtime_env.temp_dir.clone().unwrap_or_default(),
+            self.runtime_env.process_env(),
+        )
+    }
+
     /// Shared Copilot auth token file path.
     #[must_use]
     pub fn copilot_token_path(&self) -> PathBuf {
@@ -2899,9 +2914,7 @@ impl Config {
             AuthRequirement::AnthropicOAuthToken => {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
-            AuthRequirement::CursorCli => ProviderAuth::cursor(cursor_executable(
-                self.runtime_env.cursor_executable.as_deref(),
-            )),
+            AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
         }
     }
 
@@ -5744,6 +5757,48 @@ input_token_safety_margin = {margin}
         assert_eq!(provider.model, CURSOR_DEFAULT_MODEL);
         assert_eq!(auth.executable, PathBuf::from("/opt/cursor/agent"));
         assert_eq!(provider.auth.requirement(), AuthRequirement::CursorCli);
+    }
+
+    /// The Cursor child reads untrusted session text: the provider config
+    /// hands it the captured environment's allowlisted part only, so the
+    /// server's own bearer and other providers' keys never reach it.
+    #[test]
+    fn cursor_provider_hands_the_child_only_allowlisted_env() {
+        let entries = [
+            ("HOME", "/home/op"),
+            ("PATH", "/usr/bin"),
+            ("CURSOR_API_KEY", "cursor-key"),
+            ("AI_MEMORY_AUTH_TOKEN", "root-bearer-canary"),
+            ("ANTHROPIC_API_KEY", "sk-ant-canary"),
+        ];
+        let cfg = Config {
+            llm_provider: Some("cursor".into()),
+            runtime_env: RuntimeEnv {
+                temp_dir: Some(PathBuf::from("/tmp")),
+                process_env: CapturedProcessEnv(
+                    entries
+                        .iter()
+                        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                        .collect(),
+                ),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let auth = cfg
+            .llm_provider_config()
+            .unwrap()
+            .unwrap()
+            .auth
+            .require_cursor_auth()
+            .unwrap();
+        let mut names: Vec<_> = auth
+            .child_env_names()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["CURSOR_API_KEY", "HOME", "PATH"]);
     }
 
     fn load_with_toml(toml: &str) -> anyhow::Result<Config> {

@@ -3,8 +3,18 @@
 //! Consolidation calls the logged-in Cursor Agent CLI (`agent --print`)
 //! instead of a platform API key. The CLI already holds the Cursor
 //! subscription. Invocations stay in `--mode ask`: captured session text is
-//! untrusted, and `--yolo` / `--force` would let that text run tools.
+//! untrusted, and `--yolo` / `--force` would let that text run tools. For the
+//! same reason the child gets an allowlisted environment
+//! ([`cursor_child_env`]), never the server's: `AI_MEMORY_AUTH_TOKEN` and
+//! other providers' keys stay out of its reach.
+//!
+//! The CLI has no JSON-schema mode. The schema travels in the prompt, the
+//! answer is parsed leniently (code fences and surrounding prose stripped),
+//! and the caller's serde deserialisation is the only validation: a value
+//! that deserialises is accepted even if it breaks a schema constraint serde
+//! does not check.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -28,6 +38,78 @@ pub const CURSOR_DEFAULT_MODEL: &str = "cursor-grok-4.6-high";
 
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+/// Variables the child keeps, compared ASCII-case-insensitively (Windows
+/// names are case-insensitive and proxies come in both cases): identity and
+/// home for the CLI's stored login and keychain, locale, temp, the session
+/// bus for a Linux keyring, proxy and CA settings, and the Windows process
+/// basics.
+const CURSOR_CHILD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+];
+
+/// Prefixes the child keeps: locale categories and the CLI's own settings
+/// (`CURSOR_API_KEY` among them).
+const CURSOR_CHILD_ENV_PREFIXES: &[&str] = &["LC_", "CURSOR_"];
+
+/// The subset of `process_env` the Cursor Agent CLI child runs with.
+///
+/// The child reads untrusted captured session text, so everything outside
+/// the allowlist — ai-memory's own token, other providers' keys, arbitrary
+/// operator secrets — is dropped.
+#[must_use]
+pub fn cursor_child_env(process_env: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
+    process_env
+        .iter()
+        .filter(|(name, _)| is_allowed_child_var(name))
+        .cloned()
+        .collect()
+}
+
+fn is_allowed_child_var(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    CURSOR_CHILD_ENV
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        || CURSOR_CHILD_ENV_PREFIXES.iter().any(|prefix| {
+            name.len() > prefix.len()
+                && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        })
+}
 
 /// Chat provider that shells out to the Cursor `agent` CLI.
 pub struct CursorAgentProvider {
@@ -62,13 +144,20 @@ impl CursorAgentProvider {
         request: &ChatRequest,
         schema: Option<&serde_json::Value>,
     ) -> LlmResult<String> {
-        let workspace = TempWorkspace::create()?;
+        let workspace = TempWorkspace::create(&self.auth.temp_root)?;
         let body = render_request(request, schema);
         std::fs::write(workspace.path.join("request.md"), body)
             .map_err(|err| LlmError::UnexpectedShape(format!("writing cursor prompt: {err}")))?;
 
         let mut command = Command::new(&self.auth.executable);
         command
+            .env_clear()
+            .envs(
+                self.auth
+                    .child_env
+                    .iter()
+                    .map(|(name, value)| (name, value)),
+            )
             .arg("--print")
             .arg("--mode")
             .arg("ask")
@@ -181,8 +270,14 @@ struct TempWorkspace {
 }
 
 impl TempWorkspace {
-    fn create() -> LlmResult<Self> {
-        let path = std::env::temp_dir().join(format!("ai-memory-cursor-{}", Uuid::now_v7()));
+    fn create(root: &Path) -> LlmResult<Self> {
+        if !root.is_absolute() {
+            return Err(LlmError::NotConfigured(format!(
+                "cursor workspace root must be an absolute path, got {}",
+                root.display()
+            )));
+        }
+        let path = root.join(format!("ai-memory-cursor-{}", Uuid::now_v7()));
         // The prompt is captured session text: keep the workspace private
         // to the server's user on a shared temp directory.
         #[cfg(unix)]

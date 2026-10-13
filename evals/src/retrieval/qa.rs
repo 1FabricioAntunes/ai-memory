@@ -367,7 +367,11 @@ fn build_llm_provider(
             ProviderAuth::copilot(tf.to_path_buf(), None, None, base_url.map(str::to_string))
         }
         AuthRequirement::AnthropicOAuthToken => ProviderAuth::anthropic_oauth_token(api_key),
-        AuthRequirement::CursorCli => ProviderAuth::cursor("agent"),
+        AuthRequirement::CursorCli => ProviderAuth::cursor(ai_memory_llm::CursorAuth::new(
+            "agent",
+            std::env::temp_dir(),
+            &std::env::vars_os().collect::<Vec<_>>(),
+        )),
     };
 
     let config = ProviderConfig {
