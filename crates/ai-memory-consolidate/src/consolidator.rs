@@ -1225,14 +1225,15 @@ fn build_batch_request_with_slots(
          \x20\x20\"rationale\": \"<one short sentence about why this batch>\"\n\
          }\n",
     );
-    let titles_block = render_title_uniqueness_section(existing_titles);
     let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
         count_chars(&fixed_header)
             .saturating_add(count_chars(&mandatory_suffix))
-            .saturating_add(count_chars(&observations_header))
-            .saturating_add(count_chars(&titles_block)),
+            .saturating_add(count_chars(&observations_header)),
     );
+    let titles_block =
+        render_title_uniqueness_section(existing_titles, optional_budget.saturating_div(2));
+    let optional_budget = optional_budget.saturating_sub(count_chars(&titles_block));
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
@@ -1334,7 +1335,8 @@ fn build_request(
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-    let titles_block = render_title_uniqueness_section(existing_titles);
+    let titles_block =
+        render_title_uniqueness_section(existing_titles, current_body_budget.saturating_div(2));
     let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
     let current_body_block = render_current_body_section(current_body, current_body_budget);
 
@@ -1892,32 +1894,38 @@ fn retitle_leading_h1(body: &str, old: &str, new: &str) -> String {
 }
 
 /// The bounded existing-titles list for the consolidation prompt.
-fn render_existing_titles(titles: &[String]) -> String {
-    titles
-        .iter()
-        .take(EXISTING_TITLES_PROMPT_LIMIT)
-        .map(|t| format!("- {t}\n"))
-        .collect()
-}
-
 /// Shared uniqueness block injected into both consolidation prompts.
 /// The system prompt carries the durable rule; this carries the
 /// project's actual titles, which only the caller can see. Absent
 /// when the project has no other pages — the rule has nothing to
 /// list, and the fixed prompt text would otherwise eat into the
 /// minimum observation budget.
-fn render_title_uniqueness_section(titles: &[String]) -> String {
-    if titles.is_empty() {
-        return String::new();
-    }
-    format!(
-        "\n## Existing page titles in this project\n\
+///
+/// The block is optional context, so it lists only the titles that fit in
+/// `max_chars` (at most [`EXISTING_TITLES_PROMPT_LIMIT`]) and is left out
+/// when not even one does. Without that bound, a project's titles could
+/// take the room reserved for observations at a small input budget.
+fn render_title_uniqueness_section(titles: &[String], max_chars: usize) -> String {
+    const HEADER: &str = "\n## Existing page titles in this project\n\
          Do not reuse any of these for a page title — a case-insensitive \
          match counts as a reuse. The title must distinguish THIS session \
          (goal, outcome, or target); a generic phrase that other runs of \
-         the same harness would also produce is not a title.\n{}\n",
-        render_existing_titles(titles)
-    )
+         the same harness would also produce is not a title.\n";
+    let mut used = count_chars(HEADER).saturating_add(1);
+    let mut lines = String::new();
+    for title in titles.iter().take(EXISTING_TITLES_PROMPT_LIMIT) {
+        let line = format!("- {title}\n");
+        let next = used.saturating_add(count_chars(&line));
+        if next > max_chars {
+            continue;
+        }
+        used = next;
+        lines.push_str(&line);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("{HEADER}{lines}\n")
 }
 
 /// Latest page titles for duplicate-title avoidance on the session
@@ -2206,7 +2214,7 @@ mod tests {
     #[test]
     fn render_title_uniqueness_section_bounded_and_absent_when_empty() {
         let titles: Vec<String> = (0..30).map(|i| format!("Title {i}")).collect();
-        let section = render_title_uniqueness_section(&titles);
+        let section = render_title_uniqueness_section(&titles, usize::MAX);
         assert!(section.contains("Title 0\n") && section.contains("Title 14\n"));
         assert!(!section.contains("Title 15\n"), "prompt list is bounded");
         assert!(section.contains("case-insensitive"));
@@ -2214,7 +2222,7 @@ mod tests {
         // A brand-new project omits the block entirely: the durable rule
         // lives in the system prompt, and fixed prompt text must not eat
         // into the advertised minimum observation budget.
-        assert!(render_title_uniqueness_section(&[]).is_empty());
+        assert!(render_title_uniqueness_section(&[], usize::MAX).is_empty());
     }
 
     #[test]
@@ -2477,7 +2485,8 @@ mod tests {
         let instructions_block =
             render_instructions_block(instructions, optional_budget.saturating_div(2));
         let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
-        let titles_block = render_title_uniqueness_section(existing_titles);
+        let titles_block =
+            render_title_uniqueness_section(existing_titles, current_body_budget.saturating_div(2));
         let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
         let mut suffix = render_current_body_section(current_body, current_body_budget);
         suffix.push_str(&titles_block);
@@ -2530,13 +2539,13 @@ mod tests {
         prefix.push_str(&session_id.to_string());
         prefix.push_str("\n\nObservations:\n");
 
-        let titles_block = render_title_uniqueness_section(existing_titles);
         let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
             BATCH_SYSTEM_PROMPT,
-            count_chars(&prefix)
-                .saturating_add(count_chars(mandatory_suffix))
-                .saturating_add(count_chars(&titles_block)),
+            count_chars(&prefix).saturating_add(count_chars(mandatory_suffix)),
         );
+        let titles_block =
+            render_title_uniqueness_section(existing_titles, optional_budget.saturating_div(2));
+        let optional_budget = optional_budget.saturating_sub(count_chars(&titles_block));
         let instructions_block =
             render_instructions_block(instructions, optional_budget.saturating_div(2));
         let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
@@ -2658,18 +2667,19 @@ mod tests {
         // fixed field lengths — v7 UUID ids are always 36 chars) render
         // blocks of identical length. The first and last are hard anchors
         // (never pruned), so the middle one is the only prunable block and
-        // the budget sits exactly on the three-block edge.
-        let observations = vec![obs_of_size(400), obs_of_size(400), obs_of_size(400)];
-        // A deterministic titles block well above the calibration gap
-        // (the renderer caps the list at EXISTING_TITLES_PROMPT_LIMIT, so
-        // the block size is stable across runs).
-        let titles: Vec<String> = (0..80)
-            .map(|i| format!("Existing page title {i:02} with a stable suffix"))
+        // the budget sits exactly on the three-block edge. The blocks are
+        // large enough that the titles block fits the optional allowance
+        // (what is left after the observation reserve), so it is rendered.
+        let observations = vec![obs_of_size(2_900), obs_of_size(2_900), obs_of_size(2_900)];
+        // A deterministic titles block well above the calibration gap, and
+        // small enough to fit the optional allowance at this budget.
+        let titles: Vec<String> = (0..4)
+            .map(|i| format!("Existing page title {i:02}"))
             .collect();
-        let titles_block = render_title_uniqueness_section(&titles);
+        let titles_block = render_title_uniqueness_section(&titles, usize::MAX);
         let title_chars = count_chars(&titles_block);
         assert!(
-            title_chars >= 512,
+            title_chars >= 256,
             "the fixture needs a titles block well above the calibration gap: {title_chars}"
         );
 
@@ -2742,6 +2752,10 @@ mod tests {
 
         let request = build_request(sid, &observations, "", None, budgets, &titles);
         let user = &request.messages[0].content;
+        assert!(
+            user.contains(titles_block.trim()),
+            "the titles block fits the optional allowance and is rendered whole"
+        );
         assert_eq!(
             user.matches("--- observation").count(),
             2,
@@ -3304,6 +3318,62 @@ mod tests {
             "batch floor request must not omit observations"
         );
         assert_batch_dump_follows_observations_header(batch_user);
+    }
+
+    /// At the floor, a project's existing titles are optional context: they
+    /// must not take the room reserved for observations. Fifteen realistic
+    /// titles (the prompt limit) used to be subtracted as fixed text, which
+    /// left the observation budget at zero for any project with that many
+    /// pages; an observation that fits the reserve must still render whole.
+    #[test]
+    fn existing_titles_never_take_the_observation_reserve_at_the_floor() {
+        let budgets = PromptBudgets::from_limits_with_margin(
+            MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
+            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        );
+        let titles: Vec<String> = (0..EXISTING_TITLES_PROMPT_LIMIT)
+            .map(|i| format!("Fixed the consolidation floor regression number {i:02}"))
+            .collect();
+        let body_len = 800;
+        let observations = vec![obs_of_size(body_len)];
+        let whole_body = "x".repeat(body_len);
+        let single = build_request(SessionId::new(), &observations, "", None, budgets, &titles);
+        let batch = build_batch_request_with_slots(
+            SessionId::new(),
+            &observations,
+            &[],
+            None,
+            budgets,
+            &titles,
+        );
+        for (label, request) in [("single", &single), ("batch", &batch)] {
+            let user = &request.messages[0].content;
+            assert!(
+                user.contains(&whole_body),
+                "{label} floor request with titles must keep the observation reserve"
+            );
+            assert!(!user.contains("no projection budget"), "{label}");
+        }
+        assert!(estimated_input_chars::<ConsolidatedPage>(&single) <= budgets.max_input_chars);
+        assert!(estimated_input_chars::<ConsolidatedBatch>(&batch) <= budgets.max_input_chars);
+
+        // Control: with a roomy budget every title is listed.
+        let roomy = PromptBudgets::from_limits(DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS, 4_000);
+        let request = build_batch_request_with_slots(
+            SessionId::new(),
+            &observations,
+            &[],
+            None,
+            roomy,
+            &titles,
+        );
+        for title in &titles {
+            assert!(
+                request.messages[0].content.contains(title.as_str()),
+                "{title}"
+            );
+        }
     }
 
     /// The body excerpt keeps its absolute ceiling on a huge budget: past

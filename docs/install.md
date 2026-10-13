@@ -2308,10 +2308,15 @@ llama.cpp, HTTP 400 from most gateways). Lower both limits so their sum fits
 the real context window, with additional headroom for tokenizer variance:
 
 ```bash
-# e.g. a model loaded with an 8k context window
+# e.g. a model loaded with a 12k context window
 -e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=10000
 -e AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS=1000
 ```
+
+An 8k window cannot hold the default floor (8,350 input tokens at the 0.8
+margin). It fits with `AI_MEMORY_CONSOLIDATION__INPUT_TOKEN_SAFETY_MARGIN=1.0`
+and about 6,700 input tokens plus 1,000 output, at the cost of the headroom the
+margin keeps for dense text such as Portuguese or code (#884).
 
 The double underscore separates the `[consolidation]` section from each key.
 The input target accounts for the rendered observations, current page body,

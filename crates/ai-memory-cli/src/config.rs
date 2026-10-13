@@ -3974,14 +3974,16 @@ max_input_tokens = {tokens}
     }
 
     /// The small-context examples in `docs/install.md` and
-    /// `docs/llm-providers.md` must be configs that actually load, so a doc
-    /// example cannot go stale the way `max_input_tokens = 6500` did once the
-    /// floor moved (#1234). These are the literal values those docs quote.
+    /// `docs/llm-providers.md` must be configs that actually load. These are
+    /// the literal values those docs quote, copied by hand: keep them in step
+    /// when the docs change, so an example does not go stale the way
+    /// `max_input_tokens = 6500` did once the floor moved (#1234).
     #[test]
     fn documented_small_context_examples_load() {
-        for (doc, tokens, output) in [
-            ("docs/install.md", 10_000, 1_000),
-            ("docs/llm-providers.md", 10_000, 1_000),
+        for (doc, tokens, output, margin) in [
+            ("docs/install.md", 10_000, 1_000, 0.8),
+            ("docs/install.md (8k window)", 6_700, 1_000, 1.0),
+            ("docs/llm-providers.md", 10_000, 1_000, 0.8),
         ] {
             let tmp = TempDir::new().unwrap();
             let config_path = tmp.path().join("config.toml");
@@ -3991,6 +3993,7 @@ max_input_tokens = {tokens}
                     "[consolidation]
 max_input_tokens = {tokens}
 max_output_tokens = {output}
+input_token_safety_margin = {margin}
 "
                 ),
             )
