@@ -328,7 +328,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or renamed. The id is looked up inside the named workspace: sending both or
   neither is a 400, a malformed UUID is a 400, and an id that names no project
   in that workspace is a 404. `list-projects` now prints each project's id so
-  an operator can copy it. (#1208, #1226)
+  an operator can copy it, and `GET /api/v1/projects` rows carry
+  `workspace_id` and `project_id` (hidden with the row for a restricted
+  project). (#1208, #1226)
 - Added `ai-memory project init`, which creates a `.ai-memory.toml` marker at
   the current worktree root (or the current directory outside Git) after
   asking for `workspace` and `project`. The defaults are the scope the CLI and

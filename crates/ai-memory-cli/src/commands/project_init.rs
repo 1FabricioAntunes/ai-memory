@@ -147,7 +147,24 @@ fn write_new_marker(path: &Path, body: &str) -> Result<()> {
     tmp.as_file()
         .sync_all()
         .with_context(|| format!("syncing {}", tmp.path().display()))?;
-    std::fs::hard_link(tmp.path(), path).with_context(|| format!("creating {}", path.display()))?;
+    match std::fs::hard_link(tmp.path(), path) {
+        Ok(()) => {}
+        // FAT/exFAT and some network or bind mounts refuse hard links. Fall
+        // back to an exclusive create, which still never replaces a marker.
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            file.write_all(body.as_bytes())
+                .and_then(|()| file.sync_all())
+                .with_context(|| format!("writing {} (after: {error})", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("creating {}", path.display()));
+        }
+    }
     if let Ok(dir) = std::fs::File::open(dir) {
         let _ = dir.sync_all();
     }

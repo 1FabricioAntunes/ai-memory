@@ -142,15 +142,10 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
     // The flag that names the target, for the refusal's "re-run with" line and
     // the preview's fallback label. A `--project-id` run has no resolved name
     // to print, so the id stands in.
-    let target_flag = match (&project, &project_id) {
-        (Some(project), _) => format!("--project {project}"),
-        (None, Some(id)) => format!("--project-id {id}"),
-        (None, None) => unreachable!("clap requires one of --project/--project-id"),
-    };
-    let target_label = match (&project, &project_id) {
-        (Some(project), _) => project.clone(),
-        (None, Some(id)) => id.clone(),
-        (None, None) => unreachable!("clap requires one of --project/--project-id"),
+    let (target_flag, target_label) = match (&project, &project_id) {
+        (Some(project), _) => (format!("--project {project}"), project.clone()),
+        (None, Some(id)) => (format!("--project-id {id}"), id.clone()),
+        (None, None) => bail!("one of --project or --project-id is required"),
     };
 
     if !args.confirm {

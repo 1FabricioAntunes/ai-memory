@@ -2025,7 +2025,32 @@ async fn lookup_ws_no_create(
 /// is looked up by id within the workspace (404 on miss, so a foreign-scope
 /// id is correctly refused). The bad-UUID case is a 400, mirroring how
 /// `lookup_ws_proj_no_create` already maps unparseable names to 400.
+///
+/// Returns the project's stored name with the ids, so labels, admission
+/// contexts and move destinations never fall back to the UUID: a failed name
+/// read is a 500, not a guess.
 async fn resolve_target_for_admin(
+    state: &AdminState,
+    workspace: &str,
+    project_name: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<(WorkspaceId, ProjectId, String), (StatusCode, Json<serde_json::Value>)> {
+    let (ws_id, proj_id) =
+        resolve_target_ids_for_admin(state, workspace, project_name, project_id).await?;
+    match state.reader.project_name_by_id(ws_id, proj_id).await {
+        Ok(Some(name)) => Ok((ws_id, proj_id, name)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "project not found in workspace" })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+async fn resolve_target_ids_for_admin(
     state: &AdminState,
     workspace: &str,
     project_name: Option<&str>,
@@ -5024,7 +5049,7 @@ async fn handle_purge_project(
     }
 
     // Look up workspace and project IDs without auto-creating.
-    let (ws_id, proj_id) = match resolve_target_for_admin(
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
         &state,
         &req.workspace,
         req.project.as_deref(),
@@ -5032,19 +5057,9 @@ async fn handle_purge_project(
     )
     .await
     {
-        Ok(ids) => ids,
+        Ok(target) => target,
         Err(e) => return e,
     };
-    // Look up the project name after resolving by id, so display labels and
-    // admission contexts can carry it regardless of whether the operator
-    // reached us via `project = "<name>"` or `project_id = "<uuid>"`. (#1208)
-    let project_name: String = state
-        .reader
-        .project_name_by_id(ws_id, proj_id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| proj_id.to_string());
 
     let label = format!("{}/{}", req.workspace, project_name);
 
@@ -5199,7 +5214,7 @@ async fn purge_project_preview(
     req: &PurgeProjectRequest,
     author_id: Option<ai_memory_core::UserId>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let (ws_id, proj_id) = match resolve_target_for_admin(
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
         state,
         &req.workspace,
         req.project.as_deref(),
@@ -5207,19 +5222,9 @@ async fn purge_project_preview(
     )
     .await
     {
-        Ok(ids) => ids,
+        Ok(target) => target,
         Err(e) => return e,
     };
-    // Look up the project name after resolving by id, so display labels and
-    // admission contexts can carry it regardless of whether the operator
-    // reached us via `project = "<name>"` or `project_id = "<uuid>"`. (#1208)
-    let project_name: String = state
-        .reader
-        .project_name_by_id(ws_id, proj_id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| proj_id.to_string());
 
     let label = format!("{}/{}", req.workspace, project_name);
 
@@ -5888,7 +5893,7 @@ async fn handle_rename_project(
 ) -> impl IntoResponse {
     let author_id = author_ext.map(|axum::Extension(u)| u);
     // Look up workspace + source project; 404 if either is absent.
-    let (ws_id, proj_id) = match resolve_target_for_admin(
+    let (ws_id, proj_id, project_name) = match resolve_target_for_admin(
         &state,
         &req.workspace,
         req.from.as_deref(),
@@ -5896,19 +5901,9 @@ async fn handle_rename_project(
     )
     .await
     {
-        Ok(ids) => ids,
+        Ok(target) => target,
         Err(e) => return e,
     };
-    // Look up the project name after resolving by id, so display labels and
-    // admission contexts can carry it regardless of whether the operator
-    // reached us via `from = "<name>"` or `project_id = "<uuid>"`. (#1208)
-    let project_name: String = state
-        .reader
-        .project_name_by_id(ws_id, proj_id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| proj_id.to_string());
 
     // Step 3: execute the rename. The writer validates the name and
     // returns ProjectNameTaken / InvalidProjectName on conflicts. A
@@ -6463,7 +6458,7 @@ async fn move_project_core(
     }
 
     // Resolve the SOURCE without auto-creating — 404 on a typo.
-    let (src_ws, src_proj) = match resolve_target_for_admin(
+    let (src_ws, src_proj, project_name) = match resolve_target_for_admin(
         state,
         &req.from_workspace,
         req.project.as_deref(),
@@ -6471,19 +6466,9 @@ async fn move_project_core(
     )
     .await
     {
-        Ok(ids) => ids,
+        Ok(target) => target,
         Err(e) => return Err(MoveErr::from(e)),
     };
-    // Look up the project name after resolving by id, so display labels and
-    // admission contexts can carry it regardless of whether the operator
-    // reached us via `project = "<name>"` or `project_id = "<uuid>"`. (#1208)
-    let project_name: String = state
-        .reader
-        .project_name_by_id(src_ws, src_proj)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| src_proj.to_string());
 
     // Same guard on the RESOLVED name, so the `project_id` path (which has no
     // name to inspect up front) is refused identically.
