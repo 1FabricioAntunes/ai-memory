@@ -102,6 +102,27 @@ pub(crate) const COPILOT_CLI_EVENTS: [(&str, &str); 10] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Factory Droid CLI lifecycle events ai-memory hooks (#1240). Each pair is
+/// `(event-name-in-~/.factory/hooks.json, native hook-event script stem)`;
+/// Droid has no script bundle, so the `.sh` name only carries the event
+/// token the native command is rendered with.
+///
+/// Droid's documented vocabulary is Claude Code's minus `SubagentStart`
+/// (0.240.0). `SubagentStop` is left out with it: without the start
+/// boundary there is no subagent session to forget, and its payload
+/// (`task_name`, `task_result`) is not Claude's. `Notification` carries no
+/// capture. Droid fires a real `SessionEnd`, so no `finalize-session` step is
+/// needed.
+pub(crate) const DROID_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
 /// Kiro CLI v2-engine lifecycle events. Each pair is
 /// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
 ///
@@ -1018,6 +1039,36 @@ pub(crate) fn build_devin_payload_with_data_dir(
     )
 }
 
+/// `{"hooks": <event map>}` for Factory Droid (#1240). `~/.factory/hooks.json`
+/// holds the event map itself, with no wrapper key, in Claude Code's nested
+/// shape (`"Event": [{"matcher": "", "hooks": [{"type": "command",
+/// "command": …}]}]`). Droid runs each `command` through
+/// a shell with the Claude Code-shaped event JSON on stdin, so every entry
+/// invokes the native `ai-memory hook` command; there is no script bundle to
+/// fall back to, so the platform is always a native one, whatever
+/// `AI_MEMORY_HOOK_PLATFORM` asks for. An empty matcher fires on every tool
+/// and every SessionStart source.
+pub(crate) fn build_droid_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &DROID_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "droid",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
 /// Pool (Poolside Agent CLI) `.poolside/settings.yaml` `hooks:` block for
 /// install-hooks' print path. Pool's hook config is a project-scoped YAML
 /// file at the repo root — there is no user-global hook file for ai-memory
@@ -1688,6 +1739,17 @@ impl HookCommandPlatform {
         } else {
             Self::PosixNative
         })
+    }
+
+    /// The native binary command for this OS, ignoring any override: for an
+    /// agent with no script bundle a script platform would name files that
+    /// were never staged.
+    const fn native() -> Self {
+        if cfg!(windows) {
+            Self::WindowsNative
+        } else {
+            Self::PosixNative
+        }
     }
 
     /// Script fallback for setup-agent / docker-host snippets. Respects an

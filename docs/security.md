@@ -8,8 +8,8 @@ only) and records `[auth].bearer_token_file`; the server then refuses every
 route except `/healthz` without it. The hooks, the CLI and the
 `ai-memory mcp-bridge` stdio bridge read it from the data dir, so the token is
 never pasted into a harness config or passed on a command line. Claude Code
-runs the session-aware bridge, Codex and Prime Agent reference the token as
-`$AI_MEMORY_AUTH_TOKEN`, and every other MCP client `install-mcp` supports
+runs the session-aware bridge, Codex, Prime Agent and Factory Droid reference
+the token as `$AI_MEMORY_AUTH_TOKEN`, and every other MCP client `install-mcp` supports
 runs `ai-memory mcp-bridge --no-session-id` as a local stdio server. ZCode,
 which takes only HTTP entries, is the exception and needs a manual entry.
 

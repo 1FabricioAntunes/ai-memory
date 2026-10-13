@@ -150,6 +150,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::CommandCode => render_command_code(&args)?,
         McpClient::CopilotCli => render_copilot_cli(&args)?,
+        McpClient::Droid => render_droid(&args)?,
         McpClient::Swival => render_swival(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
@@ -165,8 +166,8 @@ pub(crate) fn run_with_opencode_dialect(
 /// without writing the token into the client's config.
 ///
 /// - Claude Code gets the session-aware `ai-memory mcp-bridge` entry.
-/// - Codex and Prime Agent reference `AI_MEMORY_AUTH_TOKEN` by name, the
-///   form their writers already use and both clients document.
+/// - Codex, Prime Agent and Droid reference `AI_MEMORY_AUTH_TOKEN` by name,
+///   the form their writers already use and each client documents.
 /// - Pi is unchanged: its generated extension reads the hook credential file.
 /// - Every other client that runs local commands gets a stdio entry for the
 ///   session-less bridge (`mcp-bridge --no-session-id`), in that client's own
@@ -178,7 +179,7 @@ pub(crate) fn run_with_opencode_dialect(
 fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> {
     match args.client {
         McpClient::ClaudeCode => args.session_aware = true,
-        McpClient::Codex | McpClient::PrimeAgent => args.token_env_var = true,
+        McpClient::Codex | McpClient::PrimeAgent | McpClient::Droid => args.token_env_var = true,
         McpClient::Pi => {}
         McpClient::Zcode => bail!(
             "this server's bearer token lives in {path} and ai-memory does not copy it into \
@@ -605,6 +606,9 @@ pub(crate) fn mcp_config_path_with(
         // mcp-config.json there (project `.mcp.json` / `.github/mcp.json`
         // files are left to `--config-file`).
         McpClient::CopilotCli => copilot_home_in(env("COPILOT_HOME"))?.join("mcp-config.json"),
+        // Droid's user-level MCP servers live in ~/.factory/mcp.json; a
+        // project's `.factory/mcp.json` is left to --config-file.
+        McpClient::Droid => factory_home(&home()?).join("mcp.json"),
         McpClient::Swival => {
             let cwd = std::env::current_dir()
                 .context("could not resolve current dir for .swival/mcp.json default")?;
@@ -825,6 +829,13 @@ pub(crate) fn copilot_home_in(env_override: Option<std::ffi::OsString>) -> Resul
         .join(".copilot"))
 }
 
+/// Factory Droid's user configuration root, `~/.factory`, under an injected
+/// home so path tests never consult the real one. Droid documents no
+/// variable that relocates it.
+pub(crate) fn factory_home(home: &Path) -> PathBuf {
+    home.join(".factory")
+}
+
 /// Prime Agent's agent directory: `$PRIME_AGENT_CODING_AGENT_DIR` when set and
 /// not blank, otherwise `~/.prime/agent`. The override is injected to keep
 /// path tests process-local.
@@ -945,6 +956,12 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
             "  Prime Agent reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch prime-agent."
         );
     }
+    if matches!(args.client, McpClient::Droid) && (args.auth_token.is_some() || args.token_env_var)
+    {
+        println!(
+            "  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect."
+        );
+    }
     if matches!(args.client, McpClient::Codex) && args.token_env_var {
         println!(
             "  Codex reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex."
@@ -1004,6 +1021,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KiroCli
         | McpClient::CommandCode
         | McpClient::CopilotCli
+        | McpClient::Droid
         | McpClient::Swival
         | McpClient::PrimeAgent => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
@@ -1605,6 +1623,21 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
             entry.insert("tools".into(), json!(["*"]));
+        }
+        McpClient::Droid => {
+            // Droid's `mcp.json` HTTP entry: `type: "http"` + `url`, optional
+            // `headers`. Droid expands a bare `${NAME}` only inside
+            // `headers` (and stdio env / OAuth fields), never in `url`, so
+            // the URL stays literal and the bearer is referenced by name,
+            // which also keeps the token out of the file (#1240).
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(server_url));
+            if args.auth_token.is_some() || args.token_env_var {
+                entry.insert(
+                    "headers".into(),
+                    json!({"Authorization": format!("Bearer ${{{PRIME_AGENT_TOKEN_ENV}}}")}),
+                );
+            }
         }
         McpClient::PrimeAgent => {
             // Prime Agent 0.10 counts a user HTTP server as connected, and
@@ -2346,6 +2379,25 @@ fn render_copilot_cli(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_droid(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Factory Droid CLI — merge into ~/.factory/mcp.json, or re-run with\n\
+         # --apply to merge it in place preserving other servers. A project's\n\
+         # `.factory/mcp.json` also works: pass that path via --config-file.\n\
+         #\n\
+         # The equivalent CLI registration is:\n\
+         #   droid mcp add {name} {url} --type http\n\
+         # Droid expands ${{VAR}} only in headers, so the URL is literal and a\n\
+         # bearer is read from ${env} where droid runs.\n\
+         # Pair with `ai-memory install-hooks --agent droid` for capture.\n\
+         {snippet}\n",
+        name = args.name,
+        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        env = PRIME_AGENT_TOKEN_ENV,
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_swival(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Swival CLI — merge into .swival/mcp.json in the project root
@@ -2431,6 +2483,81 @@ mod tests {
             flavor: None,
             token_env_var: false,
             stdio_bridge: false,
+        }
+    }
+
+    /// Droid's `mcp.json` HTTP entry (#1240): the URL is literal (Droid
+    /// never expands variables there), and a configured bearer becomes the
+    /// `${AI_MEMORY_AUTH_TOKEN}` reference Droid expands in headers, never
+    /// the token itself. No bearer, no header.
+    #[test]
+    fn droid_entry_keeps_url_literal_and_references_the_token_variable() {
+        let entry = build_json_mcp_entry(&args_with_token(McpClient::Droid)).unwrap();
+        assert_eq!(
+            entry,
+            json!({
+                "type": "http",
+                "url": "http://127.0.0.1:49374/mcp",
+                "headers": {"Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}"},
+            })
+        );
+        assert!(!entry.to_string().contains("test-token-deadbeef"));
+        let plain = build_json_mcp_entry(&args_for(McpClient::Droid)).unwrap();
+        assert_eq!(
+            plain,
+            json!({"type": "http", "url": "http://127.0.0.1:49374/mcp"})
+        );
+        let rendered = render_droid(&args_with_token(McpClient::Droid)).unwrap();
+        assert!(rendered.contains("\"mcpServers\""), "{rendered}");
+        assert!(rendered.contains("~/.factory/mcp.json"), "{rendered}");
+        assert!(!rendered.contains("test-token-deadbeef"), "{rendered}");
+    }
+
+    /// `--apply` merges into `~/.factory/mcp.json`'s `mcpServers`, keeping
+    /// other servers and top-level keys, and a re-run is a no-op.
+    #[test]
+    fn droid_apply_merges_into_mcp_servers_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("mcp.json");
+        std::fs::write(
+            &file,
+            json!({"mcpServers": {"other": {"type": "stdio", "command": "x"}}, "keep": 1})
+                .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::Droid);
+        args.apply = true;
+        args.config_file = Some(file.clone());
+        args.server_url = Some("http://memory:49374/mcp".into());
+        apply_to_config_file(&args).unwrap();
+        let first = std::fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(first, std::fs::read_to_string(&file).unwrap());
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], 1);
+        assert_eq!(root["mcpServers"]["other"]["command"], "x");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({"type": "http", "url": "http://memory:49374/mcp"})
+        );
+        assert_eq!(
+            existing_entry_endpoint(McpClient::Droid, &file, "ai-memory").unwrap(),
+            Some("http://memory:49374/mcp".into())
+        );
+    }
+
+    #[test]
+    fn droid_mcp_config_lives_under_dot_factory() {
+        assert_eq!(
+            factory_home(Path::new("/home/me")).join("mcp.json"),
+            Path::new("/home/me/.factory/mcp.json")
+        );
+        if let Ok(path) = mcp_config_path(McpClient::Droid) {
+            assert!(
+                path.ends_with(Path::new(".factory").join("mcp.json")),
+                "{}",
+                path.display()
+            );
         }
     }
 
@@ -3458,6 +3585,7 @@ mod tests {
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
+            McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
@@ -3534,6 +3662,7 @@ mod tests {
             McpClient::KiroCli,
             McpClient::CommandCode,
             McpClient::CopilotCli,
+            McpClient::Droid,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
@@ -3573,6 +3702,7 @@ mod tests {
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
+            McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
@@ -3641,9 +3771,10 @@ mod tests {
                 !text.contains(FILE_TOKEN),
                 "token leaked into {client:?}: {text}"
             );
-            assert!(
-                !text.contains("Authorization"),
-                "{client:?} got a header: {text}"
+            assert_eq!(
+                text.contains("Authorization"),
+                client == McpClient::Droid,
+                "only Droid takes a header, and only a variable reference: {text}"
             );
             match client {
                 McpClient::Codex => assert!(
@@ -3652,6 +3783,13 @@ mod tests {
                 ),
                 McpClient::PrimeAgent => {
                     assert!(text.contains("\"bearerTokenEnvVar\""), "{text}");
+                }
+                McpClient::Droid => {
+                    assert!(
+                        text.contains("\"Bearer ${AI_MEMORY_AUTH_TOKEN}\""),
+                        "{text}"
+                    );
+                    assert!(!text.contains("mcp-bridge"), "{text}");
                 }
                 _ => {
                     let endpoint = existing_entry_endpoint(client, &file, "ai-memory")

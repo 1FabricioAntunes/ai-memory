@@ -114,6 +114,12 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         emit_hermes(&args)?;
         return Ok(());
     }
+    // Droid has no script bundle either: its hooks.json runs the native
+    // `hook` command.
+    if matches!(args.agent, AgentChoice::Droid) {
+        emit_droid(&args)?;
+        return Ok(());
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -210,7 +216,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Openclaw
         | AgentChoice::Zero
         | AgentChoice::Zcode
-        | AgentChoice::Hermes => {
+        | AgentChoice::Hermes
+        | AgentChoice::Droid => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -306,6 +313,31 @@ fn emit_hermes(args: &SetupAgentArgs) -> Result<()> {
     println!("#       ai-memory memory-provider plugin.");
     println!();
     println!("{block}");
+    Ok(())
+}
+
+/// Print the event map for `~/.factory/hooks.json` (#1240). No scripts are
+/// staged: each entry runs the ai-memory binary's native `hook` command with
+/// Droid's event JSON on stdin, so the binary must be reachable on the host
+/// that runs Droid.
+fn emit_droid(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_droid_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload["hooks"]).context("serializing Droid hook config")?;
+    println!("# Factory Droid — merge into ~/.factory/hooks.json (the file is the");
+    println!("# event map itself). The `command` must be an ai-memory binary reachable");
+    println!("# on the host that runs Droid; prefer `ai-memory install-hooks --agent");
+    println!("# droid --apply` from that host so the path is resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat hooks.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
     Ok(())
 }
 

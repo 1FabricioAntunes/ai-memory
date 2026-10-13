@@ -1385,8 +1385,8 @@ needs a manual change.
 
 A token read from the file is never written into a harness config or onto a
 command line. `install-mcp` gives Claude Code the session-aware
-`ai-memory mcp-bridge` stdio entry, which reads the file itself; Codex and
-Prime Agent reference `AI_MEMORY_AUTH_TOKEN` by name; every other client gets
+`ai-memory mcp-bridge` stdio entry, which reads the file itself; Codex,
+Prime Agent and Factory Droid reference `AI_MEMORY_AUTH_TOKEN` by name; every other client gets
 a stdio entry, in its own config format, for `ai-memory mcp-bridge
 --no-session-id`. ZCode keeps HTTP entries only and is refused.
 `install-hooks --apply` persists it to the hook credential files and

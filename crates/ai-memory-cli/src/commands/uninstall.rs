@@ -252,6 +252,12 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
                 install_hooks::devin_config_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
+            // Droid's hooks.json is the event map itself, like Devin's
+            // hooks.v1.json.
+            (
+                install_hooks::droid_hooks_path()?,
+                HookConfigShape::FlatHookFile,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {
@@ -415,6 +421,7 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             KiroCli,
             CommandCode,
             CopilotCli,
+            Droid,
             Swival,
             Muse,
             PrimeAgent,
@@ -1335,6 +1342,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KiroCli
         | McpClient::CommandCode
         | McpClient::CopilotCli
+        | McpClient::Droid
         | McpClient::Swival
         | McpClient::Devin
         | McpClient::PrimeAgent => Some(&["mcpServers"]),

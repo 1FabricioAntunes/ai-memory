@@ -3,7 +3,7 @@
 For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
 It shows direct MCP writes, queries and handoffs without a native hook adapter.
 
-Factory Droid, Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
+Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
 `install-mcp` client; their hand-written recipes are in
 [`install.md`](install.md#clients-without-an-install-mcp-writer).
 
@@ -16,8 +16,9 @@ Factory Droid, Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > `[auth].bearer_token_file` (every fresh `ai-memory init`, and
 > `ai-memory auth enable`), `install-mcp` never writes it into a client's
 > config. Claude Code gets the session-aware `ai-memory mcp-bridge` stdio
-> entry; Codex (`bearer_token_env_var`) and Prime Agent (`bearerTokenEnvVar`)
-> name `AI_MEMORY_AUTH_TOKEN`, which you export where you start them. Every
+> entry; Codex (`bearer_token_env_var`), Prime Agent (`bearerTokenEnvVar`) and
+> Factory Droid (`Bearer ${AI_MEMORY_AUTH_TOKEN}` in `headers`) name
+> `AI_MEMORY_AUTH_TOKEN`, which you export where you start them. Every
 > other client gets a local stdio entry, in its own format, that runs
 > `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
 > the token file at launch and forwards no session id, so the client passes
@@ -313,6 +314,50 @@ nothing is pending.
 - Sources: <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers>,
   <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>,
   <https://docs.github.com/en/copilot/reference/hooks-reference>
+
+---
+
+## Factory Droid
+
+**Status:** MCP and lifecycle hooks are supported (#1240); the `SessionStart`
+hook injects the pending handoff and Droid's `SessionEnd` closes the session.
+No managed workstream.
+
+**Config files:** `~/.factory/mcp.json` for MCP and `~/.factory/hooks.json`
+for lifecycle hooks.
+
+```bash
+ai-memory install-mcp --client droid --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent droid --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer merges an HTTP entry into the root `mcpServers` map,
+preserving other servers. Droid expands `${NAME}` only in `headers`, so the
+URL stays literal and the bearer is a variable reference, never the token:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+Export `AI_MEMORY_AUTH_TOKEN` where you launch droid; an unset variable makes
+Droid fail the connection. Without a bearer the entry has no `headers`.
+`install-hooks --agent droid` run without `--server-url` reads the URL back
+from this entry (not the token, which is only a reference there). The hook
+installer, its native commands and the `settings.json` refusal are described
+in [`install.md`](install.md#factory-droid).
+
+- Sources: <https://docs.factory.com/cli/configuration/mcp>,
+  <https://docs.factory.com/harness/hooks>
 
 ---
 

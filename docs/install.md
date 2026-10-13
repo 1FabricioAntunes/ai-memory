@@ -18,7 +18,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Factory Droid, Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -1530,6 +1530,59 @@ would point every teammate at one person's install and server.
 managed workstream harness (see [managed workstreams](managed-workstreams.md));
 `install-mcp --client copilot` remains the VS Code Copilot client.
 
+### Factory Droid
+
+Droid (`droid`) keeps its user config in `~/.factory`. `install-mcp --client
+droid` (alias `factory-droid`) merges the server entry into `mcp.json` there,
+and `install-hooks --agent droid` merges lifecycle hooks into `hooks.json`,
+keeping every entry you already have in either file (#1240):
+
+```bash
+ai-memory install-mcp --client droid --apply \
+    --server-url "http://homelab:49374/mcp"
+ai-memory install-hooks --agent droid --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The MCP entry is `{"type": "http", "url": …}` under `mcpServers`. Droid
+expands `${NAME}` in `headers` but never in `url`, so the URL is written
+literally. When the server has a bearer token, the entry gets
+`"headers": {"Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}"}` instead of
+the token, so export `AI_MEMORY_AUTH_TOKEN` in the shell that starts droid:
+Droid fails that connection, naming the variable, when it is unset. A
+project's `.factory/mcp.json` also works (pass it with `--config-file`), but
+Droid's docs advise keeping auth headers out of that committed file. Without a
+token, `droid mcp add ai-memory http://127.0.0.1:49374/mcp --type http` writes
+the same entry.
+
+`~/.factory/hooks.json` holds the event map itself, with no `hooks` wrapper.
+Droid sends Claude Code-shaped JSON on stdin (`session_id`, `cwd`,
+`tool_name`, `tool_input`, `tool_response`), so each entry runs the native
+`ai-memory hook --event … --agent droid` command; there is no script bundle,
+and the local spool, bearer auth and `[capture] ignore_paths` apply. Droid's
+`Read`, `Create`, `Edit`, `ApplyPatch` (a Codex-style patch envelope),
+`LS`, `Grep`, `Glob` and `Execute` tools are mapped to the file, search and
+shell families those exclusions use, verified against the Droid 0.240.0 tool
+schemas. Droid payloads carry no tool-call id. Seven events are wired:
+`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`,
+`Stop` and `SessionEnd`. `SubagentStop` is left out because Droid has no
+`SubagentStart` to pair it with.
+
+Droid reads the `hooks` key of `~/.factory/settings.json` only while
+`hooks.json` does not exist. If your hooks live there, `--apply` refuses to
+create `hooks.json`, which would switch them off, and says so. Either move
+that `hooks` object into `~/.factory/hooks.json` and run the command again, or
+merge the entries `ai-memory install-hooks --agent droid` prints (without
+`--apply`) under the `hooks` key of `settings.json` yourself.
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`, which Droid adds to the session, and
+Droid's own `SessionEnd` closes the session, so `finalize-session` is not
+needed. Start a new droid session after installing so it loads the hooks.
+`ai-memory setup --agent droid` runs both installers; `setup` does not detect
+Droid on its own, and no managed workstream (`ai-memory run droid`) is claimed.
+
 ### Hermes Agent (Nous Research)
 
 Hermes declares lifecycle hooks in the `hooks:` block of
@@ -1929,33 +1982,6 @@ Where the client documents no expansion, the example shows `<token>`, and the
 token has to be written into that file, so keep the file private. All of
 these clients speak HTTP MCP natively; `ai-memory mcp-bridge` is a Claude
 Code-only adapter and is not needed.
-
-##### Factory Droid
-
-Droid (`droid`) reads MCP servers from `~/.factory/mcp.json` (user),
-`.factory/mcp.json` in the project root, or a `.factory/mcp.json` in an
-ancestor folder. It reloads when the file changes. Droid expands `${NAME}` in
-`headers` values (not in `url`), and its docs say to keep auth headers in the
-user file rather than the committed project file:
-
-```json
-{
-  "mcpServers": {
-    "ai-memory": {
-      "type": "http",
-      "url": "http://127.0.0.1:49374/mcp",
-      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
-    }
-  }
-}
-```
-
-Leave out `headers` when the server has no bearer token. An unset variable
-makes Droid fail that connection with an error naming it. Without a token,
-`droid mcp add ai-memory http://127.0.0.1:49374/mcp --type http` writes the
-same entry to the user file. Documented for Droid CLI 0.237.0.
-Sources: <https://docs.factory.com/cli/configuration/mcp>,
-<https://docs.factory.com/changelog/cli-updates>.
 
 ##### Warp
 

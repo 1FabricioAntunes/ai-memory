@@ -1034,6 +1034,80 @@ fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
     );
 }
 
+/// Factory Droid (#1240): `install-mcp` and `install-hooks` merge into
+/// `~/.factory/mcp.json` and the bare `~/.factory/hooks.json` event map
+/// around the user's own entries, and `uninstall` removes only ai-memory's.
+#[test]
+fn droid_install_and_uninstall_round_trip_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let mcp = home.path().join(".factory/mcp.json");
+    let hooks = home.path().join(".factory/hooks.json");
+    write_file(
+        &mcp,
+        r#"{"mcpServers":{"other":{"type":"http","url":"https://other.example/mcp"}}}"#,
+    );
+    write_file(
+        &hooks,
+        r#"{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"/usr/local/bin/guard.sh"}]}]}"#,
+    );
+
+    for args in [
+        &["install-mcp", "--client", "droid", "--apply"][..],
+        &["install-hooks", "--agent", "droid", "--apply"][..],
+    ] {
+        let out = command_with_home(home.path()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let wired: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    let pre = wired["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{wired}");
+    assert!(
+        pre[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--agent droid"),
+        "{wired}"
+    );
+    assert!(wired["SessionEnd"].is_array(), "{wired}");
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(
+        removed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let unwired = std::fs::read_to_string(&hooks).unwrap();
+    assert!(!unwired.contains("--agent droid"), "{unwired}");
+    let unwired: serde_json::Value = serde_json::from_str(&unwired).unwrap();
+    assert_eq!(
+        unwired["PreToolUse"][0]["hooks"][0]["command"],
+        "/usr/local/bin/guard.sh"
+    );
+}
+
 #[test]
 fn swival_mcp_install_and_uninstall_round_trip_from_nested_directory() {
     let _guard = cli_test_lock();

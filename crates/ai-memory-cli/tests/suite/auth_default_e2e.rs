@@ -476,6 +476,7 @@ mod slow {
         "kiro-cli",
         "command-code",
         "copilot-cli",
+        "droid",
         "swival",
         "vscode-copilot",
         "zed",

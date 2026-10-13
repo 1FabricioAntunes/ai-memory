@@ -2463,6 +2463,17 @@ pub enum AgentChoice {
     /// work.
     #[value(name = "copilot-cli")]
     CopilotCli,
+    /// Factory Droid CLI (`droid`) — lifecycle hooks merged into
+    /// `~/.factory/hooks.json` (#1240). Droid sends Claude Code-shaped hook
+    /// payloads on stdin, so each entry runs ai-memory's native `hook`
+    /// command directly; there is no script bundle. Droid reads the `hooks`
+    /// key of `~/.factory/settings.json` only while `hooks.json` is absent,
+    /// so `--apply` refuses to create `hooks.json` over hooks still kept in
+    /// `settings.json`. SessionStart stdout
+    /// (`hookSpecificOutput.additionalContext`) carries the handoff, and
+    /// Droid's own `SessionEnd` closes the session.
+    #[value(alias = "factory-droid")]
+    Droid,
 }
 
 impl AgentChoice {
@@ -2494,6 +2505,7 @@ impl AgentChoice {
             Self::Zcode => AgentKind::Zcode,
             Self::Hermes => AgentKind::Hermes,
             Self::CopilotCli => AgentKind::CopilotCli,
+            Self::Droid => AgentKind::Droid,
         }
     }
 
@@ -2512,7 +2524,8 @@ impl AgentChoice {
             | Self::Openclaw
             | Self::Zero
             | Self::Zcode
-            | Self::Hermes => None,
+            | Self::Hermes
+            | Self::Droid => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2712,6 +2725,14 @@ pub enum McpClient {
     /// mode client.
     #[value(name = "copilot-cli")]
     CopilotCli,
+    /// Factory Droid CLI — `~/.factory/mcp.json`, servers under the root
+    /// `mcpServers` map with `type: "http"` + `url` (#1240). Droid expands
+    /// `${VAR}` only in `headers`, never in `url`, so the URL is written
+    /// literally and a bearer is referenced as `${AI_MEMORY_AUTH_TOKEN}`,
+    /// which must be exported where droid runs. Pair with
+    /// `install-hooks --agent droid` for lifecycle capture.
+    #[value(alias = "factory-droid")]
+    Droid,
     /// Swival CLI — project-scoped `.swival/mcp.json` using native HTTP.
     /// This integration is MCP-only; Swival's lifecycle callback does not
     /// expose a stable session identifier for reliable capture correlation.
@@ -4521,6 +4542,28 @@ mod tests {
                 panic!("expected install-hooks for {alias}");
             };
             assert_eq!(args.agent, AgentChoice::CommandCode);
+        }
+    }
+
+    #[test]
+    fn droid_install_hooks_and_install_mcp_parse_with_the_factory_alias() {
+        for alias in ["droid", "factory-droid"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::Droid);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Droid);
+            // Native commands only: there is no `hooks/droid` bundle.
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::Droid);
         }
     }
 

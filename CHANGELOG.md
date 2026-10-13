@@ -350,6 +350,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hooks already resolve for the checkout, so accepting them keeps the memory
   where it is. It writes only those two keys, needs an interactive terminal,
   and never overwrites an existing marker. (#1227)
+- Added first-class Factory Droid CLI support. `install-mcp --client droid`
+  (alias `factory-droid`) merges an HTTP entry into `~/.factory/mcp.json`,
+  with the URL written literally and a bearer referenced as
+  `Bearer ${AI_MEMORY_AUTH_TOKEN}`: Droid expands variables in headers but
+  never in the URL.
+  `install-hooks --agent droid` merges native
+  `ai-memory hook --event … --agent droid` commands for seven events into
+  `~/.factory/hooks.json`, keeps your own entries, changes nothing on a
+  re-run, and refuses to create that file while `~/.factory/settings.json`
+  holds hooks, which Droid would then stop reading. Sessions are recorded as
+  agent `droid` (migration V78). The `SessionStart` hook delivers the pending
+  handoff, and Droid's own `SessionEnd` closes the session. Droid's `Read`,
+  `Create`, `Edit`, `ApplyPatch`, `LS`, `Grep`, `Glob` and `Execute` tools
+  map to the file, search and shell families, so `[capture] ignore_paths`
+  applies to them: verified against the Droid 0.240.0 tool schemas; no
+  tool-call id in Droid payloads. `setup-agent --agent droid` prints the
+  hook config and `uninstall` removes both entries. (#1240)
 
 ### Changed
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or

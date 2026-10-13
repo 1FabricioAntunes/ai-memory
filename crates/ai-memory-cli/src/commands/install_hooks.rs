@@ -353,6 +353,15 @@ fn grok_hooks_path_in(
         .join("ai-memory.json"))
 }
 
+/// `~/.factory/hooks.json` — Factory Droid's user-level lifecycle hooks
+/// (#1240), the event map itself with no wrapper key.
+pub(crate) fn droid_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(install_mcp::factory_home(
+        &home_dir().context("could not locate $HOME for ~/.factory/hooks.json")?,
+    )
+    .join("hooks.json"))
+}
+
 /// `~/.config/zero/hooks.json` — Zero's user-level lifecycle hook config
 /// (issue #156). Zero resolves it under `$XDG_CONFIG_HOME` falling back to
 /// `~/.config`; like the OpenCode plugin path below we target the default
@@ -872,6 +881,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_copilot_cli_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::Droid => {
+                let path = match &args.config_file {
+                    Some(path) => path.clone(),
+                    None => droid_hooks_path()?,
+                };
+                apply_to_droid_hooks(&path, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -1026,6 +1042,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 &[COPILOT_CLI_PROFILE.events],
             )
         }
+        AgentChoice::Droid => render_droid(&server_url, auth, &config.data_dir, strategy),
     }
 }
 
@@ -1216,6 +1233,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Pool => return None,
             AgentChoice::KiroCliV3 => kiro_cli_v3_hooks_path().ok()?,
             AgentChoice::CopilotCli => copilot_cli_hooks_path().ok()?,
+            AgentChoice::Droid => droid_hooks_path().ok()?,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -1479,6 +1497,18 @@ fn infer_installed_mcp_config(
             &["mcpServers", "ai-memory"],
             "url",
         )),
+        // `install-mcp --client droid` writes the bearer as the
+        // `${AI_MEMORY_AUTH_TOKEN}` reference Droid expands, not the token,
+        // so only the URL is inferred from it.
+        McpClient::Droid => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )
+        .map(|inferred| InferredMcpConfig {
+            auth_token: None,
+            ..inferred
+        })),
         McpClient::Grok => infer_grok_mcp_config(&content),
         McpClient::OpenCode | McpClient::OpenCode2 => infer_opencode_mcp_config(&content, client),
         McpClient::Cursor => Ok(infer_json_mcp_config(
@@ -1632,6 +1662,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // file to infer a server URL or token from.
         AgentChoice::Hermes => None,
         AgentChoice::CopilotCli => Some(McpClient::CopilotCli),
+        AgentChoice::Droid => Some(McpClient::Droid),
     }
 }
 
@@ -6771,6 +6802,138 @@ fn render_hermes_output(
     out
 }
 
+/// Merge ai-memory's entries into Droid's `hooks.json` (#1240), keeping
+/// every other entry in it, idempotently.
+///
+/// Droid reads the `hooks` key of the `settings.json` beside it only while
+/// `hooks.json` is absent, so creating the file over hooks kept there would
+/// switch them off without a word. That case is refused with the two ways
+/// out; an existing `hooks.json` is already the file Droid reads.
+fn apply_to_droid_hooks(
+    path: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    if !path.exists() {
+        let settings = path.with_file_name("settings.json");
+        if droid_settings_hold_hooks(&settings)? {
+            anyhow::bail!(
+                "{settings} keeps Droid hooks under its `hooks` key, and Droid reads those only \
+                 while {path} does not exist, so creating {path} would switch them off. Either \
+                 move that `hooks` object into {path} (the file holds the event map itself, \
+                 with no `hooks` wrapper) and re-run this command, or add the entries \
+                 `ai-memory install-hooks --agent droid` prints (without --apply) under \
+                 the `hooks` key of {settings} yourself.",
+                settings = settings.display(),
+                path = path.display(),
+            );
+        }
+    }
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = super::render_shared::build_droid_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .context("internal: build_droid_hooks_payload didn't return a hooks object")?;
+    let outcome = apply_atomic(path, |existing| {
+        mutate_json(existing, |root| {
+            for (event, value) in our_hooks {
+                overlay_event_hooks(root, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    print!("{DROID_INSTALL_NOTES}");
+    Ok(())
+}
+
+const DROID_INSTALL_NOTES: &str = "\
+# NOTE: Droid adds SessionStart stdout to the session as context, so the
+#       prior session's handoff is delivered automatically, and its own
+#       SessionEnd closes the session.
+# NOTE: start a new droid session for it to load the new hooks.
+";
+
+/// Whether Droid's `settings.json` holds hook entries under `hooks`, the
+/// ones Droid reads while no `hooks.json` sits beside it. Parsed as JSONC
+/// since a settings file may carry comments; one that cannot be parsed is
+/// refused rather than guessed at.
+fn droid_settings_hold_hooks(settings: &Path) -> Result<bool> {
+    let text = match fs::read_to_string(settings) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", settings.display())),
+    };
+    let root: serde_json::Value = jsonc_parser::parse_to_ast(
+        &text,
+        &jsonc_parser::CollectOptions::default(),
+        &jsonc_parser::ParseOptions::default(),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "parsing {} to check whether Droid hooks live there: {e}",
+            settings.display()
+        )
+    })?
+    .value
+    .map_or(serde_json::Value::Null, Into::into);
+    Ok(match root.get("hooks") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Object(hooks)) => !hooks.is_empty(),
+        Some(_) => true,
+    })
+}
+
+/// Print Droid's `hooks.json` event map (dry-run counterpart of
+/// [`apply_to_droid_hooks`]).
+fn render_droid(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_droid_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload["hooks"]).context("serializing droid hook config")?;
+    println!("# Factory Droid CLI hook config — merge into ~/.factory/hooks.json (the");
+    println!("# file is this event map itself), or re-run with --apply to merge it in");
+    println!("# place. If you keep hooks under the `hooks` key of ~/.factory/settings.json");
+    println!("# instead, add these entries there: Droid reads settings.json hooks only");
+    println!("# while hooks.json does not exist.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat the file as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
+    }
+    print!("{DROID_INSTALL_NOTES}");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 fn render_devin(
     hooks_dir: &Path,
     server_url: &str,
@@ -7640,6 +7803,215 @@ mod tests {
                 fs::set_permissions(&p, perms).unwrap();
             }
         }
+    }
+
+    fn droid_args(config_file: &Path) -> InstallHooksArgs {
+        InstallHooksArgs {
+            agent: AgentChoice::Droid,
+            config_file: Some(config_file.to_path_buf()),
+            ..default_hook_args()
+        }
+    }
+
+    /// `install-hooks --agent droid --apply` merges native `--agent droid`
+    /// commands into `hooks.json` (the bare event map), keeps every
+    /// third-party entry, and a re-apply changes nothing (#1240).
+    #[test]
+    fn droid_apply_merges_native_hooks_and_is_idempotent() {
+        let factory = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let hooks_json = factory.path().join("hooks.json");
+        fs::write(
+            &hooks_json,
+            serde_json::json!({
+                "PreToolUse": [{
+                    "matcher": "Execute",
+                    "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh", "timeout": 5}]
+                }],
+                "Notification": [{"hooks": [{"type": "command", "command": "notify-send hi"}]}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = droid_args(&hooks_json);
+
+        apply_to_droid_hooks(&hooks_json, "http://memory:49374", None, data.path(), &args).unwrap();
+        let first = fs::read_to_string(&hooks_json).unwrap();
+        apply_to_droid_hooks(&hooks_json, "http://memory:49374", None, data.path(), &args).unwrap();
+        assert_eq!(
+            first,
+            fs::read_to_string(&hooks_json).unwrap(),
+            "re-apply is a no-op"
+        );
+        let backups = fs::read_dir(factory.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".bak-")
+            })
+            .count();
+        assert_eq!(backups, 1, "only the first apply changed the file");
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert!(root.get("hooks").is_none(), "hooks.json has no wrapper key");
+        for (event, script) in super::super::render_shared::DROID_EVENTS {
+            let entries = root[event].as_array().unwrap();
+            let ours: Vec<_> = entries
+                .iter()
+                .filter(|e| is_ai_memory_hook_entry(e))
+                .collect();
+            assert_eq!(ours.len(), 1, "{event}: exactly one ai-memory entry");
+            assert_eq!(ours[0]["matcher"], "", "{event}");
+            let command = ours[0]["hooks"][0]["command"].as_str().unwrap();
+            let stem = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!(" hook --event {stem} --agent droid --server-url ")),
+                "{event}: {command}"
+            );
+            assert!(
+                !command.contains(".sh"),
+                "{event}: no script bundle: {command}"
+            );
+        }
+        assert!(root.get("SubagentStop").is_none());
+        // Third-party entries survive, in their own events and beside ours.
+        assert_eq!(
+            root["Notification"][0]["hooks"][0]["command"],
+            "notify-send hi"
+        );
+        let pre = root["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["matcher"], "Execute");
+        assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+    }
+
+    /// Droid reads `settings.json`'s `hooks` only while `hooks.json` is
+    /// absent, so creating `hooks.json` over them is refused and leaves both
+    /// files untouched. Settings without hooks (the control), and a
+    /// `hooks.json` that already exists, proceed.
+    #[test]
+    fn droid_apply_refuses_to_create_hooks_json_over_settings_hooks() {
+        let data = TempDir::new().unwrap();
+        for settings in [
+            r#"{"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}}"#,
+            // JSONC with comments still counts.
+            "{\n  // user hooks\n  \"hooks\": {\"Stop\": []},\n}\n",
+            r#"{"hooks": "unexpected"}"#,
+        ] {
+            let factory = TempDir::new().unwrap();
+            let hooks_json = factory.path().join("hooks.json");
+            let settings_json = factory.path().join("settings.json");
+            fs::write(&settings_json, settings).unwrap();
+            let error = apply_to_droid_hooks(
+                &hooks_json,
+                "http://memory:49374",
+                None,
+                data.path(),
+                &droid_args(&hooks_json),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                !hooks_json.exists(),
+                "{settings}: hooks.json must not be created"
+            );
+            assert_eq!(fs::read_to_string(&settings_json).unwrap(), settings);
+            assert!(error.contains("settings.json"), "{error}");
+            assert!(error.contains("hooks.json"), "{error}");
+            assert!(error.contains("--agent droid"), "{error}");
+        }
+
+        // Unparsable settings cannot prove the absence of hooks.
+        let factory = TempDir::new().unwrap();
+        let hooks_json = factory.path().join("hooks.json");
+        fs::write(factory.path().join("settings.json"), "{ not json").unwrap();
+        assert!(
+            apply_to_droid_hooks(
+                &hooks_json,
+                "http://memory:49374",
+                None,
+                data.path(),
+                &droid_args(&hooks_json)
+            )
+            .is_err()
+        );
+        assert!(!hooks_json.exists());
+
+        // Controls: no hooks in settings.json, or an empty `hooks` object.
+        for settings in [
+            r#"{"model": "x"}"#,
+            r#"{"hooks": {}}"#,
+            r#"{"hooks": null}"#,
+        ] {
+            let factory = TempDir::new().unwrap();
+            let hooks_json = factory.path().join("hooks.json");
+            fs::write(factory.path().join("settings.json"), settings).unwrap();
+            apply_to_droid_hooks(
+                &hooks_json,
+                "http://memory:49374",
+                None,
+                data.path(),
+                &droid_args(&hooks_json),
+            )
+            .unwrap();
+            assert!(hooks_json.exists(), "{settings}");
+        }
+
+        // An existing hooks.json is already what Droid reads.
+        let factory = TempDir::new().unwrap();
+        let hooks_json = factory.path().join("hooks.json");
+        fs::write(&hooks_json, "{}").unwrap();
+        fs::write(
+            factory.path().join("settings.json"),
+            r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}}"#,
+        )
+        .unwrap();
+        apply_to_droid_hooks(
+            &hooks_json,
+            "http://memory:49374",
+            None,
+            data.path(),
+            &droid_args(&hooks_json),
+        )
+        .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_json).unwrap()).unwrap();
+        assert!(root["SessionStart"].is_array());
+    }
+
+    /// `install-mcp --client droid` writes the bearer as a
+    /// `${AI_MEMORY_AUTH_TOKEN}` reference; inferring hook settings from it
+    /// keeps the URL and never takes that reference for a token.
+    #[test]
+    fn droid_mcp_inference_keeps_url_and_drops_the_env_reference() {
+        let dir = TempDir::new().unwrap();
+        let mcp = dir.path().join("mcp.json");
+        fs::write(
+            &mcp,
+            serde_json::json!({"mcpServers": {"ai-memory": {
+                "type": "http",
+                "url": "http://memory:49374/mcp",
+                "headers": {"Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}"}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let inferred = infer_installed_mcp_config(AgentChoice::Droid, Some(&mcp))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inferred.hook_server_url.as_deref(),
+            Some("http://memory:49374")
+        );
+        assert_eq!(inferred.auth_token, None);
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::Droid),
+            Some(McpClient::Droid)
+        );
     }
 
     fn default_hook_args() -> InstallHooksArgs {

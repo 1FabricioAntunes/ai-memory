@@ -5675,6 +5675,59 @@ mod tests {
         );
     }
 
+    /// Droid documents SessionStart stdout as context and parses a JSON
+    /// stdout's `hookSpecificOutput.additionalContext`, so `--agent droid`
+    /// fetches the handoff and prints Claude Code's envelope (#1240).
+    #[tokio::test]
+    async fn droid_session_start_prints_hook_specific_handoff_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "DROID-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            HookArgs {
+                agent: "droid".into(),
+                ..copilot_cli_hook_args("session-start", &base)
+            },
+            serde_json::json!({
+                "session_id": "droid-session",
+                "transcript_path": tmp.path().join("s.jsonl"),
+                "cwd": tmp.path(),
+                "permission_mode": "auto-low",
+                "hook_event_name": "SessionStart",
+                "source": "startup"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "DROID-HANDOFF",
+                }
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=droid")
+                    && request.contains("session_id=droid-session")
+            }),
+            "{recorded:?}"
+        );
+    }
+
     // ── #992: per-repository server profiles ─────────────────────────────
 
     /// Register `name` in `data_dir` with a token and the given roots.
