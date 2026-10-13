@@ -179,6 +179,10 @@ agents) either way.
 
 The plugin does not contain ai-memory. Install the binary first (above, or
 Homebrew, AUR, RPM, the Docker wrapper, the macOS app), then add the plugin.
+The plugins need ai-memory 3.0 or later: an older binary requires
+`--server-url` on every hook, so the launcher retries it against
+`http://127.0.0.1:49374` with a one-line upgrade hint on stderr, and the MCP
+entry does not connect until the binary is upgraded.
 Every hook runs `scripts/ai-memory-hook`, a short POSIX script that finds
 the binary and hands it the event with `ai-memory hook`, the same native
 command `install-hooks` wires. Capture policy (`ignore_paths`, allowlist
@@ -206,7 +210,7 @@ configure ai-memory@ai-memory`:
 
 | Option | Default | Use |
 | --- | --- | --- |
-| `server_url` | empty | Empty uses the `server_url` from your ai-memory config, so the plugin and the CLI never disagree. Set it only to point this plugin elsewhere. |
+| `server_url` | empty | Empty uses the `server_url` from your ai-memory config, so the plugin and the CLI never disagree (the launcher omits `--server-url`). Set it only to point this plugin elsewhere. |
 | `ai_memory_bin` | `ai-memory` | Path to the binary when it is not on the `PATH` the app sees. The launcher also tries `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`. |
 | `data_dir` | empty | Only for an install with a non-default data directory. |
 

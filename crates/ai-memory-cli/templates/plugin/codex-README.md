@@ -13,6 +13,10 @@ and run `ai-memory setup` (see the
 [install guide](https://github.com/akitaonrails/ai-memory#install)). Without
 the binary the plugin captures nothing and never blocks Codex.
 
+The plugin needs ai-memory 3.0 or later. With an older binary the hooks
+fall back to `http://127.0.0.1:49374` and print an upgrade hint, and the
+memory tools do not start.
+
 ## Install
 
 ```sh

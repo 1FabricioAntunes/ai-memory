@@ -88,8 +88,8 @@ printf '{"prompt":"p"}' | run_launcher CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
     CLAUDE_PLUGIN_OPTION_DATA_DIR="/data dir" \
     sh "$LAUNCHER" claude-code user-prompt-submit >/dev/null
 assert_eq "the subcommand comes first (Docker wrapper routing)" "hook" "$(head -n 1 "$TMP/argv")"
-assert_eq "argv carries event, agent, server and data dir" \
-    "hook|--event|user-prompt-submit|--agent|claude-code|--server-url|http://memory.example:1|--data-dir|/data dir" \
+assert_eq "argv carries event, agent, data dir and server" \
+    "hook|--event|user-prompt-submit|--agent|claude-code|--data-dir|/data dir|--server-url|http://memory.example:1" \
     "$(paste -sd '|' "$TMP/argv")"
 assert_eq "the origin marks a plugin event" "claude-code-plugin" "$(cat "$TMP/origin")"
 assert_eq "stdin reaches the binary unchanged" '{"prompt":"p"}' "$(cat "$TMP/stdin")"
@@ -97,8 +97,38 @@ assert_eq "stdin reaches the binary unchanged" '{"prompt":"p"}' "$(cat "$TMP/std
 printf '{}' | run_launcher CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
     CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$STUB_DIR/ai-memory" \
     sh "$LAUNCHER" claude-code stop >/dev/null
-assert_eq "an unset server option passes an empty URL (the config decides)" \
-    "hook|--event|stop|--agent|claude-code|--server-url|" "$(paste -sd '|' "$TMP/argv")"
+assert_eq "an unset server option omits --server-url (the config decides)" \
+    "hook|--event|stop|--agent|claude-code" "$(paste -sd '|' "$TMP/argv")"
+
+# A pre-3.0 binary requires --server-url and exits 2 on a usage error before
+# reading stdin. The launcher retries it once against the default local
+# server with the payload intact, says why on stderr, and exits 0.
+OLD_DIR="$TMP/old-bin"
+mkdir -p "$OLD_DIR"
+cat >"$OLD_DIR/ai-memory" <<EOF
+#!/bin/sh
+case " \$* " in
+    *" --server-url "*) ;;
+    *) echo "error: the following required arguments were not provided: --server-url" >&2; exit 2 ;;
+esac
+for arg in "\$@"; do printf '%s\n' "\$arg"; done >"$TMP/argv"
+cat >"$TMP/stdin"
+printf '{}\n'
+EOF
+chmod +x "$OLD_DIR/ai-memory"
+status=0
+out=$(printf '{"prompt":"old"}' | run_launcher CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
+    CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="$OLD_DIR/ai-memory" \
+    sh "$LAUNCHER" claude-code user-prompt-submit 2>"$TMP/stderr") || status=$?
+assert_eq "an old binary is retried with the default server" \
+    "hook|--event|user-prompt-submit|--agent|claude-code|--server-url|http://127.0.0.1:49374" \
+    "$(paste -sd '|' "$TMP/argv")"
+assert_eq "the retry still gets the whole payload" '{"prompt":"old"}' "$(cat "$TMP/stdin")"
+assert_eq "the retry replies and exits 0" "{}|0" "$out|$status"
+case "$(cat "$TMP/stderr")" in
+    *"needs 3.0 or later"*) PASS=$((PASS+1)); printf '  ok  %s\n' "an old binary gets a version-skew hint" ;;
+    *) FAIL=$((FAIL+1)); printf '  FAIL version-skew hint: %s\n' "$(cat "$TMP/stderr")" ;;
+esac
 
 printf '{}' | TEST_PATH="$STUB_DIR:/usr/bin:/bin" run_launcher CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT_DIR" \
     CLAUDE_PLUGIN_OPTION_AI_MEMORY_BIN="ai-memory" sh "$LAUNCHER" claude-code stop >/dev/null

@@ -17,6 +17,10 @@ wrapper or the macOS app; see the
 the binary the plugin captures nothing: it says so once at session start and
 never blocks Claude.
 
+The plugin needs ai-memory 3.0 or later. With an older binary the hooks
+fall back to `http://127.0.0.1:49374` and print an upgrade hint, and the
+memory tools do not connect while `server_url` is empty.
+
 ## Install
 
 ```text
