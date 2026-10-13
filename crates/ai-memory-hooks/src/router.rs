@@ -3876,6 +3876,21 @@ async fn process_authorized(
         .as_ref()
         .map(IdentityKey::to_actor_context)
         .unwrap_or_default();
+    // A redelivery of a checkpoint whose LLM rewrite already ran (or is
+    // running) must not put the rule-based page back over it: the enqueue of
+    // that same generation would be ignored, so the LLM page would be lost.
+    let checkpoint_label = match checkpoint_label {
+        Some(_)
+            if outcome == HookProcessingOutcome::Resumed
+                && state
+                    .reader
+                    .session_generation_consolidating_or_done(session_id)
+                    .await? =>
+        {
+            None
+        }
+        label => label,
+    };
     if let Some(checkpoint_label) = checkpoint_label {
         match write_checkpoint_page(
             state,
@@ -6220,6 +6235,116 @@ mod tests {
         assert!(
             checkpoint_job_queued(&state).await,
             "the redelivery must resume and queue the rewrite"
+        );
+    }
+
+    /// A resumed session keeps `ended_at` while it captures again. Its
+    /// compaction checkpoint replaces the page with the rule-based one, so the
+    /// LLM rewrite must still be queued, or the page stays rule-based for good.
+    #[tokio::test]
+    async fn checkpoint_on_a_resumed_session_queues_the_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_hook_consolidator(&mut state);
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c060";
+        for event in ["user-prompt-submit", "session-end", "user-prompt-submit"] {
+            process(&state, checkpoint_envelope(event, sid), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        assert!(
+            !checkpoint_job_queued(&state).await,
+            "SessionEnd opt-in is off"
+        );
+        process(
+            &state,
+            checkpoint_envelope("pre-compact", sid),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            checkpoint_job_queued(&state).await,
+            "the resumed session's checkpoint must queue its LLM rewrite"
+        );
+    }
+
+    /// The first delivery wrote the rule-based page and queued the rewrite,
+    /// then the client dropped before the ingest key completed. The worker
+    /// finished the rewrite before the retry arrived. The retry must leave the
+    /// LLM page in place: the same generation would not queue again.
+    #[tokio::test]
+    async fn checkpoint_retry_after_the_rewrite_keeps_the_llm_page() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_hook_consolidator(&mut state);
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c061";
+        process(
+            &state,
+            checkpoint_envelope("user-prompt-submit", sid),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let keyed = || {
+            let mut env = checkpoint_envelope("pre-compact", sid);
+            env.ingest_key = Some("pre-compact-retried".into());
+            env
+        };
+        process(&state, keyed(), None, Vec::new()).await.unwrap();
+
+        // The worker finishes generation N and writes the LLM page.
+        let now = Timestamp::now().as_microsecond();
+        let job = state
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("the checkpoint queued its rewrite");
+        let path = format!("sessions/{sid}.md");
+        state
+            .wiki
+            .write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                path: ai_memory_core::PagePath::new(path.clone()).unwrap(),
+                frontmatter: serde_json::json!({ "consolidated": true }),
+                body: "# LLM page\n\nWritten by the consolidation worker.".into(),
+                tier: ai_memory_core::Tier::Episodic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute(
+            "UPDATE session_consolidation_jobs SET state = 'completed', completed_at = ?1 \
+             WHERE generation = ?2",
+            rusqlite::params![now, i64::try_from(job.generation()).unwrap()],
+        )
+        .unwrap();
+        // The client never saw the first delivery complete.
+        db.execute("UPDATE ingest_keys SET completed_at = NULL", [])
+            .unwrap();
+
+        process(&state, keyed(), None, Vec::new()).await.unwrap();
+        let body = state
+            .reader
+            .page_body_by_ids(state.workspace_id, state.project_id, &path)
+            .await
+            .unwrap()
+            .unwrap()
+            .body;
+        assert!(
+            body.contains("Written by the consolidation worker"),
+            "{body}"
         );
     }
 

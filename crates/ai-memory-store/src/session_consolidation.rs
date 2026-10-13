@@ -54,10 +54,10 @@ impl SessionConsolidationJob {
     }
 }
 
-/// Whether the session must already have ended, or must still be open.
+/// Whether the session must already have ended, or may be in any state.
 enum EnqueueEligibility {
     EndedSession,
-    OpenSession,
+    AnySession,
 }
 
 /// Enqueue the current observation generation for an ended session.
@@ -80,13 +80,17 @@ pub fn enqueue(
     )
 }
 
-/// Enqueue the current observation generation for an *open* session checkpoint
+/// Enqueue the current observation generation for a session checkpoint
 /// (PreCompact / PostCompaction).
 ///
-/// Returns `true` only when a new generation was inserted. A duplicate
-/// checkpoint of the same generation, an already-ended session, a missing or
-/// mismatched scope, or an observation-less session returns `false` without
-/// creating work. SessionEnd owns the page once `ended_at` is set.
+/// Returns `true` only when a new generation was inserted. A duplicate of the
+/// same generation, a missing or mismatched scope, or an observation-less
+/// session returns `false` without creating work. The session may already have
+/// ended: a resumed session keeps its `ended_at` while it captures again, and a
+/// checkpoint there has just replaced the page with the rule-based one, so the
+/// rewrite must still be queued. Generations order it against SessionEnd's
+/// job: the later one covers more observations and supersedes a pending
+/// older one.
 pub fn enqueue_checkpoint(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
@@ -98,7 +102,7 @@ pub fn enqueue_checkpoint(
         workspace_id,
         project_id,
         session_id,
-        EnqueueEligibility::OpenSession,
+        EnqueueEligibility::AnySession,
     )
 }
 
@@ -111,7 +115,7 @@ fn enqueue_eligible(
 ) -> StoreResult<bool> {
     let ended_predicate = match eligibility {
         EnqueueEligibility::EndedSession => "AND s.ended_at IS NOT NULL",
-        EnqueueEligibility::OpenSession => "AND s.ended_at IS NULL",
+        EnqueueEligibility::AnySession => "",
     };
     let sql = format!(
         "INSERT OR IGNORE INTO session_consolidation_jobs \
@@ -501,15 +505,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_enqueue_refuses_an_ended_session() {
+    async fn checkpoint_enqueue_queues_a_resumed_sessions_new_generation() {
         let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        // SessionEnd already queued this generation; a checkpoint of the same
+        // generation adds nothing.
+        assert!(
+            store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, session_id)
+                .await
+                .unwrap()
+        );
         assert!(
             !store
                 .writer
                 .enqueue_session_checkpoint(workspace_id, project_id, session_id)
                 .await
                 .unwrap(),
-            "SessionEnd owns the page once the session has ended"
+            "the same generation is queued once"
+        );
+        // The session resumes (it keeps ended_at) and compacts: the checkpoint
+        // replaced the page with the rule-based one, so its rewrite must queue.
+        insert_observation(&store, workspace_id, project_id, session_id).await;
+        assert!(
+            store
+                .writer
+                .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+                .await
+                .unwrap(),
+            "a checkpoint on a resumed session queues its new generation"
         );
     }
 
