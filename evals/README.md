@@ -185,7 +185,17 @@ output with no high-signal term, or past the excerpt cap of a pasted
 prompt). Where a fact sits is a choice, so this session's
 `projection_loss` describes the fixture, not real sessions; what it
 supports is a before/after comparison. `report.json` records the seed
-and the sha256 of the generated JSON next to the numbers.
+and the sha256 of the generated JSON next to the numbers; a test pins the
+sha256 of seed 1215, so a generator change that alters it has to update the
+pin and say so beside any republished number.
+
+Two differences from a live server: fixtures and the generated session reach
+the projection without passing through the capture sanitizer (they are
+synthetic, and the injection fixture keeps its planted strings on purpose),
+and they are projected at the harness's 300,000-character default budget,
+not the server's 240,000-character one (100,000 tokens × 3 characters ×
+the 0.8 safety margin). Compare runs against each other, not against a
+server's prompts.
 
 Zero-LLM, no provider:
 

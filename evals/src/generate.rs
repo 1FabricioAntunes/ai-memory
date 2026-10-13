@@ -420,6 +420,19 @@ mod tests {
         assert_ne!(a, c, "the seed must reach the output");
     }
 
+    /// Published runs cite the sha256 of `session(1215)`. A change to the
+    /// generator (a template, a formatting tweak, the RNG) that alters those
+    /// bytes must update this pin and say so next to any republished number,
+    /// rather than silently changing what the old hash names.
+    #[test]
+    fn the_published_seed_keeps_its_sha256() {
+        let (_, sha) = dump(&session(DEFAULT_SEED)).unwrap();
+        assert_eq!(
+            sha,
+            "f25fbc436edf70647ff54b910dfa5ab72259e1b45f1c072db63b9e23d01879d4"
+        );
+    }
+
     #[test]
     fn every_fact_is_planted_exactly_once_and_nowhere_in_the_prompt() {
         let fx = session(DEFAULT_SEED);
