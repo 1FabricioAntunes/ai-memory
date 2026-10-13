@@ -1398,6 +1398,21 @@ pub const DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS: u32 = 32_000;
 /// back for the common case while leaving English budgets close to before.
 pub const DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN: f64 = 0.8;
 
+/// The char budget a configured input token limit really buys, at a given
+/// safety margin: `max_input_tokens * CHARS_PER_TOKEN * safety_margin`.
+///
+/// This is the single definition of the number the consolidation builders run
+/// with. Exposed so `config` can refuse a budget whose *effective* size cannot
+/// hold the fixed prompts plus [`MIN_OBSERVATION_RESERVE_CHARS`] of evidence,
+/// rather than comparing the raw token count and ignoring the margin (#1234).
+#[must_use]
+pub fn effective_input_chars(max_input_tokens: usize, safety_margin: f64) -> usize {
+    let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
+    // Callers pass a validated `0 < margin <= 1`, so the product never exceeds
+    // `nominal` and the cast cannot overflow.
+    (nominal as f64 * safety_margin) as usize
+}
+
 /// Conservative character-to-token estimate for provider-neutral budgeting.
 /// The exact tokenizer is provider/model-specific, so this is a target rather
 /// than a hard token count. Three characters per token plus the default
@@ -1419,9 +1434,20 @@ const SCHEMA_SERIALIZATION_FALLBACK_CHARS: usize = 32_000;
 const MIN_OBSERVATION_RESERVE_CHARS: usize = 1_024;
 
 /// Smallest input budget that still leaves room for observations after
-/// the fixed prompts and structured-output schema. Below this the batch prompt
-/// can leave too little room for observations.
-pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 6_500;
+/// the fixed prompts and structured-output schema, **at the shipped safety
+/// margin**, plus [`MIN_OBSERVATION_RESERVE_CHARS`] of evidence.
+///
+/// The budget the builders run with is
+/// `max_input_tokens * CHARS_PER_TOKEN * input_token_safety_margin`, so the
+/// floor has to clear the fixed part at the *default* margin (0.8), not at the
+/// nominal 1.0 the builders use when they are handed a bare limit. On today's
+/// prompts the batch fixed part is 18,997 chars ([system][user][schema][envelope]),
+/// so the floor is `(18,997 + 1,024) / (3 * 0.8) = 8,342`, rounded up to 8,350.
+/// `advertised_minimum_input_limit_still_carries_observation_evidence` is what
+/// holds this honest: it builds with the default margin, so the next time the
+/// prompts grow it fails there rather than silently sending the model an
+/// evidence-free prompt.
+pub const MIN_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 8_350;
 
 /// Smallest useful structured-output allowance. Lower values are unlikely to
 /// fit even one concise batch update and its JSON framing.
@@ -1465,10 +1491,7 @@ impl PromptBudgets {
         max_output_tokens: u32,
         safety_margin: f64,
     ) -> Self {
-        let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
-        // `safety_margin` is validated to `0 < margin <= 1` at config load, so
-        // the product never exceeds `nominal` and the cast cannot overflow.
-        let max_input_chars = (nominal as f64 * safety_margin) as usize;
+        let max_input_chars = effective_input_chars(max_input_tokens, safety_margin);
         Self {
             max_input_chars,
             max_output_tokens,
@@ -2822,67 +2845,6 @@ mod tests {
         }
     }
 
-    /// #1234: the advertised floor must actually leave room for observations
-    /// **at the shipped safety margin**, not just at a nominal one.
-    ///
-    /// `MIN_CONSOLIDATION_MAX_INPUT_TOKENS` is described as the smallest budget
-    /// that still leaves room for observations, and `config` refuses anything
-    /// below it. That promise only holds if the char budget the builders really
-    /// run with -- `max_input_tokens * input_token_safety_margin` -- clears the
-    /// fixed prompts. The old check compared the raw token count and ignored
-    /// the margin, and the old floor test built its budgets with
-    /// `PromptBudgets::from_limits` (margin 1.0), so both stayed green while a
-    /// default-margin install at the floor rendered zero observations and sent
-    /// the model a prompt with no evidence at all.
-    ///
-    /// This drives the real builders at the real default margin and demands at
-    /// least one rendered observation in each, so the next time the prompts
-    /// grow this fails here instead of silently emptying the prompt in
-    /// production.
-    #[test]
-    fn floor_budget_leaves_room_for_observations_at_the_default_margin() {
-        let budgets = PromptBudgets::from_limits_with_margin(
-            MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
-            MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
-            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
-        );
-        // Five ordinary-sized observations; the point is that *any* fit.
-        let observations = (0..5).map(|_| obs_of_size(210)).collect::<Vec<_>>();
-
-        let single = build_request(SessionId::new(), &observations, "", None, budgets, &[]);
-        let batch = build_batch_request_with_slots(
-            SessionId::new(),
-            &observations,
-            &[],
-            None,
-            budgets,
-            &[],
-        );
-
-        // Each builder's own response schema, so the fixed part is measured
-        // exactly as the production builder measures it.
-        assert!(
-            !single.messages[0].content.contains("observations omitted"),
-            "single: at the floor with the default {} margin every observation was              omitted, so the prompt carries no evidence;              MIN_CONSOLIDATION_MAX_INPUT_TOKENS must be raised to clear the fixed              part. Rendered: {}",
-            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
-            single.messages[0].content
-        );
-        assert!(
-            estimated_input_chars::<ConsolidatedPage>(&single) <= budgets.max_input_chars,
-            "single: the fixed prompt alone must still fit the effective budget"
-        );
-        assert!(
-            !batch.messages[0].content.contains("observations omitted"),
-            "batch: at the floor with the default {} margin every observation was              omitted, so the prompt carries no evidence;              MIN_CONSOLIDATION_MAX_INPUT_TOKENS must be raised to clear the fixed              part. Rendered: {}",
-            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
-            batch.messages[0].content
-        );
-        assert!(
-            estimated_input_chars::<ConsolidatedBatch>(&batch) <= budgets.max_input_chars,
-            "batch: the fixed prompt alone must still fit the effective budget"
-        );
-    }
-
     #[test]
     fn build_request_omits_titles_block_when_the_project_is_empty() {
         let single = build_request(
@@ -3283,11 +3245,26 @@ mod tests {
         assert!(request.messages[0].content.contains("observation"));
     }
 
+    /// #1234: the floor constant is advertised as the smallest budget that
+    /// still leaves room for observations, and `config` refuses anything below
+    /// it. That promise is only real at the margin the builders actually run
+    /// with: the char budget is
+    /// `max_input_tokens * CHARS_PER_TOKEN * input_token_safety_margin`, so a
+    /// floor derived at the nominal margin 1.0 can leave nothing once the
+    /// production default of 0.8 is applied. This test used
+    /// `PromptBudgets::from_limits` (margin 1.0) and so stayed green while a
+    /// default-margin install at the floor rendered zero observations and sent
+    /// the model a prompt with no evidence at all.
+    ///
+    /// It now builds with `DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`,
+    /// which is what makes the next prompt growth fail here instead of
+    /// silently emptying the prompt in production.
     #[test]
     fn advertised_minimum_input_limit_still_carries_observation_evidence() {
-        let budgets = PromptBudgets::from_limits(
+        let budgets = PromptBudgets::from_limits_with_margin(
             MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
             MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
         );
         let observations = vec![obs_of_size(500)];
         let single = build_request(SessionId::new(), &observations, "", None, budgets, &[]);
