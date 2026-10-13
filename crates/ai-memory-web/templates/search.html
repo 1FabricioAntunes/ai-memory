@@ -14,12 +14,14 @@
 </div>
 
 <form action="search" method="get" class="mb-8 flex gap-2">
+  <label for="search-q" class="sr-only">Search pages</label>
   <input
+    id="search-q"
     name="q"
     type="search"
     value="{{ query }}"
     placeholder="Search pages…"
-    class="flex-1 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+    class="flex-1 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
   >
   <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
     Search
@@ -44,7 +46,7 @@
       {{ hit.title }}
     </a>
     <div class="text-sm text-slate-600 dark:text-slate-400 mb-1">{{ hit.snippet|safe }}</div>
-    <div class="text-xs text-slate-400 dark:text-slate-500">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
   </li>
   {% endfor %}
 </ul>
