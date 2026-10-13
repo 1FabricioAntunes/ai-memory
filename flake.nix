@@ -404,7 +404,7 @@
 
               meta = {
                 description = "Long-term memory for AI coding agents";
-                homepage = "https://github.com/akitaonrails/ai-memory";
+                homepage = "https://aimemory.sh";
                 license = pkgs.lib.licenses.mit;
                 mainProgram = "ai-memory";
               };
