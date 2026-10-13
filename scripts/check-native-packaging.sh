@@ -48,14 +48,59 @@ assert_contains() {
   fi
 }
 
+# The TypeScript SDK in companions/ai-memory-ts is optional and never ships
+# with the server. Release tarballs, Homebrew, the Docker image, AUR, RPM and
+# Nix build the root Cargo workspace and copy hooks/ only. Fail if any of
+# their build files starts referencing the SDK.
+SERVER_DISTRIBUTION_FILES=(
+  .github/workflows/release.yml
+  bin/release
+  docker/Dockerfile
+  packaging/aur/PKGBUILD
+  packaging/aur/PKGBUILD-bin
+  packaging/rpm/ai-memory.spec
+  flake.nix
+  nix/nixos-module.nix
+  nix/settings-options.nix
+  nix/systemd-sandbox.nix
+)
+
+assert_no_sdk_reference() {
+  local file hits
+  for file in "$@"; do
+    [ -f "${file}" ] || fail "server distribution file ${file} is missing; update SERVER_DISTRIBUTION_FILES"
+    hits="$(grep -n 'ai-memory-ts' "${file}" || true)"
+    if [ -n "${hits}" ]; then
+      fail "${file} references the optional TypeScript SDK, which must stay out of the server distribution: ${hits}"
+    fi
+  done
+}
+
+check_sdk_not_distributed() {
+  log "Checking the optional TypeScript SDK stays out of the server distribution"
+  assert_no_sdk_reference "${SERVER_DISTRIBUTION_FILES[@]}"
+  # Prove the guard bites: a distribution file that names the SDK must fail.
+  local probe
+  probe="$(mktemp)"
+  printf 'COPY companions/ai-memory-ts /opt/sdk\n' >"${probe}"
+  if (assert_no_sdk_reference "${probe}") 2>/dev/null; then
+    rm -f "${probe}"
+    fail "the SDK distribution guard did not catch a reference"
+  fi
+  rm -f "${probe}"
+}
+
 main() {
+  local repo
+  repo="$(repo_root)"
+  cd "${repo}"
+  check_sdk_not_distributed
+
   require_tool systemd-analyze
   require_tool systemd-sysusers
   require_tool systemd-tmpfiles
 
-  local repo tmpfiles_output
-  repo="$(repo_root)"
-  cd "${repo}"
+  local tmpfiles_output
 
   log "Checking shell packaging syntax"
   bash -n packaging/aur/PKGBUILD
