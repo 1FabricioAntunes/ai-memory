@@ -2820,10 +2820,11 @@ mod tests {
             );
         }
         assert!(muse_settings_path_in(None, None).is_err());
-        let env = |name: &str| (name == "XDG_CONFIG_HOME").then(|| "/xdg2".into());
+        let xdg2 = if cfg!(windows) { r"C:\xdg2" } else { "/xdg2" };
+        let env = move |name: &str| (name == "XDG_CONFIG_HOME").then(|| xdg2.into());
         assert_eq!(
             mcp_config_path_with(McpClient::Muse, &env).unwrap(),
-            Path::new("/xdg2/muse/settings.json")
+            Path::new(xdg2).join("muse").join("settings.json")
         );
     }
 
