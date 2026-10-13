@@ -200,6 +200,9 @@ links + back-links.
 }
 ```
 
+`created_at` is when the page's oldest retained version was written, so it
+stays put across rewrites; `updated_at` is when the latest version was written.
+
 `404` for missing workspace/project, missing page row, or missing file
 on disk (the body is read from the markdown file at request time).
 

@@ -1660,7 +1660,7 @@ pub struct PageMeta {
     pub tier: String,
     /// Whether the page is pinned (decay-immune).
     pub pinned: bool,
-    /// ISO-8601 creation timestamp.
+    /// ISO-8601 instant the oldest retained version of the page was written.
     pub created_at: String,
     /// ISO-8601 last-update timestamp.
     pub updated_at: String,
@@ -7475,10 +7475,11 @@ impl ReaderPool {
     pub async fn page_meta_by_id(&self, page_id: PageId) -> StoreResult<Option<PageMeta>> {
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let created_expr = PAGE_FIRST_CREATED_EXPR;
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
-                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        pg.tier, pg.pinned, {created_expr}, pg.updated_at, \
                         sp.path AS supersedes_path, \
                         au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
@@ -7508,10 +7509,11 @@ impl ReaderPool {
         let path = path.to_owned();
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let created_expr = PAGE_FIRST_CREATED_EXPR;
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
-                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        pg.tier, pg.pinned, {created_expr}, pg.updated_at, \
                         sp.path AS supersedes_path, \
                         au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
@@ -8407,10 +8409,11 @@ impl ReaderPool {
         let page_path = page_path.to_owned();
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let created_expr = PAGE_FIRST_CREATED_EXPR;
             let sql = format!(
                 "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
                         {kind_expr}, \
-                        pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
+                        pg.tier, pg.pinned, {created_expr}, pg.updated_at, \
                         sp.path AS supersedes_path, \
                         au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
@@ -10453,6 +10456,25 @@ fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage>
         kind: row.get(4)?,
     })
 }
+
+/// SQL for [`PageMeta::created_at`]: when the page itself first appeared.
+///
+/// `pages.created_at` is per version, so the latest row alone would report the
+/// last rewrite. The page's versions form its `supersedes` chain (a
+/// tombstone-resurrected page is re-linked onto its old chain, #929), so the
+/// oldest retained version is the minimum along that chain. Each step is a
+/// primary-key lookup, so no index on `(path, created_at)` is needed and the
+/// walk cannot reach a same-path page in another project. Versions removed by
+/// retention or ledger reclaim end the chain early and no longer count.
+const PAGE_FIRST_CREATED_EXPR: &str = "COALESCE(\
+    (WITH RECURSIVE chain(supersedes, created_at, depth) AS (\
+        SELECT pg.supersedes, pg.created_at, 0 \
+        UNION ALL \
+        SELECT v.supersedes, v.created_at, chain.depth + 1 \
+          FROM pages v JOIN chain ON v.id = chain.supersedes \
+         WHERE chain.depth < 100000) \
+     SELECT MIN(created_at) FROM chain), \
+    pg.created_at)";
 
 fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<PageMeta>> {
     let workspace_name: String = row.get(0)?;

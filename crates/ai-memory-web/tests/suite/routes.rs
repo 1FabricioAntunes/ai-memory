@@ -363,6 +363,96 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
 }
 
 #[tokio::test]
+async fn web_page_view_created_is_the_first_versions_date() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for body in ["first", "second", "third"] {
+        wiki.write_page(wiki_req(ws, proj, "notes/versions.md", body))
+            .await
+            .unwrap();
+    }
+    wiki.write_page(wiki_req(ws, proj, "notes/single.md", "only"))
+        .await
+        .unwrap();
+
+    // Age the superseded versions; the latest keeps its fresh timestamp.
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+    let aged = jiff::Timestamp::now().as_microsecond() - 40 * 86_400_000_000;
+    let n = conn
+        .execute(
+            "UPDATE pages SET created_at = ?1 \
+             WHERE project_id = ?2 AND path = 'notes/versions.md' AND is_latest = 0",
+            rusqlite::params![aged, proj.as_bytes()],
+        )
+        .unwrap();
+    assert_eq!(n, 2, "two superseded versions");
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+    };
+
+    let text = get("/w/default/scratch/p/notes/versions.md").await;
+    assert!(
+        text.contains("Created 1 month ago"),
+        "Created should be the oldest version's date: {text}"
+    );
+    assert!(
+        text.contains("Updated just now"),
+        "Updated stays the latest version's date: {text}"
+    );
+    let text = get("/w/default/scratch/p/notes/single.md").await;
+    assert!(
+        text.contains("Created just now"),
+        "a single-version page keeps its own date: {text}"
+    );
+
+    // The JSON API reads the same page-level date, so SPA clients agree.
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let resp = api
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/pages/notes/versions.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let created = json["created_at"].as_str().unwrap();
+    let updated = json["updated_at"].as_str().unwrap();
+    assert_ne!(
+        created, updated,
+        "API created_at is the first version's: {json}"
+    );
+    let created_us = created.parse::<jiff::Timestamp>().unwrap().as_microsecond();
+    assert_eq!(created_us, aged, "{json}");
+}
+
+#[tokio::test]
 async fn smoke_search_returns_200() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store

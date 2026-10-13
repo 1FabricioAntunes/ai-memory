@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the web search page printing "50 results" with no hint when more
   pages matched. It now says it shows the first 50 results and suggests
   refining the search. (#1239)
+- Fixed the web page header and the `/api/v1` page response reporting the
+  date of the latest version as "Created", so a page rewritten many times
+  looked new. They now report when the oldest retained version was written.
+  "Updated" is unchanged. (#1238)
 
 ## [2.6.5] - 2026-10-12
 
