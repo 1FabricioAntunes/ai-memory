@@ -7,8 +7,9 @@
 //! falls back to client-local scan results when the server call fails, so it
 //! was never a plain, scriptable listing on its own.
 //!
-//! `/api/v1/projects` is mounted only by `serve --enable-web`, so a 404 there
-//! falls back to the always-mounted `GET /admin/projects`.
+//! `/api/v1/projects` is mounted only by `serve --enable-web` or
+//! `--enable-api`, so a 404 there falls back to the always-mounted
+//! `GET /admin/projects`. `show` lists projects through the same fallback.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -43,15 +44,24 @@ async fn fetch_sorted(
     endpoint: &ServerEndpoint,
     workspace: Option<&str>,
 ) -> Result<Vec<ProjectRow>> {
-    let workspace = workspace.map(str::trim).filter(|value| !value.is_empty());
-    let query = workspace.map_or_else(Vec::new, |workspace| vec![("workspace", workspace)]);
-    let mut rows = match get_json::<Vec<ProjectRow>>(endpoint, WEB_PROJECTS_PATH, &query).await {
-        Ok(rows) => rows,
-        Err(error) if is_not_found(&error) => fetch_from_admin(endpoint, workspace).await?,
-        Err(error) => return Err(error),
-    };
+    let mut rows = fetch_project_rows(endpoint, workspace).await?;
     sort_rows(&mut rows);
     Ok(rows)
+}
+
+/// The server's project listing, from `/api/v1/projects` or, when that route
+/// is not mounted, from `/admin/projects` filtered to `workspace` here.
+pub(crate) async fn fetch_project_rows(
+    endpoint: &ServerEndpoint,
+    workspace: Option<&str>,
+) -> Result<Vec<ProjectRow>> {
+    let workspace = workspace.map(str::trim).filter(|value| !value.is_empty());
+    let query = workspace.map_or_else(Vec::new, |workspace| vec![("workspace", workspace)]);
+    match get_json::<Vec<ProjectRow>>(endpoint, WEB_PROJECTS_PATH, &query).await {
+        Ok(rows) => Ok(rows),
+        Err(error) if is_not_found(&error) => fetch_from_admin(endpoint, workspace).await,
+        Err(error) => Err(error),
+    }
 }
 
 async fn fetch_from_admin(
@@ -62,9 +72,10 @@ async fn fetch_from_admin(
         .await
         .with_context(|| {
             format!(
-                "{WEB_PROJECTS_PATH} returned 404 (the server runs without `serve --enable-web`), \
-                 and the fallback {ADMIN_PROJECTS_PATH} also failed; restart the server with \
-                 `--enable-web`, or use a token the server accepts on admin routes"
+                "{WEB_PROJECTS_PATH} returned 404 and the fallback {ADMIN_PROJECTS_PATH} also \
+                 failed. The server may run without `--enable-api` (or `--enable-web`), the \
+                 server URL or base path may be wrong, or, on a multi-user server, the admin \
+                 route needs the root token"
             )
         })?;
     Ok(keep_workspace(listing.projects, workspace))
