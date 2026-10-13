@@ -796,6 +796,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         args.purge_data,
         &user_service::SystemRunner,
         crate::process_guard::sibling_processes,
+        std::time::Duration::from_secs(5),
     )?;
 
     // The current checkout's `.claude/settings.local.json` keeps its backup
@@ -919,13 +920,18 @@ fn stop_service_guarding_purge(
     purge_data: bool,
     runner: &dyn user_service::CommandRunner,
     siblings: impl Fn() -> Vec<sysinfo::Pid>,
+    exit_wait: std::time::Duration,
 ) -> Result<()> {
     let to_stop = match service {
         Some((manager, user_service::Removal::Removed(path))) => Some((*manager, path)),
         _ => None,
     };
+    let service_pid = if purge_data {
+        to_stop.and_then(|(manager, _)| service_main_pid(manager, runner))
+    } else {
+        None
+    };
     if purge_data {
-        let service_pid = to_stop.and_then(|(manager, _)| service_main_pid(manager, runner));
         let others: Vec<sysinfo::Pid> = siblings()
             .into_iter()
             .filter(|pid| Some(pid.as_u32()) != service_pid)
@@ -943,7 +949,19 @@ fn stop_service_guarding_purge(
         }
     }
     if purge_data && to_stop.is_some() {
-        let alive = siblings();
+        // `launchctl bootout` can return before the process has exited, so
+        // give the service's own process a bounded moment to go before the
+        // recheck refuses on it.
+        let mut alive = siblings();
+        if let Some(service_pid) = service_pid {
+            let deadline = std::time::Instant::now() + exit_wait;
+            while alive.iter().any(|pid| pid.as_u32() == service_pid)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                alive = siblings();
+            }
+        }
         if !alive.is_empty() {
             anyhow::bail!(crate::process_guard::busy_message("purge data", &alive));
         }
@@ -1717,6 +1735,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Answers `systemctl`/`launchctl` from a script and records each call.
     struct ServiceRunner {
@@ -1787,10 +1806,15 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let error =
-            stop_service_guarding_purge(Some(&service), true, &runner, || pids(&[4242, 777]))
-                .unwrap_err()
-                .to_string();
+        let error = stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || pids(&[4242, 777]),
+            Duration::ZERO,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("777") && !error.contains("4242"), "{error}");
         assert!(
             !runner.calls.borrow().iter().any(|c| c.contains("disable")),
@@ -1799,8 +1823,14 @@ mod tests {
         );
 
         let alive = std::cell::RefCell::new(pids(&[4242]));
-        stop_service_guarding_purge(Some(&service), true, &runner, || alive.replace(Vec::new()))
-            .unwrap();
+        stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || alive.replace(Vec::new()),
+            Duration::ZERO,
+        )
+        .unwrap();
         assert!(
             runner
                 .calls
@@ -1820,12 +1850,47 @@ mod tests {
             calls: std::cell::RefCell::default(),
             main_pid: "4242",
         };
-        let error = stop_service_guarding_purge(Some(&service), true, &runner, || {
-            vec![sysinfo::Pid::from_u32(4242)]
-        })
+        let error = stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || vec![sysinfo::Pid::from_u32(4242)],
+            Duration::from_millis(120),
+        )
         .unwrap_err()
         .to_string();
         assert!(error.contains("4242"), "{error}");
+    }
+
+    /// A service whose process takes a moment to exit after the stop (as
+    /// `launchctl bootout` allows) does not block the purge.
+    #[cfg(unix)]
+    #[test]
+    fn purge_guard_waits_for_the_stopped_service_to_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let service = setup_unit(root.path());
+        let runner = ServiceRunner {
+            calls: std::cell::RefCell::default(),
+            main_pid: "4242",
+        };
+        // Alive at the pre-check and for two polls after the stop, then gone.
+        let polls = std::cell::Cell::new(0);
+        stop_service_guarding_purge(
+            Some(&service),
+            true,
+            &runner,
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() <= 3 {
+                    vec![sysinfo::Pid::from_u32(4242)]
+                } else {
+                    Vec::new()
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(polls.get() >= 4, "the recheck must poll again");
     }
 
     #[test]
