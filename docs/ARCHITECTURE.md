@@ -157,13 +157,14 @@ from hook paths.
    fusion; it is limited to one call per query and four calls in flight, and any
    invalid, failed, timed-out, or saturated attempt preserves the local order.
    Global and supplemental global-preference results do not take this path.
-   With the opt-in `[retrieval] observation_stream`, project and `scopes`
+   With `[retrieval] observation_stream` (on by default), project and `scopes`
    searches add one more RRF stream: full-text search over `observations_fts`
    in the same `(workspace, project)`, where each matching session votes once,
    through its best-ranked observation, for its own latest unexpired
    `sessions/<id>.md` page in that scope. The vote never crosses projects (both
    the observation and the page are scope-filtered), a session without a page
-   contributes nothing, and nothing is written. If
+   contributes nothing, and nothing is written. Setting it to `false` restores
+   the earlier ranking byte for byte. If
    compiled wiki pages miss entirely in default, explicit project, or explicit
    `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`;
    `global=true` searches compiled wiki pages across projects only. Page hits
@@ -434,7 +435,7 @@ prunable rather than only after it ages in place.
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
 | `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for the *automatic* SessionEnd LLM consolidation worker. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. A manual `memory_consolidate` writes its page out-of-band and then reconciles this table (flipping a `failed`/`pending`/`superseded` row for the session to `completed`, never touching a live `running` lease), so the operator does not see a `failed` job for a session that is in fact consolidated. |
-| `observations_fts` | FTS5 virtual table over raw observation `(title, body)`. Feeds the bounded `raw_hits` fallback and, behind the opt-in `[retrieval] observation_stream`, the observation-evidence RRF stream that votes for session pages. |
+| `observations_fts` | FTS5 virtual table over raw observation `(title, body)`. Feeds the bounded `raw_hits` fallback and, through `[retrieval] observation_stream` (on by default), the observation-evidence RRF stream that votes for session pages. |
 | `workstreams`, `managed_runs`, `workstream_native_sessions` | Optional lease state plus per-harness native source and delivery cursors for `ai-memory run`. |
 | `workstream_events`, `workstream_events_fts` | Append-only normalized visible transcript events and full-text search; immutable sanitized source batches also live under `raw/workstreams/`. |
 | `links` | Wikilink / markdown cross-references. `to_page_id` (a global PageId) is nullable for unresolved forward links. `to_workspace` / `to_project` carry a cross-project scope (NULL = the source page's own project). |
@@ -591,7 +592,7 @@ does not need to ride on the public protocol change.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; single-project calls (project implicit or named with `workspace`+`project`) also union the reserved `_global` preferences scope as `global_scope_hits`, and only an explicit multi-`scopes` set opts out (#930); `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, the matched observation ids when the opt-in observation stream voted, RRF contributions, graph provenance including the typed edge kind (`causes`/`fixes`/`contradicts`) a neighbour was reached by, the page's evidence count, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. `include_superseded=true` also returns superseded (non-latest) page versions across the FTS/entity/vector/graph streams, each hit labelled `superseded: true` (the current version is never marked); default-off is byte-identical to the latest-only behaviour, and `global=true` / `as_of` are unaffected. `pin_first=true` prepends the project's bounded pinned latest pages (`ReaderPool::list_pinned_pages`, cap 10) ahead of the fused hits, deduped by page id (a pinned page that also matches appears once, marked `pinned: true`) and re-truncated to the requested limit; it applies to single-project searches (default or `workspace`+`project`), is ignored on `scopes`/`global`/`as_of`, and default-off is byte-identical. `answer=true` (opt-in, off by default) additionally synthesizes a cited natural-language answer over the top hits via the configured LLM provider (`complete_structured`, JSON-schema `{ answer, citations }`), attached as `answer: { text, citations }`; with no provider configured it returns the hits plus an `answer_unavailable` note instead of erroring, and with `answer` unset/`false` no provider is accessed and the response is byte-identical (invariant #13). It applies to the normal single-project/`scopes` path; `global`/`as_of` ignore it. Answer quality is not yet eval-validated. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) tunes the synthesis effort: `ChatRequest` carries no per-request reasoning field (the provider-level `reasoning_effort` is fixed at construction from config), so the tier maps to a per-tier max-token budget scaled off the path's base (answer base 2 000; `minimal` = 1x = byte-identical, `low` 1.5x, `medium` 2x, `high` 3x, `max` 4x). The tier is inert unless the `answer` LLM path runs (invariant #13); an unknown value is rejected by the schema (invariant #7). |
+| `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; single-project calls (project implicit or named with `workspace`+`project`) also union the reserved `_global` preferences scope as `global_scope_hits`, and only an explicit multi-`scopes` set opts out (#930); `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, the matched observation ids when the observation stream voted, RRF contributions, graph provenance including the typed edge kind (`causes`/`fixes`/`contradicts`) a neighbour was reached by, the page's evidence count, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list and a `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms` for the stored-vector scans, `graph_ms`, `observation_ms`, `rerank_ms`; a stream that did not run is left out, and `scopes` searches sum per stream). Timings are read only on an explained query; the normal path takes no clock reading for them. The global FTS-only ranker reports its active stream and `fts_ms` without per-hit details; `as_of` reports no timings. `include_expired=true` also returns TTL-expired pages. `include_superseded=true` also returns superseded (non-latest) page versions across the FTS/entity/vector/graph streams, each hit labelled `superseded: true` (the current version is never marked); default-off is byte-identical to the latest-only behaviour, and `global=true` / `as_of` are unaffected. `pin_first=true` prepends the project's bounded pinned latest pages (`ReaderPool::list_pinned_pages`, cap 10) ahead of the fused hits, deduped by page id (a pinned page that also matches appears once, marked `pinned: true`) and re-truncated to the requested limit; it applies to single-project searches (default or `workspace`+`project`), is ignored on `scopes`/`global`/`as_of`, and default-off is byte-identical. `answer=true` (opt-in, off by default) additionally synthesizes a cited natural-language answer over the top hits via the configured LLM provider (`complete_structured`, JSON-schema `{ answer, citations }`), attached as `answer: { text, citations }`; with no provider configured it returns the hits plus an `answer_unavailable` note instead of erroring, and with `answer` unset/`false` no provider is accessed and the response is byte-identical (invariant #13). It applies to the normal single-project/`scopes` path; `global`/`as_of` ignore it. Answer quality is not yet eval-validated. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) tunes the synthesis effort: `ChatRequest` carries no per-request reasoning field (the provider-level `reasoning_effort` is fixed at construction from config), so the tier maps to a per-tier max-token budget scaled off the path's base (answer base 2 000; `minimal` = 1x = byte-identical, `low` 1.5x, `medium` 2x, `high` 3x, `max` 4x). The tier is inert unless the `answer` LLM path runs (invariant #13); an unknown value is rejected by the schema (invariant #7). |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. `include_related=true` also walks the link graph outward from the page (bounded BFS reusing the `page_links` primitive per node: default 1 hop, hard cap 3, global visited set for dedup/cycle-safety, total-node cap 50, cross-project aware) and returns a `related` array of reachable pages, each labelled with its `depth` (hop distance) and `direction` (`link`/`backlink`); default-off is byte-identical (no `related` field). |
 | `memory_read_session_observations` | read-only | Page through ONE session's raw hook observations (`ObservationRecord` with full sanitized body, capped per row by `body_max_chars`), restricted to the rows that landed in the resolved scope and to sessions the caller may see; `total` and `elided_other_scope` report the in-scope count and the rows the session left in another project. `session_id` omitted reads the latest completed visible session. |
@@ -659,14 +660,27 @@ MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
 cwd parameters use their canonical names.
 
-Claude Code's optional session-aware MCP registration is a transport adapter,
-not a second tool implementation. `ai-memory mcp-bridge` serves the upstream
-tool catalogue over local stdio, delegates tool calls to the configured HTTP
-server through rmcp's client transport, and injects the inherited
-`CLAUDE_CODE_SESSION_ID` as `X-Memory-Actor-Session-Id`. The server therefore
-keeps the same auth, scope resolver, and tool handlers as direct HTTP clients.
-The adapter fails closed without a Claude session id and is installed only by
-the explicit `install-mcp --client claude-code --session-aware` option.
+`ai-memory mcp-bridge` is a transport adapter, not a second tool
+implementation. It serves the upstream tool catalogue over local stdio and
+delegates tool calls to the configured HTTP server through rmcp's client
+transport, authenticating with the bearer `Config::load` resolved, so the
+server keeps the same auth, scope resolver, and tool handlers as direct HTTP
+clients. It has two modes, chosen by the entry that launches it:
+
+- session-aware (Claude Code, `install-mcp --client claude-code
+  --session-aware`, and every Claude Code entry on a token-file install): it
+  injects the inherited `CLAUDE_CODE_SESSION_ID` as
+  `X-Memory-Actor-Session-Id` and fails closed without one, so a
+  registration meant for per-session routing never silently degrades to the
+  shared slot;
+- session-less (`--no-session-id`, every other client on a token-file
+  install): it forwards no session identity and ignores an inherited
+  `CLAUDE_CODE_SESSION_ID`, which a client started from a Claude Code
+  terminal would otherwise lend to that session's active-project pointer.
+  The client is a static MCP client and passes `workspace` + `project`.
+
+The bridge connects upstream before it serves stdio, so a refused credential
+(401) or an unreachable server ends it at once with the reason.
 
 ## HTTP authentication classes
 
@@ -684,6 +698,61 @@ browser compatibility path:
 The deprecated Basic/cookie path stops immediately when human auth becomes
 active; restart is not required. `/web` SPA HTML is public static; the builtin
 wiki browser and JSON APIs stay behind the route class above.
+
+### `GET /admin/metrics`
+
+A Prometheus text-format scrape (`text/plain; version=0.0.4`) of process
+lifetime counters: hook admissions by result and completed deliveries by
+outcome (the `IngestMetrics` atomics `/admin/status` already reports), the
+last-persisted timestamp, MCP tool calls split into `read` and `write`, and
+fixed-bucket latency histograms for `POST /hook` (time to answer, not the
+spawned processing) and `memory_query` (wall time, errors included). Buckets
+run from 1 ms to 10 s plus `+Inf`. Each observation is a bounded bucket scan and
+relaxed atomic adds, with no lock and no allocation. Every label comes from a
+closed, compile-time set (`result`, `outcome`, `kind`, `le`), so no query text,
+page body, prompt, client name, scope or project name, or token can appear in a
+series, and scope is never a label. The route sits behind the same
+`require_root_for_multiuser_admin` gate as every `/admin/*` route: root-only once
+the deployment distinguishes operators. Counters reset on restart.
+
+### Web search and the recall trace
+
+A project search in the web UI (`/web/search` with `workspace` and `project`)
+and a scoped `/api/v1/search` (one project or `scopes`) rank through the same
+three shared steps as a `memory_query` project/scopes search:
+`ai_memory_llm::embed_search_query` embeds the query with the configured
+embedder, `ReaderPool::hybrid_search_scopes` fuses FTS5, entity, vector, graph
+and observation streams and applies the authority adjustment (merging several
+scopes by best rank, then rank, path and id), and the optional
+`ai_memory_llm::RerankStage` reorders a bounded prefix. `serve` reads the config
+once and hands the same embedder and rerank stage to the MCP server and to
+`WebState` (`ai_memory_web::Recall`); the stage's four-call concurrency gate is
+shared, so the web search cannot add provider calls past it. A search with no
+scope stays the cross-project FTS5 ranker, as `memory_query(global=true)` is.
+`ai-memory-mcp/tests/suite/web_search_parity.rs` holds the orders together.
+`explain=1` on a project search renders, per hit, each stream's rank, raw score
+and RRF contribution, the fused score, the authority multiplier, the intent
+boost and the rerank score when present, plus the per-stream timings
+(`StreamTimings`). A project search resolves its scope with the guarded no-create
+lookup, so a restricted project refuses a viewer with no grant before any ranking
+runs.
+
+### Web health panel
+
+`/web/health` is a read-only page behind the same `Capability::Admin` decision
+as `/web/pending` and `/admin/*`: root-only once the deployment distinguishes
+operators. It shows the hook counters (the `IngestMetrics` behind
+`/admin/metrics`, including the 429s from saturation and rate limiting), the
+writer queue depth, the hook spool and recovery journal under the server's data
+directory (`ServeHealthProbe` in `serve.rs`), the SessionEnd consolidation queue
+(`ReaderPool::session_consolidation_queue`: counts per state, last completion,
+oldest pending request), the configured embedder and both providers' passive
+health, and the derived-index and storage figures. `ai_memory_web::health::checks`
+turns those into warnings with the fix commands `ai-memory status` prints
+(`ai_memory_core::fix_lines`: `ai-memory recover`, `ai-memory compact --confirm`,
+`ai-memory embed`, `ai-memory embed --force`, and the LLM provider's retry hint).
+The page holds counts, timestamps and configured labels only; provider error text,
+page content and scope names never reach it.
 
 ## CLI subcommand surface
 
@@ -710,10 +779,29 @@ api-key                     export-okf           message
 doctor                      backfill             project
 reclaim-ledger-versions     repair-backfill-timestamps
 server                      backup-agents        restore-agents
-profile
+profile                     setup
 ```
 
 Run `ai-memory --help` for the full tree.
+
+`setup` is the one-step native install. It is a thin composition of existing
+library calls: `init` (which mints the root bearer on a fresh data dir), a
+per-user service rendered from `packaging/systemd/ai-memory-user.service` or
+the launchd LaunchAgent template with the running binary, data dir and config
+path filled in, then `install-mcp`, `install-hooks` and global
+`install-skills` for each agent named with `--agent` or detected from its
+session store or MCP config (the stores `doctor` scans). It finishes with a
+read-only self-check: `/healthz`, a `memory_status` call over MCP, and
+`doctor`. The service manager is reached through an injectable runner, so the
+unit rendering and the `systemctl`/`launchctl` calls are tested without a real
+session. Windows has no service step. A second run changes no file. Each
+rendered unit carries an identity line with the SHA-256 of the rest of the
+file; `uninstall` stops and removes only a unit whose digest still matches.
+`install.sh`, a release asset with its own `.sha256`, installs the release
+tarball under `~/.local` after checking it against the published checksum.
+
+`auth enable` turns on the root bearer for an install created before
+new installs got one; see [`[auth]` root bearer](#auth-root-bearer).
 
 `auto-improve-report` is read-only by default; `--stage` creates one pending
 telemetry report page for audit/approval without staging learning-memory edits.
@@ -977,7 +1065,7 @@ enabled = false                  # true: skip low-information session pages from
 # max_repetition_ratio = 0.7     # 1 - distinct/total tokens above this ⇒ skip
 # repetition_min_tokens = 6      # repetition check applies only above this
 
-[retrieval]                       # opt-in ranking signals; all off by default
+[retrieval]                       # ranking signals; only observation_stream is on by default
 query_intent = false              # lexical session-recall routing: queries phrased as
                                   # "上次 / …的会话 / last time / yesterday / última sessão"
                                   # hand session pages back their default kind/tier authority penalty
@@ -993,15 +1081,16 @@ belief_authority_weight = 0.0     # fold read-time belief-strength confidence (P
                                   # no belief query runs. confidence/evidence_count are still
                                   # exposed in explain regardless (inert). DEFAULT OFF,
                                   # R2-gated: do not default on without a positive R2 delta.
-observation_stream = false        # R1 observation-evidence stream: FTS over observations_fts
+observation_stream = true         # R1 observation-evidence stream: FTS over observations_fts
                                   # in the queried project; each matching session votes ONCE
                                   # (best observation) for its own latest sessions/<id>.md
                                   # page as one more RRF stream. Its excerpt is the snippet
                                   # only when page FTS missed that page; explain reports
                                   # `observation_rank` + `observation_ids`. Read-only;
                                   # sessions without a page keep
-                                  # the raw_hits fallback; global=true unchanged. DEFAULT OFF.
-                                  # Env: AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true
+                                  # the raw_hits fallback; global=true unchanged. DEFAULT ON;
+                                  # false restores the previous ranking byte for byte.
+                                  # Env: AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false
 
 [search.fts]                      # FTS5 query-preparation tuning (contrast with [retrieval]:
                                   # this is not a ranking signal). Omit the whole section for
@@ -1259,6 +1348,46 @@ integration headers as chat. That endpoint's wire shape follows the
 OpenAI-compatible contract Copilot documents for chat, not a published
 embeddings spec, and is not covered by a live test against Copilot here.
 
+### `[auth]` root bearer
+
+```toml
+[auth]
+bearer_token_file = "auth-tokens/default"   # written by `init` on a fresh data dir
+                                            # and by `ai-memory auth enable`
+# bearer_token = "..."                      # inline alternative; never both
+```
+
+The root bearer comes from, in order: `AI_MEMORY_AUTH_TOKEN`, then
+`[auth].bearer_token` or `[auth].bearer_token_file` (setting both is a startup
+error). `Config::load` reads the file once. A relative path resolves against
+the data dir, so a container that mounts it at `/data` and a host client that
+sees the host path read the same file. A configured file that is missing or
+blank leaves no bearer, and `serve` then refuses to start. Env:
+`AI_MEMORY_AUTH__BEARER_TOKEN_FILE`.
+
+`ai-memory init` mints the token (32 random bytes, hex, `0600` under a `0700`
+`auth-tokens/`) only on a fresh data dir: no config file and no database yet,
+and no bearer supplied another way. An existing install keeps the loopback
+no-auth behaviour until `ai-memory auth enable`, which is idempotent: it reuses
+or mints the file, records the key, copies the token into the hook credential
+files (`auth-token`, `auth-header`) when none are stored, and re-registers
+every MCP client whose `ai-memory` entry targets this server the way
+`install-mcp` wires a token-file install, listing what it changed and what
+needs a manual change.
+
+A token read from the file is never written into a harness config or onto a
+command line. `install-mcp` gives Claude Code the session-aware
+`ai-memory mcp-bridge` stdio entry, which reads the file itself; Codex and
+Prime Agent reference `AI_MEMORY_AUTH_TOKEN` by name; every other client gets
+a stdio entry, in its own config format, for `ai-memory mcp-bridge
+--no-session-id`. ZCode keeps HTTP entries only and is refused.
+`install-hooks --apply` persists it to the hook credential files and
+never inlines it. Client commands of a packaged install, whose config lives
+outside the data dir and so is not read without `--config`, use
+`<data_dir>/auth-tokens/default` when no config file exists where they look,
+the server URL is loopback and no `default` server profile is registered.
+`/healthz` stays unauthenticated.
+
 ## Future work
 
 * **M9.5: local embeddings via `ort`.** Bundle `bge-small-en-v1.5`
@@ -1276,16 +1405,31 @@ embeddings spec, and is not covered by a live test against Copilot here.
   keeping deletes and semantic rewrites review-gated.
 * **Richer read surfaces for the web UI.** The multi-workspace read-only
   wiki browser shipped in `ai-memory-web` (`/web`: project list, page
-  tree, page view, search, and the root-only `/web/pending` triage page,
+  tree, page view, page history with a server-side unified diff, a paged
+  session timeline, project search through `memory_query`'s hybrid ranker
+  with a recall trace, the root-only `/web/health` panel, and the root-only
+  `/web/pending` triage page,
   whose approve and reject buttons post to the existing
   `/admin/pending-writes/*` routes). It stays read-only by design: the wiki is a
   machine-authored record, and a browser edit surface would break the
-  invariant the whole store rests on (#482). Better *reading* (richer
-  navigation, diff/history views, graph exploration) is open. See
+  invariant the whole store rests on (#482). The crate's `clippy.toml` forbids
+  the `Wiki` write and destructive methods there, so a write path fails
+  `cargo clippy -D warnings`. History reads every version at a path (`ReaderPool::page_versions`,
+  `page_version_body`, both keyed by workspace, project and path), so a version
+  a concurrent write replaced stays visible (invariant #16). TTL expiry still
+  applies: an expired version is neither listed nor readable by id, and a page
+  whose live version expired shows no history, since the forget sweep deletes
+  every row at its path. Better *reading*
+  (graph exploration) is open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
-* **Real LongMemEval-S harness.** The recall-eval framework exists
-  ([`crates/ai-memory-consolidate/tests/suite/recall_eval.rs`](../crates/ai-memory-consolidate/tests/suite/recall_eval.rs));
-  porting LongMemEval-S itself requires the dataset.
+* **Retrieval measurement gaps.** The LongMemEval-S harness ships in
+  `evals/` (pipeline, component and decomposition modes; results in
+  [`docs/benchmarks/`](benchmarks/README.md)), next to the recall-eval
+  framework
+  ([`crates/ai-memory-consolidate/tests/suite/recall_eval.rs`](../crates/ai-memory-consolidate/tests/suite/recall_eval.rs)).
+  Still unmeasured: a full-set local-embeddings run with the observation
+  stream, and `belief_authority_weight`, which needs an LLM-consolidated
+  corpus because zero-LLM session pages carry no `page_evidence`.
 
 ## Reading order
 

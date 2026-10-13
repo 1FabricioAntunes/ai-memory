@@ -84,6 +84,12 @@ pub struct RetrievalArgs {
     #[arg(long)]
     stratify: Option<usize>,
 
+    /// Score only these question ids (comma-separated or repeated), in
+    /// dataset order. Applied before `--sample` and `--stratify`: a
+    /// targeted re-run of a few questions without a full pass.
+    #[arg(long = "question-id", value_delimiter = ',')]
+    question_ids: Vec<String>,
+
     /// `server` (the default) drives a real `ai-memory serve`; `grep`
     /// scores the whole-session term-overlap baseline with no server.
     #[arg(long, value_enum, default_value_t = Engine::Server)]
@@ -425,6 +431,17 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
     }
     let mut questions = dataset::load(&dataset_path, variant)?;
     let total_loaded = questions.len();
+    if !args.question_ids.is_empty() {
+        let unknown: Vec<&String> = args
+            .question_ids
+            .iter()
+            .filter(|id| !questions.iter().any(|q| &q.question_id == *id))
+            .collect();
+        if !unknown.is_empty() {
+            bail!("--question-id not in the dataset: {unknown:?}");
+        }
+        questions.retain(|q| args.question_ids.contains(&q.question_id));
+    }
     if let Some(n) = args.sample {
         questions.truncate(n);
     }
@@ -667,7 +684,7 @@ async fn run_config(run: &RunContext<'_>, knobs: &Knobs) -> Result<report::Repor
             let evidence: HashSet<uuid::Uuid> = q
                 .answer_session_ids
                 .iter()
-                .map(|s| stored_session_uuid(s))
+                .map(|s| stored_session_uuid(&q, s))
                 .collect();
             let mut score = score::score_question(
                 &q.question_id,
@@ -816,7 +833,7 @@ fn run_grep(
             let evidence: HashSet<uuid::Uuid> = q
                 .answer_session_ids
                 .iter()
-                .map(|s| stored_session_uuid(s))
+                .map(|s| stored_session_uuid(q, s))
                 .collect();
             score::score_question(
                 &q.question_id,

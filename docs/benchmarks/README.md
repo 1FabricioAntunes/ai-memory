@@ -13,11 +13,21 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-10-12** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (2.7, unreleased; on by default)** | **0.868** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
 | **2026-09-21** | LongMemEval-S (v1) | **local embeddings (2.4 RC, current)** | **0.815** | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-21 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (2.4 RC) | 0.666 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 2026-10-12 row is the 2.7 observation stream measured on all 470
+questions: zero-LLM FTS `hit@5` 0.666 → 0.868 (hit@1 0.530 → 0.619, hit@10
+0.694 → 0.936). Local embeddings with the stream went 0.800 → 0.867 on a
+90-question stratified sample; a full-set local run with the stream has not
+been done yet, so 0.815 stays the latest full-set local number. Context
+tokens for the top five hits rose 7–19% in the final A/B runs, and p95
+latency stayed within the stream's budget. Details and commands are in the
+decomposition report below.
 
 The 2026-09-21 (2.4 RC) re-run shows no default-ranking regression: local
 `hit@5` 0.823 → 0.815 and FTS `hit@5` 0.668 → 0.666 are identical within
@@ -32,9 +42,20 @@ measured steps: dropping stopwords from bare-query FTS OR-joins
 correct masked-mean pooling. The pooling fix alone was worth ~6.6
 points over a padded-attention implementation, which the
 calibration tests caught. Every intermediate number was measured on this
-harness before the next change landed. For context, published
-embedding-based numbers on this dataset: agentmemory 0.967 R@5
-(hybrid + reranking), doobidoo/mcp-memory-service 0.804 R@5.
+harness before the next change landed.
+
+## Decomposition: pipeline vs component
+
+[longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md)
+splits the pipeline number into capture cost, ranking quality and harness
+artifacts. With each raw session indexed whole (component mode, ranking
+only), zero-LLM FTS scores 0.972 `hit@5` on all 470 questions, against 0.666
+through the shipped capture path. The gap was not the 2 KB excerpt cap: pages
+holding exactly the text capture keeps score 0.968. It was the zero-LLM
+session page, which indexed only 80-character turn titles and no assistant
+text. The harness's per-turn date prefix used about half of each title, which
+is an artifact of the harness, not of production capture. The observation
+stream recovered about two thirds of that FTS gap.
 
 ## A/B comparisons (R2)
 
@@ -53,14 +74,18 @@ baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.00
   graph. **mode: zero-llm** is the deterministic floor (`embedding_provider
   = "none"`, or any host where the model cannot load): FTS5 +
   entity/graph only.
-- **Comparability.** Published numbers from other systems on this dataset
-  (agentmemory 0.967 R@5, doobidoo/mcp-memory-service 0.804 R@5) are
-  embedding-based retrieval over raw chat logs. Our `hit@5` is the
-  comparable statistic, but our pipeline additionally pays for
-  production-shaped capture: excerpts are bounded at the 2 KB privacy
-  boundary, so evidence deep inside one long turn is out of reach of the
-  index. The cost is deliberate, because the benchmark measures the shipped
-  system rather than an idealised retriever.
+- **Comparability.** Our `hit@5` is the statistic other systems publish as
+  R@5 (any evidence session in the top 5). doobidoo/mcp-memory-service
+  publishes 0.804 R@5. agentmemory publishes 95.2% `recall_any@5` (April
+  2026), measured by indexing each whole raw session directly (BM25 plus
+  vectors, reranker disabled), which is a component measurement. Our
+  pipeline numbers also pay for capture, so they are not like-for-like with
+  a component number, and even our component numbers use a
+  different index and document construction. Our grep engine reproduces
+  agentmemory's grep adapter on all 470 questions, so the question set and
+  metric match; a joint evaluation of the two systems is pending, and no
+  ranking between them is claimed. The decomposition report has the
+  details.
 - **Regression gate.** Roadmap items 2-6 re-run this benchmark; a change
   that lowers a slice materially is a regression to fix, not a note to
   publish.

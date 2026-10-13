@@ -70,7 +70,7 @@ pub fn rank_question(q: &Question) -> Vec<uuid::Uuid> {
         .filter(|((id, _), _)| seen.insert(id.as_str()))
         .map(|((id, date), turns)| {
             (
-                stored_session_uuid(id),
+                stored_session_uuid(q, id),
                 session_text(date, turns).to_lowercase(),
             )
         })
@@ -160,7 +160,10 @@ mod tests {
         let ranked = rank_question(&q);
         assert_eq!(
             ranked,
-            [stored_session_uuid("s_a"), stored_session_uuid("s_b")]
+            [
+                stored_session_uuid(&q, "s_a"),
+                stored_session_uuid(&q, "s_b")
+            ]
         );
     }
 }

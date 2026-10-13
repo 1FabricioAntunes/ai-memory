@@ -113,6 +113,11 @@ pub struct Cli {
 pub enum Command {
     /// Initialise the data directory layout.
     Init(InitArgs),
+    /// Set up a native install in one step: `init`, a user service
+    /// (systemd `--user` or a launchd LaunchAgent), and hooks, MCP and skills
+    /// for every detected agent, then a read-only self-check. Shows the plan
+    /// and asks first unless `--yes` is given. Re-running changes nothing.
+    Setup(SetupArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
     /// List every workspace/project pair the server knows about (plain,
@@ -123,6 +128,8 @@ pub enum Command {
     /// Check capture coverage: compare local harness session stores for this
     /// project against what the server captured, and warn when a harness ran
     /// here recently but has no captured sessions (its hook is likely missing).
+    /// Also reports agentmemory MCP entries and rules-file guideline blocks
+    /// left after a migration; it only reads and prints the fix.
     Doctor(DoctorArgs),
     /// One-time import of this project's existing local harness session history
     /// into a brand-new (empty) ai-memory store, so installing hooks
@@ -235,7 +242,8 @@ pub enum Command {
     /// Current values are listed under `--client`; see docs/mcp-install.md
     /// for the full guide.
     InstallMcp(InstallMcpArgs),
-    /// Internal stdio-to-HTTP MCP bridge for session-aware Claude Code installs.
+    /// Internal stdio-to-HTTP MCP bridge: session-aware for Claude Code, or
+    /// session-less (`--no-session-id`) for every other stdio MCP client.
     #[command(hide = true)]
     McpBridge(McpBridgeArgs),
     /// Stage + commit the wiki tree under git.
@@ -1352,6 +1360,13 @@ pub enum AuthCommand {
     Logout(AuthLogoutArgs),
     /// Show stored provider auth state without printing secrets.
     Status(AuthStatusArgs),
+    /// Require a bearer token on this install's server. Idempotent: mints
+    /// `<data_dir>/auth-tokens/default` (owner-only) if missing, records
+    /// `[auth].bearer_token_file`, gives the hooks the token through their
+    /// credential files, and re-registers Claude Code's MCP entry as the
+    /// `ai-memory mcp-bridge` stdio bridge. The token is never printed or
+    /// written into a harness config. Restart the server afterwards.
+    Enable(AuthEnableArgs),
 }
 
 /// Provider choices for `auth`.
@@ -1401,6 +1416,15 @@ pub struct AuthLogoutArgs {
 /// Arguments for `auth status`.
 #[derive(Debug, Args)]
 pub struct AuthStatusArgs {}
+
+/// Arguments for `auth enable`.
+#[derive(Debug, Args)]
+pub struct AuthEnableArgs {
+    /// Leave harness MCP registrations alone; only provision the token,
+    /// the config key and the hook credential files.
+    #[arg(long)]
+    pub no_mcp: bool,
+}
 
 /// Which concern `uninstall` should touch. Omitted = all four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1953,6 +1977,26 @@ pub struct InitArgs {
     /// Overwrite an existing `config.toml` if present.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for `setup`.
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Apply the plan without asking. Without it, `setup` shows the plan and
+    /// asks on a terminal, or exits non-zero when there is no terminal to
+    /// ask on.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Wire this agent instead of the detected ones. Repeat for several.
+    /// Detection looks for each harness's session store or MCP config under
+    /// your home; OpenCode 2 and the Kiro CLI v3 engine are only wired when
+    /// named here.
+    #[arg(long = "agent", value_enum)]
+    pub agents: Vec<AgentChoice>,
+    /// Do not install or start a user service; use this when the server
+    /// already runs some other way (Docker, a packaged system unit).
+    #[arg(long)]
+    pub no_service: bool,
 }
 
 /// Arguments for `status`.
@@ -3194,14 +3238,32 @@ pub struct InstallMcpArgs {
     /// wants `gemini`. Kimi Code and Kiro already get theirs; this overrides.
     #[arg(long, value_enum)]
     pub flavor: Option<SchemaFlavor>,
+    /// Reference the token by the `AI_MEMORY_AUTH_TOKEN` variable name
+    /// instead of embedding it (Codex `bearer_token_env_var`, Prime Agent
+    /// `bearerTokenEnvVar`). Set by the installer, never a flag: it is how an
+    /// install whose token lives in `[auth].bearer_token_file` keeps the token
+    /// out of the harness config.
+    #[arg(skip)]
+    pub token_env_var: bool,
+    /// Write a stdio entry that runs the session-less `ai-memory mcp-bridge`
+    /// instead of an HTTP entry. Set by the installer, never a flag: it is how
+    /// a client without env-var indirection reaches a server whose token lives
+    /// in `[auth].bearer_token_file`.
+    #[arg(skip)]
+    pub stdio_bridge: bool,
 }
 
-/// Arguments for the internal Claude Code session-aware MCP bridge.
+/// Arguments for the internal stdio-to-HTTP MCP bridge.
 #[derive(Debug, Clone, Args)]
 pub struct McpBridgeArgs {
     /// Remote ai-memory base URL or full `/mcp` endpoint.
     #[arg(long)]
     pub server_url: Option<String>,
+    /// Run as a plain stdio-to-HTTP bridge that forwards no session identity,
+    /// for MCP clients other than Claude Code. Without it the bridge forwards
+    /// `CLAUDE_CODE_SESSION_ID` and refuses to start when it is missing.
+    #[arg(long)]
+    pub no_session_id: bool,
 }
 
 /// Transport for the MCP server.

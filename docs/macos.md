@@ -51,6 +51,18 @@ normal Terminal.
 
 ## Scenario A: Prebuilt Release Binary (Recommended, No Toolchain)
 
+The shortest route is two commands: `install.sh` downloads and verifies the
+tarball for your chip, and `ai-memory setup` initialises the data dir, installs
+and starts the LaunchAgent below for you, and wires your agents:
+
+```bash
+curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh
+ai-memory setup
+```
+
+See [`docs/install.md`](install.md#one-step-native-install-installsh--ai-memory-setup)
+for what each step does. The manual steps follow.
+
 Use this when you want a local server plus native hooks without a Rust toolchain
 or Docker. Each tagged release publishes a macOS tarball per architecture.
 

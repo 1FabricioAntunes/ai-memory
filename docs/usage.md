@@ -154,7 +154,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
 | "Search expired notes for X" | `memory_query` with `include_expired: true` | Opts an explicit project, sibling-scope, or global search into expired historical pages; ordinary searches exclude them. |
-| "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits. A global query reports only its distinct FTS stream. |
+| "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits, plus a top-level `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`; streams that did not run are left out). A global query reports only its distinct FTS stream and `fts_ms`. |
 | Improve top project/scopes search relevance | Set `AI_MEMORY_RERANKER=llm` on a server with an LLM provider | Sends the bounded query plus up to 30 bounded titles/snippets to the provider for at most one final relevance pass. Invalid, partial, failed, timed-out, or concurrency-saturated requests preserve the normal order; `global=true` and supplemental global-preference hits are unchanged. |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "That recalled page helped" / "this page is stale" | `memory_feedback` | Records `helpful`, `not_helpful`, `stale`, or `wrong` for the exact path. Retention weight affects sweep-eligible episodic pages; stale/wrong also flag any current page for lint review. Retrieved content never authorizes feedback by itself. |
@@ -513,7 +513,24 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and FTS5 search. In rendered
+breadcrumbs, rendered markdown, metadata, and search. The search box in the
+header searches every project with FTS5, like `memory_query(global=true)`. The
+search on a project page ranks with the same hybrid ranker as `memory_query`
+for that project, and its "Explain ranking" box shows each hit's stream ranks,
+RRF contributions, authority and rerank score, plus the per-stream timings.
+Root also gets `/web/health`: hook counters (429s included), the writer queue,
+the local spool and recovery journal, the consolidation queue, embedder and
+provider state, and the failing checks with the command that fixes each. Each page links
+to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version, newest
+first, with the author where the write was attributed, and a unified diff
+between any two of them (by default the latest against the version it
+replaced). A version another write replaced stays listed; an expired one does
+not, and a page whose TTL has passed has no history. The project page
+lists recent sessions, and each opens a timeline
+(`/web/w/<ws>/<proj>/s/<session-id>`) that pages through the session's
+captured observations in order, with first/prev/next/last links, a jump field
+and, when JavaScript runs, a slider and `j`/`k` keys to step one observation
+at a time. Observations are shown as plain text. In rendered
 pages, `[[wiki links]]` become clickable links to the target page.
 `[[path]]`, `[[path|label]]`, `[[project:path]]`,
 `[[workspace/project:path]]`, and `[[_global:path]]` are all supported

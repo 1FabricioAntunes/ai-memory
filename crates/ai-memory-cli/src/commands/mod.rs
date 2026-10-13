@@ -26,10 +26,12 @@ pub(crate) fn is_scope_ambiguous(error: &anyhow::Error) -> bool {
         })
 }
 
+pub(crate) mod agentmemory_residue;
 pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;
 pub mod auth;
+pub mod auth_enable;
 pub mod auto_improve;
 pub mod auto_improve_report;
 pub mod backfill;
@@ -98,6 +100,7 @@ pub mod run_autowire;
 pub mod search;
 pub mod serve;
 pub mod server;
+pub mod setup;
 pub mod setup_agent;
 pub mod show;
 pub mod status;
@@ -105,6 +108,7 @@ pub mod transcript_capture;
 pub mod uninstall;
 pub mod upgrade;
 pub mod user;
+pub mod user_service;
 pub mod workstream_search;
 pub mod workstreams;
 pub mod write_page;

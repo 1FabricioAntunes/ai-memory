@@ -4,6 +4,8 @@ The [README quick-start](../README.md#quick-start) covers the happy
 paths (Docker + Claude Code, Arch AUR, Fedora RPM, macOS menu bar app). This
 page covers everything else:
 
+- [One-step native install](#one-step-native-install-installsh--ai-memory-setup)
+  (`install.sh` + `ai-memory setup`, Linux and macOS, no root)
 - [Server on a different machine](#server-on-a-different-machine)
   (homelab, LAN box, remote server)
 - [Configuring the CLI URL and auth](#configuring-the-cli-url-and-auth)
@@ -50,6 +52,112 @@ Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
 > engine's rootless and SELinux state.
 
 ---
+
+## One-step native install (`install.sh` + `ai-memory setup`)
+
+On Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel), two commands go
+from nothing to a running server with your agents wired. Neither needs root.
+
+```bash
+curl -fsSL https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh | sh
+ai-memory setup
+```
+
+`install.sh` is published with every release, next to its own
+`install.sh.sha256`. It picks `ai-memory-<os>-<arch>.tar.gz` for the machine,
+downloads it with its `.sha256` file, and stops before unpacking anything when
+the checksum file is missing, names another asset, or does not match. It also
+refuses an archive holding an absolute or `..` path. The release goes to
+`~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
+binary, so the bundled `hooks/` directory sits beside it and
+`ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
+is not such a link (the Docker wrapper, a hand-built binary) is left alone and
+the script exits. The whole script runs from one function called on its last
+line, so a download cut short runs nothing. To read it before running it:
+
+```bash
+curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh
+curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh.sha256
+sha256sum -c install.sh.sha256   # macOS: shasum -a 256 -c install.sh.sha256
+sh install.sh
+```
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AI_MEMORY_VERSION` | latest | Install this release, e.g. `2.7.0` |
+| `AI_MEMORY_BIN_DIR` | `~/.local/bin` | Where the `ai-memory` link goes |
+| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked |
+| `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
+| `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
+
+Windows is not covered by the script; use the zip in
+[`docs/windows.md`](windows.md).
+
+`ai-memory setup [--yes] [--agent <name>]... [--no-service]` runs, in order,
+the commands a native install otherwise needs one by one:
+
+1. `init`. On a fresh data dir this mints the root bearer token into
+   `<data_dir>/auth-tokens/default` (owner-only) and records
+   `[auth] bearer_token_file`, as described in
+   [`[auth]` root bearer](ARCHITECTURE.md#auth-root-bearer). An existing install
+   keeps its config and its auth posture; `ai-memory auth enable` is still the
+   opt-in for a token there.
+2. A per-user service running `serve --transport http --enable-web` on that
+   data dir and config: `~/.config/systemd/user/ai-memory.service` (or under
+   `$XDG_CONFIG_HOME`) on Linux, rendered from the packaged user unit, or
+   `~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist` on macOS,
+   rendered from the packaged LaunchAgent. The unit runs the binary `setup` ran
+   from. The step is skipped when a server already answers at the configured
+   URL and no unit of ours exists yet (Docker, a packaged system unit, a
+   foreground `serve`), when the configured server is not on this machine,
+   with `--no-service`, and on Windows.
+3. For each agent: `install-mcp --apply`, `install-hooks --apply` and
+   `install-skills --scope global`. With no `--agent`, `setup` wires every
+   harness whose session store or MCP config exists under your home, using the
+   same store locations as `doctor` (including `CLAUDE_CONFIG_DIR`,
+   `CODEX_HOME` and similar relocations). OpenCode 2 and the Kiro CLI v3
+   engine share a store with OpenCode and Kiro CLI, so they are wired only
+   when named, for example `--agent opencode2`.
+4. A self-check that writes nothing: `GET /healthz`, a `memory_status` call
+   over MCP with the install's credential, and `doctor`.
+
+Without `--yes`, `setup` prints this plan and asks on a terminal; with no
+terminal (a script, an agent's tool call) it changes nothing and exits
+non-zero, asking for `--yes`. Each step is idempotent: a second run rewrites no
+file and leaves a running service alone. A step that fails does not stop the
+others; `setup` lists each `problem:` at the end and exits non-zero. The token
+is never printed or passed on a command line, and no harness config holds it:
+hooks read the credential files `init` writes, and MCP clients reach the
+server through `ai-memory mcp-bridge`.
+
+`uninstall --apply` removes what `setup` wired, the service included. Every
+unit `setup` renders carries an identity line holding the SHA-256 of the rest of
+the file, and `uninstall` removes only a unit whose line is there and still
+matches: on Linux it runs `systemctl --user disable --now ai-memory.service`,
+deletes the file and runs `systemctl --user daemon-reload`; on macOS it boots
+the LaunchAgent out and deletes the plist. A unit `setup` did not write, or one
+edited since, is left in place and `uninstall` says so. If you need to remove
+such a unit, or the service manager refused, do it by hand:
+
+```bash
+# Linux
+systemctl --user disable --now ai-memory.service
+rm ~/.config/systemd/user/ai-memory.service
+systemctl --user daemon-reload
+# macOS
+launchctl bootout "gui/$(id -u)/com.github.akitaonrails.ai-memory"
+rm ~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist
+```
+
+An AI agent installing ai-memory for its user can follow
+[`INSTALL_FOR_AGENTS.md`](../INSTALL_FOR_AGENTS.md), which comes down to
+`ai-memory setup --yes --agent <self>`.
+
+`scripts/onboarding-acceptance.sh` measures this path in a clean temporary
+home against a locally built release: two commands, and about one second from
+the first command to a `memory_query` that returns a captured hook event (a
+debug build on a Linux workstation, local embeddings off so no model download
+is counted). The target is 60 seconds.
 
 ## Server on a different machine
 
@@ -311,12 +419,29 @@ $EDITOR ~/.config/ai-memory/config.toml
 $EDITOR ~/.config/ai-memory/env
 ```
 
-For a loopback-only local service, bearer auth is optional. If you want one:
+`init` on a fresh data dir also writes a random root bearer token to
+`~/.local/share/ai-memory/auth-tokens/default` (owner-only) and records
+`bearer_token_file = "auth-tokens/default"` in the config, so the service
+requires it on every route except `/healthz`. You never copy it by hand:
+`install-hooks --apply` and `install-mcp --apply` find it in the data dir,
+the hooks read it from there, and Claude Code is registered as the
+`ai-memory mcp-bridge` stdio bridge, which reads the file at launch. Codex and
+Prime Agent reference `$AI_MEMORY_AUTH_TOKEN` instead; export it where you
+start them:
 
 ```bash
-TOKEN=$(ai-memory generate-auth-token)
-printf 'AI_MEMORY_AUTH_TOKEN=%s\n' "$TOKEN" >> ~/.config/ai-memory/env
+export AI_MEMORY_AUTH_TOKEN="$(cat ~/.local/share/ai-memory/auth-tokens/default)"
 ```
+
+Every other client `install-mcp` supports gets a local stdio entry that
+runs `ai-memory mcp-bridge --no-session-id`, which also reads the token file
+at launch, so `ai-memory` must be on the `PATH` the client sees. ZCode only
+takes HTTP entries and is refused; add its entry by hand with the header if
+you accept the token in its config.
+
+An install created before this default keeps running without auth.
+`ai-memory status` then shows `auth: none (loopback)`; run
+`ai-memory auth enable` and restart the service to turn the token on.
 
 Start and inspect the service:
 
@@ -336,8 +461,9 @@ loginctl enable-linger "$USER"
 Verify the HTTP server:
 
 ```bash
-curl http://127.0.0.1:49374/mcp
-# Expect a JSON-RPC error, which means the server is reachable.
+curl -s http://127.0.0.1:49374/healthz
+# Expect {"status":"ok"}. /healthz needs no token; `curl -sI http://127.0.0.1:49374/mcp`
+# answers 401 without one.
 ```
 
 ### System-level service
@@ -366,6 +492,17 @@ sudoedit /etc/ai-memory/env
 
 The package installs `/etc/ai-memory/env` as root-readable only because it may
 hold API keys. Keep that file out of backups or logs that other users can read.
+
+`init` also wrote the root bearer token to
+`/var/lib/ai-memory/auth-tokens/default`, readable only by the `ai-memory`
+user. To wire your own login's agents to this server, copy it into your
+user's data dir once; `install-mcp` and `install-hooks` then find it there:
+
+```bash
+install -d -m 0700 ~/.local/share/ai-memory/auth-tokens
+sudo cat /var/lib/ai-memory/auth-tokens/default \
+  | install -m 0600 /dev/stdin ~/.local/share/ai-memory/auth-tokens/default
+```
 
 For LAN exposure, set a non-loopback bind and allowed hosts in
 `/etc/ai-memory/config.toml`, and set a bearer token in `/etc/ai-memory/env`:
@@ -1747,6 +1884,228 @@ handoff injection at session start or the client's closest equivalent, except
 for Zero's no-stdout SessionStart behavior. Grok delivers on the first
 `PostToolUse` instead (Antigravity CLI uses `PreInvocation`).
 
+#### Clients without an `install-mcp` writer
+
+The clients below can reach ai-memory over streamable HTTP, but `install-mcp`
+has no `--client` value for them, so you add the entry by hand. Each recipe
+follows the client's own documentation at the version named. None of them has
+been run end to end against ai-memory yet; the
+[support matrix](support-matrix.md) marks them `MCP-only (documented)`.
+If one does not connect as described, please open an issue with the client
+version.
+
+All of them are MCP-only here: ai-memory installs no lifecycle hooks for them,
+so there is no automatic capture and no handoff injection. Ask the agent to
+call `memory_handoff_begin` before you leave and `memory_handoff_accept` when
+you resume. None of them sends ai-memory a session id, so they are static
+clients: project-scoped calls need `workspace` and `project`, which the
+routing snippet from `ai-memory install-instructions --target AGENTS.md`
+tells the model.
+
+The examples use the local server, `http://127.0.0.1:49374/mcp`. For a remote
+server, change the URL and add the bearer header shown. Where the client
+expands environment variables in its config, the example reads the token
+from `AI_MEMORY_AUTH_TOKEN`; export it in the shell that starts the client.
+Where the client documents no expansion, the example shows `<token>`, and the
+token has to be written into that file, so keep the file private. All of
+these clients speak HTTP MCP natively; `ai-memory mcp-bridge` is a Claude
+Code-only adapter and is not needed.
+
+##### Factory Droid
+
+Droid (`droid`) reads MCP servers from `~/.factory/mcp.json` (user),
+`.factory/mcp.json` in the project root, or a `.factory/mcp.json` in an
+ancestor folder. It reloads when the file changes. Droid expands `${NAME}` in
+`headers` values (not in `url`), and its docs say to keep auth headers in the
+user file rather than the committed project file:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+Leave out `headers` when the server has no bearer token. An unset variable
+makes Droid fail that connection with an error naming it. Without a token,
+`droid mcp add ai-memory http://127.0.0.1:49374/mcp --type http` writes the
+same entry to the user file. Documented for Droid CLI 0.237.0.
+Sources: <https://docs.factory.com/cli/configuration/mcp>,
+<https://docs.factory.com/changelog/cli-updates>.
+
+##### Warp
+
+Warp reads `~/.warp/.mcp.json` and, after you approve it, a project's
+`.warp/.mcp.json`. You can also add the server under **Settings > Agents >
+MCP servers > + Add**. A URL server takes `url` and an optional `headers`
+map, with no `type` key:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Warp does not document environment-variable expansion in `headers`. Leave
+out `headers` when the server has no bearer token. The separate Warp Agent
+CLI keeps its own file with the same `mcpServers` format (`~/.warp_cli/.mcp.json`
+on macOS; the docs give no Linux path). Documented for Warp
+v0.2026.10.07.08.29.
+Sources: <https://docs.warp.dev/agents/capabilities/mcp>,
+<https://docs.warp.dev/agents/cli/configuration/>.
+
+##### Cline
+
+The Cline CLI reads `~/.cline/data/settings/cline_mcp_settings.json`
+(override the path with `CLINE_MCP_SETTINGS_PATH`). In the VS Code extension,
+open the **MCP Servers** icon, then **Configure > Configure MCP Servers**, and
+edit the same `mcpServers` map. Set `type` to `streamableHttp`: without it,
+Cline falls back to the legacy SSE transport.
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "disabled": false
+    }
+  }
+}
+```
+
+Cline does not document environment-variable expansion in `headers`. Leave
+out `headers` when the server has no bearer token; in that case the CLI can
+write the entry with
+`cline mcp add ai-memory http://127.0.0.1:49374/mcp --transport http`.
+Documented for the Cline extension 4.1.23 and CLI 3.0.70.
+Source: <https://docs.cline.bot/mcp/mcp-overview>.
+
+##### Kilo Code
+
+The Kilo Code VS Code extension and the Kilo CLI share one config:
+`~/.config/kilo/kilo.jsonc` (or `kilo.json`) globally, or `kilo.jsonc` /
+`.kilo/kilo.jsonc` in the project. Servers live under the `mcp` key, and a
+remote server has `type: "remote"`; Kilo tries streamable HTTP first and
+falls back to SSE. Kilo expands `{env:NAME}` in config values:
+
+```json
+{
+  "mcp": {
+    "ai-memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:49374/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": { "Authorization": "Bearer {env:AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+ai-memory uses a bearer token, not OAuth, so `"oauth": false` stops Kilo from
+starting an OAuth flow. Leave out `headers` when the server has no bearer
+token. The older `mcp_settings.json` and `.kilocode/mcp.json` files are not
+in the current docs. Documented for Kilo Code 7.8.8.
+Sources: <https://kilo.ai/docs/automate/mcp/using-in-kilo-code>,
+<https://kilo.ai/docs/automate/mcp/using-in-cli>.
+
+##### Goose
+
+Goose keeps extensions in `~/.config/goose/config.yaml`
+(`%APPDATA%\Block\goose\config\config.yaml` on Windows). Run `goose
+configure`, choose **Add Extension > Remote Extension (Streamable HTTP)**,
+enter the URL, and, for a server with a bearer token, add the custom request
+header `Authorization: Bearer <token>`. The resulting entry has this shape;
+note that the URL key is `uri`:
+
+```yaml
+extensions:
+  ai-memory:
+    type: streamable_http
+    name: ai-memory
+    enabled: true
+    uri: "http://127.0.0.1:49374/mcp"
+    headers:
+      Authorization: "Bearer <token>"
+    timeout: 300
+```
+
+Goose does not document environment-variable expansion in `headers`. Leave
+`headers` empty (`{}`) when the server has no bearer token. For one session,
+`goose session --with-streamable-http-extension "http://127.0.0.1:49374/mcp"`
+loads the server without saving it (that flag takes no header). Documented
+for Goose 1.54.0.
+Sources: <https://goose-docs.ai/docs/guides/config-files>,
+<https://goose-docs.ai/docs/getting-started/using-extensions>,
+<https://goose-docs.ai/docs/guides/goose-cli-commands>.
+
+##### Qwen Code
+
+Qwen Code reads `mcpServers` from `~/.qwen/settings.json` (user) or
+`.qwen/settings.json` (project). A streamable-HTTP server uses `httpUrl`; the
+plain `url` key means the legacy SSE transport. Qwen Code expands `$NAME` and
+`${NAME}` in every string of `settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "httpUrl": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+Leave out `headers` when the server has no bearer token; in that case
+`qwen mcp add --scope user --transport http ai-memory http://127.0.0.1:49374/mcp`
+writes the entry. Documented for Qwen Code 0.25.1.
+Sources: <https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/>,
+<https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/>.
+
+##### OpenHuman
+
+OpenHuman (tinyhumansai/openhuman) adds servers through the **mcp.json** tab
+of its MCP Servers screen. That document is a view over OpenHuman's own
+server store, not a file you edit on disk. A server with `url` is dialled
+over streamable HTTP, and `headers` holds its credentials:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+OpenHuman does not document environment-variable expansion in that
+document. It stores header values write-only and never shows them again.
+Leave out `headers` when the server has no bearer token. Documented for
+OpenHuman 0.64.15.
+Sources: <https://tinyhumans.gitbook.io/openhuman/features/integrations/mcp-and-skills>,
+<https://tinyhumans.gitbook.io/openhuman/developing/architecture/mcp-registry>.
+
+##### Aider
+
+Aider has no MCP support in any release (checked against 0.86.2 and its
+release history), so there is no recipe. Its feature request is
+[Aider-AI/aider#3314](https://github.com/Aider-AI/aider/issues/3314).
+
 ---
 
 ## Installing hooks without docker
@@ -2721,7 +3080,16 @@ address you published to. The `-p` above is therefore doing the real work: it
 is what keeps this container loopback-only. If you change it to publish on a
 LAN address, set `AI_MEMORY_AUTH_TOKEN` as well.
 
-Then wire up the agent CLI. Both commands default to no auth and
+A container started this way has no token, since it never ran `init`. To
+require one, run `ai-memory auth enable` through the wrapper (it writes the
+token into the volume), `docker restart ai-memory`, then re-run
+`ai-memory install-hooks --agent <agent> --apply` so the host hooks get it.
+`install-hooks` copies the token from the volume to an owner-only file under
+`~/.local/share/ai-memory/native-runner/`, and the commands the wrapper runs
+natively (`install-hooks`, `mcp-bridge`, `run`) read it from there, never from
+a command line.
+
+Then wire up the agent CLI. Both commands default to
 `http://127.0.0.1:49374` - no extra flags needed for the local case:
 
 ```bash

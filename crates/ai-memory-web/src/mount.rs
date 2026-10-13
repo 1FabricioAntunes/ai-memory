@@ -314,6 +314,11 @@ pub struct WebMountSpec<'a> {
     /// A trusted identity proxy is configured; the root-only pending-writes
     /// page needs it to decide whether operators are told apart.
     pub trusted_proxy_identity: bool,
+    /// The server's configured embedder and reranker, so project search in
+    /// `/web` and `/api/v1` ranks like `memory_query`.
+    pub recall: crate::Recall,
+    /// Process-side sources for the root-only health page.
+    pub health: Option<Arc<crate::health::HealthSources>>,
 }
 
 /// Public SPA vs dual-auth wiki/API split.
@@ -379,7 +384,13 @@ fn split_web_routers_unframed(
             html_auth: None,
         });
     }
-    let api = build_api_router(&reader, &wiki, spec.cors_origins);
+    let mut state = crate::WebState::new(reader, wiki)
+        .with_trusted_proxy_identity(spec.trusted_proxy_identity)
+        .with_recall(spec.recall);
+    if let Some(health) = spec.health {
+        state = state.with_health(health);
+    }
+    let api = build_api_router(state.clone(), spec.cors_origins);
     let protected_api = axum::Router::new().nest("/api/v1", api);
     if !enable_web {
         return Ok(SplitWebRouters {
@@ -422,14 +433,7 @@ fn split_web_routers_unframed(
             spec.base_path,
             mount,
         ),
-        protected: mount_builtin_browser(
-            protected_api,
-            crate::WebState::new(reader, wiki)
-                .with_trusted_proxy_identity(spec.trusted_proxy_identity),
-            &slug,
-            mount,
-            browser_inject,
-        ),
+        protected: mount_builtin_browser(protected_api, state, &slug, mount, browser_inject),
         html_auth: Some(auth_cfg),
     })
 }
@@ -453,8 +457,8 @@ fn mount_web_router(
 /// the operator configured any. The layer is scoped to this router only
 /// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
 /// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = crate::api_router(reader.clone(), wiki.clone());
+fn build_api_router(state: crate::WebState, cors_origins: &[String]) -> axum::Router {
+    let api = crate::routes::build_api(Arc::new(state));
     if cors_origins.is_empty() {
         return api;
     }
@@ -722,6 +726,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1124,6 +1130,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1202,6 +1210,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1229,6 +1239,51 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // A page version and a session, so the history and timeline routes
+        // answer 200 rather than an error page.
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: ai_memory_core::PagePath::new("notes/a.md").unwrap(),
+                title: "A".into(),
+                body: "a".into(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let session = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
         let base_href = web_base_href("", "/web");
         let router = mount_web_router(
             axum::Router::new(),
@@ -1243,15 +1298,29 @@ mod tests {
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
-        for uri in ["/web", "/web/pending", "/web/login", "/api/v1/projects"] {
+        let session_uri = format!("/web/w/default/scratch/s/{session}");
+        for uri in [
+            "/web",
+            "/web/pending",
+            "/web/login",
+            "/api/v1/projects",
+            "/web/w/default/scratch/h/notes/a.md",
+            session_uri.as_str(),
+            "/api/v1/workspaces/default/projects/scratch/history/notes/a.md",
+        ] {
             let resp = router
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
+            if uri.contains("/h/") || uri.contains("/s/") || uri.contains("/history/") {
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
             let headers = resp.headers();
             assert_eq!(
                 headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
@@ -1301,6 +1370,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1361,6 +1432,8 @@ mod tests {
                 base_href: &base_href,
                 base_path: &base,
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1450,6 +1523,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1507,6 +1582,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -1553,6 +1630,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: crate::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
