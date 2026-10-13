@@ -1673,9 +1673,10 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Persist one open-session checkpoint job (PreCompact / PostCompaction)
-    /// for the current observation generation. Duplicate generations are
-    /// idempotent. An already-ended session is refused.
+    /// Persist one checkpoint job (PreCompact / PostCompaction) for the
+    /// current observation generation. Duplicate generations are idempotent.
+    /// The session may already have ended: a resumed session keeps
+    /// `ended_at` while it captures again.
     pub async fn enqueue_session_checkpoint(
         &self,
         workspace_id: WorkspaceId,
@@ -1693,7 +1694,8 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Atomically claim the oldest due SessionEnd consolidation job.
+    /// Atomically claim the oldest due session consolidation job (SessionEnd
+    /// or checkpoint).
     pub async fn claim_session_consolidation(
         &self,
         now: i64,

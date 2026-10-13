@@ -2099,7 +2099,8 @@ impl Config {
         if effective_input_chars < required_input_chars {
             anyhow::bail!(
                 "consolidation.max_input_tokens must leave at least {required_input_chars} \
-                 characters for the prompt (got {}, which is {effective_input_chars} at \
+                 characters for the prompt ({min_input_tokens} tokens at the default \
+                 input_token_safety_margin) (got {}, which is {effective_input_chars} at \
                  input_token_safety_margin = {safety_margin}); below that the system \
                  prompt and page conventions leave no room for observations. Raise \
                  max_input_tokens, or raise input_token_safety_margin towards 1.0",

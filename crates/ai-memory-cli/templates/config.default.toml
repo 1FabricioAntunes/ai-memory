@@ -176,7 +176,9 @@ per_user = false
 # LLM consolidation prompt limits. These are approximate because tokenizers
 # differ by provider and model. Their sum must fit the model's context window;
 # leave additional headroom for tokenizer variance. Small local models must
-# lower both values together. Startup minimums are 6500 input and 1000 output.
+# lower both values together. Startup minimums are 8350 input (at the default
+# input_token_safety_margin of 0.8; a lower margin needs proportionally more)
+# and 1000 output.
 # Consolidation turns a finished session's raw observations into wiki
 # pages. Off (zero-LLM) you still get session pages + search; with an
 # LLM you get distilled concept/gotcha/rule pages. Reach for these knobs
