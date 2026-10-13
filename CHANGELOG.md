@@ -11,6 +11,16 @@ and [0.x](docs/changelog/0.x.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed pages written by an auto-improvement approval getting no embedding.
+  An approval through `pending-writes approve`, the `memory_auto_improve`
+  tool, `POST /admin/auto-improve` or the scheduler wrote and indexed the
+  page but never embedded it, so it stayed out of the vector stream of
+  hybrid search until an embedding backfill ran, which by default is only at
+  the next server start. The approval now embeds the applied page the same
+  way `memory_write_page` does (#1258).
+
 ## [2.6.7] - 2026-10-13
 
 ### Deprecated

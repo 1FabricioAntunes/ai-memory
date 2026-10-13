@@ -1836,6 +1836,17 @@ impl Wiki {
             }
         };
 
+        // Embed the applied version like `write_page` does, after the
+        // mutation guard is released (the provider call may block). Without
+        // this, approved pages stayed vectorless until a backfill ran: the
+        // watcher's reindex of the file we just wrote hits the store's
+        // unchanged-content short-circuit, so it never embeds them either.
+        if let ApproveAutoImproveProposalResult::Approved { page_id } = &result {
+            let abstract_text = frontmatter_abstract(&markdown.frontmatter);
+            self.embed_page_version(*page_id, &markdown.body, abstract_text)
+                .await?;
+        }
+
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
             chain.dispatch_async(
                 Some(path.as_str()),
@@ -4828,6 +4839,36 @@ mod tests {
                 .unwrap()
                 .body,
             "new proposal body"
+        );
+    }
+
+    /// An approved auto-improvement page is embedded on approval, like every
+    /// `write_page` version. Before, nothing on the write path embedded it:
+    /// the page stayed out of the vector stream until an embedding backfill
+    /// (startup, scheduled or `ai-memory embed`) found it.
+    #[tokio::test]
+    async fn auto_improve_approval_embeds_the_applied_page() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(32));
+        let wiki = wiki.with_embedder(embedder);
+        let id = stage_one(&store, ws, proj, "notes/embedded.md", "approved body").await;
+        let result = wiki
+            .approve_auto_improve_proposal(ws, proj, id, ActorContext::default(), None, None)
+            .await
+            .unwrap();
+        let ApproveAutoImproveProposalResult::Approved { page_id } = result else {
+            panic!("expected approval, got {result:?}");
+        };
+        let embedded = store
+            .reader
+            .embedded_page_ids(ws, proj, "synthetic".into(), "bag-of-words-v1".into(), 32)
+            .await
+            .unwrap();
+        assert!(
+            embedded.contains(&page_id),
+            "the approved page version must be embedded by the approval itself"
         );
     }
 
