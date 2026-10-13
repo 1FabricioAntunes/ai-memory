@@ -2015,6 +2015,21 @@ pub struct PageLinks {
     pub backlinks: Vec<RelatedPage>,
 }
 
+/// The first few outgoing links and back-links of one page, with how many
+/// of each the viewer may see in total. Returned by
+/// [`ReaderPool::page_links_preview`].
+#[derive(Debug, Clone, Default)]
+pub struct PageLinksPreview {
+    /// The first outgoing links, in [`PageLinks`] order.
+    pub links: Vec<RelatedPage>,
+    /// Visible outgoing links in total.
+    pub links_total: usize,
+    /// The first back-links, in [`PageLinks`] order.
+    pub backlinks: Vec<RelatedPage>,
+    /// Visible back-links in total.
+    pub backlinks_total: usize,
+}
+
 /// Hard ceiling on how far [`ReaderPool::related_walk`] traverses the link
 /// graph. A caller's requested depth is clamped into `1..=RELATED_WALK_MAX_DEPTH`
 /// — a deeper walk is refused, not honoured, so one read cannot fan out across
@@ -8352,6 +8367,41 @@ impl ReaderPool {
         path: String,
         viewer: Option<UserId>,
     ) -> StoreResult<PageLinks> {
+        let preview = self
+            .page_links_rows(workspace_id, project_id, path, viewer, None)
+            .await?;
+        Ok(PageLinks {
+            links: preview.links,
+            backlinks: preview.backlinks,
+        })
+    }
+
+    /// [`Self::page_links`] cut to the first `limit` of each direction in
+    /// SQL, with the visible totals counted under the same filters, so a
+    /// page with many neighbours does not load them all to show a few.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_links_preview(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+        viewer: Option<UserId>,
+        limit: usize,
+    ) -> StoreResult<PageLinksPreview> {
+        self.page_links_rows(workspace_id, project_id, path, viewer, Some(limit))
+            .await
+    }
+
+    async fn page_links_rows(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+        viewer: Option<UserId>,
+        limit: Option<usize>,
+    ) -> StoreResult<PageLinksPreview> {
         self.with_conn(move |conn| {
             let id_opt: Option<Vec<u8>> = conn
                 .query_row(
@@ -8363,7 +8413,7 @@ impl ReaderPool {
                 )
                 .optional()?;
             let Some(id_bytes) = id_opt else {
-                return Ok(PageLinks::default());
+                return Ok(PageLinksPreview::default());
             };
 
             // Outgoing: latest unexpired pages this page links to.
@@ -8374,33 +8424,29 @@ impl ReaderPool {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
             // A link into a repository the viewer cannot read would show them
             // its name and a page title and path inside it — the same leak as a
-            // graph edge — so the far end is filtered like one.
+            // graph edge — so the far end is filtered like one. The total is
+            // counted over the same filtered rows.
             let visible = readable_repository_predicate("pg.project_id", viewer);
             let ttl = not_expired("pg", "?2");
             let now = now_us();
-            let outgoing = format!(
-                "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
-                            ws.name, pr.name \
-                     FROM links l \
-                     JOIN pages pg ON pg.id = l.to_page_id \
-                     JOIN projects pr ON pr.id = pg.project_id \
-                     JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
-                     ORDER BY ws.name, pr.name, pg.path"
-            );
-            let incoming = format!(
-                "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
-                            ws.name, pr.name \
-                     FROM links l \
-                     JOIN pages pg ON pg.id = l.from_page_id \
-                     JOIN projects pr ON pr.id = pg.project_id \
-                     JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
-                     ORDER BY ws.name, pr.name, pg.path"
-            );
+            let select = |far: &str, near: &str| {
+                format!(
+                    "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
+                                ws.name, pr.name \
+                         FROM links l \
+                         JOIN pages pg ON pg.id = l.{far} \
+                         JOIN projects pr ON pr.id = pg.project_id \
+                         JOIN workspaces ws ON ws.id = pg.workspace_id \
+                         WHERE l.{near} = ?1 AND pg.is_latest = 1{visible}{ttl}"
+                )
+            };
+            let outgoing = select("to_page_id", "from_page_id");
+            let incoming = select("from_page_id", "to_page_id");
+            let cut = limit.map_or_else(String::new, |n| format!(" LIMIT {n}"));
 
-            let collect = |sql: &str| -> StoreResult<Vec<RelatedPage>> {
-                let mut stmt = conn.prepare(sql)?;
+            let collect = |base: &str| -> StoreResult<(Vec<RelatedPage>, usize)> {
+                let sql = format!("{base} ORDER BY ws.name, pr.name, pg.path{cut}");
+                let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(params![id_bytes, now], |row| {
                     Ok(RelatedPage {
                         path: row.get(0)?,
@@ -8414,12 +8460,26 @@ impl ReaderPool {
                 for r in rows {
                     out.push(r?);
                 }
-                Ok(out)
+                let total = if limit.is_some_and(|n| out.len() >= n) {
+                    let count: i64 = conn.query_row(
+                        &format!("SELECT COUNT(*) FROM ({base})"),
+                        params![id_bytes, now],
+                        |row| row.get(0),
+                    )?;
+                    usize::try_from(count).unwrap_or(usize::MAX)
+                } else {
+                    out.len()
+                };
+                Ok((out, total))
             };
 
-            Ok(PageLinks {
-                links: collect(&outgoing)?,
-                backlinks: collect(&incoming)?,
+            let (links, links_total) = collect(&outgoing)?;
+            let (backlinks, backlinks_total) = collect(&incoming)?;
+            Ok(PageLinksPreview {
+                links,
+                links_total,
+                backlinks,
+                backlinks_total,
             })
         })
         .await
