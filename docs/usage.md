@@ -192,7 +192,7 @@ agent, which then runs it without a recap. Prompts that do not start with
 | Claude Code | With that prompt (`UserPromptSubmit` `additionalContext`, up to 8,000 chars) |
 | Codex | With that prompt (developer context, up to 6,000 chars to stay under Codex's hook-output preview limit) |
 | OpenCode V1 / V2 | With that prompt and later model calls, until the next compaction |
-| Grok Build | After the first tool result of that turn: Grok discards `UserPromptSubmit` output. A request with no tool call expires after 30 minutes or at session end |
+| Grok Build | After the first tool result of that turn: Grok discards `UserPromptSubmit` output. The recap shares that field with a handoff delivered at the same time and is sized to fit; when the handoff leaves too little room, it comes with the next tool result. A request with no tool call expires after 30 minutes or at session end |
 
 A session that has not been compacted yet answers with a one-line notice. The
 full record stays available through `memory_read_session_observations` with

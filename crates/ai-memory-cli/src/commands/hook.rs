@@ -555,6 +555,18 @@ fn write_success_response<W: std::io::Write>(
 
 const GROK_ADDITIONAL_CONTEXT_CHARS: usize = 10_000;
 
+/// Grok carries the handoff and the recap in one `additionalContext`, clipped
+/// at [`GROK_ADDITIONAL_CONTEXT_CHARS`]. The recap is asked to fit the room
+/// the handoff leaves, so the clip never cuts its closing fence. `None` when
+/// that room is under the smallest recap the server renders: the recap then
+/// waits for the next tool result, which has the whole field to itself.
+fn grok_recap_room(handoff_chars: usize) -> Option<usize> {
+    const JOIN: usize = "\n\n".len();
+    GROK_ADDITIONAL_CONTEXT_CHARS
+        .checked_sub(handoff_chars + JOIN)
+        .filter(|room| *room >= ai_memory_hooks::RECAP_BUDGET_MIN)
+}
+
 fn grok_post_tool_handoff_envelope(handoff: &str) -> serde_json::Value {
     serde_json::json!({
         "hookSpecificOutput": {
@@ -1334,8 +1346,16 @@ where
                     parts.push(handoff);
                 }
             }
-            if wants_recap && let Some(session_id) = canonical_session_id.as_deref() {
-                let url = recap_url(base, &args.agent, session_id, None);
+            // With no handoff the server's default budget already fits.
+            let recap_budget = match parts.first() {
+                Some(handoff) => grok_recap_room(handoff.chars().count()).map(Some),
+                None => Some(None),
+            };
+            if wants_recap
+                && let Some(session_id) = canonical_session_id.as_deref()
+                && let Some(budget) = recap_budget
+            {
+                let url = recap_url(base, &args.agent, session_id, budget);
                 if let Some(recap) =
                     get_handoff(&client, &url, bearer.as_deref(), handoff_timeout()).await
                 {
@@ -7299,6 +7319,80 @@ mod tests {
         assert!(!String::from_utf8_lossy(&stdout).contains("RECAP-BODY"));
         let seen = all_requests(&mut requests).await;
         assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn grok_recap_sharing_a_handoff_asks_for_the_room_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        write_recap_marker(&data_dir, Duration::from_secs(5));
+        // The fake server answers both GETs with this 3,000-char body.
+        let body: &'static str = Box::leak("H".repeat(3_000).into_boxed_str());
+        let (base, mut requests) = serve_requests("200 OK", body).await;
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        let context = envelope["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert_eq!(context.chars().count(), 3_000 + 2 + 3_000);
+        let seen = all_requests(&mut requests).await;
+        let recap = recap_requests(&seen);
+        assert_eq!(recap.len(), 1, "{seen:?}");
+        // 10,000 minus the handoff and the blank line joining them.
+        assert!(recap[0].contains("budget=6998"), "{}", recap[0]);
+    }
+
+    #[tokio::test]
+    async fn grok_recap_waits_for_the_next_tool_when_a_handoff_leaves_no_room() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        write_recap_marker(&data_dir, Duration::from_secs(5));
+        let body: &'static str = Box::leak("H".repeat(9_000).into_boxed_str());
+        let (base, mut requests) = serve_requests("200 OK", body).await;
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            9_000,
+            "only the handoff"
+        );
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            data_dir
+                .join("recap-pending")
+                .join("grok-session")
+                .is_file(),
+            "the recap must stay pending"
+        );
+
+        // The next tool result has the whole context to itself.
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        assert!(!stdout.is_empty());
+        let seen = all_requests(&mut requests).await;
+        let recap = recap_requests(&seen);
+        assert_eq!(recap.len(), 1, "{seen:?}");
+        assert!(!recap[0].contains("budget="), "{}", recap[0]);
+        assert!(!data_dir.join("recap-pending").join("grok-session").exists());
     }
 
     #[tokio::test]

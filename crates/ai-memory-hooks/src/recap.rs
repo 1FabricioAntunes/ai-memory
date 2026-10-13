@@ -157,7 +157,8 @@ async fn build_recap(
 /// Default recap size: under the 10,000-char cap Claude Code and Grok put on
 /// one `additionalContext` field.
 pub(crate) const RECAP_BUDGET_DEFAULT: usize = 8_000;
-const RECAP_BUDGET_MIN: usize = 2_000;
+/// The smallest recap `/recap` renders: a smaller `budget` is raised to it.
+pub const RECAP_BUDGET_MIN: usize = 2_000;
 const RECAP_BUDGET_MAX: usize = 9_500;
 /// The last reply and the handoffs each keep this much room when present,
 /// so a long run of prompts cannot crowd them out.
