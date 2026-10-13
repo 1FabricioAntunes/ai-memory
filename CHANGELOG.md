@@ -588,12 +588,6 @@ and [0.x](docs/changelog/0.x.md).
   same URL. The `opencode-zen` provider alias is unchanged.
 
 ### Fixed
-- Fixed the companion relay refusing to open its queue on Windows when another
-  relay process was committing to the same queue. SQLite deletes its rollback
-  journal at each commit, and Windows answers "access denied" for a file
-  that is being deleted, so the queue-file guard failed with `inspect
-  relay.sqlite-journal: Access is denied`. The guard now retries that answer
-  for up to about 100 ms; a file that stays unreadable is still refused.
 - Fixed SessionEnd consolidation repeating the same expensive prompt on the
   durable queue when the structured LLM response fails deterministically: a
   truncated or empty response, malformed JSON, or an unexpected response
@@ -603,17 +597,6 @@ and [0.x](docs/changelog/0.x.md).
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
-- Fixed `ai-memory hook` running inside a helper container on Docker-wrapper
-  installs (Linux/macOS). A hook config or plugin that called the wrapper paid
-  about 280 ms per event, over the 200 ms hook budget, and its default
-  `127.0.0.1` server URL pointed at the container instead of the host server.
-  The wrapper now runs `hook` and `hook-drain` through the same
-  checksum-verified native host client as `mcp-bridge` and `install-hooks`.
-  A hook only reuses the installed client, with no update check or download
-  on the hook path. When no client is installed yet, the wrapper says to run
-  `ai-memory install-hooks` once, skips the event and exits 0, so the agent
-  is never blocked.
-
 ### Security
 - Fixed HTTP Basic sign-in to the web UI minting a 30-day `ai_memory_auth`
   cookie that held the root bearer token. Basic sign-in sets no cookie now;
@@ -624,6 +607,35 @@ and [0.x](docs/changelog/0.x.md).
   hits now come only from sessions the caller may read under the
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
+
+## [2.6.7] - 2026-10-13
+
+### Deprecated
+
+- The 1.x compatibility-token commands `user add`, `user expire`,
+  `user revive` and `user rotate-token`, and their admin endpoints, will be
+  removed in 3.0.0. Tokens they issued keep working after the upgrade as
+  ordinary API keys; manage them with `api-key list|rotate|revoke`, and add
+  people with `user add-human`.
+
+### Fixed
+
+- Fixed the companion relay refusing to open its queue on Windows when another
+  relay process was committing to the same queue. SQLite deletes its rollback
+  journal at each commit, and Windows answers "access denied" for a file
+  that is being deleted, so the queue-file guard failed with `inspect
+  relay.sqlite-journal: Access is denied`. The guard now retries that answer
+  for up to about 100 ms; a file that stays unreadable is still refused.
+- Fixed `ai-memory hook` running inside a helper container on Docker-wrapper
+  installs (Linux/macOS). A hook config or plugin that called the wrapper paid
+  about 280 ms per event, over the 200 ms hook budget, and its default
+  `127.0.0.1` server URL pointed at the container instead of the host server.
+  The wrapper now runs `hook` and `hook-drain` through the same
+  checksum-verified native host client as `mcp-bridge` and `install-hooks`.
+  A hook only reuses the installed client, with no update check or download
+  on the hook path. When no client is installed yet, the wrapper says to run
+  `ai-memory install-hooks` once, skips the event and exits 0, so the agent
+  is never blocked.
 
 ## [2.6.6] - 2026-10-13
 
@@ -5209,7 +5221,8 @@ and [0.x](docs/changelog/0.x.md).
   ai-memory's own entries. Legacy ai-memory script and native hook commands
   remain recognized by their specific hook signatures.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.7...HEAD
+[2.6.7]: https://github.com/akitaonrails/ai-memory/compare/v2.6.6...v2.6.7
 [2.6.6]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...v2.6.6
 [2.6.5]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
