@@ -307,6 +307,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ai-memory status` and `ai-memory doctor` now show the server's auth
   posture, and for an unauthenticated loopback server print
   `auth: none (loopback)` with the fix, `ai-memory auth enable`.
+- Added `ai-memory project init`, which creates a `.ai-memory.toml` marker at
+  the current worktree root (or the current directory outside Git) after
+  asking for `workspace` and `project`. The defaults are the scope the CLI and
+  hooks already resolve for the checkout, so accepting them keeps the memory
+  where it is. It writes only those two keys, needs an interactive terminal,
+  and never overwrites an existing marker. (#1227)
 
 ### Changed
 - Changed scoped `/api/v1/search` (a single `workspace` + `project`, or

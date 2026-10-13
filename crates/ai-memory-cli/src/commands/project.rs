@@ -20,7 +20,7 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// token, unknown project, or invalid mode for a server-side action.
 pub async fn run(config: &Config, args: ProjectArgs) -> Result<()> {
     match args.command {
-        ProjectCommand::Init(args) => crate::commands::project_init::run(args),
+        ProjectCommand::Init(args) => crate::commands::project_init::run(config, args),
         ProjectCommand::Access(args) => {
             let ep = ServerEndpoint::from_config_resolving_auth(config).await;
             access(&ep, args).await

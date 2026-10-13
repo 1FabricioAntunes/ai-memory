@@ -80,30 +80,18 @@ worktree root:
 ai-memory project init
 ```
 
-The command asks for `workspace` and `project`, offering defaults from the
-checkout's `upstream` remote, then `origin`. The immediate namespace before the
-repository name becomes the workspace (`gitlab.com/acme/group/api` suggests
-`group` / `api`). A remote with no namespace suggests `default` for the
-workspace. A checkout without a usable remote suggests `default` and its root
-directory name.
+The command asks for `workspace` and `project`. Each default is the scope the
+CLI and hooks already resolve for the checkout: an inherited marker's value,
+else the project derived from the normalized `upstream`, then `origin`, remote
+(`github.com/acme/api` → `default` / `acme-api`), else the root directory name.
+Accepting the defaults therefore pins the scope your memory already lives in.
+Outside Git, the marker is written to the current directory.
 
-Outside Git, the marker is written to the current directory; its parent and
-current directory names suggest workspace and project. The command requires an
-interactive terminal, never overwrites an existing marker, and writes the
-following defaults alongside the chosen names:
-
-```toml
-[recall]
-default_global = false
-
-[profile]
-contribute = false
-consume = false
-
-[briefing]
-inject_on_session_start = true
-max_chars = 4000
-```
+A name may not contain `/`, `\`, whitespace or control characters. The
+command needs an interactive terminal, never overwrites an existing marker,
+and writes only `workspace` and `project`, so every other key keeps its
+default until you add it. In a repository, commit the file so every checkout
+and worktree routes the same way.
 
 ## Schema
 

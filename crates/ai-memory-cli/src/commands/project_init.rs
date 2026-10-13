@@ -1,11 +1,9 @@
 //! `ai-memory project init` — create a checkout-local scope marker.
 //!
-//! This command deliberately stays local: it chooses a directory, suggests a
-//! scope from the checkout's Git metadata, then creates `.ai-memory.toml`.
+//! This command deliberately stays local: it chooses a directory, suggests the
+//! scope every client already resolves there, then creates `.ai-memory.toml`.
 //! It does not create a server-side project or contact the configured server.
 
-use std::ffi::OsStr;
-use std::fs::OpenOptions;
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::Path;
 
@@ -13,9 +11,7 @@ use ai_memory_core::MARKER_FILENAME;
 use anyhow::{Context, Result, bail};
 
 use crate::cli::ProjectInitArgs;
-use crate::config::DEFAULT_WORKSPACE;
-
-const FALLBACK_PROJECT: &str = "project";
+use crate::config::Config;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Suggestions {
@@ -29,17 +25,35 @@ struct Suggestions {
 /// Returns an error outside an interactive terminal, when the current
 /// directory or marker cannot be inspected, or when the marker cannot be
 /// created without replacing an existing file.
-pub fn run(_: ProjectInitArgs) -> Result<()> {
+pub fn run(config: &Config, _: ProjectInitArgs) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("`ai-memory project init` needs an interactive terminal");
     }
-    let cwd = std::env::current_dir().context("reading the current directory")?;
-    initialize(&cwd, &mut io::stdin().lock(), &mut io::stdout().lock())
+    // The physical directory to write in (the Docker wrapper binds the
+    // checkout at /work), and the scope every client already resolves for
+    // this checkout: marker walk, then the git remote, then the basename. A
+    // marker that names a different scope would split the project's memory.
+    let start = match super::scope_directories(config) {
+        Some((_, lookup_cwd)) => std::path::PathBuf::from(lookup_cwd),
+        None => std::env::current_dir().context("reading the current directory")?,
+    };
+    let (workspace, project) = super::resolve_scope(config, None, None)?;
+    initialize(
+        &start,
+        &Suggestions { workspace, project },
+        &mut io::stdin().lock(),
+        &mut io::stdout().lock(),
+    )
 }
 
-fn initialize(cwd: &Path, input: &mut impl io::BufRead, output: &mut impl io::Write) -> Result<()> {
-    let repo_root = ai_memory_consolidate::discover_repo_root(cwd).ok();
-    let directory = repo_root.as_deref().unwrap_or(cwd);
+fn initialize(
+    start: &Path,
+    suggestions: &Suggestions,
+    input: &mut impl io::BufRead,
+    output: &mut impl io::Write,
+) -> Result<()> {
+    let repo_root = ai_memory_consolidate::discover_repo_root(start).ok();
+    let directory = repo_root.as_deref().unwrap_or(start);
     let marker = directory.join(MARKER_FILENAME);
     if marker
         .try_exists()
@@ -51,70 +65,18 @@ fn initialize(cwd: &Path, input: &mut impl io::BufRead, output: &mut impl io::Wr
         );
     }
 
-    let suggestions = suggestions_for(
-        directory,
-        repo_root.is_some(),
-        preferred_remote_identity(cwd).as_deref(),
-    );
     let workspace = prompt_scope_value("Workspace", &suggestions.workspace, input, output)?;
     let project = prompt_scope_value("Project", &suggestions.project, input, output)?;
-    let body = render_marker(&workspace, &project);
-    write_new_marker(&marker, &body)?;
+    write_new_marker(&marker, &render_marker(&workspace, &project))?;
     writeln!(output, "Created {}.", marker.display()).context("reporting created marker")?;
+    if repo_root.is_some() {
+        writeln!(
+            output,
+            "Commit it so every checkout and worktree of this repository routes the same way."
+        )
+        .context("reporting created marker")?;
+    }
     Ok(())
-}
-
-fn preferred_remote_identity(cwd: &Path) -> Option<String> {
-    let (upstream, origin) = ai_memory_consolidate::read_identity_remotes(cwd);
-    normalized_remote(upstream.as_deref(), origin.as_deref())
-}
-
-fn normalized_remote(upstream: Option<&str>, origin: Option<&str>) -> Option<String> {
-    [upstream, origin]
-        .into_iter()
-        .flatten()
-        .find_map(ai_memory_core::repository_identity::normalize_remote_url)
-}
-
-fn suggestions_for(directory: &Path, is_git_checkout: bool, remote: Option<&str>) -> Suggestions {
-    if let Some(remote) = remote
-        && let Some(suggestions) = suggestions_from_remote(remote)
-    {
-        return suggestions;
-    }
-
-    Suggestions {
-        workspace: if is_git_checkout {
-            DEFAULT_WORKSPACE.to_owned()
-        } else {
-            directory
-                .parent()
-                .and_then(path_basename)
-                .unwrap_or_else(|| DEFAULT_WORKSPACE.to_owned())
-        },
-        project: path_basename(directory).unwrap_or_else(|| FALLBACK_PROJECT.to_owned()),
-    }
-}
-
-fn suggestions_from_remote(remote: &str) -> Option<Suggestions> {
-    let segments: Vec<&str> = remote
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    let project = segments.last()?.to_string();
-    let workspace = if segments.len() >= 3 {
-        segments[segments.len() - 2].to_owned()
-    } else {
-        DEFAULT_WORKSPACE.to_owned()
-    };
-    Some(Suggestions { workspace, project })
-}
-
-fn path_basename(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(OsStr::to_str)
-        .filter(|name| !name.trim().is_empty())
-        .map(str::to_owned)
 }
 
 fn prompt_scope_value(
@@ -144,41 +106,51 @@ fn prompt_scope_value(
         }
         writeln!(
             output,
-            "Enter a non-empty workspace or project name without '/'."
+            "Enter a non-empty name without '/', '\\', spaces or control characters."
         )
         .context("reporting invalid marker scope")?;
     }
 }
 
+/// A scope name goes into URLs and paths everywhere, so refuse what would need
+/// escaping there: separators, whitespace and control characters.
 fn valid_scope_value(value: &str) -> bool {
-    !value.is_empty() && !value.contains('/')
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_whitespace() || c.is_control())
 }
 
+/// Only the scope: every other marker key keeps the server's default (the
+/// cross-project profile on, session-start briefing off) until the user opts
+/// in by hand.
 fn render_marker(workspace: &str, project: &str) -> String {
     let mut document = toml_edit::DocumentMut::new();
     document["workspace"] = toml_edit::value(workspace);
     document["project"] = toml_edit::value(project);
-    document["recall"] = toml_edit::Item::Table(toml_edit::Table::new());
-    document["recall"]["default_global"] = toml_edit::value(false);
-    document["profile"] = toml_edit::Item::Table(toml_edit::Table::new());
-    document["profile"]["contribute"] = toml_edit::value(false);
-    document["profile"]["consume"] = toml_edit::value(false);
-    document["briefing"] = toml_edit::Item::Table(toml_edit::Table::new());
-    document["briefing"]["inject_on_session_start"] = toml_edit::value(true);
-    document["briefing"]["max_chars"] = toml_edit::value(4_000);
     document.to_string()
 }
 
+/// Write `body` to a new file at `path` atomically: a temporary sibling is
+/// written and synced, then linked into place, which fails rather than
+/// replace a marker that appeared meanwhile. A crash leaves no partial marker.
 fn write_new_marker(path: &Path, body: &str) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(body.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing {}", path.display()))?;
+    let dir = path
+        .parent()
+        .context("marker path has no parent directory")?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".ai-memory.toml.")
+        .tempfile_in(dir)
+        .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
+    tmp.write_all(body.as_bytes())
+        .with_context(|| format!("writing {}", tmp.path().display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing {}", tmp.path().display()))?;
+    std::fs::hard_link(tmp.path(), path).with_context(|| format!("creating {}", path.display()))?;
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -189,82 +161,52 @@ mod tests {
 
     use super::*;
 
+    fn suggest(workspace: &str, project: &str) -> Suggestions {
+        Suggestions {
+            workspace: workspace.to_owned(),
+            project: project.to_owned(),
+        }
+    }
+
+    /// The suggestion is the scope the CLI and hooks already resolve. A
+    /// checkout whose remote is `github.com/acme/api` is `default`/`acme-api`
+    /// everywhere, so a marker suggesting `acme`/`api` would split its memory.
     #[test]
-    fn upstream_wins_over_origin_when_suggesting_scope() {
-        let remote = normalized_remote(
-            Some("git@git.example.test:acme/platform/api.git"),
-            Some("git@github.com:personal/api.git"),
-        )
-        .unwrap();
-        assert_eq!(remote, "git.example.test/acme/platform/api");
+    fn a_remote_checkout_resolves_to_the_scope_every_client_uses() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("checkout");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://github.com/acme/api.git"],
+        );
+        let (workspace, project) =
+            crate::commands::resolve_scope_for_path(&Config::default(), &repo).unwrap();
         assert_eq!(
-            suggestions_from_remote(&remote),
-            Some(Suggestions {
-                workspace: "platform".to_owned(),
-                project: "api".to_owned(),
-            })
+            (workspace.as_str(), project.as_str()),
+            ("default", "acme-api")
         );
     }
 
+    /// An ancestor marker's workspace is inherited, so the suggestion keeps it.
     #[test]
-    fn origin_is_used_when_upstream_is_not_a_remote_identity() {
-        assert_eq!(
-            normalized_remote(Some("../parent"), Some("https://github.com/acme/api.git")),
-            Some("github.com/acme/api".to_owned())
-        );
+    fn an_ancestor_workspace_marker_is_inherited() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(MARKER_FILENAME), "workspace = \"team\"\n").unwrap();
+        let repo = temp.path().join("service");
+        std::fs::create_dir(&repo).unwrap();
+        let (workspace, _) =
+            crate::commands::resolve_scope_for_path(&Config::default(), &repo).unwrap();
+        assert_eq!(workspace, "team");
     }
 
+    /// Only the scope is written; every other key keeps the server default.
     #[test]
-    fn ownerless_remote_uses_default_workspace() {
-        assert_eq!(
-            suggestions_from_remote("github.com/api"),
-            Some(Suggestions {
-                workspace: "default".to_owned(),
-                project: "api".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn directories_without_git_use_parent_and_current_name() {
-        let dir = Path::new("/work/team/service");
-        assert_eq!(
-            suggestions_for(dir, false, None),
-            Suggestions {
-                workspace: "team".to_owned(),
-                project: "service".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn git_checkout_without_remote_uses_default_and_root_name() {
-        let dir = Path::new("/work/team/service");
-        assert_eq!(
-            suggestions_for(dir, true, None),
-            Suggestions {
-                workspace: "default".to_owned(),
-                project: "service".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn root_fallbacks_are_stable() {
-        assert_eq!(
-            suggestions_for(Path::new("/"), false, None),
-            Suggestions {
-                workspace: "default".to_owned(),
-                project: "project".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn marker_body_matches_the_interactive_template() {
+    fn the_marker_holds_only_the_scope() {
         assert_eq!(
             render_marker("acme", "api"),
-            "workspace = \"acme\"\nproject = \"api\"\n\n[recall]\ndefault_global = false\n\n[profile]\ncontribute = false\nconsume = false\n\n[briefing]\ninject_on_session_start = true\nmax_chars = 4000\n"
+            "workspace = \"acme\"\nproject = \"api\"\n"
         );
     }
 
@@ -274,27 +216,45 @@ mod tests {
         let mut input = Cursor::new(b"team\napi\n");
         let mut output = Vec::new();
 
-        initialize(temp.path(), &mut input, &mut output).unwrap();
+        initialize(
+            temp.path(),
+            &suggest("default", "x"),
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(temp.path().join(MARKER_FILENAME)).unwrap(),
             render_marker("team", "api")
         );
         assert!(String::from_utf8(output).unwrap().contains("Created "));
+        // No temporary sibling is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != MARKER_FILENAME)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
     fn initialize_accepts_the_suggested_values_on_empty_input() {
         let temp = tempfile::tempdir().unwrap();
-        let suggestions = suggestions_for(temp.path(), false, None);
         let mut input = Cursor::new(b"\n\n");
         let mut output = Vec::new();
 
-        initialize(temp.path(), &mut input, &mut output).unwrap();
+        initialize(
+            temp.path(),
+            &suggest("default", "acme-api"),
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(temp.path().join(MARKER_FILENAME)).unwrap(),
-            render_marker(&suggestions.workspace, &suggestions.project)
+            render_marker("default", "acme-api")
         );
     }
 
@@ -320,19 +280,26 @@ mod tests {
         let mut input = Cursor::new(b"team\napi\n");
         let mut output = Vec::new();
 
-        initialize(&nested, &mut input, &mut output).unwrap();
+        initialize(&nested, &suggest("default", "x"), &mut input, &mut output).unwrap();
 
         assert!(worktree.join(MARKER_FILENAME).is_file());
         assert!(!main.join(MARKER_FILENAME).exists());
+        assert!(String::from_utf8(output).unwrap().contains("Commit it"));
     }
 
     #[test]
-    fn initialize_reprompts_for_slash_values() {
+    fn initialize_reprompts_for_names_that_need_escaping() {
         let temp = tempfile::tempdir().unwrap();
-        let mut input = Cursor::new(b"team/api\nteam\napi/service\napi\n");
+        let mut input = Cursor::new(b"team/api\nmy team\nteam\napi\\x\napi\n");
         let mut output = Vec::new();
 
-        initialize(temp.path(), &mut input, &mut output).unwrap();
+        initialize(
+            temp.path(),
+            &suggest("default", "x"),
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(temp.path().join(MARKER_FILENAME)).unwrap(),
@@ -341,9 +308,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(output)
                 .unwrap()
-                .matches("without '/'.")
+                .matches("Enter a non-empty name")
                 .count(),
-            2
+            3
         );
     }
 
@@ -355,7 +322,13 @@ mod tests {
         let mut input = Cursor::new(b"team\napi\n");
         let mut output = Vec::new();
 
-        let error = initialize(temp.path(), &mut input, &mut output).unwrap_err();
+        let error = initialize(
+            temp.path(),
+            &suggest("default", "x"),
+            &mut input,
+            &mut output,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("refusing to overwrite"));
         assert_eq!(
@@ -365,13 +338,32 @@ mod tests {
         assert!(output.is_empty());
     }
 
+    /// A marker that appears between the check and the write is not replaced.
+    #[test]
+    fn the_write_never_replaces_a_marker_that_appeared_meanwhile() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join(MARKER_FILENAME);
+        std::fs::write(&marker, "workspace = \"raced\"\n").unwrap();
+        assert!(write_new_marker(&marker, "workspace = \"new\"\n").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "workspace = \"raced\"\n"
+        );
+    }
+
     #[test]
     fn initialize_aborts_on_end_of_input_without_creating_a_marker() {
         let temp = tempfile::tempdir().unwrap();
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
 
-        let error = initialize(temp.path(), &mut input, &mut output).unwrap_err();
+        let error = initialize(
+            temp.path(),
+            &suggest("default", "x"),
+            &mut input,
+            &mut output,
+        )
+        .unwrap_err();
 
         assert_eq!(error.to_string(), "aborted (no input)");
         assert!(!temp.path().join(MARKER_FILENAME).exists());

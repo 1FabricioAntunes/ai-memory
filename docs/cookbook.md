@@ -497,6 +497,7 @@ ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
 ai-memory recover                    # replay outage spool/transcripts safely
 ai-memory list-projects              # every workspace/project the server knows about
+ai-memory project init               # pin this checkout's scope in a .ai-memory.toml
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
 ai-memory write-page …               # save a durable page
