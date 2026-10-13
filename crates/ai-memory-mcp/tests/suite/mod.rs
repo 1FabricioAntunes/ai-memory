@@ -36,6 +36,7 @@ mod query_pin_first;
 mod query_reasoning;
 mod query_superseded;
 mod read_page_related;
+mod recap_identity;
 mod retrieval_via_tools;
 mod slot_identity;
 mod stress_autoscope;
