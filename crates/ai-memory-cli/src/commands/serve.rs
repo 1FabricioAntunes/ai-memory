@@ -5332,6 +5332,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
+            store.reader.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),
