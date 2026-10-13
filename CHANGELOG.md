@@ -11,6 +11,8 @@ and [0.x](docs/changelog/0.x.md).
 
 ## [Unreleased]
 
+## [2.6.7] - 2026-10-13
+
 ### Deprecated
 
 - The 1.x compatibility-token commands `user add`, `user expire`,
@@ -4622,7 +4624,8 @@ and [0.x](docs/changelog/0.x.md).
   ai-memory's own entries. Legacy ai-memory script and native hook commands
   remain recognized by their specific hook signatures.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.7...HEAD
+[2.6.7]: https://github.com/akitaonrails/ai-memory/compare/v2.6.6...v2.6.7
 [2.6.6]: https://github.com/akitaonrails/ai-memory/compare/v2.6.5...v2.6.6
 [2.6.5]: https://github.com/akitaonrails/ai-memory/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...v2.6.4
