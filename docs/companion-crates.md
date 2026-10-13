@@ -78,11 +78,12 @@ the public MCP write/delete tools. It must never open the wiki directory or
 SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
 MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
 
-Slice 1 (read-only export), slice 3 (two-way sync through the MCP write
-tool), slice 4 (conditional writes and opt-in deletes) and slice 5 (the CI
-check and post-merge hook) ship as
+All five slices of #986 have shipped. Slice 1 (read-only export) came first,
+in 2.x. Slice 2 (the compare-and-write seam in core), slice 3 (two-way sync
+through the MCP write tool), slice 4 (conditional writes and opt-in deletes)
+and slice 5 (the CI check and post-merge hook) ship in 3.0. The companion is
 [`ai-memory-wikisync`](#ai-memory-wikisync-team-wiki-export-and-sync)
-below; the remaining slices are tracked in #986.
+below.
 
 ## `ai-memory-client`: shared private capture privacy
 

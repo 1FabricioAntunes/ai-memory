@@ -29,7 +29,11 @@ For the full list of changes, see the 3.0.0 section of
    reinstall it.
 4. If you use the `ai-memory-wikisync` or `ai-memory-importer` companions,
    upgrade the server first. Their 3.0 versions refuse to write to a server
-   older than 3.0.
+   older than 3.0. The first `ai-memory-wikisync` run after the upgrade
+   rewrites unedited files from an earlier export so they carry the new
+   frontmatter.
+5. The Claude Code and Codex marketplace plugins need ai-memory 3.0 or later.
+   Upgrade the binary before you install them.
 
 ## Upgrade steps
 
@@ -103,6 +107,10 @@ running without auth after the upgrade. To turn it on, run
 file, gives it to the installed hooks, and re-registers the MCP clients that
 point at this server. `ai-memory status` and `ai-memory doctor` now print the
 server's auth posture.
+
+A browser that signs in to the web UI with HTTP Basic no longer gets an
+`ai_memory_auth` cookie. A cookie a 2.x server set keeps working until human
+auth is enabled.
 
 ### `memory_query` searches observations by default
 

@@ -351,6 +351,7 @@ covers the same tests, slower, no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
+  `tests/hooks/test_plugin_launcher.sh`, `tests/install_sh.sh`,
   `tests/e2e/handoff_smoke.sh`, `tests/wrapper_upgrade.sh`,
   `tests/e2e/external_relay_smoke.py`, `scripts/check-native-packaging.sh`,
   `scripts/check-nix-packaging.sh` (Nix flake output),

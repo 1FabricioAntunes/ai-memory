@@ -37,8 +37,19 @@ and [0.x](docs/changelog/0.x.md).
   hidden `ai-memory render-plugins`, with a test that fails when the
   committed files drift from it. When Claude settings-file hooks and the
   plugin are both installed, the settings hooks win and the plugin skips the
-  events they deliver; sessions with no project folder are not captured
-  through the plugin. `setup` and `ai-memory run` no longer write settings
+  events they deliver, but only a settings hook with a catch-all matcher
+  (empty, `*` or absent) counts; sessions with no project folder are not
+  captured through the plugin. Droid running the Claude Code plugin gets the
+  same treatment: the plugin skips folderless sessions and the events
+  `install-hooks --agent droid` already delivers. The Claude Code hooks start
+  the launcher with `sh`, a relative `ai_memory_bin` option is ignored, and
+  the plugin trees and every `*.sh` are pinned to LF line endings. With no
+  server URL set, the launcher omits `--server-url`; a binary older than 3.0
+  rejects that, so the launcher retries it once against
+  `http://127.0.0.1:49374` and prints an upgrade hint. The plugins need
+  ai-memory 3.0 or later. On Windows, Codex calls `ai-memory hook` directly
+  without the launcher, so folderless sessions are captured there and a
+  missing binary goes unreported; `docs/install.md` records this. `setup` and `ai-memory run` no longer write settings
   hooks, MCP entries or skills for an agent whose plugin is enabled;
   `doctor` reports each plugin, version skew, double wiring and Codex plugin
   hooks Codex skips; `upgrade` also updates the Claude Code plugin;
@@ -58,11 +69,9 @@ and [0.x](docs/changelog/0.x.md).
   raw score and RRF contribution in every stream, the fused score, the
   authority multiplier, and the intent boost and rerank score when present;
   the page also lists the streams that ran, the embedder and reranker in use,
-  and each stream's time in milliseconds. A scoped `/api/v1/search` (one
-  project or `scopes`) uses the same ranker, so it returns the same order as
-  `memory_query`, and its `rank` is now the fused rank. A search without a
-  scope is still the cross-project FTS5 search, as `memory_query(global=true)`
-  is. Project search follows the per-project read rule: a viewer without a
+  and each stream's time in milliseconds. A web search without a scope is
+  still the cross-project FTS5 search, as `memory_query(global=true)` is.
+  Project search follows the per-project read rule: a viewer without a
   grant on a restricted project gets a 403 and no trace, and an unknown project
   is a 404.
 - Added a root-only server health page at `/web/health`, linked from the web UI
@@ -85,7 +94,10 @@ and [0.x](docs/changelog/0.x.md).
   `install.sh.sha256`. It downloads the release tarball for the machine, checks
   it against the published `.sha256` file and refuses to install when that file
   is missing, names another asset or does not match, or when the archive holds
-  an absolute or `..` path. It unpacks under `~/.local/lib/ai-memory`, links
+  an absolute or `..` path or a symlink or hard-link member. Its `wget`
+  fallback for the default GitHub URL runs only with `--https-only` and
+  refuses a `wget` that lacks the flag. It unpacks under
+  `~/.local/lib/ai-memory` without restoring file ownership, links
   `~/.local/bin/ai-memory`, needs no root, leaves an existing non-link
   `ai-memory` (such as the Docker wrapper) alone, and runs nothing when the
   download is cut short. The new `ai-memory setup [--yes] [--agent <name>]...
@@ -94,11 +106,16 @@ and [0.x](docs/changelog/0.x.md).
   user unit or launchd LaunchAgent with this install's binary, data dir and
   config, wires MCP, hooks and global Agent Skills for each named or detected
   agent, and ends with a read-only check of `/healthz`, `memory_status` and
-  `doctor`. It shows the plan and asks first; without a terminal it changes
-  nothing unless given `--yes`. A second run changes nothing. Windows has no
-  service step. `ai-memory uninstall --apply` stops and removes that service,
-  but only a unit `setup` wrote and nobody edited since; any other unit at that
-  path is left alone and reported. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
+  `doctor`. The unit names a stable path to the binary (the invoked path, an
+  `ai-memory` on `PATH`, or Homebrew's `opt/bin` link) when the resolved
+  binary sits in a versioned Homebrew Cellar or `/nix/store` path, so the
+  service survives an upgrade or garbage collection. It shows the plan and
+  asks first; without a terminal it changes nothing unless given `--yes`. A
+  second run changes nothing. Windows has no service step. `ai-memory
+  uninstall --apply` stops and removes that service, but only a unit `setup`
+  wrote and nobody edited since; any other unit at that path is left alone
+  and reported. With `--purge-data`, uninstall refuses a live ai-memory
+  process before it stops the service. `INSTALL_FOR_AGENTS.md` tells an AI agent how to install
   ai-memory for its user, and `scripts/onboarding-acceptance.sh` measures the
   path from a clean home to the first returned memory.
 - Added page history and session replay to the read-only web UI. Each page
@@ -122,9 +139,13 @@ and [0.x](docs/changelog/0.x.md).
   `ai-memory-web` crate now has a `clippy.toml` that forbids the `Wiki` write
   and destructive methods, so a write path in the web UI or `/api/v1` fails
   `cargo clippy -D warnings`.
-- Added an observation stream to `memory_query` ranking:
-  `[retrieval] observation_stream` (env
-  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM`, on by default). A zero-LLM
+- Added an observation stream to `memory_query` ranking, on by default
+  because it raised hit@5 on the retrieval eval for both zero-LLM and
+  local-embedding search while staying inside its latency and context-token
+  budgets. To keep the previous ranking, set `[retrieval]
+  observation_stream = false` (or
+  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`); ranking is then identical
+  to before. A zero-LLM
   session page keeps only a short excerpt of each turn, so the detail a
   question asks about often lives only in the session's observations. With the
   flag on, project and `scopes` searches also run full-text search over
@@ -136,8 +157,12 @@ and [0.x](docs/changelog/0.x.md).
   only shares topic words in its titles cannot outvote the session holding
   the answer. When page search did not
   match the page itself, the matching excerpt becomes the hit's snippet, and
-  `explain=true` reports an `observation` stream with the matched observation
-  ids. Hits are still pages and nothing is written; sessions without a page
+  `explain=true` lists `observation` in `streams_active` whenever the stream
+  runs and reports the matched observation ids. The excerpt and the ids are
+  shown only when the caller may read that session's timeline; another
+  operator's observations still vote for the shared session page. The stream
+  finds the project's observation range with an index seek. Hits are still
+  pages and nothing is written; sessions without a page
   keep the `raw_hits` fallback, and `global=true` search is unchanged.
 - Added a root-only `GET /admin/metrics` endpoint in Prometheus text format.
   It exposes the hook admission and delivery counters, MCP tool calls split
@@ -170,7 +195,7 @@ and [0.x](docs/changelog/0.x.md).
   quit from anything else, and the zero-LLM session page closes its summary
   with `ended (<reason>)`. Payloads without a reason are stored as before.
   (#1225)
-- The web UI shows pending cross-project mail. Project cards carry an amber
+- Added pending cross-project mail to the web UI. Project cards carry an amber
   `N inbox` badge when messages are waiting for an agent in that project, the
   home page summarises the total and links the projects holding mail, and the
   project page gains a read-only Mailbox section listing up to five of them
@@ -178,8 +203,8 @@ and [0.x](docs/changelog/0.x.md).
   empty state when there are none. A sender the viewer may not read is shown as
   "a project you cannot read", and the page never pops or cancels a message.
   (#1202)
-- `install-mcp --client prime-agent` registers ai-memory with Prime Agent
-  (PrimeIntellect-ai/prime-agent), merging an HTTP entry into the `mcpServers`
+- Added `install-mcp --client prime-agent`, which registers ai-memory with
+  Prime Agent (PrimeIntellect-ai/prime-agent), merging an HTTP entry into the `mcpServers`
   map of `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default
   `~/.prime/agent/settings.json`) and preserving other settings and servers.
   With a token the entry names `"bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"`
@@ -188,9 +213,9 @@ and [0.x](docs/changelog/0.x.md).
   OAuth grant), so export it where you launch `prime-agent`. Without a token
   the server is still callable through `mcp.call_tool("ai-memory", ...)` but is
   not listed. MCP-only: Prime Agent 0.10 has no lifecycle hooks. (#1163)
-- `memory_write_page` accepts `expected_page_id` (write only if that is still
-  the page's latest version) or `create_only` (write only if the page does not
-  exist), and `memory_delete_page` accepts `expected_page_id`. A precondition
+- Added `expected_page_id` (write only if that is still the page's latest
+  version) and `create_only` (write only if the page does not exist) to
+  `memory_write_page`, and `expected_page_id` to `memory_delete_page`. A precondition
   that no longer holds fails with `reason: "precondition_failed"` and the
   current version, and changes nothing. `memory_read_page` returns the version
   as `page_id` and `/api/v1` pages as `id`. This is the compare-and-write the
@@ -203,7 +228,7 @@ and [0.x](docs/changelog/0.x.md).
   after each merge: a dry-run report unless `--on-merge apply`, never with
   `--prefer`, and never with a stored token. The cookbook has a GitHub
   Actions recipe. (#986)
-- The `ai-memory-wikisync` companion now propagates deletes with
+- Added delete propagation to the `ai-memory-wikisync` companion with
   `sync --propagate-deletes` (#986, slice 4): a file deleted in the repository
   deletes its server page through `memory_delete_page`, and a page deleted on
   the server deletes its file, when the other side is unchanged since the last
@@ -214,8 +239,8 @@ and [0.x](docs/changelog/0.x.md).
   reported and left alone while the rest apply, and `sync --apply` refuses a
   server older than 3.0. Without the flag deletes are still only reported.
   (#986)
-- `ai-memory doctor` now reports three silent capture failures: an unreachable
-  server (reported instead of aborting the check), a hook spool that is full and
+- Changed `ai-memory doctor` to report three silent capture failures: an
+  unreachable server (reported instead of aborting the check), a hook spool that is full and
   evicting undelivered events, and installed ai-memory Codex hooks that Codex
   skips because they are untrusted or changed since they were trusted (asked
   of Codex itself through `codex app-server`). `ai-memory status` no longer says
@@ -227,9 +252,11 @@ and [0.x](docs/changelog/0.x.md).
   `--prefer repo` or `--prefer server`; deletes are reported, not synced.
   It is a dry-run without `--apply`, refuses files without frontmatter,
   refuses to overwrite server pages whose metadata a write would clear, and
-  re-reads each page right before writing it. (#1164)
-- `finalize-session --agent antigravity-cli` now replays the session's typed
-  prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
+  re-reads each page right before writing it. An export, or an import's
+  rewrite of the repository file, is skipped and reported when that file
+  changed during the run, and the run exits non-zero. (#1164)
+- Changed `finalize-session --agent antigravity-cli` to replay the session's
+  typed prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
   live Antigravity sessions, whose hooks carry no prompt event, get a summary
   page titled by the first prompt, a handoff with "Started/Last", and prompts
   that `memory_query` and `memory_recent` can find. Only lines whose
@@ -238,8 +265,8 @@ and [0.x](docs/changelog/0.x.md).
   prompt typed after the first finalize arrives with the next one. A checkout
   the capture allowlist does not admit and `--all-owners` runs replay nothing,
   and a missing `history.jsonl` only warns. (#1160)
-- `ai-memory run` accepts `copilot` (alias `copilot-cli`) and manages GitHub
-  Copilot CLI as a workstream harness: a fresh session gets a generated
+- Added `copilot` (alias `copilot-cli`) to `ai-memory run`, which manages
+  GitHub Copilot CLI as a workstream harness: a fresh session gets a generated
   `--session-id`, a returning one is resumed with `--resume=<id>`, user
   selectors (`--resume`, `--continue`, `--session-id`, `--connect`) win,
   utility subcommands pass through, and `--yolo` maps to Copilot's native
@@ -249,7 +276,7 @@ and [0.x](docs/changelog/0.x.md).
   and the existing SessionStart hook delivers the workstream context. The
   first managed launch auto-wires Copilot's hooks and MCP, and `doctor` now
   counts its local sessions. Verified against Copilot CLI 1.0.92. (#1040)
-- GitHub Copilot CLI is now a first-class routing target:
+- Made GitHub Copilot CLI a first-class routing target:
   `install-skills --agent copilot-cli` (and `install-instructions
   --skills-agent copilot-cli`) writes the managed Agent Skills to the
   repository's `.github/skills` or, globally, to `$COPILOT_HOME/skills`
@@ -269,7 +296,10 @@ and [0.x](docs/changelog/0.x.md).
   and recovery replay now use reserved `recovery_*` idempotency keys, so
   re-running `backfill --force` over sessions imported by ai-memory ≤2.6.0 (or
   plain-backfilling a recovery-replayed session) can duplicate those older
-  observations. (#1125)
+  observations. Every spool drain path deletes an event the server answered
+  `dropped_*` or `resumed` instead of re-sending it each pass, and a hook
+  that finds the spool's capacity lock busy waits up to 50 ms and then spools
+  the event anyway. (#1125)
 - Added `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` for the `openai-compat`
   provider (opt-in, off by default, ignored by every other provider): when
   set, every chat request carries
@@ -280,7 +310,9 @@ and [0.x](docs/changelog/0.x.md).
   Agent CLI (`agent --print --mode ask`) so a Cursor subscription can drive
   summaries without an API key. The default model is `cursor-grok-4.6-high`
   ("Grok 4.6"). `AI_MEMORY_CURSOR_AGENT` overrides the binary. The provider never passes
-  `--yolo` or `--force`, because the prompt is captured session text. (#1127)
+  `--yolo` or `--force`, because the prompt is captured session text, and
+  runs `agent` with an allowlisted environment, so it never inherits
+  `AI_MEMORY_AUTH_TOKEN` or provider keys. (#1127)
 - Added `applies_to` and `enforced_by` arguments to `memory_write_page`, and
   `--applies-to` / `--enforced-by` to `ai-memory write-page`, for profile
   entries. Both fields were documented as profile-entry frontmatter, but no
@@ -299,8 +331,8 @@ and [0.x](docs/changelog/0.x.md).
   a Cordis profile patch rather than a fixed config file, so the command prints a
   ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
   refuses `--apply`. (#1193)
-- The `ai-memory-importer` companion imports agentmemory data. `agentmemory-vault`
-  reads its Obsidian vault export; `agentmemory-export` reads its `ExportData`
+- Added agentmemory import to the `ai-memory-importer` companion.
+  `agentmemory-vault` reads its Obsidian vault export; `agentmemory-export` reads its `ExportData`
   JSON file, from disk only, and needs a mapping file from agentmemory's
   project names (or exact session working directories) to ai-memory
   workspaces and projects. `--apply` refuses to run while any record is
@@ -316,8 +348,8 @@ and [0.x](docs/changelog/0.x.md).
   `--replay-observations` replays them as `external-import` sessions through
   `/hook/batch`, and records with no ai-memory counterpart are counted in the
   manifest. The cookbook has a "Coming from agentmemory" section.
-- `ai-memory doctor` reports agentmemory configuration left behind after a
-  migration: an MCP server entry in any harness config `install-mcp` knows (or
+- Added an agentmemory residue check to `ai-memory doctor`. It reports
+  agentmemory configuration left behind after a migration: an MCP server entry in any harness config `install-mcp` knows (or
   in a project's `.mcp.json`, `.cursor/mcp.json`, `.gemini/settings.json` or
   `.vscode/mcp.json`), and agentmemory guideline blocks in rules files such as
   `AGENTS.md`, `GEMINI.md`, `.cursor/rules/` and `.kiro/steering/`. It names
@@ -360,7 +392,7 @@ and [0.x](docs/changelog/0.x.md).
   patch too). Only ZCode, whose config keeps HTTP entries only, is refused with
   the manual option. `uninstall` recognises these entries.
   `install-hooks --apply` stores the token in the hook credential files only.
-- `ai-memory status` and `ai-memory doctor` now show the server's auth
+- Changed `ai-memory status` and `ai-memory doctor` to show the server's auth
   posture, and for an unauthenticated loopback server print
   `auth: none (loopback)` with the fix, `ai-memory auth enable`.
 - Added a server-side drop list for tool events: `[ingest]
@@ -440,9 +472,8 @@ and [0.x](docs/changelog/0.x.md).
   `scopes`) to rank with the same hybrid ranker as `memory_query` instead of
   FTS5 alone, so it returns the same order as `memory_query`, and `rank` is
   now the fused rank. Cross-project search without a scope is unchanged.
-- Documented hand-written MCP recipes for Factory Droid, Warp, Cline, Kilo
-  Code, Goose, Qwen Code and OpenHuman in `docs/install.md`, and listed them
-  in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
+- Documented hand-written MCP recipes for Warp, Cline, Kilo Code, Goose,
+  Qwen Code and OpenHuman in `docs/install.md`, and listed them in `docs/support-matrix.md` as `MCP-only (documented)`: each recipe follows
   the client's own documentation at a named version and has not yet been run
   end to end. Aider is not listed because it has no MCP support.
 - Published `docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md`, which
@@ -457,14 +488,6 @@ and [0.x](docs/changelog/0.x.md).
   figure is 95.2% from a component harness with the reranker disabled, not
   like-for-like with ai-memory's pipeline numbers. `docs/comparison.md` gains a
   "From agentmemory" migration note.
-- Changed `memory_query` ranking to include the observation stream by
-  default, after it raised hit@5 on the retrieval eval for both zero-LLM and
-  local-embedding search while staying inside its latency and context-token
-  budgets. `explain=true` lists `observation` in
-  `streams_active` whenever it runs. To keep the previous ranking, set
-  `[retrieval] observation_stream = false` (or
-  `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`); ranking is then identical
-  to before.
 - Changed `ai-memory init` on a fresh data dir (no config file and no
   database yet) to create a root bearer token at
   `<data_dir>/auth-tokens/default` and record `[auth] bearer_token_file`, so
@@ -478,7 +501,8 @@ and [0.x](docs/changelog/0.x.md).
   server's credential. The Docker wrapper hands a host command (`install-hooks`,
   `mcp-bridge`, `run`) the token of a server initialized on its volume as an
   owner-only file that `install-hooks` copies from the volume, never on a
-  command line. With no human accounts the built-in web UI answers a browser
+  command line. The wrapper deletes that host copy when `install-hooks` finds
+  no token in the volume and after a successful `uninstall --apply`. With no human accounts the built-in web UI answers a browser
   with a Basic sign-in prompt instead of redirecting to a login form that
   could not succeed: any username, and the token file's contents as the
   password. `ai-memory setup` prints that URL and the file to read, never the
@@ -542,6 +566,17 @@ and [0.x](docs/changelog/0.x.md).
   on the hook path. When no client is installed yet, the wrapper says to run
   `ai-memory install-hooks` once, skips the event and exits 0, so the agent
   is never blocked.
+
+### Security
+- Fixed HTTP Basic sign-in to the web UI minting a 30-day `ai_memory_auth`
+  cookie that held the root bearer token. Basic sign-in sets no cookie now;
+  a cookie set by an older build keeps working until human auth is enabled.
+- Fixed `memory_query`, `/web/search` and `/api/v1/search` showing another
+  operator's captured observations on a multi-user server. Observation
+  excerpts, the observation ids in `explain`, and raw-observation fallback
+  hits now come only from sessions the caller may read under the
+  session-timeline owner rule. Another operator's observations still rank
+  shared session pages.
 
 ## [2.6.6] - 2026-10-13
 

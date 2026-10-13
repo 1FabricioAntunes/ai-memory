@@ -286,7 +286,7 @@ invariants), **ALREADY** (we have it and should say so).
 | Larger capture caps | Keep ours (2 KB / 16 KiB) | Privacy boundary (invariant 6); the decomposition showed the caps were not the cause (pages holding exactly the captured text scored 0.968) |
 | PaaS deploy templates (Fly, Railway, Render, Coolify) | DECLINE for now (a demand-gated docs recipe at most) | Non-loopback already refuses to run without auth; a hosted path is not our product |
 | Redis or other external store backends | DECLINE | Invariants 2 and 3 (single-writer SQLite; indexes in the same transaction) and markdown as truth |
-| Harness long tail (Droid, Warp, Cline, Kilo, Goose, Qwen Code, Aider, …) | SHIPPED (3.0) as MCP recipes for seven more clients; hooks only where the harness has a lifecycle API (Droid accepted, #1240) | Any MCP client reaches us over HTTP |
+| Harness long tail (Droid, Warp, Cline, Kilo, Goose, Qwen Code, Aider, …) | SHIPPED (3.0) as MCP recipes for six more clients (Warp, Cline, Kilo Code, Goose, Qwen Code, OpenHuman), plus first-class Droid; hooks only where the harness has a lifecycle API (Droid accepted, #1240) | Any MCP client reaches us over HTTP |
 | Image / vision memory | DECLINE | Off-mission; the sanitizer boundary is text-only |
 | Bidirectional bridge with a harness's own `MEMORY.md` | DECLINE (bidirectional); one-way import ADOPT | Two sources of truth contradict our routing rule against harness-local stores |
 | Obsidian vault export | ALREADY | The wiki is already markdown in git; open `<data_dir>/wiki/<ws>/<project>` as a vault |
@@ -393,7 +393,8 @@ next to Caura's trust tiers.
   root-only health panel in the web UI; explain timings and a content-free
   `/admin/metrics`; auth on by default for new installs with `auth enable`
   for existing ones; a two-command native install for Linux and macOS
-  (`install.sh` + `ai-memory setup`); MCP recipes for seven more clients; an importer for
+  (`install.sh` + `ai-memory setup`); MCP recipes for six more clients (Warp, Cline,
+  Kilo Code, Goose, Qwen Code, OpenHuman), plus first-class Droid; an importer for
   agentmemory's vault and export plus a `doctor` check for its leftovers; and
   git-based wiki sync (`ai-memory-wikisync`).
 - **The real weakness was retrieval through capture**, and it was

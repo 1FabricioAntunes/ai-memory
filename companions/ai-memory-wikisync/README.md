@@ -240,5 +240,5 @@ ai-memory-wikisync uninstall-hook --dest docs/wiki [--hooks-dir DIR]
    write tool.
 4. Deletes and conflict reporting (`--propagate-deletes`, conditional
    writes).
-5. This release: post-merge hook and CI integration (`install-hook`,
-   `sync --check`).
+5. Post-merge hook and CI integration (`install-hook`, `sync --check`)
+   (ai-memory 3.0).

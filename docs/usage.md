@@ -300,8 +300,12 @@ Omitted fields do not inherit the previous version; empty entity lists and
 relation objects clear those fields. Empty `kind` or `abstract` strings omit
 those keys. Existing requests without the new fields remain valid, including
 the admin's existing top-level `kind`. Arbitrary frontmatter, scope and author
-fields are never copied from metadata. This is an unconditional replacement;
-it provides no patch or compare-and-write precondition.
+fields are never copied from metadata. Without `expected_page_id` or
+`create_only` the write is an unconditional replacement. Only
+`memory_write_page` accepts those preconditions; `POST /admin/write-page` has
+neither. See
+[Change a page only if nobody else has](programmatic-memory.md#change-a-page-only-if-nobody-else-has)
+for conditional writes.
 
 ## Install the routing snippet and Agent Skills
 
