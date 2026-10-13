@@ -14,13 +14,13 @@ and [0.x](docs/changelog/0.x.md).
 ### Added
 - Added kind and tier filters to the web search. The search page in `/web`
   has "Kind" and "Tier" selects, and `/web/search` accepts `kind` and `tier`
-  for both a project search and a cross-project one. A filtered search looks
-  through up to 500 candidates per stream rather than the first page of
-  results and says so when the ranker had more, so a rare kind is not crowded
-  out. A project search filters inside the ranker, before the reranker, so
-  the reranker scores only pages the filter keeps. The kind match ignores
-  case and a nonstandard kind is flagged on an empty result. An unknown
-  `tier` is a 400. (#1248)
+  for both a project search and a cross-project one. Every retrieval stream
+  applies the filter in its own query, so other kinds cannot crowd out a rare
+  one, a filtered search asks the streams for no more candidates than an
+  unfiltered one, and the
+  reranker scores only pages the filter keeps. Kind and tier both ignore
+  case, a nonstandard kind is flagged on an empty result, and "Search all
+  projects" keeps the filters. An unknown `tier` is a 400. (#1248)
 - Added backlinks, outgoing links and an outline to the web page view. A page
   in `/web` now has a side column (below the text on narrow screens) with "On
   this page", the h2 and h3 headings linked to their anchors (shown from two

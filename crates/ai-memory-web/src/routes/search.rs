@@ -12,19 +12,16 @@
 //!   viewer may read, as `memory_query(global=true)` does. Its trace is the
 //!   FTS time alone; there are no per-hit streams to show.
 //!
-//! `kind` and `tier` narrow either mode after fusion, inside the ranker. The
-//! streams are asked for a wider candidate pool so a rare kind is not crowded
-//! out, which means the order of the survivors can differ slightly from the
-//! unfiltered top hits of the same query.
+//! `kind` and `tier` narrow either mode inside each stream's SQL, so a rare
+//! kind is never crowded out by other kinds. Survivors are ranked among
+//! themselves, so their order can differ slightly from the unfiltered hits of
+//! the same query, and graph expansion seeds only from pages the filter keeps.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_core::Tier;
-use ai_memory_store::{
-    FILTER_CANDIDATE_POOL, PAGE_KINDS, PageFilter, SearchExplain, StreamTimings,
-};
+use ai_memory_store::{PAGE_KINDS, PageFilter, SearchExplain, StreamTimings};
 use askama::Template;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -44,8 +41,6 @@ const GLOBAL_DEFAULT_LIMIT: usize = 50;
 const SCOPED_DEFAULT_LIMIT: usize = 20;
 /// Upper bound on `limit`, the same clamp `memory_query` applies.
 const MAX_LIMIT: usize = 100;
-/// Memory tiers the filter offers, in `Tier` declaration order.
-const TIERS: [&str; 4] = ["working", "episodic", "semantic", "procedural"];
 
 /// Query-string parameters for the search endpoint.
 #[derive(Debug, Deserialize)]
@@ -127,30 +122,28 @@ pub(crate) async fn handler(
         },
     };
     let kind = non_empty(params.kind.as_deref()).map(str::to_owned);
+    // Matched like `kind`, ignoring ASCII case; the canonical name is what
+    // the SQL compares.
     let tier = match non_empty(params.tier.as_deref()) {
-        Some(value) if Tier::from_str(value).is_ok() => Some(value.to_owned()),
-        Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "tier must be working, episodic, semantic or procedural",
-            )
-                .into_response();
-        }
+        Some(value) => match Tier::ALL
+            .iter()
+            .find(|t| t.as_str().eq_ignore_ascii_case(value))
+        {
+            Some(t) => Some(t.as_str()),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "tier must be working, episodic, semantic or procedural",
+                )
+                    .into_response();
+            }
+        },
         None => None,
     };
     let filtered = kind.is_some() || tier.is_some();
     let filter = PageFilter {
         kind: kind.as_deref(),
-        tier: tier.as_deref(),
-    };
-    // The global search has no ranker-side filter, so a filtered one is asked
-    // for a wide pool and the limit is applied to what survives.
-    let fetch_limit = |limit: usize| {
-        if filtered {
-            FILTER_CANDIDATE_POOL
-        } else {
-            limit + 1
-        }
+        tier,
     };
     let internal = |error: ai_memory_store::StoreError| {
         tracing::error!(%error, "web search failed");
@@ -162,8 +155,6 @@ pub(crate) async fn handler(
     // apart from one that has exactly `limit` matches.
     let mut limit_used = 0;
     let mut truncated = false;
-    // The filter saw a full pool, so matches ranked past it were not looked at.
-    let mut pool_capped = false;
     let mut timings = None;
     let mut streams_active: Vec<&'static str> = Vec::new();
     match &scope {
@@ -195,7 +186,6 @@ pub(crate) async fn handler(
                 };
                 timings = result.timings;
                 streams_active = result.streams_active;
-                pool_capped = result.filter_pool_full;
                 truncated = result.hits.len() > limit;
                 // The trace position is the rank among the hits shown.
                 for (position, (hit, details)) in result.hits.into_iter().take(limit).enumerate() {
@@ -223,7 +213,7 @@ pub(crate) async fn handler(
             let started = explain.then(std::time::Instant::now);
             let raw = match state
                 .reader
-                .search_pages_with_meta(query.clone(), fetch_limit(limit), None, viewer)
+                .search_pages_with_meta(query.clone(), limit + 1, None, viewer, filter)
                 .await
             {
                 Ok(raw) => raw,
@@ -236,11 +226,6 @@ pub(crate) async fn handler(
                 });
                 streams_active = vec!["fts"];
             }
-            pool_capped = filtered && raw.len() >= FILTER_CANDIDATE_POOL;
-            let raw: Vec<_> = raw
-                .into_iter()
-                .filter(|h| filter.keeps(&h.kind, &h.tier))
-                .collect();
             truncated = raw.len() > limit;
             for h in raw.into_iter().take(limit) {
                 let path = h.path.as_str().to_owned();
@@ -296,8 +281,16 @@ pub(crate) async fn handler(
         .unwrap_or_default()
         .to_owned();
     let kind_options = filter_options(&PAGE_KINDS, kind.as_deref());
-    let tier_options = filter_options(&TIERS, tier.as_deref());
-    let global_href = format!("search?q={}", encode_segment(&query));
+    let tiers = Tier::ALL.map(|t| t.as_str());
+    let tier_options = filter_options(&tiers, tier);
+    // Leaving the project keeps the filters, so an empty filtered result here
+    // is compared with the same filters everywhere.
+    let mut global_href = format!("search?q={}", encode_segment(&query));
+    for (name, value) in [("kind", kind.as_deref()), ("tier", tier)] {
+        if let Some(value) = value {
+            global_href.push_str(&format!("&{name}={}", encode_segment(value)));
+        }
+    }
     let view = SearchView {
         global_href,
         project_href: project_href(&workspace, &project),
@@ -306,8 +299,6 @@ pub(crate) async fn handler(
         hits,
         hit_count,
         filtered,
-        pool_capped,
-        filter_pool: FILTER_CANDIDATE_POOL,
         unknown_kind,
         kind_options,
         tier_options,

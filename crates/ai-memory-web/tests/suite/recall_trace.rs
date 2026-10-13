@@ -578,9 +578,14 @@ async fn search_filters_a_project_by_kind_and_tier_keeping_rank_order() {
     assert_eq!(hit_paths(&body), ["procedures/rotate.md"], "{body}");
     let (_, body) = get(&app, &format!("{base}&tier=procedural"), None).await;
     assert_eq!(hit_paths(&body), ["procedures/rotate.md"], "{body}");
+    // The tier ignores case, as the kind does.
+    let (status, body) = get(&app, &format!("{base}&tier=Procedural"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hit_paths(&body), ["procedures/rotate.md"], "{body}");
 
     // The survivors of `kind=fact` are the unfiltered list minus the
-    // procedure, in the same order: the filter runs after ranking.
+    // procedure, in the same order: dropping one page from every stream
+    // leaves the others' relative ranks alone here.
     let expected: Vec<_> = all
         .iter()
         .filter(|p| *p != "procedures/rotate.md")
@@ -594,6 +599,12 @@ async fn search_filters_a_project_by_kind_and_tier_keeping_rank_order() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(hit_paths(&body).is_empty(), "{body}");
     assert!(body.contains("with these filters"), "{body}");
+    // "Search all projects" keeps the filters, so it does not read as if
+    // the filter matched elsewhere.
+    assert!(
+        body.contains(r#"href="search?q=token%20rotation&amp;kind=procedure&amp;tier=semantic""#),
+        "{body}"
+    );
 
     // The selects keep the current choice.
     let (_, body) = get(
@@ -695,27 +706,6 @@ async fn kind_filter_is_case_insensitive_and_flags_a_nonstandard_kind() {
     assert!(body.contains("is not a standard page kind"), "{body}");
 }
 
-#[test]
-fn tier_filter_offers_every_tier() {
-    use ai_memory_core::Tier;
-    // An exhaustive match: a new `Tier` variant fails to compile here until
-    // the filter's list is revisited.
-    for tier in [
-        Tier::Working,
-        Tier::Episodic,
-        Tier::Semantic,
-        Tier::Procedural,
-    ] {
-        let name = match tier {
-            Tier::Working => "working",
-            Tier::Episodic => "episodic",
-            Tier::Semantic => "semantic",
-            Tier::Procedural => "procedural",
-        };
-        assert_eq!(name.parse::<Tier>().unwrap(), tier);
-    }
-}
-
 /// Scores every candidate equally and remembers which pages it was shown.
 #[derive(Default)]
 struct RecordingReranker {
@@ -751,8 +741,8 @@ impl Reranker for RecordingReranker {
     }
 }
 
-/// The filter runs in the ranker, before the reranker: pages the filter
-/// drops are never sent to the (paid, slow) reranker.
+/// The streams filter before the reranker: pages the filter drops are never
+/// sent to the (paid, slow) reranker.
 #[tokio::test]
 async fn reranker_is_shown_only_the_pages_the_filter_keeps() {
     let f = fixture(false).await;
@@ -805,7 +795,8 @@ async fn reranker_is_shown_only_the_pages_the_filter_keeps() {
 }
 
 /// A rare kind that the unfiltered result ranks out of view is still found:
-/// the filter is applied to a candidate pool far wider than one page.
+/// the FTS stream filters in SQL, so 60 better-ranked facts, more than its
+/// candidate window, cannot push the gotcha out.
 #[tokio::test]
 async fn kind_filter_finds_a_rare_kind_the_unfiltered_page_ranks_out() {
     let f = fixture(false).await;
@@ -841,6 +832,236 @@ async fn kind_filter_finds_a_rare_kind_the_unfiltered_page_ranks_out() {
         .unwrap();
     let app = web(&f, Recall::default());
     let base = "/web/search?q=crowdword&workspace=default&project=alpha&limit=5";
+
+    let (_, body) = get(&app, base, None).await;
+    assert!(
+        !hit_paths(&body).contains(&"gotchas/quiet.md".to_owned()),
+        "control: the gotcha must be ranked out of the first page: {body}"
+    );
+    let (_, body) = get(&app, &format!("{base}&kind=gotcha"), None).await;
+    assert_eq!(hit_paths(&body), ["gotchas/quiet.md"], "{body}");
+}
+
+/// Every stream applies the filter itself. Each non-procedure page below is
+/// reached by its own stream (page FTS, entity, vector, both directions of
+/// graph from the procedure, observation votes), so dropping the predicate from any one of
+/// them lets that page into a `kind=procedure` result. Control: unfiltered,
+/// all of them are hits.
+#[tokio::test]
+async fn kind_and_tier_filters_hold_in_every_stream() {
+    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+
+    let f = fixture(false).await;
+    let ws = f
+        .store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    // Written with the embedder, so the vector stream reaches every page.
+    let wiki = f.wiki.clone().with_embedder(embedder());
+    wiki.write_page(WritePageRequest {
+        frontmatter: serde_json::json!({"kind": "procedure"}),
+        tier: Tier::Procedural,
+        ..req(
+            ws,
+            f.alpha,
+            "procedures/quokka.md",
+            "# Quokka care\n\nFeed the quokka at dawn. See [[notes/vault]].",
+        )
+    })
+    .await
+    .unwrap();
+    wiki.write_page(req(
+        ws,
+        f.alpha,
+        "notes/quokka-fact.md",
+        "# Quokka fact\n\nA quokka is a small marsupial.",
+    ))
+    .await
+    .unwrap();
+    wiki.write_page(WritePageRequest {
+        frontmatter: serde_json::json!({"kind": "fact", "entities": ["quokka"]}),
+        ..req(
+            ws,
+            f.alpha,
+            "notes/tagged.md",
+            "# Tagged\n\nIsland wildlife.",
+        )
+    })
+    .await
+    .unwrap();
+    // Links to the procedure without naming it in its text: the graph
+    // stream's incoming side alone reaches it.
+    f.store
+        .writer
+        .upsert_page(ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: f.alpha,
+            path: PagePath::new("notes/pointer.md").unwrap(),
+            title: "Pointer".into(),
+            body: "Island care handbook.".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: vec![ai_memory_core::LinkTarget {
+                workspace: None,
+                project: None,
+                path: PagePath::new("procedures/quokka.md").unwrap(),
+                relation: None,
+            }],
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let session_id = SessionId::new();
+    f.store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session_id,
+            workspace_id: ws,
+            project_id: f.alpha,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    f.store
+        .writer
+        .insert_observation(ai_memory_core::Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id: ws,
+                project_id: f.alpha,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "where does the quokka sleep".into(),
+                importance: 5,
+            },
+            &ai_memory_core::Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    let session_path = format!("sessions/{session_id}.md");
+    f.store
+        .writer
+        .upsert_page(ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: f.alpha,
+            path: PagePath::new(session_path.clone()).unwrap(),
+            title: "A session".into(),
+            body: "Reviewed the release.".into(),
+            tier: Tier::Episodic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let app = web(
+        &f,
+        Recall {
+            embedder: Some(embedder()),
+            rerank: None,
+        },
+    );
+    let base = "/web/search?q=quokka&workspace=default&project=alpha&limit=50";
+
+    let (status, body) = get(&app, base, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let all = hit_paths(&body);
+    for path in [
+        "procedures/quokka.md",
+        "notes/quokka-fact.md",
+        "notes/tagged.md",
+        "notes/vault.md",
+        "notes/pointer.md",
+        "notes/deploy.md",
+        session_path.as_str(),
+    ] {
+        assert!(
+            all.contains(&path.to_owned()),
+            "control lacks {path}: {all:?}"
+        );
+    }
+
+    for filter in [
+        "kind=procedure",
+        "tier=procedural",
+        "kind=PROCEDURE&tier=procedural",
+    ] {
+        let (status, body) = get(&app, &format!("{base}&{filter}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{filter}: {body}");
+        assert_eq!(
+            hit_paths(&body),
+            ["procedures/quokka.md"],
+            "{filter}: {body}"
+        );
+    }
+    // The other way round: the session page alone is episodic.
+    let (_, body) = get(&app, &format!("{base}&tier=episodic"), None).await;
+    assert_eq!(hit_paths(&body), [session_path], "{body}");
+}
+
+/// The cross-project search filters in SQL too: 60 better-ranked facts, more
+/// than its candidate window for `limit=5`, cannot push a matching gotcha out.
+#[tokio::test]
+async fn cross_project_kind_filter_sees_past_the_candidate_window() {
+    let f = fixture(false).await;
+    let ws = f
+        .store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    for n in 0..60 {
+        f.store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: ws,
+                project_id: f.alpha,
+                path: PagePath::new(format!("notes/crowd-{n}.md")).unwrap(),
+                title: "Crowd".into(),
+                body: "crowdword crowdword crowdword crowdword crowdword.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    f.wiki
+        .write_page(WritePageRequest {
+            frontmatter: serde_json::json!({"kind": "gotcha"}),
+            ..req(
+                ws,
+                f.alpha,
+                "gotchas/quiet.md",
+                "# Quiet\n\nOne mention of crowdword among many other unrelated words \
+                 about cats, rivers, mountains, bridges and old maps.",
+            )
+        })
+        .await
+        .unwrap();
+    let app = web(&f, Recall::default());
+    let base = "/web/search?q=crowdword&limit=5";
 
     let (_, body) = get(&app, base, None).await;
     assert!(

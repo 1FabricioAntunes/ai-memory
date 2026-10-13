@@ -3555,7 +3555,7 @@ async fn explained_search_as(
         )
         .await
         .unwrap()
-        .hits
+        .0
         .into_iter()
         .map(|(hit, details)| (hit, details.unwrap()))
         .collect()

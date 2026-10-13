@@ -438,16 +438,12 @@ pub(crate) const OBSERVATION_ROWID_SPAN_SQL: &str = "SELECT \
      (SELECT MAX(rowid) FROM observations INDEXED BY idx_observations_project \
       WHERE project_id = ?1)";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct PageAuthority {
     factor: f64,
     /// Kind/tier penalty this page carries *because* it is a session page
     /// (`0.0` for every other kind). A `session_recall` query gives it back.
     session_penalty: f64,
-    /// Semantic kind and tier the factor was derived from, kept so a
-    /// [`PageFilter`] needs no second read of the same rows.
-    kind: String,
-    tier: String,
 }
 
 impl PageAuthority {
@@ -520,8 +516,6 @@ impl PageAuthority {
         Self {
             factor: factor.clamp(0.55, 1.50),
             session_penalty,
-            kind: kind.to_owned(),
-            tier: tier.to_owned(),
         }
     }
 
@@ -875,17 +869,12 @@ pub struct VectorQuery<'a> {
     pub dim: u32,
 }
 
-/// Candidates each stream is asked for when a [`PageFilter`] is active.
+/// Narrows a search to pages of one kind and/or tier.
 ///
-/// The streams have no kind or tier predicate, so a filter can only keep what
-/// they return. A pool this much wider than an unfiltered search's keeps a
-/// rare kind from being crowded out by pages of other kinds that outrank it.
-pub const FILTER_CANDIDATE_POOL: usize = 500;
-
-/// Narrows a [`HybridSearch`] to pages of one kind and/or tier.
-///
-/// Applied after fusion and authority, before the result is cut to
-/// `limit`, so `limit` counts hits that passed it.
+/// Every stream applies it in its own SQL, so each returns only pages the
+/// filter keeps and a rare kind cannot be crowded out by other kinds. Entity
+/// frequencies are still counted over every page, so the filter leaves an
+/// entity's weight unchanged. Graph expansion seeds from the kept hits only.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PageFilter<'a> {
     /// Semantic kind to keep, compared ASCII case-insensitively; `None`
@@ -896,28 +885,43 @@ pub struct PageFilter<'a> {
 }
 
 impl PageFilter<'_> {
-    fn is_active(&self) -> bool {
-        self.kind.is_some() || self.tier.is_some()
-    }
-
-    /// Whether a page of this kind and tier passes the filter.
-    #[must_use]
-    pub fn keeps(&self, kind: &str, tier: &str) -> bool {
-        self.kind.is_none_or(|k| k.eq_ignore_ascii_case(kind))
-            && self.tier.is_none_or(|t| t == tier)
+    /// An ` AND …` predicate over the pages row `alias`, taking each bound
+    /// value's placeholder from `placeholder`, and those values in order.
+    fn sql(&self, alias: &str, mut placeholder: impl FnMut() -> String) -> (String, Vec<Value>) {
+        let mut clause = String::new();
+        let mut values = Vec::new();
+        if let Some(kind) = self.kind {
+            let kind_expr = page_kind_expr(
+                &format!("{alias}.path"),
+                &format!("{alias}.frontmatter_json"),
+            );
+            clause.push_str(&format!(
+                " AND {kind_expr} = {} COLLATE NOCASE",
+                placeholder()
+            ));
+            values.push(Value::Text(kind.to_owned()));
+        }
+        if let Some(tier) = self.tier {
+            clause.push_str(&format!(" AND {alias}.tier = {}", placeholder()));
+            values.push(Value::Text(tier.to_owned()));
+        }
+        (clause, values)
     }
 }
 
-/// What [`ReaderPool::hybrid_search_scopes`] returns.
-#[derive(Debug)]
-pub struct HybridHits {
-    /// Hits best first, each with its explain details when asked for.
-    pub hits: Vec<(PageHit, Option<SearchExplain>)>,
-    /// Per-stream wall time; `explain` only.
-    pub timings: Option<StreamTimings>,
-    /// A [`PageFilter`] was active and a stream returned its whole
-    /// candidate pool, so matches ranked past it were never looked at.
-    pub filter_pool_full: bool,
+/// Placeholders `?first`, `?first+1`, … for [`PageFilter::sql`] in a
+/// statement that numbers its parameters.
+fn numbered_placeholders(first: usize) -> impl FnMut() -> String {
+    let mut next = first;
+    move || {
+        next += 1;
+        format!("?{}", next - 1)
+    }
+}
+
+/// Placeholder for [`PageFilter::sql`] in a statement of anonymous `?`s.
+fn anonymous_placeholder() -> String {
+    "?".to_owned()
 }
 
 /// One [`ReaderPool::hybrid_search_scopes`] request.
@@ -1351,14 +1355,6 @@ pub struct PageHitWithMeta {
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
-    /// Semantic kind, so the web search can filter without a second lookup.
-    /// Empty on a recency listing, which nothing filters. Not serialized: the
-    /// MCP `global_hits` shape stays as it was.
-    #[serde(skip)]
-    pub kind: String,
-    /// Memory tier; see `kind`.
-    #[serde(skip)]
-    pub tier: String,
 }
 
 /// One raw observation fallback hit returned when compiled wiki pages miss.
@@ -2650,6 +2646,8 @@ impl ReaderPool {
     ///
     /// `viewer` restricts the hits to repositories that user may read — see
     /// [`readable_repository_filter`]. `None` searches every repository.
+    /// `filter` keeps only pages of a kind and/or tier, before the cut to
+    /// `limit`.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2659,16 +2657,18 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         viewer: Option<UserId>,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (visible, visible_params) = readable_repository_filter("pages.project_id", viewer, 4);
+        let (kept, kept_params) =
+            filter.sql("pages", numbered_placeholders(4 + visible_params.len()));
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
-            let (visible, visible_params) =
-                readable_repository_filter("pages.project_id", viewer, 4);
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
@@ -2678,7 +2678,7 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible} \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible}{kept} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?2",
                 not_expired = not_expired("pages", "?3"),
@@ -2691,6 +2691,7 @@ impl ReaderPool {
                 Value::Integer(cutoff),
             ];
             bound.extend(visible_params);
+            bound.extend(kept_params);
             let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
@@ -2740,8 +2741,6 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
-                        kind,
-                        tier,
                     },
                     authority,
                 ));
@@ -2779,11 +2778,13 @@ impl ReaderPool {
                 authority_candidate_limit(limit),
                 expiry_cutoff_us,
                 false,
+                PageFilter::default(),
             )
             .await?;
         Ok(rerank_page_hits(candidates, limit))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn search_page_candidates_for_project(
         &self,
         workspace_id: WorkspaceId,
@@ -2792,12 +2793,14 @@ impl ReaderPool {
         candidate_limit: usize,
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (kept, kept_params) = filter.sql("pages", numbered_placeholders(6));
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
@@ -2809,7 +2812,7 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  WHERE pages_fts MATCH ?1 \
                    AND pages.workspace_id = ?2 \
-                   AND pages.project_id = ?3{latest}{not_expired} \
+                   AND pages.project_id = ?3{latest}{not_expired}{kept} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?4",
                 latest = latest_only("pages", include_superseded),
@@ -2817,37 +2820,36 @@ impl ReaderPool {
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![
-                    fts_query,
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    candidate_limit as i64,
-                    cutoff
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let path: String = row.get(1)?;
-                    let title: String = row.get(2)?;
-                    let snippet: String = row.get(3)?;
-                    let rank: f64 = row.get(4)?;
-                    let tier: String = row.get(5)?;
-                    let pinned = row.get::<_, i64>(6)? != 0;
-                    let frontmatter_json: String = row.get(7)?;
-                    let kind: String = row.get(8)?;
-                    Ok((
-                        id_bytes,
-                        path,
-                        title,
-                        snippet,
-                        rank,
-                        tier,
-                        pinned,
-                        frontmatter_json,
-                        kind,
-                    ))
-                },
-            )?;
+            let mut bound = vec![
+                Value::Text(fts_query),
+                Value::Blob(workspace_id.as_bytes().to_vec()),
+                Value::Blob(project_id.as_bytes().to_vec()),
+                Value::Integer(candidate_limit as i64),
+                Value::Integer(cutoff),
+            ];
+            bound.extend(kept_params);
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: String = row.get(3)?;
+                let rank: f64 = row.get(4)?;
+                let tier: String = row.get(5)?;
+                let pinned = row.get::<_, i64>(6)? != 0;
+                let frontmatter_json: String = row.get(7)?;
+                let kind: String = row.get(8)?;
+                Ok((
+                    id_bytes,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    tier,
+                    pinned,
+                    frontmatter_json,
+                    kind,
+                ))
+            })?;
 
             let mut candidates = Vec::new();
             for row in rows {
@@ -3024,7 +3026,7 @@ impl ReaderPool {
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
-            .map(|(hit, authority)| (hit.id, authority.clone()))
+            .map(|(hit, authority)| (hit.id, *authority))
             .collect();
         // Entity-only hits never passed through an FTS candidate row;
         // read their authority off the version row itself (no latest
@@ -3258,6 +3260,7 @@ impl ReaderPool {
     /// unexpired page in this scope contributes nothing; the raw-observation
     /// fallback still covers live sessions. The two reads share one read
     /// transaction so the mapping sees a single snapshot. Read-only.
+    #[allow(clippy::too_many_arguments)]
     async fn observation_stream_votes(
         &self,
         workspace_id: WorkspaceId,
@@ -3266,11 +3269,14 @@ impl ReaderPool {
         candidate_limit: usize,
         cutoff: i64,
         owner_filter: OwnerFilter,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<ObservationVote>> {
         let fts_query = normalize_fts_query(query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
+        // The session pages' lookup takes anonymous `?`s after its IN list.
+        let (kept, kept_params) = filter.sql("pages", anonymous_placeholder);
         let row_limit = candidate_limit
             .saturating_mul(OBSERVATION_STREAM_ROWS_PER_CANDIDATE)
             .min(OBSERVATION_STREAM_MAX_ROWS);
@@ -3367,13 +3373,14 @@ impl ReaderPool {
                 placeholders.push('?');
                 sql_params.push(Value::Text(format!("sessions/{session_id}.md")));
             }
+            sql_params.extend(kept_params);
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title \
                  FROM pages \
                  WHERE pages.workspace_id = ?1 \
                    AND pages.project_id = ?2 \
                    AND pages.is_latest = 1{not_expired} \
-                   AND pages.path IN ({placeholders})",
+                   AND pages.path IN ({placeholders}){kept}",
                 not_expired = not_expired("pages", "?3"),
             );
             let mut pages: std::collections::HashMap<String, (PageId, String)> =
@@ -3657,8 +3664,6 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
-                    kind: String::new(),
-                    tier: String::new(),
                 });
             }
             Ok(hits)
@@ -5113,6 +5118,7 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: i64,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         self.top_embedding_hits_in_table(
             EmbeddingTable::Body,
@@ -5125,6 +5131,7 @@ impl ReaderPool {
             limit,
             expiry_cutoff_us,
             include_superseded,
+            filter,
         )
         .await
     }
@@ -5145,18 +5152,20 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: i64,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let table = table.name();
+        let (kept, kept_params) = filter.sql("pages", numbered_placeholders(7));
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT {table}.page_id, {table}.vector, pages.path \
                  FROM {table} \
                  JOIN pages ON pages.id = {table}.page_id \
                  WHERE pages.workspace_id = ?1 \
-                   AND pages.project_id = ?2{latest}{not_expired} \
+                   AND pages.project_id = ?2{latest}{not_expired}{kept} \
                    AND {table}.provider = ?3 \
                    AND {table}.model = ?4 \
                    AND {table}.dim = ?5",
@@ -5164,22 +5173,21 @@ impl ReaderPool {
                 not_expired = not_expired("pages", "?6"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(
-                params![
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    provider,
-                    model,
-                    dim,
-                    expiry_cutoff_us,
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let vec_bytes: Vec<u8> = row.get(1)?;
-                    let path: String = row.get(2)?;
-                    Ok((id_bytes, vec_bytes, path))
-                },
-            )?;
+            let mut bound = vec![
+                Value::Blob(workspace_id.as_bytes().to_vec()),
+                Value::Blob(project_id.as_bytes().to_vec()),
+                Value::Text(provider),
+                Value::Text(model),
+                Value::Integer(i64::from(dim)),
+                Value::Integer(expiry_cutoff_us),
+            ];
+            bound.extend(kept_params);
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let vec_bytes: Vec<u8> = row.get(1)?;
+                let path: String = row.get(2)?;
+                Ok((id_bytes, vec_bytes, path))
+            })?;
 
             let mut out = Vec::new();
             for row in rows {
@@ -5549,6 +5557,7 @@ impl ReaderPool {
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
+    #[cfg(test)]
     pub(crate) async fn entity_hits_for_project(
         &self,
         workspace_id: WorkspaceId,
@@ -5586,11 +5595,39 @@ impl ReaderPool {
         as_of_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<Vec<EntityHit>> {
+        self.entity_hits_filtered(
+            workspace_id,
+            project_id,
+            query,
+            limit,
+            expiry_cutoff_us,
+            as_of_us,
+            include_superseded,
+            PageFilter::default(),
+        )
+        .await
+    }
+
+    /// [`Self::entity_hits_for_project_at`] returning only pages `filter`
+    /// keeps. Entity frequencies still count every page.
+    #[allow(clippy::too_many_arguments)]
+    async fn entity_hits_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        as_of_us: Option<i64>,
+        include_superseded: bool,
+        filter: PageFilter<'_>,
+    ) -> StoreResult<Vec<EntityHit>> {
         let tokens = entity_query_tokens(query);
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (kept, kept_params) = filter.sql("pg", anonymous_placeholder);
         self.with_conn(move |conn| {
             let mut placeholders = String::with_capacity(tokens.len() * 96);
             let mut sql_params: Vec<Value> = Vec::with_capacity(tokens.len() * 5 + 7);
@@ -5635,6 +5672,7 @@ impl ReaderPool {
                     sql_params.push(Value::Integer(cutoff));
                 }
             }
+            sql_params.extend(kept_params);
             sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
 
             let mut sql = String::with_capacity(placeholders.len() + 1_200);
@@ -5663,7 +5701,7 @@ impl ReaderPool {
                  FROM freq f \
                  JOIN entity_page_links l ON l.entity_id = f.entity_id \
                  JOIN pages pg ON pg.id = l.page_id \
-                 WHERE pg.workspace_id = ? AND pg.project_id = ?{version_filter} \
+                 WHERE pg.workspace_id = ? AND pg.project_id = ?{version_filter}{kept} \
                  GROUP BY pg.id, pg.path, pg.title \
                  ORDER BY weight DESC, matches DESC, pg.path ASC \
                  LIMIT ?",
@@ -5809,6 +5847,7 @@ impl ReaderPool {
                 limit,
                 expiry_cutoff_us,
                 false,
+                PageFilter::default(),
             )
             .await?
             .into_iter()
@@ -5820,6 +5859,7 @@ impl ReaderPool {
     /// produced each neighbour (`seed_ord` indexes into the caller's
     /// `seed_ids`) and in which direction the link points. Feeds the
     /// `memory_query` explain surface.
+    #[allow(clippy::too_many_arguments)]
     async fn graph_neighbors_for_project_explained(
         &self,
         workspace_id: WorkspaceId,
@@ -5828,11 +5868,14 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<GraphNeighbor>> {
         if seed_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (out_kept, out_kept_params) = filter.sql("tp", anonymous_placeholder);
+        let (in_kept, in_kept_params) = filter.sql("fp", anonymous_placeholder);
         self.with_conn(move |conn| {
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
@@ -5851,9 +5894,11 @@ impl ReaderPool {
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(now));
+            sql_params.extend(out_kept_params);
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(now));
+            sql_params.extend(in_kept_params);
 
             let out_descriptor = page_descriptor_expr("tp.body", "tp.frontmatter_json");
             let in_descriptor = page_descriptor_expr("fp.body", "fp.frontmatter_json");
@@ -5873,7 +5918,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
                    JOIN pages tp ON tp.id = l.to_page_id \
-                   WHERE tp.workspace_id = ? AND tp.project_id = ?{out_latest}{out_not_expired} \
+                   WHERE tp.workspace_id = ? AND tp.project_id = ?{out_latest}{out_not_expired}{out_kept} \
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
                           {in_descriptor} AS snippet, \
@@ -5882,7 +5927,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
                    JOIN pages fp ON fp.id = l.from_page_id \
-                   WHERE fp.workspace_id = ? AND fp.project_id = ?{in_latest}{in_not_expired} \
+                   WHERE fp.workspace_id = ? AND fp.project_id = ?{in_latest}{in_not_expired}{in_kept} \
                  ) \
                  SELECT id, path, title, snippet, stream_ord, link_type \
                  FROM neighbors \
@@ -6262,7 +6307,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<(Vec<(PageHit, SearchExplain)>, StreamTimings)> {
-        let (hits, timings, _) = self
+        let (hits, timings) = self
             .hybrid_search_inner(
                 workspace_id,
                 project_id,
@@ -6311,7 +6356,7 @@ impl ReaderPool {
         &self,
         scopes: &[(WorkspaceId, ProjectId)],
         search: HybridSearch<'_>,
-    ) -> StoreResult<HybridHits> {
+    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, Option<StreamTimings>)> {
         // Provider/model/dim only select which stored vectors are eligible;
         // with no query vector the vector stream never runs, so the empty
         // triple is inert rather than a fake identity.
@@ -6325,10 +6370,9 @@ impl ReaderPool {
             None => (None, String::new(), String::new(), 0),
         };
         let mut timings: Option<StreamTimings> = None;
-        let mut filter_pool_full = false;
         let mut per_scope = Vec::with_capacity(scopes.len());
         for &(workspace_id, project_id) in scopes {
-            let (hits, scope_timings, pool_full) = self
+            let (hits, scope_timings) = self
                 .hybrid_search_inner(
                     workspace_id,
                     project_id,
@@ -6345,7 +6389,6 @@ impl ReaderPool {
                     search.filter,
                 )
                 .await?;
-            filter_pool_full |= pool_full;
             if search.explain {
                 timings
                     .get_or_insert_with(Default::default)
@@ -6391,11 +6434,7 @@ impl ReaderPool {
         } else {
             hits
         };
-        Ok(HybridHits {
-            hits,
-            timings,
-            filter_pool_full,
-        })
+        Ok((hits, timings))
     }
 
     /// The streams [`Self::hybrid_search_scopes`] runs for a query, in the
@@ -6432,7 +6471,7 @@ impl ReaderPool {
         include_superseded: bool,
         owner_filter: &OwnerFilter,
         filter: PageFilter<'_>,
-    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings, bool)> {
+    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings)> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Stream timings exist only for explain: `explain.then(Instant::now)`
         // reads no clock on the normal path.
@@ -6445,39 +6484,24 @@ impl ReaderPool {
         // bounded candidate window used by FTS-only search. A `limit * 2`
         // window was too narrow at small limits for a canonical page to enter
         // the fused pool and receive its bounded promotion.
-        // A filter can only keep what the streams return, so they are asked
-        // for a wide pool and `limit` is applied to what survives.
-        let candidate_limit = authority_candidate_limit(if filter.is_active() {
-            limit.max(FILTER_CANDIDATE_POOL)
-        } else {
-            limit
-        });
+        let candidate_limit = authority_candidate_limit(limit);
         // Tokenize the borrowed query before the FTS candidate call consumes
         // it. This avoids cloning a caller-controlled query on the hot path.
         // The default path uses the latest-only entry; the opt-in path reaches
         // superseded versions through the `_at` entry with no `as_of` instant.
         let started = explain.then(std::time::Instant::now);
-        let entity_hits = if include_superseded {
-            self.entity_hits_for_project_at(
+        let entity_hits = self
+            .entity_hits_filtered(
                 workspace_id,
                 project_id,
                 &query,
                 candidate_limit,
                 Some(cutoff),
                 None,
-                true,
+                include_superseded,
+                filter,
             )
-            .await?
-        } else {
-            self.entity_hits_for_project(
-                workspace_id,
-                project_id,
-                &query,
-                candidate_limit,
-                Some(cutoff),
-            )
-            .await?
-        };
+            .await?;
         timings.entity_ms = elapsed_ms(started);
         // The stream-off hot path keeps moving the query without a clone.
         let observation_query = if tuning.observation_stream {
@@ -6494,12 +6518,13 @@ impl ReaderPool {
                 candidate_limit,
                 Some(cutoff),
                 include_superseded,
+                filter,
             )
             .await?;
         timings.fts_ms = elapsed_ms(started);
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
-            .map(|(hit, authority)| (hit.id, authority.clone()))
+            .map(|(hit, authority)| (hit.id, *authority))
             .collect();
         let fts_hits: Vec<PageHit> = fts_candidates
             .into_iter()
@@ -6522,6 +6547,7 @@ impl ReaderPool {
                         candidate_limit,
                         cutoff,
                         include_superseded,
+                        filter,
                     )
                     .await?;
             }
@@ -6536,6 +6562,7 @@ impl ReaderPool {
                     candidate_limit,
                     cutoff,
                     include_superseded,
+                    filter,
                 )
                 .await?;
             timings.vector_ms = elapsed_ms(started);
@@ -6577,6 +6604,7 @@ impl ReaderPool {
                 candidate_limit,
                 Some(cutoff),
                 include_superseded,
+                filter,
             )
             .await?;
         timings.graph_ms = elapsed_ms(started);
@@ -6592,6 +6620,7 @@ impl ReaderPool {
                     candidate_limit,
                     cutoff,
                     owner_filter.clone(),
+                    filter,
                 )
                 .await?;
             timings.observation_ms = elapsed_ms(started);
@@ -6599,11 +6628,6 @@ impl ReaderPool {
         } else {
             Vec::new()
         };
-
-        let filter_pool_full = filter.is_active()
-            && [fts_hits.len(), vec_hits.len(), entity_hits.len()]
-                .into_iter()
-                .any(|returned| returned >= candidate_limit);
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
@@ -6914,13 +6938,6 @@ impl ReaderPool {
                 // back to HashMap iteration order.
                 .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
         });
-        if filter.is_active() {
-            out.retain(|(hit, _)| {
-                authorities
-                    .get(&hit.id)
-                    .is_some_and(|a| filter.keeps(&a.kind, &a.tier))
-            });
-        }
         out.truncate(limit);
         // Label the superseded versions among the final hits so the caller can
         // tell historical versions from the current one. Only the opt-in path
@@ -6935,7 +6952,7 @@ impl ReaderPool {
                 hit.superseded = superseded.contains(&hit.id);
             }
         }
-        Ok((out, timings, filter_pool_full))
+        Ok((out, timings))
     }
 
     /// The subset of `page_ids` that are superseded (non-latest) versions in
@@ -12948,9 +12965,9 @@ mod tests {
                 super::PageFilter::default(),
             )
         };
-        let (_, off, _) = search(false).await.unwrap();
+        let (_, off) = search(false).await.unwrap();
         assert_eq!(off, super::StreamTimings::default());
-        let (_, on, _) = search(true).await.unwrap();
+        let (_, on) = search(true).await.unwrap();
         assert!(on.fts_ms.is_some() && on.entity_ms.is_some() && on.graph_ms.is_some());
         assert!(on.observation_ms.is_some(), "the stream is on by default");
         assert!(on.vector_ms.is_none(), "no query vector, no vector scan");

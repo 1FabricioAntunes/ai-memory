@@ -688,11 +688,6 @@ pub(crate) struct SearchView {
     pub project_href: String,
     /// A kind or tier filter narrowed the hits.
     pub filtered: bool,
-    /// The filter looked only at the top `filter_pool` matches, and the
-    /// ranker had more.
-    pub pool_capped: bool,
-    /// Matches a filtered search ranks before it filters.
-    pub filter_pool: usize,
     /// The kind filter names no standard kind (empty when it does, or when
     /// there is none); a custom frontmatter kind or a typo.
     pub unknown_kind: String,
