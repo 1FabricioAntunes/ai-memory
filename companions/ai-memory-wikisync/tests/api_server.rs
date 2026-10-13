@@ -76,7 +76,7 @@ struct Fixture {
     /// Edit this page right before an MCP call on it is handled, to simulate
     /// another writer landing between a sync's classification and its write.
     edit_before_mcp: Option<&'static str>,
-    /// A server older than 2.7: no `expected_page_id` in the tool schema, no
+    /// A server older than 3.0: no `expected_page_id` in the tool schema, no
     /// `id` on pages, and preconditions silently ignored.
     old_server: bool,
     /// Arguments of every MCP tool call, in order.
@@ -1125,7 +1125,7 @@ async fn sync_apply_checks_the_tool_schema_before_a_create() {
     )
     .unwrap();
     let err = sync(addr, &dest).await.expect_err("old server refused");
-    assert!(format!("{err:#}").contains("ai-memory >= 2.7"), "{err:#}");
+    assert!(format!("{err:#}").contains("ai-memory >= 3.0"), "{err:#}");
     assert!(fixture.page("decisions/new.md").is_none());
     assert!(fixture.mcp_calls.lock().unwrap().is_empty());
 }

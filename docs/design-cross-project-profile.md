@@ -333,7 +333,7 @@ As shipped, grouping compares a candidate only with groups that share one of
 its tokens (an inverted index), once per distinct token set in each group,
 which keeps a pass near-linear without any stored state. Fully incremental
 grouping, keyed by a stored group per candidate, needs a schema change and is
-left to 2.7.
+left to 3.0.
 
 Lower priority, considered and not scheduled: a byte ruler with retry instead
 of truncating long statements (truncation only affects the rare entry over 200

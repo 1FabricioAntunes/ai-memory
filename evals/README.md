@@ -378,7 +378,7 @@ These flags split a hit@k number into evidence the index never saw and
 ranking on evidence it did. All are opt-in; the defaults reproduce the
 published baselines. The results are in
 [`docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md`](../docs/benchmarks/longmemeval-s-decomposition-2026-10-12.md).
-On a 2.7 server the observation stream is on by default, so reproducing a
+On a 3.0 server the observation stream is on by default, so reproducing a
 2.6-era baseline also needs
 `--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
 
@@ -426,7 +426,7 @@ Honest-numbers notes:
   holding exactly the captured text score 0.968 FTS `hit@5` against
   0.972 for whole raw sessions. The larger cost was the zero-LLM session
   page, which indexed only 80-character turn titles; the observation
-  stream (on by default in 2.7) puts the observation bodies back into
+  stream (on by default in 3.0) puts the observation bodies back into
   ranking;
 - each session's original date is prepended to its turn text, since a
   replayed history must carry its own timestamps (the official

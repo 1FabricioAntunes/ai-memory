@@ -19,7 +19,7 @@ const ERROR_PREVIEW: usize = 300;
 /// JSON-RPC `invalid_request`, the code a failed precondition carries.
 const INVALID_REQUEST: i64 = -32600;
 /// The server release that added conditional page writes.
-pub(crate) const MIN_SERVER: &str = "2.7";
+pub(crate) const MIN_SERVER: &str = "3.0";
 
 /// What a conditional write requires of the destination page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

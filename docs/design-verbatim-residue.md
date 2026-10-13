@@ -480,7 +480,7 @@ Fifteen facts are planted once each:
 Where a fact sits is a choice, so this session's `projection_loss` describes
 the fixture, not real sessions (§1.2 is the evidence for those); what it
 supports is the off/on comparison. Zero-LLM at the default budget of
-`build_batch_request` on `release/2.7` today: 225 of 300 observations
+`build_batch_request` on `release/3.0` today: 225 of 300 observations
 selected, one body truncated, 8 of 15 facts lost, exactly the eight planted
 at risk, and `recall_prompt` 0.886. A test pins that split (the seven kept,
 the pasted prompt's two lost, at least six of the eight at risk lost), so a
@@ -712,7 +712,7 @@ runs, not after.
   left); at 0.8 the first room appears near 8,000 tokens (209 characters).
   Not part of this series.
 
-## 8. Pull request plan (base `release/2.7`)
+## 8. Pull request plan (base `release/3.0`)
 
 | PR | Content | Size |
 |---|---|---|
@@ -781,7 +781,7 @@ warning, so every new `pub` item carries a doc comment), `cargo tf`,
 `cargo deny check`; gitleaks runs on the PR range with the fail-closed
 config. If the maintainer would rather implement the mechanism from this
 document, that is a fine outcome too; the fork stays rebased on
-`release/2.7`, so it never competes with that work.
+`release/3.0`, so it never competes with that work.
 
 ## 9. Decisions
 

@@ -135,7 +135,7 @@ Initial source support is intentionally narrow:
   `ExportData` JSON file (`agentmemory-export`, with a required project
   mapping file). Both write through MCP `memory_write_page` with explicit
   scope, every write conditional (`create_only`, then `expected_page_id` per
-  later version), refuse servers older than 2.7, and land under
+  later version), refuse servers older than 3.0, and land under
   `imported/agentmemory/`, outside every reserved family. Each page version
   carries a stable UUIDv5 ingest key, so a rerun skips what is already there.
   Observations are dropped unless replayed as `external-import` sessions
@@ -230,7 +230,7 @@ Re-home by kind:
 - Treat non-overwrite checks on `/admin/write-page` as best-effort: the OMC
   route re-checks before each write but cannot make that endpoint atomic with
   the read. The agentmemory routes use the conditional MCP write seam that
-  shipped in 2.7 instead, so the server refuses a page that appeared or
+  shipped in 3.0 instead, so the server refuses a page that appeared or
   changed.
 - Keep LLM normalization optional; deterministic import should work with no LLM.
 - Keep provider-specific performance tweaks, such as model parameter changes, out
@@ -273,7 +273,7 @@ directions are family-scoped and dry-run by default.
   with explicit `workspace` and `project`, so sanitization, admission and
   attribution apply. Every call carries the classified page version
   (`expected_page_id`, or `create_only` for a new page). It never opens the
-  wiki directory or SQLite, and refuses to write to a server older than 2.7,
+  wiki directory or SQLite, and refuses to write to a server older than 3.0,
   which would ignore the precondition.
 - `sync --check` is read-only (no files, no state) and exits 0 in sync,
   3 on drift, 4 on conflicts or refusals; a clone without state compares
@@ -364,7 +364,7 @@ never reaches the hook file.
 ### Roadmap (#986)
 
 1. Read-only export into a project repository (shipped).
-2. Conditional mutation seam in core (shipped in 2.7: `expected_page_id` /
+2. Conditional mutation seam in core (shipped in 3.0: `expected_page_id` /
    `create_only` on `memory_write_page`, `expected_page_id` on
    `memory_delete_page`, and the version id on `memory_read_page` and
    `/api/v1` pages).
@@ -573,14 +573,14 @@ and preference for a separate repository above remain unchanged.
   a particular SDK nor approves speculative endpoints or wire fields. A reported
   capability would not replace authorization.
 - Conditional editing needs a safe core compare-and-write seam, coordinated
-  with the normal Wiki and writer paths. 2.7 ships it: `memory_write_page` and
+  with the normal Wiki and writer paths. 3.0 ships it: `memory_write_page` and
   `memory_delete_page` take `expected_page_id` (and writes `create_only`), and
   a stale version writes or deletes nothing
   ([`programmatic-memory.md`](programmatic-memory.md)). An editor still needs
   to show a fresh diff and ask again when its revision went stale.
 - Any retained-version or evidence reads need current access checks and bounded
   retention semantics; they must not recover expired or purged content from Git.
-  2.7's read-only page history in the built-in web UI follows those rules (it
+  3.0's read-only page history in the built-in web UI follows those rules (it
   hides expired versions); no graph or procedure interface is approved here.
 - Mutations must retain sanitization, admission, attribution, and disk/SQL
   recovery. Direct admission follows the configured failure policy; it is not

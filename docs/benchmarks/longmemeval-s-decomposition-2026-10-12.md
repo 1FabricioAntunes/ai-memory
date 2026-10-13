@@ -3,7 +3,7 @@
 This report splits ai-memory's LongMemEval-S `hit@5` into its parts:
 evidence the index never sees, ranking on evidence it does see, and
 artifacts of the harness itself. It then records what the observation
-stream, shipped in 2.7 (unreleased), recovered.
+stream, shipped in 3.0 (unreleased), recovered.
 
 It publishes two kinds of number, and they answer different questions:
 
@@ -22,10 +22,10 @@ Every number below comes from the in-repo harness (`evals/`, see
 
 Decomposition runs (2026-10-10 to 2026-10-11):
 
-- server: `release/2.7` at `7dd6b2c2` (the binary reports 2.6.3), before the
+- server: `release/3.0` at `7dd6b2c2` (the binary reports 2.6.3), before the
   observation stream existed
 - harness: `420a8556` (the instruments) and `31f515dc` (adds
-  `--http-timeout-secs`); `release/2.7` carries the same `evals/` tree as
+  `--http-timeout-secs`); `release/3.0` carries the same `evals/` tree as
   `7a2c603d` and `8b797e08`
 - dataset: `longmemeval_s` (sha256 `08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894`);
   where noted, `longmemeval_s_cleaned` (Hugging Face
@@ -40,14 +40,14 @@ Decomposition runs (2026-10-10 to 2026-10-11):
 
 Pipeline re-runs (2026-10-13, corrected harness): the FTS full-set pipeline
 with reachability, both date-prefix ablations and the strat-230 local
-pipeline-vs-whole-session A/B, on `release/2.7` at `7e08baa7` with
+pipeline-vs-whole-session A/B, on `release/3.0` at `7e08baa7` with
 `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` on every arm (see "Harness
 correction").
 
 Observation-stream runs (2026-10-13, corrected harness):
 
 - build: the shipped ranking, `41793120` on top of `25594224`, for the
-  full-set FTS and local A/Bs; `release/2.7` at `7e08baa7` for the first
+  full-set FTS and local A/Bs; `release/3.0` at `7e08baa7` for the first
   version. The stream is on by default in both, so the baseline side sets
   `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false` and the candidate side
   `=true`
@@ -195,10 +195,10 @@ for takes its lexical evidence from the stream alone: page FTS over its
 title-only body still reports a rank but adds nothing, so a session that only
 shares topic words in its titles cannot outvote the session holding the
 answer. Hits are still pages, and nothing new is written to the wiki. It is on
-by default in 2.7; setting it to `false` restores the previous ranking
+by default in 3.0; setting it to `false` restores the previous ranking
 exactly.
 
-Stream off → on, same build (`release/2.7` at `41793120` on top of
+Stream off → on, same build (`release/3.0` at `41793120` on top of
 `25594224`, the shipped ranking), same questions, all 470, corrected harness:
 
 | run | hit@5 | hit@1 | hit@10 | recall@5 | p95 ms | flips |
@@ -236,7 +236,7 @@ vector, like its FTS row, sees only the title-only body.
 In its first version the stream's vote was added on top of page FTS, so a
 session page whose title list shared topic words with the question still
 collected both. That version, stream off → on, corrected harness, on
-`release/2.7` at `7e08baa7`:
+`release/3.0` at `7e08baa7`:
 
 | run | questions | hit@5 | hit@1 | hit@10 | recall@5 | p95 ms | flips |
 |---|---|---|---|---|---|---|---|
@@ -328,7 +328,7 @@ Reachability is unchanged too (0.056 / 0.102 on the session page).
 
 ## Reproduce
 
-Build once, from a `release/2.7` checkout:
+Build once, from a `release/3.0` checkout:
 
 ```bash
 cargo build --release -p ai-memory-cli -p ai-memory-eval

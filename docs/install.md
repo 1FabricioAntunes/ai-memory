@@ -84,7 +84,7 @@ sh install.sh
 
 | Variable | Default | Effect |
 |---|---|---|
-| `AI_MEMORY_VERSION` | latest | Install this release, e.g. `2.7.0` |
+| `AI_MEMORY_VERSION` | latest | Install this release, e.g. `3.0.0` |
 | `AI_MEMORY_BIN_DIR` | `~/.local/bin` | Where the `ai-memory` link goes |
 | `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked |
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |

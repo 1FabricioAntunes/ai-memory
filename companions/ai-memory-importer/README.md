@@ -54,7 +54,7 @@ and its source without adding product-specific agent kinds to core.
 Two routes read what agentmemory exports. Both write through the MCP
 `memory_write_page` tool with explicit `workspace` and `project`, every write
 conditional: `create_only` for a page's first version and `expected_page_id`
-for each later one. They refuse a server older than ai-memory 2.7, which would
+for each later one. They refuse a server older than ai-memory 3.0, which would
 ignore those arguments. Pages land under `--dest-prefix` (default
 `imported/agentmemory`), never under ai-memory's own `sessions/` or any other
 reserved family.

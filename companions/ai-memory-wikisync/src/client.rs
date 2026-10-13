@@ -44,7 +44,7 @@ pub struct PageSummary {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiPage {
     /// Latest version id, the token a conditional MCP write or delete
-    /// passes back. Servers older than 2.7 do not send it.
+    /// passes back. Servers older than 3.0 do not send it.
     #[serde(default)]
     pub id: Option<String>,
     pub path: String,

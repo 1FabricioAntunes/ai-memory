@@ -13,15 +13,15 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
-| **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (2.7, unreleased; on by default)** | **0.951** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
-| **2026-10-13** | LongMemEval-S (v1) | **local embeddings + observation stream (2.7, unreleased; on by default)** | **0.936** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0, unreleased; on by default)** | **0.951** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **local embeddings + observation stream (3.0, unreleased; on by default)** | **0.936** | [longmemeval-s-decomposition-2026-10-12.md](longmemeval-s-decomposition-2026-10-12.md) |
 | 2026-09-21 | LongMemEval-S (v1) | local embeddings (2.4 RC, current release) | 0.815 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-21 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (2.4 RC) | 0.666 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
 
-The 2026-10-13 rows are the 2.7 observation stream measured on all 470
+The 2026-10-13 rows are the 3.0 observation stream measured on all 470
 questions, comparing the stream off and on with the same build. Zero-LLM FTS
 `hit@5` went 0.662 → 0.951 (hit@1 0.511 → 0.857, hit@10 0.687 → 0.972; 139
 questions gained, 3 lost) and local embeddings 0.796 → 0.936 (hit@1 0.536 →

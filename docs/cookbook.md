@@ -204,7 +204,7 @@ Everything is opt-in and fail-safe: the family allowlist must be explicit
 with a diff summary and refused without `--force`, no frontmatter is forged,
 and the tool never runs git itself. `sync` sends reviewed repository edits
 back through MCP (each write conditional on the version it planned against;
-needs ai-memory 2.7+), and deletes travel only with `--propagate-deletes`.
+needs ai-memory 3.0+), and deletes travel only with `--propagate-deletes`.
 
 ### Keep it in step after merges and in CI
 

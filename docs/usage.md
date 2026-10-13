@@ -567,7 +567,7 @@ code; external schemes inside the brackets (`http://`, `https://`,
 `mailto:`, `data:`, `javascript:`, `vbscript:`, `tel:`, `file:`)
 stay literal too.
 
-With no bearer token configured on loopback (an install from before 2.7 that
+With no bearer token configured on loopback (an install from before 3.0 that
 never ran `ai-memory auth enable`), the built-in wiki remains anonymous. A
 fresh install has a bearer token and no human accounts, so a browser gets a
 Basic sign-in prompt: any username, and the contents of

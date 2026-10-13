@@ -638,7 +638,7 @@ pub(crate) mod tests {
         let error = run(args(td.path(), &server.url, &manifest))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains(">= 2.7"), "{error:#}");
+        assert!(error.to_string().contains(">= 3.0"), "{error:#}");
         assert_eq!(server.state().write_calls, 0);
     }
 

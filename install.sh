@@ -13,7 +13,7 @@
 # and wire your agents.
 #
 # Environment (all optional):
-#   AI_MEMORY_VERSION           release to install, e.g. 2.7.0 (default: latest)
+#   AI_MEMORY_VERSION           release to install, e.g. 3.0.0 (default: latest)
 #   AI_MEMORY_BIN_DIR           where the `ai-memory` link goes (default: ~/.local/bin)
 #   AI_MEMORY_LIB_DIR           where the release is unpacked
 #                               (default: ~/.local/lib/ai-memory)
@@ -142,7 +142,7 @@ main() {
     esac
     case "$version" in
         latest) url_dir="$release_base/latest/download" ;;
-        *[!0-9A-Za-z.+-]*) die "AI_MEMORY_VERSION must look like 2.7.0" ;;
+        *[!0-9A-Za-z.+-]*) die "AI_MEMORY_VERSION must look like 3.0.0" ;;
         v*) url_dir="$release_base/download/$version" ;;
         *) url_dir="$release_base/download/v$version" ;;
     esac

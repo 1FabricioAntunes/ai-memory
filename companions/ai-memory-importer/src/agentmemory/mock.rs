@@ -40,7 +40,7 @@ pub(crate) struct MockState {
     pub(crate) requests: Vec<String>,
     pub(crate) write_calls: usize,
     pub(crate) failure: Option<Failure>,
-    /// Advertise `create_only` in `tools/list` (a 2.7+ server).
+    /// Advertise `create_only` in `tools/list` (a 3.0+ server).
     pub(crate) conditional: bool,
     pub(crate) hook_batches: Vec<Value>,
     next_id: usize,

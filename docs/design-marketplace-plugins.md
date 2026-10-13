@@ -1,6 +1,6 @@
 # Design proposal: ai-memory as marketplace plugins (#1166)
 
-**Status: proposal for 2.7, research done 2026-10-13. Not implemented.**
+**Status: proposal for 3.0, research done 2026-10-13. Not implemented.**
 Builds on RFC #1166, the feedback comments on it, and the
 [`docs/desktop/`](desktop/) notes (especially
 [`verification-2026-10.md`](desktop/verification-2026-10.md) and
@@ -23,9 +23,9 @@ The marketplace lives in this repository. Catalog files sit at the repository
 root and pin each plugin to the release tag, so `/plugin marketplace add
 akitaonrails/ai-memory` only ever installs released plugin content.
 
-Recommended 2.7 scope: the Claude Code plugin (CLI and the desktop Code tab),
+Recommended 3.0 scope: the Claude Code plugin (CLI and the desktop Code tab),
 its marketplace, CI validation, a sandboxed end-to-end test, and the
-`setup`/`doctor`/`upgrade` integration. Codex follows in 2.7 if the trust
+`setup`/`doctor`/`upgrade` integration. Codex follows in 3.0 if the trust
 question below resolves cleanly. Cursor, Cowork capture, Antigravity and
 Gemini come later.
 
@@ -394,7 +394,7 @@ it) before Cursor ships.
 
 ## Manifests
 
-These are the files the renderer would produce for 2.7.0. The Claude ones
+These are the files the renderer would produce for 3.0.0. The Claude ones
 passed `claude plugin validate --strict` in the prototype.
 
 ### Phase 1: Claude Code
@@ -414,7 +414,7 @@ passed `claude plugin validate --strict` in the prototype.
         "source": "git-subdir",
         "url": "https://github.com/akitaonrails/ai-memory.git",
         "path": "plugins/claude-code",
-        "ref": "v2.7.0"
+        "ref": "v3.0.0"
       }
     }
   ]
@@ -427,7 +427,7 @@ passed `claude plugin validate --strict` in the prototype.
 {
   "name": "ai-memory",
   "displayName": "ai-memory",
-  "version": "2.7.0",
+  "version": "3.0.0",
   "description": "Long-term memory across sessions and harnesses. Hands each lifecycle event to the installed ai-memory binary, which applies your capture exclusions and sends a sanitized record only to your ai-memory server (default http://127.0.0.1:49374). Adds the ai-memory MCP tools. No telemetry. Requires the ai-memory binary.",
   "author": { "name": "AkitaOnRails", "url": "https://github.com/akitaonrails" },
   "homepage": "https://github.com/akitaonrails/ai-memory",
@@ -483,7 +483,7 @@ plugin's own `timeout` cannot raise it ("Timeouts set on plugin-provided
 hooks don't raise the budget"); the native `session-end` already fits it,
 because it hands the drain to a detached process. `async: true` on the tool
 events is worth measuring later, but it changes how Claude reports output, so
-2.7 keeps parity with the settings hooks.
+3.0 keeps parity with the settings hooks.
 
 `plugins/claude-code/.mcp.json`:
 
@@ -534,7 +534,7 @@ Portable layout, which Codex 0.162.1 accepted locally (finding 10).
         "source": "git-subdir",
         "url": "https://github.com/akitaonrails/ai-memory.git",
         "path": "plugins/codex",
-        "ref": "v2.7.0"
+        "ref": "v3.0.0"
       },
       "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
       "category": "Productivity"
@@ -549,7 +549,7 @@ Portable layout, which Codex 0.162.1 accepted locally (finding 10).
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "ai-memory",
-  "version": "2.7.0",
+  "version": "3.0.0",
   "description": "Long-term memory across sessions and harnesses, backed by the installed ai-memory binary and your ai-memory server. No telemetry."
 }
 ```
@@ -591,7 +591,7 @@ trusted after a plugin upgrade (open question 2). The catalog
 `preToolUse`, `postToolUse`, `postToolUseFailure`, `preCompact`, `stop`):
 
 ```json
-{ "name": "ai-memory", "version": "2.7.0",
+{ "name": "ai-memory", "version": "3.0.0",
   "description": "Long-term memory across sessions and harnesses, backed by the installed ai-memory binary. No telemetry.",
   "author": { "name": "AkitaOnRails" }, "license": "MIT" }
 ```
@@ -721,7 +721,7 @@ Mapped to the boundary inventory, all at integration level:
 | Docker wrapper routes `hook` to the native client | Wrapper fix | `scripts/check-native-packaging.sh` |
 | Sandboxed Claude install fires hooks into a scratch server | Real wiring, no API key | `plugins.yml` |
 
-## Phased plan for 2.7
+## Phased plan for 3.0
 
 Estimates are engineer-days for one person familiar with the codebase.
 
@@ -731,11 +731,11 @@ Estimates are engineer-days for one person familiar with the codebase.
 | **1. Claude Code plugin** | Renderer and hidden `render-plugins`; launcher; `plugins/claude-code`; root catalog; `hook` origin de-duplication; empty `--server-url` handling; Docker wrapper `hook` routing; `setup`/`install-*`/`doctor`/`upgrade`/`uninstall` integration; drift, launcher, parity and de-duplication tests; `docs/install.md` and `docs/mcp-install.md` sections, `plugins/README.md`, CHANGELOG `Added`, security-boundaries row | 4-5 |
 | **2. CI and release automation** | `plugins.yml` (validate, launcher, sandboxed e2e, Codex smoke); `bin/release` stamping; `validate-version` extension; release zip asset | 1.5-2 |
 | **3. Codex plugin** | `plugins/codex`, `.agents/plugins/marketplace.json`, `commandWindows`, trust guidance in docs, `doctor` plugin-hook trust check | 2 |
-| **4. Cursor plugin** (2.7 stretch, else 2.8) | Depends on the phase 0 answers; #721 detection of the Cursor plugin; branch strategy for the Cursor import | 2-3 |
+| **4. Cursor plugin** (3.0 stretch, else 3.1) | Depends on the phase 0 answers; #721 detection of the Cursor plugin; branch strategy for the Cursor import | 2-3 |
 | **Later** | Cowork capture if phase 0 shows hooks run in the VM; Antigravity; Gemini; Copilot CLI and Droid catalogs; a directory submission | — |
 
 Phases 1 to 3 come to roughly 9 to 10.5 days. This is additive work, so it targets
-`release/2.7`, not `main`.
+`release/3.0`, not `main`.
 
 ## Open questions for the maintainer
 
@@ -745,7 +745,7 @@ Phases 1 to 3 come to roughly 9 to 10.5 days. This is additive work, so it targe
    possibly review of the whole repository? An allowlist-capture variant
    (events only from repositories with an `.ai-memory.toml` marker) would
    arguably satisfy the "project-relevance gate" rule. That would be a
-   second plugin with a different default, so it is not proposed for 2.7.
+   second plugin with a different default, so it is not proposed for 3.0.
 2. **Codex trust across upgrades.** If Codex hashes hook commands after
    expanding `${PLUGIN_ROOT}`, every plugin update needs a fresh `/hooks`
    approval, and an untrusted hook is skipped silently. Is that acceptable
@@ -769,7 +769,7 @@ Phases 1 to 3 come to roughly 9 to 10.5 days. This is additive work, so it targe
 6. **Token option.** Add a `sensitive` `auth_token` option, kept in the OS
    credential store, for remote-server users who never run the CLI's auth
    commands? It would need the hook to accept a token from the environment,
-   a new input on the trust boundary. Proposed: no for 2.7.
+   a new input on the trust boundary. Proposed: no for 3.0.
 7. **Marketplace and plugin names.** `ai-memory@ai-memory` reads a little
    odd, but both names are free of the reserved prefixes, and changing a
    plugin name later needs a `renames` entry. Keep it?

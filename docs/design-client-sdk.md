@@ -415,13 +415,13 @@ header or a request body.
   Pi bridge already sends `2025-03-26` and accepts that answer. The SDK uses
   only `initialize`, `tools/list` and `tools/call`, which behave the same across
   those versions.
-- The minimum server is 2.7.0, the release that adds conditional writes
+- The minimum server is 3.0.0, the release that adds conditional writes
   and deletes (`expected_page_id`, `create_only`) and the version id on page
-  reads (`CHANGELOG.md`, `[Unreleased]` on `release/2.7`). `GET /identity` and
+  reads (`CHANGELOG.md`, `[Unreleased]` on `release/3.0`). `GET /identity` and
   incremental `recent` shipped in 2.6.0. A floor below the precondition seam
   would let an older server ignore `expectedPageId` as an unknown argument and
   turn a guarded write into an unconditional one, which is why wikisync
-  refuses servers older than 2.7 (`ensure_conditional_writes` in
+  refuses servers older than 3.0 (`ensure_conditional_writes` in
   `companions/ai-memory-wikisync/src/mcp.rs`).
 - `capabilities()` runs `initialize` (server name, version, protocol version),
   `tools/list` (tool names and input-schema property names) and
@@ -741,7 +741,7 @@ rule extension (§6.3); a pointer in [programmatic-memory.md](programmatic-memor
 and [companion-crates.md](companion-crates.md).
 
 Maintainer decisions before phase 1 starts: approve the start (this document),
-and confirm the 2.7.0 floor.
+and confirm the 3.0.0 floor.
 
 ### Phase 2: reads and messaging (about 4 to 5 days)
 

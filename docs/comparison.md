@@ -45,14 +45,14 @@ What still sets ai-memory apart:
   runs on a laptop, a homelab box, or a LAN server, with no paid tier.
 - **Capture under the harness you already use.** One server; 20+ harnesses
   (Claude Code, Codex, Cursor, Gemini, OpenCode, Kimi, …) feed and read the
-  same memory. Replication between servers is not automatic; in 2.7
+  same memory. Replication between servers is not automatic; in 3.0
   (unreleased) the `ai-memory-wikisync` companion adds two-way,
   conflict-aware sync between a server's wiki and a git repository.
 
 It also publishes retrieval numbers, produced by the in-repo harness with full
 provenance and measured end to end through the shipped capture pipeline:
 LongMemEval-S hit@5 **0.666** zero-LLM and **0.815** with the default local
-embeddings in the published 2.6 line. The observation stream in 2.7
+embeddings in the published 2.6 line. The observation stream in 3.0
 (unreleased, on by default) raises zero-LLM to **0.951** and local embeddings
 to **0.936** on all 470 questions, measured on one build with the stream off
 and on. With capture skipped and each raw session indexed whole (component
@@ -246,19 +246,19 @@ ships something ai-memory does not, it is named.
   with DB tokens and OIDC, claim-once handoffs and cross-project messaging,
   guarded backup/restore/purge, and no runtime dependency under the Elastic
   License (iii-engine's engine is ELv2). You give up editing and forgetting
-  memories in a browser (the 2.7 web UI adds page history with diffs, a
+  memories in a browser (the 3.0 web UI adds page history with diffs, a
   session timeline, a recall trace and a health panel, but stays read-only by
-  design), the iii console's OpenTelemetry traces (ai-memory 2.7 has
+  design), the iii console's OpenTelemetry traces (ai-memory 3.0 has
   per-stream timings in `explain=true` and a root-only Prometheus
   `/admin/metrics` instead), the coordination tools (leases, actions,
   routines, signals, sentinels), mesh sync (the nearest equivalent is the
   git-based `ai-memory-wikisync` companion), image memory, the two-way Claude
-  `MEMORY.md` bridge, PaaS deploy templates, an npm package (ai-memory 2.7
+  `MEMORY.md` bridge, PaaS deploy templates, an npm package (ai-memory 3.0
   installs natively on Linux and macOS in two commands, `install.sh` and then
   `ai-memory setup`, but has no `npx` route, and Windows gets no service
   step), and the opt-in local cross-encoder reranker. The benchmark numbers are not
   like-for-like (component vs pipeline, see above). To move your data, the
-  `ai-memory-importer` companion (2.7) reads agentmemory's Obsidian vault
+  `ai-memory-importer` companion (3.0) reads agentmemory's Obsidian vault
   (`agentmemory-vault`) or its `ExportData` JSON (`agentmemory-export`), and
   `ai-memory doctor` flags agentmemory MCP entries and rules-file guideline
   blocks left behind; see
@@ -383,10 +383,10 @@ ships something ai-memory does not, it is named.
 - **Distribution through plugin directories.** Cognee's Claude Code plugin is
   listed in Anthropic's official plugin directory, and Mem0, Supermemory and
   OpenViking ship native plugins per agent. ai-memory
-  installs with `install.sh` and `ai-memory setup` (2.7) or `install-hooks`,
+  installs with `install.sh` and `ai-memory setup` (3.0) or `install-hooks`,
   not from a plugin marketplace.
 - **An installer that detects and wires every agent.** `ai-memory setup`
-  (2.7) wires MCP, hooks and Agent Skills for each detected agent on Linux and
+  (3.0) wires MCP, hooks and Agent Skills for each detected agent on Linux and
   macOS. Hindsight's coding-agent package covers 16+ agents, and memU's
   `memu-agent detect` finds unknown agents' transcripts. Windows has no
   service step yet.
@@ -404,12 +404,12 @@ ships something ai-memory does not, it is named.
   recall into each request. ai-memory's hooks inject the session brief at
   session start (on the first prompt for harnesses without a start hook);
   later recall is an agent tool call.
-- **No "show what was recalled" view in the agent.** The 2.7 web UI has a
+- **No "show what was recalled" view in the agent.** The 3.0 web UI has a
   recall trace with per-stream ranks, but the agent session has no compact
   card showing the user which memories were injected.
 - **Retrieval through capture, and no local reranker.** Through the shipped
   pipeline, LongMemEval-S hit@5 is 0.815 with local embeddings and 0.666
-  zero-LLM (2.6); the 2.7 observation stream raises them to 0.936 and 0.951. Ranking
+  zero-LLM (2.6); the 3.0 observation stream raises them to 0.936 and 0.951. Ranking
   the same raw sessions whole scores 0.972 zero-LLM. The
   [decomposition](benchmarks/longmemeval-s-decomposition-2026-10-12.md) traced
   the gap to capture, and within capture not to the 2 KB privacy cap (pages holding exactly the captured text
@@ -430,7 +430,7 @@ ships something ai-memory does not, it is named.
 
   | Tool | Number | Kind | Setup |
   |---|---|---|---|
-  | ai-memory 2.7 (unreleased) | LongMemEval-S hit@5 0.951 FTS / 0.936 local (2.6: 0.666 / 0.815) | Retrieval through capture | In-repo harness, all 470 questions; component mode FTS 0.972 |
+  | ai-memory 3.0 (unreleased) | LongMemEval-S hit@5 0.951 FTS / 0.936 local (2.6: 0.666 / 0.815) | Retrieval through capture | In-repo harness, all 470 questions; component mode FTS 0.972 |
   | MemPalace | 96.6% R@5 raw, 98.4% held-out (450 q) | Retrieval only | Different harness |
   | agentmemory | 95.2% `recall_any@5`; 2026-10-09 baseline 96.2% any-hit, 84.68% strict recall-all@5 | Retrieval, component | Whole raw sessions, reranker disabled; the authors say the baseline supports no competitive claim |
   | Mem0 | LongMemEval 94.4, LoCoMo 92.5, BEAM 64.1 (1M) / 48.6 (10M) | End-to-end QA, LLM-judged | Managed platform, top-200 budget; harness defaults to gpt-4o reader and judge; headline models not stated |

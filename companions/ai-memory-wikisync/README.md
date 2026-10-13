@@ -13,7 +13,7 @@ team's shared memory can live as reviewable markdown in git:
 - `sync --check` is a read-only CI gate, and `install-hook` runs `sync`
   after every git merge.
 
-`sync --apply` needs ai-memory 2.7 or later: every write and delete is
+`sync --apply` needs ai-memory 3.0 or later: every write and delete is
 conditional on the page version the plan saw, and an older server would
 ignore that condition, so `sync` refuses to write to one.
 
@@ -158,7 +158,7 @@ Safety rules:
   after it was classified is refused by the server, reported as "changed
   during this run", and left with its old state for the next run; the other
   pages still sync, and the run exits non-zero. A server without these
-  preconditions (before ai-memory 2.7) is detected before anything is
+  preconditions (before ai-memory 3.0) is detected before anything is
   written and refused.
 - **The server's version wins after an import.** If the server stores
   something other than the file (the sanitizer redacting a secret), the file
@@ -230,7 +230,7 @@ ai-memory-wikisync uninstall-hook --dest docs/wiki [--hooks-dir DIR]
 ## Roadmap (#986)
 
 1. Read-only export into a project repository (`export`).
-2. Conditional mutation seam (compare-and-write) in core (ai-memory 2.7).
+2. Conditional mutation seam (compare-and-write) in core (ai-memory 3.0).
 3. Two-way sync (`sync`): repository edits flow back through the public MCP
    write tool.
 4. Deletes and conflict reporting (`--propagate-deletes`, conditional

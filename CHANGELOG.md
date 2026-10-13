@@ -177,7 +177,7 @@ and [0.x](docs/changelog/0.x.md).
   deleted only with `--prefer repo`. Every sync write and delete now carries
   the page version it was planned against, so a page changed during the run is
   reported and left alone while the rest apply, and `sync --apply` refuses a
-  server older than 2.7. Without the flag deletes are still only reported.
+  server older than 3.0. Without the flag deletes are still only reported.
   (#986)
 - `ai-memory doctor` now reports three silent capture failures: an unreachable
   server (reported instead of aborting the check), a hook spool that is full and
@@ -273,7 +273,7 @@ and [0.x](docs/changelog/0.x.md).
   under `sessions/` or another reserved family, and links to pages that were
   not imported become plain text. Every write goes through `memory_write_page`
   with `create_only` or `expected_page_id`, and the importer refuses servers
-  older than 2.7. A memory's versions are written oldest first so ai-memory
+  older than 3.0. A memory's versions are written oldest first so ai-memory
   keeps the supersession chain, and `forgetAfter` becomes `expires_at`. Each
   page carries a stable UUIDv5 ingest key, so an interrupted import resumes
   without duplicates and a rerun writes nothing. Text is redacted before

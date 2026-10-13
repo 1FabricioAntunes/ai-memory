@@ -134,7 +134,7 @@ Notes:
 - `init` on a fresh data dir writes a root bearer token to
   `<data_dir>/auth-tokens/default`. The hooks, the CLI and `install-mcp` read
   it from there, so you never pass `--auth-token` locally. An install from
-  before 2.7 keeps running without a token until `ai-memory auth enable`.
+  before 3.0 keeps running without a token until `ai-memory auth enable`.
 - Keep the extracted `ai-memory` at a stable path; the hook commands (and the
   symlink, if you made one) reference it. Re-run `install-hooks` and re-point
   the symlink if you move it.
