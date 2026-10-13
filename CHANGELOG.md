@@ -11,6 +11,14 @@ and [0.x](docs/changelog/0.x.md).
 
 ## [Unreleased]
 
+### Deprecated
+
+- The 1.x compatibility-token commands `user add`, `user expire`,
+  `user revive` and `user rotate-token`, and their admin endpoints, will be
+  removed in 3.0.0. Tokens they issued keep working after the upgrade as
+  ordinary API keys; manage them with `api-key list|rotate|revoke`, and add
+  people with `user add-human`.
+
 ### Fixed
 
 - Fixed the companion relay refusing to open its queue on Windows when another
