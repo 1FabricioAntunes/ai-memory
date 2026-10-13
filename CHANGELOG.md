@@ -350,7 +350,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server's credential. The Docker wrapper hands a host command (`install-hooks`,
   `mcp-bridge`, `run`) the token of a server initialized on its volume as an
   owner-only file that `install-hooks` copies from the volume, never on a
-  command line.
+  command line. With no human accounts the built-in web UI answers a browser
+  with a Basic sign-in prompt instead of redirecting to a login form that
+  could not succeed: any username, and the token file's contents as the
+  password. `ai-memory setup` prints that URL and the file to read, never the
+  token. The macOS menu bar app reads the token from its data dir when none is
+  saved in Settings, so an install it initialized turns green without pasting
+  anything.
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites

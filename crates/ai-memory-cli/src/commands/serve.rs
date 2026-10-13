@@ -6111,8 +6111,10 @@ mod tests {
             .unwrap();
         assert_eq!(json_401.status(), StatusCode::UNAUTHORIZED);
 
-        // Browser navigations redirect to the public login page.
-        let html_redir = router
+        // With a bearer and no human accounts there is no login form that
+        // could succeed, so a browser navigation gets the Basic challenge,
+        // not a redirect to the login page.
+        let html_challenge = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -6125,16 +6127,33 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(html_redir.status(), StatusCode::SEE_OTHER);
-        let location = html_redir
+        assert_eq!(html_challenge.status(), StatusCode::UNAUTHORIZED);
+        assert!(html_challenge.headers().get(header::LOCATION).is_none());
+        let challenge = html_challenge
             .headers()
-            .get(header::LOCATION)
+            .get(header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        assert!(
-            location.starts_with("/web/login?next="),
-            "expected login redirect, got {location}"
-        );
+        assert!(challenge.starts_with("Basic "), "challenge: {challenge}");
+
+        // The token as the Basic password opens the wiki.
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode("root:secret");
+        let signed_in = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .header("Authorization", format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status(), StatusCode::OK);
 
         // Login HTML is public (no auth).
         let login = router
