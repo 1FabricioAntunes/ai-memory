@@ -409,7 +409,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the project. The search page gained a "Search in" selector (`scope=<workspace>/<project>`)
   that lists only the projects the viewer may read, an "in workspace/project ×"
   chip that clears the scope, a breadcrumb, and a "Search all projects" button
-  when a scoped search finds nothing. (#NNN)
+  when a scoped search finds nothing. (#1245)
 
 ### Fixed
 - Fixed SessionEnd consolidation repeating the same expensive prompt on the
