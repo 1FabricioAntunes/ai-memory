@@ -11,6 +11,11 @@
 //! This module only does the arithmetic over rendered byte costs; the hook
 //! router owns the strings and the security scaffold around them.
 
+/// A body at most this many bytes longer than what its page already shows
+/// is completed even while other pages still wait for their L1: the rest of
+/// such a page costs about what a second heading would.
+const SHORT_BODY_SLACK: usize = 128;
+
 /// How deep a core page renders in the brief. Ordered by depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BriefTier {
@@ -142,34 +147,44 @@ pub(crate) fn assign_tiers(
     let mut room = remaining.saturating_sub(omitted_reserve + recent_reserve);
 
     let included = &pages[..omitted_from];
-    let mut promote = |tiers: &mut [BriefTier], privileged: bool, target: BriefTier| {
-        for (idx, page) in included.iter().enumerate() {
-            let current = tiers[idx];
-            if page.privileged != privileged
-                || page.tiers.is_none()
-                || current >= target
-                || current == BriefTier::TitleOnly
-            {
-                continue;
-            }
-            let (from, to) = (page.cost(current), page.cost(target));
-            if to > from && to - from <= room {
-                tiers[idx] = target;
-                room -= to - from;
-            }
+    let (privileged, unprivileged): (Vec<usize>, Vec<usize>) =
+        (0..omitted_from).partition(|&idx| pages[idx].privileged);
+    let delta = |tiers: &[BriefTier], idx: usize, target: BriefTier| {
+        let page = &pages[idx];
+        match (page.tiers, tiers[idx]) {
+            (Some(_), current) if current != BriefTier::TitleOnly && current < target => page
+                .cost(target)
+                .checked_sub(page.cost(current))
+                .filter(|d| *d > 0),
+            _ => None,
         }
     };
-    promote(&mut tiers, true, BriefTier::L1);
-    promote(&mut tiers, true, BriefTier::L2);
-    promote(&mut tiers, false, BriefTier::L1);
+    let mut promote =
+        |tiers: &mut [BriefTier], order: &[usize], target: BriefTier, max_delta: usize| {
+            for &idx in order {
+                if let Some(d) = delta(tiers, idx, target)
+                    && d <= room.min(max_delta)
+                {
+                    tiers[idx] = target;
+                    room -= d;
+                }
+            }
+        };
+    promote(&mut tiers, &privileged, BriefTier::L1, usize::MAX);
+    promote(&mut tiers, &privileged, BriefTier::L2, usize::MAX);
+    promote(&mut tiers, &unprivileged, BriefTier::L1, usize::MAX);
+    promote(&mut tiers, &unprivileged, BriefTier::L2, SHORT_BODY_SLACK);
     // Full bodies for the remaining pages only once every included page
     // shows as much as its L1 can: a long body must not outbid a summary.
+    // Cheapest first, so the room left shows as many whole pages as it can.
     let every_page_at_l1 = included
         .iter()
         .zip(&tiers)
         .all(|(page, tier)| *tier >= BriefTier::L1 || !page.l1_adds());
     if every_page_at_l1 {
-        promote(&mut tiers, false, BriefTier::L2);
+        let mut cheapest = unprivileged;
+        cheapest.sort_by_key(|&idx| (delta(&tiers, idx, BriefTier::L2), idx));
+        promote(&mut tiers, &cheapest, BriefTier::L2, usize::MAX);
     }
 
     BriefPlan {
@@ -265,8 +280,9 @@ mod tests {
         // Room for both L1s but not for a body on top of them.
         let plan = assign(&pages, 100 + 800 + 40, 0);
         assert_eq!(plan.tiers, vec![L1, L1]);
-        // One L1 does not fit: no unprivileged body may jump the queue.
-        let pages = [page(false, 100, 900, 950), page(false, 100, 150, 160)];
+        // One L1 does not fit: no long unprivileged body may jump the queue
+        // (a body within `SHORT_BODY_SLACK` of its excerpt is the exception).
+        let pages = [page(false, 100, 900, 950), page(false, 100, 150, 600)];
         let plan = assign(&pages, 100 + 200 + 100, 0);
         assert_eq!(plan.tiers, vec![L0, L1]);
     }
@@ -324,6 +340,28 @@ mod tests {
             100 + spent(&pages, &plan) + plan.recent_reserve <= ceiling,
             "{plan:?}"
         );
+    }
+
+    #[test]
+    fn a_body_almost_shown_is_completed_even_when_a_summary_did_not_fit() {
+        // The first page's L1 does not fit, which holds back every other
+        // unprivileged body; the second page is 60 bytes from whole.
+        let pages = [page(false, 100, 900, 950), page(false, 100, 100, 160)];
+        let plan = assign(&pages, 100 + 200 + 200, 0);
+        assert_eq!(plan.tiers, vec![L0, L2]);
+    }
+
+    #[test]
+    fn cheaper_bodies_go_first_so_more_pages_show_whole() {
+        // Room for 400 bytes of bodies: the first page alone, or both of
+        // the others.
+        let pages = [
+            page(false, 100, 100, 500),
+            page(false, 100, 100, 300),
+            page(false, 100, 100, 300),
+        ];
+        let plan = assign(&pages, 100 + 300 + 400, 0);
+        assert_eq!(plan.tiers, vec![L0, L2, L2]);
     }
 
     #[test]

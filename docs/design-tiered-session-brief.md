@@ -586,11 +586,23 @@ first call" policy after coverage without eating the recent share.
    truncate an L2 in this pass. Truncation of one body is what starves
    later pages today. If L2 does not fit, the page stays at L1.
 4. **Unprivileged L1.** Same as (2) for the remaining included pages.
-5. **Unprivileged L2.** Same as (3), only after every included page is
+5. **Short bodies.** In store order, complete any unprivileged page whose
+   whole body is at most `SHORT_BODY_SLACK` (128) bytes more than what it
+   already shows. This runs before the gate in (6), so one page whose L1
+   did not fit cannot hold back bodies that cost about a heading.
+6. **Unprivileged L2.** Same as (3), only after every included page is
    at its max useful depth: L1 (or L0 when L1 is a zero-delta no-op),
    or TitleOnly. Title-only and zero-delta pages count as already at
-   max depth. They do not block L2 of siblings. Remaining budget then
-   deepens already-included pages.
+   max depth. They do not block L2 of siblings. Pages go cheapest delta
+   first (store order breaks ties), so the room left shows as many
+   whole pages as it can.
+
+The risk review (old vs new renderer on the same fixtures) measured the
+trade-off this ordering makes: with 24 rules of 300-800 bytes at 8000
+bytes, the old renderer showed 12 whole bodies and omitted 11 pages; the
+coverage-first packer shows all 24, and fewer of them whole. Steps 5
+and 6 recover whole bodies only from bytes coverage did not need; they
+never take a page out of the brief to make room for another's body.
 
 **No L2 truncation during assignment.** The only remaining cut of page
 text is (a) the L0/L1 clips themselves, (b) the post-escape clamp on the

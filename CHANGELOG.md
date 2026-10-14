@@ -15,16 +15,19 @@ version in [`docs/changelog/`](docs/changelog/):
 - Changed how the opt-in session-start brief (`[briefing]
   inject_on_session_start`) spends `max_chars`. Every pinned, `_rules/` and
   `_slots/` page now gets a short excerpt first, taken from its frontmatter
-  `abstract:` or `summary:` or else the prose it opens with, and the budget left
-  deepens pages to a longer excerpt and then the whole body, pinned and
-  `_slots/` pages first. Before, the brief printed whole bodies in order, so one
-  long `_rules/` page was cut with a `[truncated by ...]` note and every page
-  after it was reduced to an "omitted" path. Bodies are no longer cut: a body
-  that does not fit whole shows its excerpt. Four or more unpinned excerpts from
-  one folder share a heading, and the omitted list and the closing note now
-  point at `memory_read_page`. Small wikis whose pages fit still get every body
-  whole; pin a page to have it shown in full first. The change needs no new
-  marker key and no migration. (#1264)
+  `abstract:` or `summary:`, or else from the prose it opens with (read on
+  into its first list items). The budget left deepens pages to a longer
+  excerpt and then the whole body: pinned and `_slots/` pages first, then
+  pages a few bytes short of whole, then the cheapest bodies. Before, the
+  brief printed whole bodies in order, so one long `_rules/` page was cut with
+  a `[truncated by ...]` note and every page after it became an "omitted"
+  path. Bodies are no longer cut: a body that does not fit whole shows its
+  excerpt. Four or more unpinned excerpts from one folder share a heading,
+  and the omitted list and the closing note point at `memory_read_page`.
+  Small wikis whose pages fit still get every body whole. A project with many
+  standing pages now sees all of them, fewer in full: pin a page, or give it
+  an `abstract:`, to control what it shows. The change adds no marker key
+  and no migration. (#1264)
 
 ## [3.0.0] - 2026-10-13
 
