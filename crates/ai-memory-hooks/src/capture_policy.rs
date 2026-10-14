@@ -3643,6 +3643,19 @@ fn windows_session(cwd: &str) -> bool {
     normalize_root(cwd).is_ok_and(|root| flavor_of(&root) == Flavor::Windows)
 }
 
+/// Never-match `ignore_paths` entry used by server re-inspection to compile
+/// an Active policy without seeing the client's real patterns. The spelling
+/// must share the cwd's path flavor: a POSIX absolute sentinel is rejected
+/// on a Windows repository (GHSA-gcpc-88hm-3xqr), which would make every
+/// kept file and shell event metadata-only (#1250).
+pub(crate) fn inspection_sentinel(cwd: &str) -> &'static str {
+    if windows_session(cwd) {
+        "C:/__ai_memory_capture_server_inspection_never_match__"
+    } else {
+        "/__ai_memory_capture_server_inspection_never_match__"
+    }
+}
+
 /// Whether a Windows shell word names a file the matcher cannot place, so a
 /// command holding it proves no miss: a drive-relative path (`C:docs\x`, a
 /// bare `C:`), which Windows resolves from that drive's own current directory
@@ -5687,6 +5700,36 @@ mod tests {
                 CapturePolicy::resolve(CaptureSource::Parsed(&config(pattern)), r"C:\repo", None);
             assert_eq!(policy.state(), PolicyState::Active, "{pattern}");
         }
+    }
+
+    /// Server re-inspection compiles a never-match sentinel as Active. The
+    /// sentinel must share the cwd's path flavor: a POSIX absolute one is
+    /// Invalid on a Windows repository (GHSA-gcpc-88hm-3xqr), which is how
+    /// #1250 over-stripped kept events.
+    #[test]
+    fn inspection_sentinel_matches_cwd_flavor() {
+        const POSIX: &str = "/__ai_memory_capture_server_inspection_never_match__";
+        const WINDOWS: &str = "C:/__ai_memory_capture_server_inspection_never_match__";
+        let config = |pattern: &str| CaptureConfig {
+            ignore_paths: vec![pattern.to_owned()],
+        };
+        let state = |pattern: &str, cwd: &str| {
+            CapturePolicy::resolve(CaptureSource::Parsed(&config(pattern)), cwd, None).state()
+        };
+        assert_eq!(inspection_sentinel(r"C:\repo"), WINDOWS);
+        assert_eq!(inspection_sentinel(r"\\server\share\repo"), WINDOWS);
+        assert_eq!(inspection_sentinel("/repo"), POSIX);
+        assert_eq!(inspection_sentinel("/c/repo"), POSIX);
+        assert_eq!(state(POSIX, r"C:\repo"), PolicyState::Invalid);
+        assert!(
+            describe_invalid_capture_config(&config(POSIX), r"C:\repo", None)
+                .as_deref()
+                .is_some_and(|reason| reason.contains("POSIX"))
+        );
+        assert_eq!(state(WINDOWS, r"C:\repo"), PolicyState::Active);
+        assert_eq!(state(POSIX, "/repo"), PolicyState::Active);
+        assert_eq!(state(POSIX, "/c/repo"), PolicyState::Active);
+        assert_eq!(state(WINDOWS, r"\\server\share\repo"), PolicyState::Active);
     }
 
     /// Native and generated TypeScript classify every tool name alike; the

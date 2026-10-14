@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed Windows capture dropping the body of file and shell tool events
+  the client had kept. With `[capture] ignore_paths` active, server
+  re-inspection compiled a POSIX never-match sentinel and treated the
+  policy as invalid, so a kept Read or Bash became metadata-only. The
+  sentinel now follows the event cwd's path flavor. (#1250)
+
 ## [3.0.0] - 2026-10-13
 
 ### Added
