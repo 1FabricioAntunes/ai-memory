@@ -3697,6 +3697,49 @@ mod tests {
         assert_eq!(cfg.server_url, "https://from-env.example");
     }
 
+    /// #1269: deriving the URL must not make an operator look like they
+    /// configured it.
+    ///
+    /// `server_url_configured()` is what `install-hooks` and `install-mcp`
+    /// read to decide whether to infer the URL from an existing MCP entry
+    /// rather than fall back to the compiled default. Someone who only edited
+    /// `bind` has not chosen a `server_url`, so the answer has to stay false
+    /// or those installers change behaviour for them.
+    #[test]
+    fn a_derived_server_url_is_not_reported_as_configured() {
+        let cfg = load_with_toml("bind = \"127.0.0.1:49921\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://127.0.0.1:49921");
+        assert!(
+            cfg.server_url_derived_from_bind,
+            "the loader must record that it derived the value"
+        );
+        assert!(
+            !cfg.server_url_configured(),
+            "a bind-derived URL is not an operator-configured one"
+        );
+
+        // Control: a value the operator actually wrote is still reported as
+        // configured, and is not marked derived.
+        let cfg = load_with_toml("server_url = \"https://memory.example\"\n").unwrap();
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+
+        // Control: the environment counts as explicit too, even when it names
+        // the default URL.
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load_with_runtime_env(
+            None,
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                server_url: Some(DEFAULT_SERVER_URL.into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+    }
+
     /// The default install must be byte-identical to before this change: the
     /// default bind derives exactly the default URL.
     #[test]
