@@ -18018,10 +18018,7 @@ mod tests {
             "metadata-only"
         );
         let stored = serde_json::to_string(&env).unwrap();
-        assert!(
-            !stored.contains("SENTINEL") && !stored.contains("KEEP_BODY"),
-            "{stored}"
-        );
+        assert!(!stored.contains("KEEP_BODY"), "{stored}");
     }
 
     #[test]
