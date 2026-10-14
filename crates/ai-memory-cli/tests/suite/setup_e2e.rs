@@ -114,7 +114,12 @@ fn setup_without_yes_and_without_a_terminal_changes_nothing() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ai-memory setup will:"), "{}", text(&out));
     assert!(
-        stdout.contains("wire claude-code (detected)"),
+        stdout.contains("1. claude-code: MCP + hooks + skills (found its session store at"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stdout.contains("not in this plan (add with --agent <name>):") && stdout.contains("cursor"),
         "{}",
         text(&out)
     );
@@ -127,6 +132,45 @@ fn setup_without_yes_and_without_a_terminal_changes_nothing() {
     assert!(!sandbox.data_dir().join("config.toml").exists());
     assert!(!sandbox.data_dir().join("auth-tokens").exists());
     assert_eq!(sandbox.snapshot(), before, "setup wrote without --yes");
+}
+
+/// `--plan --json` prints a parseable plan naming the detected agent and its
+/// evidence, exits zero, and writes nothing, with no terminal and no `--yes`.
+#[test]
+fn setup_plan_json_prints_the_plan_and_changes_nothing() {
+    let sandbox = Sandbox::new();
+    let store = sandbox.home.join(".claude/projects");
+    std::fs::create_dir_all(&store).unwrap();
+    let before = sandbox.snapshot();
+    let port = crate::e2e_support::free_port();
+    let out = sandbox
+        .cmd(Some(port))
+        .args(["setup", "--plan", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON plan");
+    assert_eq!(plan["format"], 1, "{plan}");
+    assert_eq!(plan["fresh"], true, "{plan}");
+    assert_eq!(plan["agents"][0]["agent"], "claude-code", "{plan}");
+    assert_eq!(
+        plan["agents"][0]["found"]["kind"], "session_store",
+        "{plan}"
+    );
+    assert_eq!(
+        plan["agents"][0]["found"]["path"],
+        store.display().to_string(),
+        "{plan}"
+    );
+    assert!(!sandbox.data_dir().join("config.toml").exists());
+    assert_eq!(sandbox.snapshot(), before, "setup --plan wrote");
+
+    // `--plan` cannot be combined with `--yes`, and `--json` needs `--plan`.
+    for args in [&["setup", "--plan", "--yes"][..], &["setup", "--json"][..]] {
+        let refused = sandbox.cmd(Some(port)).args(args).output().unwrap();
+        assert!(!refused.status.success(), "{args:?}: {}", text(&refused));
+    }
+    assert_eq!(sandbox.snapshot(), before, "a refused setup wrote");
 }
 
 /// Spawns a server through the fake service manager: the slow tier.
@@ -270,6 +314,11 @@ esac
         let stdout = String::from_utf8_lossy(&first.stdout);
         assert!(stdout.contains("healthz: ok"), "{}", text(&first));
         assert!(stdout.contains("memory_status: ok"), "{}", text(&first));
+        assert!(
+            stdout.contains("What do you remember about this project?"),
+            "{}",
+            text(&first)
+        );
 
         let data_dir = sandbox.data_dir();
         let token = std::fs::read_to_string(data_dir.join("auth-tokens/default"))

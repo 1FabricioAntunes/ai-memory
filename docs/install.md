@@ -99,8 +99,8 @@ sh install.sh
 Windows is not covered by the script; use the zip in
 [`docs/windows.md`](windows.md).
 
-`ai-memory setup [--yes] [--agent <name>]... [--no-service]` runs, in order,
-the commands a native install otherwise needs one by one:
+`ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]]`
+runs, in order, the commands a native install otherwise needs one by one:
 
 1. `init`. On a fresh data dir this mints the root bearer token into
    `<data_dir>/auth-tokens/default` (owner-only) and records
@@ -127,17 +127,29 @@ the commands a native install otherwise needs one by one:
    `install-skills --scope global`. With no `--agent`, `setup` wires every
    harness whose session store or MCP config exists under your home, using the
    same store locations as `doctor` (including `CLAUDE_CONFIG_DIR`,
-   `CODEX_HOME` and similar relocations). OpenCode 2 and the Kiro CLI v3
-   engine share a store with OpenCode and Kiro CLI, so they are wired only
-   when named, for example `--agent opencode2`.
+   `CODEX_HOME` and similar relocations). The plan numbers each agent and
+   says what it was found by (its session store, its MCP config, or for Muse
+   its directory), then lists the other agents `--agent` accepts. Cursor,
+   Gemini CLI, Droid and the other agents with no store to look for are
+   wired by naming them. OpenCode 2 and the Kiro CLI v3 engine share a store
+   with OpenCode and Kiro CLI, so they are wired only when named, for example
+   `--agent opencode2`.
 4. A self-check that writes nothing: `GET /healthz`, a `memory_status` call
    over MCP with the install's credential, and `doctor`.
 
-Without `--yes`, `setup` prints this plan and asks on a terminal; with no
-terminal (a script, an agent's tool call) it changes nothing and exits
-non-zero, asking for `--yes`. Each step is idempotent: a second run rewrites no
+Without `--yes`, `setup` prints this plan and asks on a terminal. `y` applies
+it. With more than one agent in the plan you can instead type the numbers of
+the agents to wire (`1 3` or `1,3`); every other step still runs, and an answer
+naming a number outside the plan changes nothing. With no terminal (a script,
+an agent's tool call) it changes nothing and exits non-zero, asking for
+`--yes`. `--plan` prints the plan and exits without changing anything;
+`--plan --json` prints it as a JSON document for a script or front end, with a
+`format` field that is bumped only when a field changes meaning or is removed. Each step is idempotent: a second run rewrites no
 file and leaves a running service alone. A step that fails does not stop the
-others; `setup` lists each `problem:` at the end and exits non-zero. The token
+others; `setup` lists each `problem:` at the end and exits non-zero. When every step
+passed it ends by naming the agents to restart and the question to ask one of
+them, "What do you remember about this project?": answering it takes a call
+to ai-memory's tools, so the reply shows the wiring works. The token
 is never printed or passed on a command line, and no harness config holds it:
 hooks read the credential files `init` writes, and MCP clients reach the
 server through `ai-memory mcp-bridge`.
@@ -501,8 +513,10 @@ Download the `x86_64` or `aarch64` RPM from the
 [latest GitHub release](https://github.com/akitaonrails/ai-memory/releases/latest)
 and install it with `sudo dnf install ./ai-memory-*.rpm`. The package includes
 the binary, hook sources, system and user systemd units, and system service
-configuration. Follow the [user-level service](#user-level-service) or
-[system service](#system-service) steps below to initialize and start it.
+configuration. On a single-user machine, run `ai-memory setup`, as in the
+[one-step native install](#one-step-native-install-installsh--ai-memory-setup).
+For the manual route, follow the [user-level service](#user-level-service) or
+[system service](#system-service) steps below.
 
 ## Arch Linux native packages (AUR)
 
@@ -546,6 +560,14 @@ only one can listen on `127.0.0.1:49374` unless you change `bind` in one config.
 
 Use this on a single-user workstation. It needs no sudo after package install and
 keeps all state in your home directory.
+
+The short route is `ai-memory setup`, which does everything below and wires
+your agents too (see the
+[one-step native install](#one-step-native-install-installsh--ai-memory-setup)).
+It writes its own unit to `~/.config/systemd/user/ai-memory.service`, which
+takes precedence over the packaged one of the same name, with the config at
+`~/.local/share/ai-memory/config.toml`. The manual steps below use the packaged
+unit and its paths instead.
 
 ```bash
 mkdir -p ~/.config/ai-memory ~/.local/share/ai-memory

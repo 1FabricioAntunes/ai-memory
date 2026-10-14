@@ -32,6 +32,23 @@ version in [`docs/changelog/`](docs/changelog/):
   and tier both ignore case, a nonstandard kind is flagged on an empty
   result, and "Search all projects" keeps the filters. An unknown `tier` is
   a 400. (#1248)
+- Added `ai-memory setup --plan`, which prints the plan and changes nothing,
+  and `--plan --json`, which prints it as a JSON document with a `format`
+  version for a script or front end to render. The plan now says what each
+  detected agent was found by (its session store, its MCP config, or Muse's
+  directory), numbers the agents, and lists the other agents `--agent`
+  accepts. At the prompt you can type the numbers of the agents to wire
+  instead of `y`; a number outside the plan changes nothing. (#1270)
+
+### Changed
+- `ai-memory setup` now ends by naming the agents to restart and the question
+  to ask one of them, "What do you remember about this project?", instead of
+  a generic restart line. `install.sh` names the link's full path in its
+  `next:` line when `~/.local/bin` is not on `PATH`, so the suggested command
+  no longer fails with "command not found". The AUR install and upgrade
+  messages, and the README Fedora, Arch and macOS app steps, point to
+  `ai-memory setup` instead of the manual `init`, `systemctl` and
+  `install-*` commands. (#1270)
 
 ### Fixed
 - Fixed Windows capture dropping the body of file and shell tool events

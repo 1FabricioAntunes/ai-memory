@@ -21,8 +21,11 @@
 //! they do when run by hand.
 //!
 //! Every step is idempotent, so a second `setup` changes nothing. Without
-//! `--yes` the plan is shown first and confirmed on a terminal; with no
-//! terminal to ask on, `setup` changes nothing and exits non-zero.
+//! `--yes` the plan is shown first and confirmed on a terminal, where the
+//! operator can also pick which of the planned agents to wire; with no
+//! terminal to ask on, `setup` changes nothing and exits non-zero. `--plan`
+//! prints the plan (as JSON with `--json`, for a front end to render) and
+//! changes nothing.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -49,6 +52,14 @@ const SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The MCP entry name every installer writes by default.
 const ENTRY_NAME: &str = "ai-memory";
+
+/// What `setup` tells the operator to ask a restarted agent: answering it
+/// takes a call to ai-memory's tools, so the reply shows the wiring works.
+const FIRST_QUESTION: &str = "What do you remember about this project?";
+
+/// Bumped when a field of the `--plan --json` document changes meaning or
+/// goes away; adding a field does not bump it.
+const PLAN_FORMAT: u32 = 1;
 
 /// Harnesses that share a native store with another one, so finding the store
 /// cannot tell them apart: OpenCode 2 shares OpenCode's, and the Kiro CLI v3
@@ -77,9 +88,12 @@ enum ServicePlan {
     Skip(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentPlan {
     agent: AgentChoice,
+    /// Where detection found the agent; `None` when it was named with
+    /// `--agent`.
+    found: Option<Found>,
     mcp: Option<McpClient>,
     skills: InstallSkillsAgent,
     /// The ai-memory marketplace plugin is enabled for this agent: it carries
@@ -87,10 +101,31 @@ struct AgentPlan {
     plugin: bool,
 }
 
+/// The evidence detection found an agent by, shown in the plan so the
+/// operator can tell why an agent is listed before agreeing to wire it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+enum Found {
+    SessionStore(PathBuf),
+    McpConfig(PathBuf),
+    ConfigDir(PathBuf),
+}
+
+impl Found {
+    fn describe(&self) -> String {
+        match self {
+            Self::SessionStore(path) => format!("found its session store at {}", path.display()),
+            Self::McpConfig(path) => format!("found its MCP config at {}", path.display()),
+            Self::ConfigDir(path) => format!("found its directory at {}", path.display()),
+        }
+    }
+}
+
 impl AgentPlan {
-    fn new(agent: AgentChoice) -> Self {
+    fn new(agent: AgentChoice, found: Option<Found>) -> Self {
         Self {
             agent,
+            found,
             mcp: install_hooks::mcp_client_for_agent(agent),
             skills: skills_for(agent),
             plugin: false,
@@ -98,7 +133,12 @@ impl AgentPlan {
     }
 
     /// [`Self::new`], with the plugin state of `agent` under `home`.
-    fn detect(agent: AgentChoice, home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Self {
+    fn detect(
+        agent: AgentChoice,
+        found: Option<Found>,
+        home: &Path,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Self {
         let harness = match agent {
             AgentChoice::ClaudeCode => Some(agent_plugins::PluginHarness::ClaudeCode),
             AgentChoice::Codex => Some(agent_plugins::PluginHarness::Codex),
@@ -107,9 +147,26 @@ impl AgentPlan {
         Self {
             plugin: harness
                 .is_some_and(|harness| agent_plugins::enabled(harness, home, env).is_some()),
-            ..Self::new(agent)
+            ..Self::new(agent, found)
         }
     }
+
+    fn wiring(&self) -> &'static str {
+        match (self.plugin, self.mcp.is_some()) {
+            (true, _) => "plugin",
+            (false, true) => "mcp+hooks+skills",
+            (false, false) => "hooks+skills",
+        }
+    }
+}
+
+/// The `--agent` spelling of an agent, as `--help` lists it.
+fn agent_name(agent: AgentChoice) -> String {
+    use clap::ValueEnum as _;
+    agent.to_possible_value().map_or_else(
+        || agent.kind().as_str().to_owned(),
+        |value| value.get_name().to_owned(),
+    )
 }
 
 /// The skill directory family an agent reads; agents without one of their
@@ -154,18 +211,24 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
     let exe = service_exe(&exe, &env);
 
     let written_config = init_config_path(config, config_path);
-    let agents = if args.agents.is_empty() {
+    let agents: Vec<(AgentChoice, Option<Found>)> = if args.agents.is_empty() {
         let mut found = detect_agents(
             &home,
             &|harness| doctor::relocated_session_dir_with(harness, &env),
             &|client| install_mcp::mcp_config_path_with(client, &env).ok(),
         );
-        if muse_detected(&home, &env) {
-            found.push(AgentChoice::Muse);
+        if let Some(dir) = muse_detected(&home, &env) {
+            found.push((AgentChoice::Muse, Found::ConfigDir(dir)));
         }
         found
+            .into_iter()
+            .map(|(agent, found)| (agent, Some(found)))
+            .collect()
     } else {
         dedup(args.agents.iter().copied())
+            .into_iter()
+            .map(|agent| (agent, None))
+            .collect()
     };
     let service = if args.no_service {
         ServicePlan::Skip("skipped (--no-service)".to_owned())
@@ -188,21 +251,28 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
             reachable,
         )
     };
-    let plan = SetupPlan {
+    let mut plan = SetupPlan {
         data_dir: config.data_dir.clone(),
         fresh: !written_config.exists(),
         config_path: written_config,
         service,
         agents: agents
             .into_iter()
-            .map(|agent| AgentPlan::detect(agent, &home, &env))
+            .map(|(agent, found)| AgentPlan::detect(agent, found, &home, &env))
             .collect(),
         detected: args.agents.is_empty(),
     };
 
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&plan_document(&plan))?);
+        return Ok(());
+    }
     print_plan(&plan);
+    if args.plan {
+        return Ok(());
+    }
     if !args.yes {
-        confirm()?;
+        plan.agents = choose_agents(confirm(plan.agents.len())?, plan.agents);
     }
     execute(
         config,
@@ -218,7 +288,7 @@ fn init_config_path(config: &Config, explicit: Option<&Path>) -> PathBuf {
     explicit.map_or_else(|| config.data_dir.join("config.toml"), Path::to_path_buf)
 }
 
-fn dedup(agents: impl Iterator<Item = AgentChoice>) -> Vec<AgentChoice> {
+fn dedup<T: PartialEq>(agents: impl Iterator<Item = T>) -> Vec<T> {
     let mut seen = Vec::new();
     for agent in agents {
         if !seen.contains(&agent) {
@@ -229,25 +299,51 @@ fn dedup(agents: impl Iterator<Item = AgentChoice>) -> Vec<AgentChoice> {
 }
 
 /// The agents to wire when none was named: every harness `doctor` scans whose
-/// session store exists, or whose MCP config file does, under `home`.
+/// session store exists, or whose MCP config file does, under `home`, each
+/// with the evidence it was found by (the store when both exist).
 fn detect_agents(
     home: &Path,
     session_dir_for: &dyn Fn(ManagedHarness) -> Option<PathBuf>,
     mcp_config_for: &dyn Fn(McpClient) -> Option<PathBuf>,
-) -> Vec<AgentChoice> {
-    let found = doctor::SCANNED_HARNESSES
+) -> Vec<(AgentChoice, Found)> {
+    let mut found: Vec<(AgentChoice, Found)> = Vec::new();
+    for harness in doctor::SCANNED_HARNESSES
         .iter()
         .copied()
         .filter(|harness| !EXPLICIT_ONLY.contains(harness))
-        .filter_map(|harness| {
-            let agent = run_autowire::agent_choice_for_harness(harness)?;
-            let store = native_store_root(harness, home, session_dir_for(harness).as_deref());
-            let config = install_hooks::mcp_client_for_agent(agent)
+    {
+        let Some(agent) = run_autowire::agent_choice_for_harness(harness) else {
+            continue;
+        };
+        if found.iter().any(|(seen, _)| *seen == agent) {
+            continue;
+        }
+        let store = native_store_root(harness, home, session_dir_for(harness).as_deref());
+        let evidence = if store.is_dir() {
+            Some(Found::SessionStore(store))
+        } else {
+            install_hooks::mcp_client_for_agent(agent)
                 .and_then(mcp_config_for)
-                .is_some_and(|path| path.is_file());
-            (store.is_dir() || config).then_some(agent)
-        });
-    dedup(found)
+                .filter(|path| path.is_file())
+                .map(Found::McpConfig)
+        };
+        if let Some(evidence) = evidence {
+            found.push((agent, evidence));
+        }
+    }
+    found
+}
+
+/// Every agent `setup --agent` accepts that is not in the plan, so an agent
+/// detection cannot find (no session store or MCP config to look for) is
+/// still one name away.
+fn other_agents(planned: &[AgentPlan]) -> Vec<String> {
+    use clap::ValueEnum as _;
+    AgentChoice::value_variants()
+        .iter()
+        .filter(|agent| !planned.iter().any(|plan| plan.agent == **agent))
+        .map(|agent| agent_name(*agent))
+        .collect()
 }
 
 /// Whether Meta Muse Code has run for this user: its config directory
@@ -256,7 +352,7 @@ fn detect_agents(
 /// Muse has no native-session adapter, so it is found by these directories
 /// rather than by [`detect_agents`]. Each XDG variable counts only when it is
 /// an absolute path, lexically.
-fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> bool {
+fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let xdg = |name: &str, fallback: &[&str]| {
         super::path_util::agent_config_home(env(name))
             .filter(|dir| dir.is_absolute())
@@ -267,8 +363,12 @@ fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> bool {
             })
             .join("muse")
     };
-    xdg("XDG_CONFIG_HOME", &[".config"]).is_dir()
-        || xdg("XDG_DATA_HOME", &[".local", "share"]).is_dir()
+    [
+        xdg("XDG_CONFIG_HOME", &[".config"]),
+        xdg("XDG_DATA_HOME", &[".local", "share"]),
+    ]
+    .into_iter()
+    .find(|dir| dir.is_dir())
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -399,13 +499,16 @@ fn print_plan(plan: &SetupPlan) {
                 "was named"
             }
         );
+    } else {
+        println!("  - wire these agents:");
     }
-    for agent in &plan.agents {
+    for (number, agent) in plan.agents.iter().enumerate() {
         let name = agent.agent.kind().as_str();
+        let number = number + 1;
         if agent.plugin {
             println!(
-                "  - leave {name} to its enabled ai-memory plugin ({}), which carries the \
-                 hooks, MCP entry and skills",
+                "      {number}. {name}: leave it to its enabled ai-memory plugin ({}), which \
+                 carries the hooks, MCP entry and skills",
                 agent_plugins::PLUGIN_ID
             );
             continue;
@@ -415,33 +518,179 @@ fn print_plan(plan: &SetupPlan) {
         } else {
             "hooks"
         };
-        println!(
-            "  - wire {name}{}: {mcp} + skills",
-            if plan.detected { " (detected)" } else { "" }
-        );
+        let why = agent
+            .found
+            .as_ref()
+            .map_or_else(|| "named with --agent".to_owned(), Found::describe);
+        println!("      {number}. {name}: {mcp} + skills ({why})");
     }
     println!("  - check /healthz, memory_status and doctor (read-only)");
+    let others = other_agents(&plan.agents);
+    if !others.is_empty() {
+        println!(
+            "Also supported, not in this plan (add with --agent <name>): {}",
+            others.join(", ")
+        );
+    }
 }
 
-/// Ask on a terminal; refuse without one.
-fn confirm() -> Result<()> {
+/// What the operator answered at the prompt.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// Apply the whole plan.
+    All,
+    /// Apply it with only these agents, as 1-based plan numbers in order.
+    Only(Vec<usize>),
+}
+
+/// Ask on a terminal; refuse without one. With more than one planned agent
+/// the operator may answer with the numbers of the agents to wire.
+fn confirm(agents: usize) -> Result<Answer> {
     if !std::io::stdin().is_terminal() {
         bail!(
             "nothing was changed: there is no terminal to confirm this plan on. Re-run \
              `ai-memory setup --yes` to apply it."
         );
     }
-    print!("Proceed? [y/N] ");
+    if agents > 1 {
+        print!("Proceed? [y/N], or type the numbers of the agents to wire (e.g. 1 3): ");
+    } else {
+        print!("Proceed? [y/N] ");
+    }
     std::io::stdout().flush().ok();
     let mut answer = String::new();
     std::io::stdin()
         .lock()
         .read_line(&mut answer)
         .context("reading the answer")?;
-    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
-        Ok(())
-    } else {
-        bail!("nothing was changed")
+    parse_answer(&answer, agents)
+}
+
+/// Read a prompt answer: yes, or (with more than one agent) a list of agent
+/// numbers separated by spaces or commas. Anything else declines, and so does
+/// a number outside the plan, so a typo never wires an agent nobody chose.
+fn parse_answer(answer: &str, agents: usize) -> Result<Answer> {
+    let answer = answer.trim();
+    if matches!(answer, "y" | "Y" | "yes" | "YES" | "Yes") {
+        return Ok(Answer::All);
+    }
+    let numbers: Vec<&str> = answer
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if agents < 2 || numbers.is_empty() {
+        bail!("nothing was changed");
+    }
+    let mut chosen = Vec::new();
+    for part in numbers {
+        match part.parse::<usize>() {
+            Ok(number) if (1..=agents).contains(&number) => chosen.push(number),
+            _ => bail!("nothing was changed: {part} is not an agent number from 1 to {agents}"),
+        }
+    }
+    chosen.sort_unstable();
+    Ok(Answer::Only(dedup(chosen.into_iter())))
+}
+
+/// The planned agents the answer kept, in plan order.
+fn choose_agents(answer: Answer, agents: Vec<AgentPlan>) -> Vec<AgentPlan> {
+    match answer {
+        Answer::All => agents,
+        Answer::Only(numbers) => agents
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| numbers.contains(&(index + 1)))
+            .map(|(_, agent)| agent)
+            .collect(),
+    }
+}
+
+/// The plan as `setup --plan --json` prints it.
+#[derive(Debug, serde::Serialize)]
+struct PlanDocument {
+    format: u32,
+    data_dir: PathBuf,
+    config_path: PathBuf,
+    fresh: bool,
+    service: ServiceDocument,
+    agents: Vec<AgentDocument>,
+    /// `--agent` names accepted but not in the plan.
+    other_agents: Vec<String>,
+    checks: [&'static str; 3],
+    first_question: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ServiceDocument {
+    Install {
+        manager: &'static str,
+        path: PathBuf,
+    },
+    Skip {
+        reason: String,
+    },
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AgentDocument {
+    agent: String,
+    /// `null` when the agent was named with `--agent`.
+    found: Option<Found>,
+    wiring: &'static str,
+}
+
+fn plan_document(plan: &SetupPlan) -> PlanDocument {
+    PlanDocument {
+        format: PLAN_FORMAT,
+        data_dir: plan.data_dir.clone(),
+        config_path: plan.config_path.clone(),
+        fresh: plan.fresh,
+        service: match &plan.service {
+            ServicePlan::Install(unit) => ServiceDocument::Install {
+                manager: unit.manager.describe(),
+                path: unit.path.clone(),
+            },
+            ServicePlan::Skip(reason) => ServiceDocument::Skip {
+                reason: reason.clone(),
+            },
+        },
+        agents: plan
+            .agents
+            .iter()
+            .map(|agent| AgentDocument {
+                agent: agent_name(agent.agent),
+                found: agent.found.clone(),
+                wiring: agent.wiring(),
+            })
+            .collect(),
+        other_agents: other_agents(&plan.agents),
+        checks: ["healthz", "memory_status", "doctor"],
+        first_question: FIRST_QUESTION,
+    }
+}
+
+/// The closing line once every step passed: restart the wired agents, then
+/// ask one of them something only ai-memory can answer.
+fn next_step(agents: &[AgentPlan]) -> String {
+    let names: Vec<&str> = agents
+        .iter()
+        .map(|agent| agent.agent.kind().as_str())
+        .collect();
+    match names.as_slice() {
+        [] => "ai-memory is set up, but no agent is wired; run `ai-memory setup --agent <name>`."
+            .to_owned(),
+        [one] => format!(
+            "ai-memory is set up. Restart {one} so it loads the new hooks and MCP entry, then \
+             ask it: \"{FIRST_QUESTION}\" It answers through ai-memory's tools; a new install \
+             remembers nothing yet, and every session from now on is captured."
+        ),
+        many => format!(
+            "ai-memory is set up. Restart {} so they load the new hooks and MCP entry, then ask \
+             one of them: \"{FIRST_QUESTION}\" It answers through ai-memory's tools; a new \
+             install remembers nothing yet, and every session from now on is captured.",
+            many.join(", ")
+        ),
     }
 }
 
@@ -510,7 +759,7 @@ async fn execute(
     let mut skills_done = BTreeSet::new();
     for agent in &plan.agents {
         println!("\n== {}", agent.agent.kind().as_str());
-        for problem in wire_agent(&config, *agent, &mut skills_done) {
+        for problem in wire_agent(&config, agent, &mut skills_done) {
             problems.push(format!("{}: {problem}", agent.agent.kind().as_str()));
         }
     }
@@ -530,9 +779,7 @@ async fn execute(
         println!("{hint}");
     }
     if problems.is_empty() {
-        println!(
-            "ai-memory is set up. Restart your agents so they load the new hooks and MCP entry."
-        );
+        println!("{}", next_step(&plan.agents));
         return Ok(());
     }
     for problem in &problems {
@@ -575,7 +822,11 @@ async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> b
 /// first so an OpenCode major-version move has one entry before the hook
 /// installer reads it (the order `ai-memory run` auto-wire uses). Returns the
 /// failures.
-fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<String>) -> Vec<String> {
+fn wire_agent(
+    config: &Config,
+    plan: &AgentPlan,
+    skills_done: &mut BTreeSet<String>,
+) -> Vec<String> {
     let mut problems = Vec::new();
     if plan.plugin {
         // Writing the settings-file wiring as well would load every skill
@@ -721,22 +972,34 @@ mod tests {
     fn muse_is_detected_by_its_config_or_data_directory() {
         let none = |_: &str| -> Option<OsString> { None };
         let home = tempfile::tempdir().unwrap();
-        assert!(!muse_detected(home.path(), &none));
+        assert_eq!(muse_detected(home.path(), &none), None);
         std::fs::create_dir_all(home.path().join(".local/share/muse/sessions")).unwrap();
-        assert!(muse_detected(home.path(), &none));
+        assert_eq!(
+            muse_detected(home.path(), &none),
+            Some(home.path().join(".local/share/muse"))
+        );
 
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".config/muse")).unwrap();
-        assert!(muse_detected(home.path(), &none));
+        assert_eq!(
+            muse_detected(home.path(), &none),
+            Some(home.path().join(".config/muse"))
+        );
 
         let home = tempfile::tempdir().unwrap();
         let xdg = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(xdg.path().join("muse")).unwrap();
         let xdg_path = xdg.path().as_os_str().to_owned();
         let env = move |name: &str| (name == "XDG_CONFIG_HOME").then(|| xdg_path.clone());
-        assert!(muse_detected(home.path(), &env));
+        assert_eq!(
+            muse_detected(home.path(), &env),
+            Some(xdg.path().join("muse"))
+        );
         assert_eq!(skills_for(AgentChoice::Muse), InstallSkillsAgent::Agents);
-        assert_eq!(AgentPlan::new(AgentChoice::Muse).mcp, Some(McpClient::Muse));
+        assert_eq!(
+            AgentPlan::new(AgentChoice::Muse, None).mcp,
+            Some(McpClient::Muse)
+        );
     }
 
     /// A versioned Homebrew binary is recorded through the `opt/<formula>`
@@ -842,17 +1105,17 @@ mod tests {
         };
         let home = tempfile::tempdir().unwrap();
         let env = |_: &str| None;
-        assert!(!AgentPlan::detect(AgentChoice::ClaudeCode, home.path(), &env).plugin);
+        assert!(!AgentPlan::detect(AgentChoice::ClaudeCode, None, home.path(), &env).plugin);
 
         install_claude_plugin(home.path(), "3.0.0", false);
-        assert!(!AgentPlan::detect(AgentChoice::ClaudeCode, home.path(), &env).plugin);
+        assert!(!AgentPlan::detect(AgentChoice::ClaudeCode, None, home.path(), &env).plugin);
         install_claude_plugin(home.path(), "3.0.0", true);
-        assert!(AgentPlan::detect(AgentChoice::ClaudeCode, home.path(), &env).plugin);
-        assert!(!AgentPlan::detect(AgentChoice::Codex, home.path(), &env).plugin);
-        assert!(!AgentPlan::detect(AgentChoice::Grok, home.path(), &env).plugin);
+        assert!(AgentPlan::detect(AgentChoice::ClaudeCode, None, home.path(), &env).plugin);
+        assert!(!AgentPlan::detect(AgentChoice::Codex, None, home.path(), &env).plugin);
+        assert!(!AgentPlan::detect(AgentChoice::Grok, None, home.path(), &env).plugin);
 
         install_codex_plugin(home.path());
-        assert!(AgentPlan::detect(AgentChoice::Codex, home.path(), &env).plugin);
+        assert!(AgentPlan::detect(AgentChoice::Codex, None, home.path(), &env).plugin);
     }
 
     /// A token-file install learns how to open the web UI: the URL and the
@@ -876,6 +1139,141 @@ mod tests {
         assert!(!hint.contains("file-root-token"), "{hint}");
     }
 
+    fn agents_of(found: &[(AgentChoice, Found)]) -> Vec<AgentChoice> {
+        found.iter().map(|(agent, _)| *agent).collect()
+    }
+
+    fn plan_with(agents: Vec<AgentPlan>) -> SetupPlan {
+        SetupPlan {
+            data_dir: PathBuf::from("/data"),
+            config_path: PathBuf::from("/data/config.toml"),
+            fresh: true,
+            service: ServicePlan::Skip("skipped (--no-service)".to_owned()),
+            agents,
+            detected: true,
+        }
+    }
+
+    /// Yes applies everything; numbers keep only those agents, in plan
+    /// order and once each. A number outside the plan, a stray word, a blank
+    /// line, and numbers offered for a single agent all decline, so a typo
+    /// never wires an agent nobody chose.
+    #[test]
+    fn the_prompt_answer_picks_all_some_or_none_of_the_agents() {
+        assert_eq!(parse_answer("y\n", 3).unwrap(), Answer::All);
+        assert_eq!(parse_answer("Yes", 1).unwrap(), Answer::All);
+        assert_eq!(
+            parse_answer("3, 1 3\n", 3).unwrap(),
+            Answer::Only(vec![1, 3])
+        );
+        assert_eq!(parse_answer("2", 2).unwrap(), Answer::Only(vec![2]));
+        for declined in ["", "\n", "n", "no", "4", "0", "1 x", "-1"] {
+            let error = parse_answer(declined, 3).unwrap_err().to_string();
+            assert!(
+                error.starts_with("nothing was changed"),
+                "{declined:?}: {error}"
+            );
+        }
+        assert!(
+            parse_answer("1", 1).is_err(),
+            "numbers need two agents to pick from"
+        );
+    }
+
+    #[test]
+    fn chosen_numbers_keep_those_agents_in_plan_order() {
+        let agents = vec![
+            AgentPlan::new(AgentChoice::ClaudeCode, None),
+            AgentPlan::new(AgentChoice::Codex, None),
+            AgentPlan::new(AgentChoice::Grok, None),
+        ];
+        let kept = choose_agents(Answer::Only(vec![1, 3]), agents.clone());
+        assert_eq!(
+            kept.iter().map(|plan| plan.agent).collect::<Vec<_>>(),
+            vec![AgentChoice::ClaudeCode, AgentChoice::Grok]
+        );
+        assert_eq!(choose_agents(Answer::All, agents.clone()), agents);
+    }
+
+    /// The JSON plan names each agent by its `--agent` spelling with the
+    /// evidence it was found by, lists every other accepted agent, and
+    /// carries the layout version a front end checks.
+    #[test]
+    fn the_json_plan_carries_agents_evidence_and_the_rest() {
+        let store = PathBuf::from("/home/u/.claude/projects");
+        let mut codex = AgentPlan::new(AgentChoice::Codex, None);
+        codex.plugin = true;
+        let plan = plan_with(vec![
+            AgentPlan::new(
+                AgentChoice::ClaudeCode,
+                Some(Found::SessionStore(store.clone())),
+            ),
+            codex,
+            AgentPlan::new(AgentChoice::OpenCode2, None),
+        ]);
+        let json = serde_json::to_value(plan_document(&plan)).unwrap();
+        assert_eq!(json["format"], PLAN_FORMAT);
+        assert_eq!(json["service"]["action"], "skip");
+        assert_eq!(json["agents"][0]["agent"], "claude-code");
+        assert_eq!(json["agents"][0]["found"]["kind"], "session_store");
+        assert_eq!(
+            json["agents"][0]["found"]["path"],
+            store.display().to_string()
+        );
+        assert_eq!(json["agents"][0]["wiring"], "mcp+hooks+skills");
+        assert_eq!(json["agents"][1]["wiring"], "plugin");
+        assert_eq!(json["agents"][2]["agent"], "opencode2");
+        assert!(json["agents"][2]["found"].is_null());
+        assert_eq!(json["first_question"], FIRST_QUESTION);
+        let others: Vec<&str> = json["other_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        assert!(
+            others.contains(&"cursor") && others.contains(&"gemini-cli"),
+            "{others:?}"
+        );
+        assert!(!others.contains(&"claude-code") && !others.contains(&"opencode2"));
+        {
+            use clap::ValueEnum as _;
+            assert_eq!(others.len() + 3, AgentChoice::value_variants().len());
+        }
+    }
+
+    /// Every accepted `--agent` value round-trips through the name the plan
+    /// prints, so a name copied from the plan always parses.
+    #[test]
+    fn every_listed_agent_name_parses_back() {
+        use clap::ValueEnum as _;
+        for agent in AgentChoice::value_variants() {
+            assert_eq!(
+                AgentChoice::from_str(&agent_name(*agent), false).ok(),
+                Some(*agent)
+            );
+        }
+    }
+
+    #[test]
+    fn the_closing_line_names_the_agents_and_the_question() {
+        let one = next_step(&[AgentPlan::new(AgentChoice::ClaudeCode, None)]);
+        assert!(one.contains("Restart claude-code so it loads"), "{one}");
+        assert!(one.contains(FIRST_QUESTION), "{one}");
+        let two = next_step(&[
+            AgentPlan::new(AgentChoice::ClaudeCode, None),
+            AgentPlan::new(AgentChoice::Codex, None),
+        ]);
+        assert!(
+            two.contains("Restart claude-code, codex so they load"),
+            "{two}"
+        );
+        assert!(two.contains("ask one of them"), "{two}");
+        let none = next_step(&[]);
+        assert!(none.contains("no agent is wired"), "{none}");
+        assert!(!none.contains(FIRST_QUESTION), "{none}");
+    }
+
     fn spec(home: &Path) -> user_service::ServiceSpec {
         user_service::ServiceSpec {
             exe: PathBuf::from("/opt/ai-memory/ai-memory"),
@@ -896,7 +1294,16 @@ mod tests {
         std::fs::write(&codex_config, "").unwrap();
         let mcp = |client: McpClient| (client == McpClient::Codex).then(|| codex_config.clone());
         let found = detect_agents(home, &|_| None, &mcp);
-        assert_eq!(found, vec![AgentChoice::ClaudeCode, AgentChoice::Codex]);
+        assert_eq!(
+            found,
+            vec![
+                (
+                    AgentChoice::ClaudeCode,
+                    Found::SessionStore(home.join(".claude").join("projects"))
+                ),
+                (AgentChoice::Codex, Found::McpConfig(codex_config.clone())),
+            ]
+        );
     }
 
     /// Control: an empty home detects nothing, and a named-but-missing MCP
@@ -918,7 +1325,10 @@ mod tests {
         std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
         std::fs::create_dir_all(home.join(".kiro/sessions/cli")).unwrap();
         let found = detect_agents(home, &|_| None, &|_| None);
-        assert_eq!(found, vec![AgentChoice::OpenCode, AgentChoice::KiroCli]);
+        assert_eq!(
+            agents_of(&found),
+            vec![AgentChoice::OpenCode, AgentChoice::KiroCli]
+        );
     }
 
     /// A relocated store (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, …) is looked for
@@ -932,7 +1342,13 @@ mod tests {
             (harness == ManagedHarness::Claude).then(|| elsewhere.clone())
         };
         let found = detect_agents(&tmp.path().join("home"), &relocate, &|_| None);
-        assert_eq!(found, vec![AgentChoice::ClaudeCode]);
+        assert_eq!(
+            found,
+            vec![(
+                AgentChoice::ClaudeCode,
+                Found::SessionStore(elsewhere.clone())
+            )]
+        );
     }
 
     #[test]

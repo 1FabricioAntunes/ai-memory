@@ -211,8 +211,11 @@ and links `~/.local/bin/ai-memory`. `ai-memory setup` then creates the data
 directory with a bearer token in an owner-only file, starts a per-user service
 (systemd `--user` or a launchd LaunchAgent), and wires MCP, hooks and Agent
 Skills for every agent it finds, or the ones you name with `--agent`. It shows
-the plan and asks first; `--yes` skips the question, and running it again
-changes nothing. Restart your agents afterwards. Details, the environment
+the plan, with where it found each agent, and asks first: answer `y`, or type
+the numbers of the agents to wire. `--plan` prints the plan and changes
+nothing, `--yes` skips the question, and running it again changes nothing.
+Afterwards, restart your agents and ask one of them "What do you remember
+about this project?" to see it answer through ai-memory. Details, the environment
 variables and how to verify the script before running it are in
 [`docs/install.md`](docs/install.md#one-step-native-install-installsh--ai-memory-setup).
 An AI agent installing ai-memory for you can follow
@@ -238,6 +241,7 @@ user-level systemd units.
 ```bash
 yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary
 yay -S ai-memory        # builds from source
+ai-memory setup         # data dir, user service, agents, self-check
 ```
 
 ### Fedora (RPM)
@@ -250,17 +254,12 @@ then install it:
 sudo dnf install ./ai-memory-*.rpm
 ```
 
-Then follow the native Linux service instructions in [`docs/install.md`](docs/install.md).
-
-Single-user workstation:
+On a single-user workstation, `ai-memory setup` then does the rest, as on the
+two-command path above: data dir and token, a user service, the agents it
+finds, and a self-check.
 
 ```bash
-mkdir -p ~/.config/ai-memory ~/.local/share/ai-memory
-ai-memory --data-dir ~/.local/share/ai-memory \
-  --config ~/.config/ai-memory/config.toml init
-systemctl --user enable --now ai-memory.service
-ai-memory install-mcp --client claude-code --apply
-ai-memory install-hooks --agent claude-code --apply
+ai-memory setup
 ```
 
 System service installs use `/var/lib/ai-memory` and `/etc/ai-memory/` via the
@@ -287,12 +286,12 @@ open "companions/ai-memory-macos/dist/AI Memory.app"
 Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
 from the menu extra (no Dock icon). The app reads the bearer token `init`
 wrote into its data dir, so the status item turns green on its own. Then wire
-an agent with the bundled binary:
+your agents with the bundled binary; `--no-service` leaves the app's
+LaunchAgent in charge:
 
 ```bash
 BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
-"$BIN" install-mcp --client claude-code --apply
-"$BIN" install-hooks --agent claude-code --apply
+"$BIN" setup --no-service
 ```
 
 Prebuilt tarball and launchd-without-the-app paths:

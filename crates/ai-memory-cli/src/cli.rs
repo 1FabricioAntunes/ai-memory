@@ -1975,6 +1975,15 @@ pub struct SetupArgs {
     /// already runs some other way (Docker, a packaged system unit).
     #[arg(long)]
     pub no_service: bool,
+    /// Print the plan and change nothing: what would be created, which
+    /// agents would be wired and why each was detected, and which supported
+    /// agents are not in the plan.
+    #[arg(long, conflicts_with = "yes")]
+    pub plan: bool,
+    /// With `--plan`, print the plan as a JSON document (its `format` field
+    /// names the layout version) for a script or front end to render.
+    #[arg(long, requires = "plan")]
+    pub json: bool,
 }
 
 /// Arguments for `status`.

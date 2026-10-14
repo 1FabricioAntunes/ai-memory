@@ -217,11 +217,15 @@ main() {
 
     say "installed $("$link" --version 2>/dev/null || echo ai-memory) to $lib_dir"
     say "linked $link"
+    # Off PATH, a bare `ai-memory setup` would fail with "command not found",
+    # so the next step names the link itself.
     case ":${PATH:-}:" in
-        *":$bin_dir:"*) ;;
-        *) say "$bin_dir is not on PATH; add it, e.g. export PATH=\"$bin_dir:\$PATH\"" ;;
+        *":$bin_dir:"*) say "next: ai-memory setup" ;;
+        *)
+            say "$bin_dir is not on PATH; add it, e.g. export PATH=\"$bin_dir:\$PATH\""
+            say "next: $link setup"
+            ;;
     esac
-    say "next: ai-memory setup"
 }
 
 main "$@"
