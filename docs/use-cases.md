@@ -126,8 +126,8 @@
 - **"What did we decide about X six weeks ago?"** Use `memory_query X` from
   the agent for FTS5 fused with entity matches and linked-page expansion (plus
   vector similarity when an embedder is configured). For a quick terminal-only
-  FTS5 lookup, use `ai-memory search X`; that admin command does not run the
-  hybrid streams. Pages are
+  FTS5 lookup, use `ai-memory search X` (add `--global` to search every
+  project); that admin command does not run the hybrid streams. Pages are
   LLM-consolidated, so the hit is a coherent decision page, not a raw
   chat log. Pass `explain: true` to see why each hit ranked where it
   did in project or explicit-scope retrieval. Cross-project

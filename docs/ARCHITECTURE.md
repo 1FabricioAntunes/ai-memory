@@ -746,6 +746,10 @@ once and hands the same embedder and rerank stage to the MCP server and to
 `WebState` (`ai_memory_web::Recall`); the stage's four-call concurrency gate is
 shared, so the web search cannot add provider calls past it. A search with no
 scope stays the cross-project FTS5 ranker, as `memory_query(global=true)` is.
+The web search also takes `kind` and `tier` filters, which every stream applies
+in its own query (`PageFilter`), so a filtered search narrows each stream
+before fusion and the reranker only sees pages the filter keeps;
+`memory_query` and `/api/v1/search` pass no filter.
 `ai-memory-mcp/tests/suite/web_search_parity.rs` holds the orders together.
 `explain=1` on a project search renders, per hit, each stream's rank, raw score
 and RRF contribution, the fused score, the authority multiplier, the intent
@@ -891,7 +895,16 @@ that touch the relevant area.
    client instead: the server snapshots SQLite with its online backup API while
    the writer remains live. (basic-memory #765.)
 10. **Atomic file writes** (tmp + rename + fsync). Watcher ignores
-    own writes by filename prefix.
+    own writes by filename prefix. On Windows, an antivirus scanner, the
+    indexer or a concurrent process can hold a file for a moment, so file
+    operations that race with them treat specific Windows errors as
+    transient: a bounded retry or a skip, never an unbounded wait, and never
+    a weaker check for a file that stays inaccessible. Each site keeps its
+    own policy because their deadlines differ (the hook path stays inside its
+    200 ms budget); the sites are listed in
+    [design-windows-ci.md](design-windows-ci.md#windows-transient-file-errors).
+    New file-I/O code with the same race follows the same pattern, with a
+    test that injects the error so it also runs off Windows.
 11. **Absolute canonical data dir** default; logged loudly on
     startup. (agentmemory #303.)
 12. **No global singletons / `lazy_static` configs.** All deps
