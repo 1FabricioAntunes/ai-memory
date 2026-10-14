@@ -674,3 +674,6 @@ MIT. See [LICENSE](LICENSE).
 This codebase is being built collaboratively with Claude Code
 (Anthropic Claude Opus 4.7) following the plan documented in
 `docs/design-decisions.md`.
+
+Optional [self-service MCP API keys](docs/self-service-keys.md) reuse existing
+browser authentication and are disabled by default.

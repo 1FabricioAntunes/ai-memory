@@ -3336,6 +3336,11 @@ pub enum TransportKind {
 /// Arguments for `serve`.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
+    /// Enable optional browser-session management API (requires an opt-in build).
+    #[cfg(feature = "self-service-keys")]
+    #[arg(long, env = "AI_MEMORY_ENABLE_SELF_SERVICE_KEYS")]
+    pub enable_self_service_keys: bool,
+
     /// Transport to expose the MCP server on.
     #[arg(long, value_enum, default_value_t = TransportKind::Stdio)]
     pub transport: TransportKind,
@@ -3468,6 +3473,33 @@ pub struct WritePageArgs {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "self-service-keys")]
+    #[test]
+    fn self_service_keys_is_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_self_service_keys);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-self-service-keys",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_self_service_keys);
+    }
+    #[cfg(not(feature = "self-service-keys"))]
+    #[test]
+    fn self_service_keys_flag_is_absent_by_default() {
+        assert!(Cli::try_parse_from(["ai-memory", "serve", "--enable-self-service-keys"]).is_err());
+    }
+
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;

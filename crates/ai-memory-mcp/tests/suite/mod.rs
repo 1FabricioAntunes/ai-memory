@@ -40,3 +40,6 @@ mod retrieval_via_tools;
 mod slot_identity;
 mod stress_autoscope;
 mod web_search_parity;
+
+#[cfg(feature = "self-service-keys")]
+mod self_service_keys;

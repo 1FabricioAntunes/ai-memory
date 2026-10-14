@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+- Added optional human-session self-service native API keys, gated by the
+  `self-service-keys` build feature and runtime switch. Reused existing
+  authentication, credential hashing, and SQLite storage. (#1231)
+
 ## [3.0.0] - 2026-10-13
 
 ### Added

@@ -38,3 +38,6 @@ extern crate self as ai_memory_mcp;
 #[cfg(test)]
 #[path = "../tests/suite/mod.rs"]
 mod integration;
+
+#[cfg(feature = "self-service-keys")]
+pub mod self_service_keys;

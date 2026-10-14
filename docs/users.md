@@ -803,3 +803,5 @@ ones who should keep access; nothing is granted automatically.
   authenticates as, like any other. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.
+
+See [Self-service MCP API keys](self-service-keys.md) for the opt-in HTTP surface.
