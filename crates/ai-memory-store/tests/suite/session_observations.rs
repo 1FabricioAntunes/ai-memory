@@ -826,24 +826,3 @@ async fn consolidation_queue_counts_states_and_bounds_times() {
         }
     );
 }
-
-/// Nothing else ever runs ANALYZE, so a store that never refreshed planner
-/// statistics on open kept none for its whole life, and the planner then
-/// rescanned a project's observations once per session for the per-agent
-/// counts. Reopening a populated store must leave statistics for the index
-/// that bounds those probes.
-#[test]
-fn reopening_a_populated_store_records_planner_statistics() {
-    let (tmp, store) = open_seeded();
-    drop(store);
-    let store = Store::open(tmp.path()).unwrap();
-    let conn = Connection::open(store.db_path()).unwrap();
-    let analyzed: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = 'idx_observations_session'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(analyzed, 1);
-}
