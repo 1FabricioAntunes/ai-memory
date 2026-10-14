@@ -142,6 +142,78 @@ pub(crate) fn sentinel_path(data_dir: &Path, cwd: &Path) -> PathBuf {
     data_dir.join("backfill-state").join(format!("{digest:x}"))
 }
 
+/// How long an in-progress marker blocks a new automatic backfill for the same
+/// checkout. A worker that died without releasing it (killed, crashed host)
+/// stops blocking after this, so the marker can never wedge the trigger.
+const INFLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Cap on the emptiness probe. Without it a saturated server leaves every
+/// spawned backfill parked on an open connection, which piles more load on it.
+const EMPTINESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn inflight_path(data_dir: &Path, cwd: &Path) -> PathBuf {
+    let mut path = sentinel_path(data_dir, cwd).into_os_string();
+    path.push(".inflight");
+    PathBuf::from(path)
+}
+
+/// Claim the right to spawn the automatic backfill for `cwd`.
+///
+/// Returns `true` when this caller created the marker and must spawn (or call
+/// [`release_inflight`] if the spawn fails). `O_CREAT|O_EXCL` makes the claim
+/// atomic, so a burst of SessionStart hooks in a directory with no sentinel
+/// launches one backfill, not one per session. A marker older than
+/// [`INFLIGHT_STALE_AFTER`] is replaced.
+pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> bool {
+    let path = inflight_path(data_dir, cwd);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let _ = write!(file, "{}", std::process::id());
+                return true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= INFLIGHT_STALE_AFTER);
+                if !stale || std::fs::remove_file(&path).is_err() {
+                    return false;
+                }
+            }
+            // An unwritable state dir must not turn into a spawn storm either:
+            // the pre-guard behavior is not worth keeping for this case.
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Drop the in-progress marker taken by [`claim_inflight`].
+pub(crate) fn release_inflight(data_dir: &Path, cwd: &Path) {
+    let _ = std::fs::remove_file(inflight_path(data_dir, cwd));
+}
+
+struct InflightGuard<'a> {
+    data_dir: &'a Path,
+    cwd: &'a Path,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        release_inflight(self.data_dir, self.cwd);
+    }
+}
+
 fn write_sentinel(data_dir: &Path, cwd: &Path) {
     let path = sentinel_path(data_dir, cwd);
     if let Some(parent) = path.parent() {
@@ -201,6 +273,12 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
 
 /// [`run`] for the checkout at `cwd`.
 async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -> Result<()> {
+    // The SessionStart hook took the in-progress marker before spawning this
+    // worker; free it however the run ends so a failed run can be retried.
+    let _inflight = args.auto.then_some(InflightGuard {
+        data_dir: &config.data_dir,
+        cwd: &cwd,
+    });
     // The automatic (SessionStart-spawned) path honors the opt-out and records
     // that it has been attempted for this checkout, so it runs at most once per
     // machine regardless of outcome. Manual runs ignore both.
@@ -303,13 +381,22 @@ async fn project_is_empty(
     workspace: &str,
     project: &str,
 ) -> Result<bool> {
-    match get_json::<ByAgentResponse>(
-        endpoint,
-        "/admin/sessions/by-agent",
-        &[("workspace", workspace), ("project", project)],
+    let probe = tokio::time::timeout(
+        EMPTINESS_PROBE_TIMEOUT,
+        get_json::<ByAgentResponse>(
+            endpoint,
+            "/admin/sessions/by-agent",
+            &[("workspace", workspace), ("project", project)],
+        ),
     )
     .await
-    {
+    .unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "the server did not answer within {}s",
+            EMPTINESS_PROBE_TIMEOUT.as_secs()
+        ))
+    });
+    match probe {
         Ok(response) => Ok(response.by_agent.iter().map(|c| c.sessions).sum::<u64>() == 0),
         // A project that has never been written to does not exist server-side
         // yet, so the no-create lookup answers 404 — which is the strongest
@@ -1202,6 +1289,47 @@ mod tests {
         // whatever it is given, so a literal 0 yields nothing.
         assert!(select_sessions(vec![session("a", 1)], 0).is_empty());
         assert_eq!(select_sessions(vec![session("a", 1)], 1).len(), 1);
+    }
+
+    /// #1287: a burst of SessionStart hooks in one directory must spawn one
+    /// backfill. Only the first claim wins; another directory is unaffected.
+    #[test]
+    fn only_one_session_start_claims_the_backfill_per_checkout() {
+        let data = tempfile::tempdir().unwrap();
+        let app = Path::new("/home/me/projects/app");
+        let other = Path::new("/home/me/projects/other");
+
+        assert!(claim_inflight(data.path(), app));
+        assert!(!claim_inflight(data.path(), app), "second burst member");
+        assert!(!claim_inflight(data.path(), app), "third burst member");
+        assert!(claim_inflight(data.path(), other), "separate checkout");
+
+        release_inflight(data.path(), app);
+        assert!(claim_inflight(data.path(), app), "free again after release");
+    }
+
+    /// A worker that died without releasing its marker must not block the
+    /// checkout forever.
+    #[test]
+    fn a_stale_inflight_marker_is_replaced() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        assert!(claim_inflight(data.path(), cwd));
+
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        assert!(
+            claim_inflight(data.path(), cwd),
+            "stale marker is taken over"
+        );
+        assert!(!claim_inflight(data.path(), cwd), "the new claim holds");
     }
 
     #[test]
