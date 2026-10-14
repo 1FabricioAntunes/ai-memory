@@ -25,6 +25,13 @@ version in [`docs/changelog/`](docs/changelog/):
   session index (0.3 s on the same store). The session list and session
   detail reads behind `/web`, `/api/v1` and `memory_read_session_observations`
   ran the same per-session probes and are pinned the same way. (#1257)
+- Fixed pages written by an auto-improvement approval getting no embedding.
+  An approval through `pending-writes approve`, the `memory_auto_improve`
+  tool, `POST /admin/auto-improve` or the scheduler wrote and indexed the
+  page but never embedded it, so it stayed out of the vector stream of
+  hybrid search until an embedding backfill ran, which by default is only at
+  the next server start. The approval now embeds the applied page the same
+  way `memory_write_page` does (#1258).
 
 ## [3.0.0] - 2026-10-13
 
