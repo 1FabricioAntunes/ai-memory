@@ -646,23 +646,34 @@ Additional boundary rules:
   wrong hash makes `brew install` fail for everyone. This is a mandatory,
   recurring post-release step (it has been forgotten repeatedly); do not rely
   on a contributor PR to the tap to remember it.
-- **Every release re-runs the retrieval benchmark and compares it with the
-  previous release.** Before tagging, run the LongMemEval-S harness
-  (`evals/`, see `docs/benchmarks/README.md`) on the release-candidate SHA:
-  the full 470-question set for zero-LLM FTS and for the default local
-  embeddings, with the same flags as the last published run. Diff every
-  slice, not only the overall number, against the previous release's
-  published report for accuracy (`hit@k`, `recall@k`), latency (query
-  p50/p95), context tokens (raw and top-five) and ingest throughput. For each
-  material change, decide whether it was warranted: a deliberate trade the
-  CHANGELOG states (for example more tokens for a measured accuracy gain), or
-  a regression we introduced. An unwarranted regression blocks the release
-  until it is fixed. Run-to-run noise is about ±0.005 overall and ±0.02–0.03
-  on small slices; a larger drop, or one slice drifting down release after
-  release, is not noise. Publish the fresh numbers in `docs/benchmarks/` and
-  keep `docs/comparison.md` and `docs/competitive-parity.md` in step with
-  them. A release that touches retrieval should improve these numbers, not
-  merely hold them.
+- **A release that touches retrieval re-runs the retrieval benchmark once,
+  on the final release candidate, and compares it with the previous
+  release.** The full run takes hours, so it is never run speculatively:
+  - *Only when needed.* First diff the range against the last tag for
+    retrieval code (store reader and ranking, the hook capture to
+    observation path, consolidation output that pages are built from,
+    embeddings, the `evals/` harness). When nothing there changed, carry the
+    previous published numbers forward and say so in the release notes,
+    with that diff as the evidence.
+  - *Once, after code freeze.* Run it a single time on the final
+    release-candidate tree, after the last code change including audit
+    fixes; later docs-only or version-only commits do not invalidate it.
+    Never run it on intermediate branches or pull request heads.
+  - *What to run and compare.* The LongMemEval-S harness (`evals/`, see
+    `docs/benchmarks/README.md`) on the full 470-question set for zero-LLM
+    FTS and for the default local embeddings, with the same flags as the last
+    published run. Diff every slice, not only the overall number, against the
+    previous release's published report for accuracy (`hit@k`, `recall@k`),
+    latency (query p50/p95), context tokens (raw and top-five) and ingest
+    throughput, and say for each material change whether it is a deliberate
+    trade the CHANGELOG states or a possible regression. Run-to-run noise is
+    about ±0.005 overall and ±0.02–0.03 on small slices.
+  - *A drop does not block the release.* Publish the honest numbers in
+    `docs/benchmarks/`, keep `docs/comparison.md` and
+    `docs/competitive-parity.md` in step, and open an issue for the next
+    release with the slice deltas, run dirs and suspected commits, to decide
+    there whether it is a regression, noise or a warranted trade. A release
+    that touches retrieval should still aim to improve these numbers.
 - **Reclaim build storage after every release — run `cargo clean`.** The
   multi-worktree, multi-target-dir release flow (integration worktrees, per-agent
   worktrees, separate `CARGO_TARGET_DIR`s) leaves many stale 100–180 MB test
