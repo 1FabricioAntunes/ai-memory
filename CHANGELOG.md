@@ -24,7 +24,7 @@ version in [`docs/changelog/`](docs/changelog/):
   one folder share a heading, and the omitted list and the closing note now
   point at `memory_read_page`. Small wikis whose pages fit still get every body
   whole; pin a page to have it shown in full first. The change needs no new
-  marker key and no migration. (#NNN)
+  marker key and no migration. (#1264)
 
 ## [3.0.0] - 2026-10-13
 
