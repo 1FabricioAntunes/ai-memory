@@ -352,7 +352,7 @@ Restated from `AGENTS.md` because they bound the packing:
    section for that suffix, at least the count-only line, before any
    L1/L2 promotion. Promotions must not eat the omitted section down to
    nothing. Named formulas (`recent_cap`, `count_only_floor`,
-   `remaining`, walk-back that recomputes each step) live in §3.
+   `remaining`) live in §3.
 
 10. **Title-only pages render as a path line.** Empty body and empty
     frontmatter: a single `- `{path}`` line, the same grammar as the
@@ -528,9 +528,9 @@ recent_cap       = min(recent_full, variable_region / 4)
 count_only_line(n) = format!(
     "\n**{n} core page(s) omitted by budget** (read via `memory_read_page`)\n"
 )
-count_only_floor = count_only_line(24).len()
-                 // 69 bytes after the header swap. 2-digit n because the
-                 // L0 pass does not yet know suffix length (n=1..=9 is 68).
+count_only_floor = count_only_line(core.len()).len()
+                 // The L0 pass does not yet know the suffix length; core.len()
+                 // bounds it, so this is the most digits the line can need.
                  // 0 when core is empty.
 
 l0_spent     = prefix_len + sum of standalone costs of assigned pages
@@ -552,9 +552,10 @@ the post-L0 value (leftover after the omitted floor / 4). L1/L2
 promotions compete only against
 `content_ceiling - omitted_reserve - recent_reserve - l0_spent`.
 
-At render, omitted is given leftover first (it may grow from count-only
-to a path list if promotions left room), then recent. That keeps
-today's "omitted has first call" policy after coverage.
+At render, omitted is given the leftover minus `recent_reserve` (it may
+grow from count-only to a path list if promotions left room), then
+recent takes what omitted did not use. That keeps today's "omitted has
+first call" policy after coverage without eating the recent share.
 
 **Assignment, in order.**
 
@@ -572,15 +573,10 @@ today's "omitted has first call" policy after coverage.
    is 0 and the unused `count_only_floor` sits in `remaining` for
    promotions.
 
-   **Walk-back.** While the suffix is nonempty and
-   `l0_spent + omitted_reserve + recent_reserve > content_ceiling`,
-   move **only the last assigned page** onto the omitted suffix
-   (suffix invariant) and **recompute** `l0_spent`, `remaining`,
-   `omitted_reserve`, and `recent_reserve` from the formulas above
-   (full omitted grows as `l0_spent` shrinks). Stop when
-   `l0_spent + omitted_reserve + recent_reserve <= content_ceiling`
-   or no assigned page remains. A max-size last L0 plus a long omitted
-   path list is the case that needs this.
+   No walk-back is needed. The coverage ceiling already holds back
+   `recent_cap + count_only_floor`, so after the pass `remaining` is at
+   least the count-only line for any suffix, and `omitted_reserve` plus
+   `recent_reserve` never exceed `remaining` by construction.
 2. **Privileged L1.** For included privileged pages, in order: upgrade
    L0→L1 when `l1` is longer than `l0` and the delta fits in the
    post-reserve remainder.
@@ -728,7 +724,7 @@ flowchart TD
   start[GET /handoff briefing=1] --> fetch["session_brief_pages_with_slot_visibility<br/>24 core + 10 recent"]
   fetch --> excerpt["excerpt_from_page<br/>frontmatter + body"]
   excerpt --> l0["Assign L0 / TitleOnly prefix of core<br/>suffix = omitted"]
-  l0 --> reserves["omitted_reserve + recent_reserve; walk-back last L0 if overflow"]
+  l0 --> reserves["omitted_reserve + recent_reserve"]
   reserves --> privL1[Upgrade privileged to L1]
   privL1 --> privL2["Upgrade privileged to full L2<br/>only if entire body fits"]
   privL2 --> restL1[Upgrade remaining to L1]
@@ -1002,8 +998,6 @@ existing three):
   truncation.
 - 24 max-size L0 `_rules/` pages at `BRIEF_BUDGET_DEFAULT` still emit
   at least the count-only omitted line, and still fit the budget.
-  Walk-back, when it runs, recomputes `omitted_reserve` from the new
-  suffix after each move (stale reserve is a bug).
 - Extractive fallbacks: abstract present (L0 uses it even when summary
   exists); summary present and abstract absent (L0 and L1 both use
   summary; zero-delta if it is ≤256 bytes); neither (first paragraph);

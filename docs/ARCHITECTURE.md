@@ -219,6 +219,21 @@ from hook paths.
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
 
+**Session-start project brief:** when the project's marker sets
+`[briefing] inject_on_session_start`, `GET /handoff` appends a brief of the
+project's pinned, `_rules/` and `_slots/` pages, packed into `[briefing]
+max_chars` (clamped to 1500-20000) with no LLM call. Every page first gets an
+extractive L0 excerpt (`ai_memory_core::excerpt`: frontmatter `abstract`, else
+`summary`, else the first prose paragraph, 256 bytes); the bytes left deepen
+pages to an L1 excerpt (`summary` first, 500 bytes, the same clip as A2
+compaction) and then to the whole body, pinned and `_slots/` pages before the
+rest (`ai_memory_hooks::brief_tiers`). A body is included whole or not at all.
+Four or more unpinned excerpts of one family share a heading. Pages that do not
+fit are listed by path for `memory_read_page`, and the count of them is
+reserved before any page is deepened. The security notice, the
+untrusted-history fence (with fence markers inside page text escaped) and the
+closing footer are never traded for content.
+
 **Cross-project profile:** after the project brief, SessionStart appends a
 fenced, byte-budgeted, byte-stable digest of the user's usual choices from other
 projects (`docs/cross-project-profile.md`), filtered by the stack the project's
