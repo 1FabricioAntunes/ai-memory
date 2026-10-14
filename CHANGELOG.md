@@ -12,6 +12,12 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `ai-memory run --yolo` failing with `401 Unauthorized` after it
+  re-ran itself under ai-jail on an install whose bearer token lives in
+  `[auth].bearer_token_file`. ai-jail's private home hides the data dir, so
+  the jailed run had no token. The outer run now passes the token it resolved,
+  and a `server_url` set in `config.toml`, into the jail through the
+  environment, never the command line. (#1284)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
