@@ -402,22 +402,32 @@ pub(crate) fn is_setup_run_entry(data: &str) -> bool {
 }
 
 /// The `--data-dir` a `setup` logon entry names, unquoted the way
-/// [`windows_arg`] quoted it; `None` when the entry names none.
+/// [`windows_arg`] quoted it; `None` when the entry names none. Only the
+/// first argument after the quoted executable is read, as `render_windows`
+/// writes it, so a `--data-dir` inside the executable's own path never
+/// counts.
 fn run_entry_data_dir(data: &str) -> Option<String> {
-    let rest = data.split_once(" --data-dir ")?.1.trim_start();
-    let quoted = rest.strip_prefix('"')?;
+    let (_program, args) = data.strip_prefix('"')?.split_once('"')?;
+    let quoted = args
+        .trim_start()
+        .strip_prefix("--data-dir")?
+        .trim_start()
+        .strip_prefix('"')?;
     let (dir, _) = quoted.split_once('"')?;
     // `windows_arg` doubled the backslashes that end the path.
     let trailing = dir.len() - dir.trim_end_matches('\\').len();
     Some(dir[..dir.len() - trailing / 2].to_owned())
 }
 
-/// Whether two Windows paths name the same directory: the `\\?\` prefix,
-/// trailing separators and letter case do not count.
+/// Whether two Windows paths name the same directory: the verbatim prefix
+/// (`\\?\C:\…`, `\\?\UNC\server\share\…`), trailing separators and letter
+/// case do not count.
 fn same_windows_dir(left: &str, right: &str) -> bool {
     let plain = |path: &str| {
-        let path = path.strip_prefix(r"\\?\").unwrap_or(path);
-        path.trim_end_matches(['\\', '/']).replace('/', "\\")
+        let path = path.replace('/', "\\");
+        super::path_util::strip_windows_verbatim_prefix(&path)
+            .trim_end_matches('\\')
+            .to_owned()
     };
     plain(left).eq_ignore_ascii_case(&plain(right))
 }
@@ -516,11 +526,15 @@ const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 mod user_registry {
     use anyhow::{Context as _, Result};
 
+    /// A `REG_SZ` value. `get_string` also reads `REG_EXPAND_SZ`, which
+    /// `setup` never writes: such a value under the same name is someone
+    /// else's, as it was when `reg query` output was parsed for `REG_SZ`.
     pub(super) fn get(subkey: &str, name: &str) -> Option<String> {
-        windows_registry::CURRENT_USER
-            .open(subkey)
-            .and_then(|key| key.get_string(name))
-            .ok()
+        let key = windows_registry::CURRENT_USER.open(subkey).ok()?;
+        match key.get_type(name).ok()? {
+            windows_registry::Type::String => key.get_string(name).ok(),
+            _ => None,
+        }
     }
 
     pub(super) fn set(subkey: &str, name: &str, data: &str) -> Result<()> {
@@ -1473,6 +1487,34 @@ mod windows_entry_tests {
         ));
         assert!(!same_windows_dir(r"C:\a\ai-memory", r"C:\b\ai-memory"));
         assert!(!same_windows_dir(r"C:\ai-memory", r"C:\ai-memory-test"));
+        // A verbatim UNC path names the same share as its plain spelling.
+        assert!(same_windows_dir(
+            r"\\?\UNC\server\share\ai-memory",
+            r"\\server\share\ai-memory\"
+        ));
+        assert!(!same_windows_dir(
+            r"\\?\UNC\server\share\ai-memory",
+            r"\\server\other\ai-memory"
+        ));
+    }
+
+    /// A `--data-dir` inside the executable's path is not the option.
+    #[test]
+    fn the_data_dir_is_read_after_the_executable() {
+        let entry = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\tools --data-dir bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", r"C:\Users\me\AppData\Local\ai-memory").unwrap(),
+            windows_arg("config", r"C:\c.toml").unwrap(),
+        );
+        assert_eq!(
+            run_entry_data_dir(&entry).as_deref(),
+            Some(r"C:\Users\me\AppData\Local\ai-memory")
+        );
+        assert!(is_setup_run_entry_for(
+            &entry,
+            Path::new(r"C:\Users\me\AppData\Local\ai-memory")
+        ));
     }
 
     /// The test that found this: an `uninstall` run against a temporary data
@@ -1582,5 +1624,47 @@ mod user_registry_tests {
         user_registry::delete(&subkey, "ai-memory").unwrap();
         assert_eq!(user_registry::get(&subkey, "ai-memory"), None);
         windows_registry::CURRENT_USER.remove_tree(&subkey).unwrap();
+    }
+
+    /// `setup` writes `REG_SZ`; an expandable string under the same name was
+    /// put there by someone else and must not read as `setup`'s entry, or
+    /// `uninstall` would delete it.
+    #[test]
+    fn only_a_plain_string_value_is_read() {
+        let subkey = format!(r"Software\ai-memory-tests\{}", uuid::Uuid::new_v4());
+        let data =
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d" --config "C:\d\config.toml" service-host"#;
+        let key = windows_registry::CURRENT_USER.create(&subkey).unwrap();
+
+        key.set_expand_string("ai-memory", data).unwrap();
+        assert_eq!(user_registry::get(&subkey, "ai-memory"), None);
+
+        // Control: the same data as REG_SZ is read.
+        key.set_string("ai-memory", data).unwrap();
+        assert_eq!(
+            user_registry::get(&subkey, "ai-memory").as_deref(),
+            Some(data)
+        );
+        windows_registry::CURRENT_USER.remove_tree(&subkey).unwrap();
+    }
+
+    /// The entry `render` writes for an install is recognised as that
+    /// install's, even when the executable's own path holds ` --data-dir `.
+    #[test]
+    fn a_rendered_entry_belongs_to_its_own_data_dir() {
+        let data_dir = std::path::PathBuf::from(r"C:\Users\me\AppData\Local\ai-memory");
+        let spec = super::ServiceSpec {
+            exe: r"C:\tools --data-dir bin\ai-memory.exe".into(),
+            data_dir: data_dir.clone(),
+            config_path: data_dir.join("config.toml"),
+            home: r"C:\Users\me".into(),
+            xdg_config_home: None,
+        };
+        let unit = super::render(super::ServiceManager::WindowsRun, &spec).unwrap();
+        assert!(super::is_setup_run_entry_for(&unit.contents, &data_dir));
+        assert!(!super::is_setup_run_entry_for(
+            &unit.contents,
+            std::path::Path::new(r"C:\tools")
+        ));
     }
 }
