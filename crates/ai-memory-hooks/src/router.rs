@@ -13770,7 +13770,9 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        // A hang guard only: the Windows runner has needed more than 2s to
+        // carry the first SessionEnd to the admission tail.
+        tokio::time::timeout(Duration::from_secs(30), entered.notified())
             .await
             .expect("first SessionEnd reached the paused tail");
 
