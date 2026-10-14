@@ -2539,13 +2539,7 @@ fn exec_under_ai_jail(
     };
     let forwarded: Vec<OsString> = std::env::args_os().skip(1).collect();
     let resolved = jail_resolved_env(config);
-    let present: Vec<&str> = FORWARDED_ENV_NAMES
-        .iter()
-        .copied()
-        .filter(|name| {
-            std::env::var_os(name).is_some() || resolved.iter().any(|(set, _)| set == name)
-        })
-        .collect();
+    let present = jail_forwarded_names(config, &resolved);
     // `--agent-state` is a bare toggle: enable it so the harness's own login
     // state survives ai-jail's ephemeral private home (ai-jail derives the
     // per-harness state location from the wrapped `run <harness>` it parses).
@@ -2561,6 +2555,19 @@ fn exec_under_ai_jail(
     );
     eprintln!("{}", jail_summary(toggles, project_config));
     reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+}
+
+/// The [`FORWARDED_ENV_NAMES`] the re-exec passes with `--env NAME`: those set
+/// in the environment [`Config::load`] captured (invariant #1: never the live
+/// one), plus the ones [`jail_resolved_env`] sets on the ai-jail process.
+fn jail_forwarded_names(config: &Config, resolved: &[(&'static str, String)]) -> Vec<&'static str> {
+    FORWARDED_ENV_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            config.runtime_env.var_os(name).is_some() || resolved.iter().any(|(set, _)| set == name)
+        })
+        .collect()
 }
 
 /// Values this run resolved from its config and data dir that the jailed
@@ -4680,6 +4687,23 @@ mod tests {
                 "{name} is set on ai-jail but never forwarded into the jail"
             );
         }
+    }
+
+    #[test]
+    fn jail_forwarded_names_come_from_the_captured_env_and_resolved_values() {
+        let config = Config {
+            runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[
+                ("CLAUDE_CONFIG_DIR", "/home/op/.claude"),
+                ("UNRELATED", "x"),
+            ]),
+            ..Config::default()
+        };
+        let resolved = [("AI_MEMORY_AUTH_TOKEN", "file-token".to_owned())];
+        assert_eq!(
+            jail_forwarded_names(&config, &resolved),
+            ["AI_MEMORY_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"]
+        );
+        assert!(jail_forwarded_names(&Config::default(), &[]).is_empty());
     }
 
     #[test]
