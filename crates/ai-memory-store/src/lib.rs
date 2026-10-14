@@ -1929,11 +1929,10 @@ mod tests {
         );
     }
 
-    /// The brief's L0/L1 excerpts come from frontmatter the core rows carry,
-    /// and the A2 marker tells the renderer a short body is already the
-    /// compacted one.
+    /// The brief's L0/L1 excerpts come from the frontmatter the core rows
+    /// carry, A2-compacted pages included.
     #[tokio::test]
-    async fn session_brief_pages_carry_frontmatter_and_the_compacted_marker() {
+    async fn session_brief_pages_carry_frontmatter() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let ws = store
@@ -1965,8 +1964,10 @@ mod tests {
         let summarized = by_path("_rules/a-summarized.md");
         assert_eq!(summarized.frontmatter_json["abstract"], "one-line pointer");
         assert_eq!(summarized.frontmatter_json["summary"], "longer summary");
-        assert!(!summarized.compacted, "a normal write is not compacted");
-        assert!(by_path("_rules/b-compacted.md").compacted);
+        assert_eq!(
+            by_path("_rules/b-compacted.md").frontmatter_json["compacted"],
+            true
+        );
     }
 
     #[tokio::test]

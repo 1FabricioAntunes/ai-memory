@@ -1733,8 +1733,6 @@ pub struct BriefPageBody {
     /// and `summary:`. `{}` if the stored JSON ever fails to parse, which
     /// leaves that page with body-only excerpts.
     pub frontmatter_json: serde_json::Value,
-    /// Whether A2 compaction rewrote the body (`compacted_at` is set).
-    pub compacted: bool,
 }
 
 /// One row per (workspace, project) with aggregate stats.
@@ -7739,8 +7737,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let core_sql = format!(
-                "SELECT path, title, body, pinned, updated_at, frontmatter_json, \
-                        compacted_at IS NOT NULL \
+                "SELECT path, title, body, pinned, updated_at, frontmatter_json \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                    AND (path GLOB '_rules/*' \
@@ -7760,7 +7757,6 @@ impl ReaderPool {
                     row.get::<_, i64>(3)? != 0,
                     updated_us,
                     row.get::<_, String>(5)?,
-                    row.get::<_, bool>(6)?,
                 ))
             };
             let core_rows = match slot_glob.as_deref() {
@@ -7787,26 +7783,23 @@ impl ReaderPool {
             let core: Vec<BriefPageBody> = core_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .map(
-                    |(path, title, body, pinned, updated_us, frontmatter, compacted)| {
-                        jiff::Timestamp::from_microsecond(updated_us)
-                            .map(|ts| BriefPageBody {
-                                path,
-                                title,
-                                body,
-                                pinned,
-                                updated_at: ts.to_string(),
-                                frontmatter_json: serde_json::from_str(&frontmatter)
-                                    .unwrap_or_else(|_| serde_json::json!({})),
-                                compacted,
-                            })
-                            .map_err(|e| {
-                                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(
-                                    format!("bad updated_at: {e}"),
-                                ))
-                            })
-                    },
-                )
+                .map(|(path, title, body, pinned, updated_us, frontmatter)| {
+                    jiff::Timestamp::from_microsecond(updated_us)
+                        .map(|ts| BriefPageBody {
+                            path,
+                            title,
+                            body,
+                            pinned,
+                            updated_at: ts.to_string(),
+                            frontmatter_json: serde_json::from_str(&frontmatter)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        })
+                        .map_err(|e| {
+                            StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(
+                                format!("bad updated_at: {e}"),
+                            ))
+                        })
+                })
                 .collect::<StoreResult<Vec<_>>>()?;
 
             let mut recent_stmt = conn.prepare_cached(&format!(

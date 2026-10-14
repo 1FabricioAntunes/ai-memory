@@ -6596,7 +6596,6 @@ mod tests {
                 pinned: true,
                 updated_at: "2026-07-30T00:00:00Z".into(),
                 frontmatter_json: serde_json::json!({}),
-                compacted: false,
             }],
             &[],
             BRIEF_BUDGET_DEFAULT,
@@ -16354,7 +16353,6 @@ mod tests {
             pinned,
             updated_at: "2026-10-13T00:00:00Z".into(),
             frontmatter_json,
-            compacted: false,
         }
     }
 
@@ -16540,7 +16538,7 @@ mod tests {
     fn render_session_brief_excerpts_compacted_and_empty_pages() {
         let footer = "_Extractively compacted from a cold episodic page (A2 tier-down). \
                       The full pre-compaction body is retained in git history._";
-        let mut compacted = brief_core_page(
+        let compacted = brief_core_page(
             "_rules/compacted.md",
             &format!(
                 "Writes go through one actor.\n\n## Retained facts\n\n- `WriterHandle`\n\n{footer}\n"
@@ -16548,7 +16546,6 @@ mod tests {
             true,
             serde_json::json!({"abstract": "Single writer.", "compacted": true}),
         );
-        compacted.compacted = true;
         let core = vec![
             compacted,
             brief_core_page(
@@ -16769,7 +16766,6 @@ mod tests {
                         "q".repeat(300),
                     )})
                 },
-                compacted: false,
             })
             .collect();
         let recent: Vec<ai_memory_store::BriefingPage> = (0..BRIEF_RECENT_PAGES_LIMIT)

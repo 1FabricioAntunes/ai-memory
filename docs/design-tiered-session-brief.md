@@ -90,7 +90,7 @@ Verified in `crates/ai-memory-hooks/src/router.rs`:
 
 `BriefPageBody` in `crates/ai-memory-store/src/reader.rs` (around 1720) is
 `{path, title, body, pinned, updated_at}`. Full body only. No abstract,
-summary, frontmatter, or compacted flag.
+summary, or frontmatter.
 
 `session_brief_pages` / `session_brief_pages_with_slot_visibility`
 (around 7703-7760):
@@ -313,10 +313,11 @@ Restated from `AGENTS.md` because they bound the packing:
    store-order positions.
 
 4. **`BriefPageBody` grows the raw materials the helper needs.** Add
-   `frontmatter_json: serde_json::Value` and `compacted: bool`
-   (`compacted_at IS NOT NULL`). The renderer calls a core helper. The
-   store stays a fetch. Rationale: extraction has to live in one place;
-   `ai-memory-store` should not own clip policy.
+   `frontmatter_json: serde_json::Value`. The renderer calls a core
+   helper. The store stays a fetch. Rationale: extraction has to live in
+   one place; `ai-memory-store` should not own clip policy. An earlier
+   draft also carried a `compacted` flag; nothing in packing reads it,
+   so it is not fetched.
 
 5. **Tiering is on whenever briefing is on.** No `[briefing] tiered`
    flag. Briefing is already the opt-in for spending tokens on every
@@ -439,16 +440,14 @@ brief walker also skips ADR metadata lines and continues when a
 block's remainder is empty.
 
 **Compacted pages.** `excerpt_from_page` takes only frontmatter and
-body. It does not read `BriefPageBody.compacted`. Packing must not
-require that flag for nonempty L0/L1. A2 left `abstract:` in
+body, so a compacted page needs no flag for nonempty L0/L1. A2 left `abstract:` in
 frontmatter and put the L1 line at the top of the body, then
 keep-tokens, then `COMPACTION_FOOTER`. Typical result: L0 from abstract
 (or summary, or the L1 line clipped to 256), L1 from
 summary/abstract/first paragraph (the A2 line), L2 the whole compacted
 body including keep-tokens. Promoting to L2 is how keep-tokens reach
-the agent. Never treat `compacted == true` as "skip extraction" (that
-is how a page becomes an empty section). The flag is a hint that L2
-is still useful when the body is already short.
+the agent. Never treat a compacted page as "skip extraction" (that is
+how a page becomes an empty section).
 
 If L0 and L1 would be identical strings, both fields may hold that
 string; the packer treats a zero-delta upgrade as a no-op. Same for L1
@@ -460,11 +459,10 @@ pages with no keep-token tail).
 Extend the core SELECT:
 
 ```sql
-SELECT path, title, body, pinned, updated_at, frontmatter_json, compacted_at
+SELECT path, title, body, pinned, updated_at, frontmatter_json
 ```
 
-Map `compacted_at IS NOT NULL` to `BriefPageBody.compacted`. Parse
-`frontmatter_json` to `serde_json::Value`; on parse failure use `{}`
+Parse `frontmatter_json` to `serde_json::Value`; on parse failure use `{}`
 (body-only excerpts). Every write serializes the column through
 `serde_json`, and the recent-pages query already runs `json_extract`
 over it, so a corrupt row is not a new failure mode of this fetch.
@@ -744,7 +742,7 @@ sequenceDiagram
   Hook->>Handoff: briefing=1, briefing_budget=N
   Note over Hook,Handoff: 1s shell / 3s native. No LLM.
   Handoff->>Store: session_brief_pages_with_slot_visibility
-  Store-->>Handoff: BriefPageBody + frontmatter_json + compacted
+  Store-->>Handoff: BriefPageBody + frontmatter_json
   Handoff->>Core: extract L0/L1 per page
   Core-->>Handoff: PageExcerpt
   Handoff-->>Out: fenced brief (untrusted historical data)
@@ -805,7 +803,7 @@ grow.
 **Rust (internal).**
 
 - `ai_memory_core::excerpt::{excerpt_from_page, PageExcerpt, BRIEF_L0_MAX_BYTES, BRIEF_L1_MAX_BYTES}`
-- `BriefPageBody { frontmatter_json, compacted, …existing }`
+- `BriefPageBody { frontmatter_json, …existing }`
 - `render_session_brief` signature can stay
   `(core, recent, budget) -> Option<String>`. It will read the new
   fields.
@@ -1005,7 +1003,7 @@ existing three):
   still yields nonempty L0/L1 and, when promoted to L2, still contains
   the keep-token section. A compacted body that is only the A2 footer
   (no summary, no keep-tokens, no abstract) is title-only, not that
-  footer as L0. Nonempty L0/L1 must not require the `compacted` flag.
+  footer as L0.
 - Fence-escape still lengthens untrusted text and still clamps. Include
   a fence marker in `abstract:` / `frontmatter_json`, not only in
   `body`: L0 text is what long pages actually inject.
@@ -1032,7 +1030,6 @@ existing three):
 Store (`session_brief_pages_*`):
 
 - `frontmatter_json` round-trip (abstract/summary present).
-- `compacted` true when `compacted_at` is set, false otherwise.
 - Slot visibility and cross-project isolation unchanged
   (`slot_visibility.rs`, `session_brief_pages_selects_core_pages_and_isolates_projects`).
 
@@ -1117,7 +1114,7 @@ Released CHANGELOG sections stay frozen.
 | L0 of 256 × 24 plus headings still omits a tail at 4000 bytes | Medium | Expected as coverage math. After the L0 pass, reserve at least the count-only omitted line so those standing rules still appear as a count. Test at `BRIEF_BUDGET_DEFAULT` with 24 max-size L0s. Typical abstracts are <120 bytes (~15-20 pages). Raising the 24-row fetch limit is a follow-up. |
 | Denser brief = more injection surface | Medium | Fence, notice, footer, escape, clamp unchanged. Abstracts are short. |
 | Extractive first paragraph is a useless heading-like sentence | Low | Skip `#` headings and ADR metadata. Operators can set `abstract:`. |
-| A2 compacted page double-summarized to empty | High if shipped | Explicit test; `compacted` is a hint for L2 usefulness (keep-tokens), never a skip. |
+| A2 compacted page double-summarized to empty | High if shipped | Explicit test; extraction never skips a compacted page, and L2 carries its keep-tokens. |
 | Footer growth breaks `BRIEF_BUDGET_MIN` | Low | Scaffold is 816 bytes today, leftover 684; +22 for `memory_read_page` leaves 662, still ≥500. Re-measure from `brief_scaffold_len()` in commit 4. |
 | `BriefPageBody` struct-literal tests fail to compile | Low | commit 3 updates every literal (hooks tests around 6465 and 16216+). |
 | GET /handoff exceeds 1s | Low | Same 24-body fetch as today; extraction is microseconds. No LLM. |
@@ -1232,15 +1229,15 @@ Base: `release/3.1`.
   CHANGELOG: omit until commit 4 so `[Unreleased]` does not advertise
   a user-invisible type.
 
-### Commit 3: Carry frontmatter and compacted on `BriefPageBody`
+### Commit 3: Carry frontmatter on `BriefPageBody`
 
 - **Title:** `feat(store): session brief rows include frontmatter and compacted`
 - **Files:** `crates/ai-memory-store/src/reader.rs` (`BriefPageBody`,
   `session_brief_pages_with_slot_visibility` SELECT/mapper),
   `crates/ai-memory-store/src/lib.rs` isolation test, slot tests if they
   construct rows, `crates/ai-memory-hooks/src/router.rs` struct
-  literals in existing tests (fill `frontmatter_json: Default::default()`,
-  `compacted: false`) with **no packing change**.
+  literals in existing tests (fill `frontmatter_json`) with **no packing
+  change**.
 - **Dependencies:** commit 2 not strictly required (fields are raw), but
   land after commit 2 to avoid a hooks compile that later grows a helper
   import. Prefer commit 2 then commit 3.
