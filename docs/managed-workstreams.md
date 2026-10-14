@@ -1104,6 +1104,14 @@ If the outage exceeds one lease window, the original launcher may renew its run
 only while no newer launcher has claimed the workstream. A replacement prepare,
 cancel, finish, or destructive operation remains terminal for the old run.
 
+The outage wording is reserved for a server the launcher could not reach. When
+the server answers a heartbeat and rejects it, the notice carries the server's
+own reason instead. The common case is a lease the machine slept through: the
+launcher stops probing while the host is suspended, the 90-second lease lapses,
+and the first heartbeat after wake is answered with `managed run lease is not
+active` rather than being lost in transit. Reporting that as an outage would
+send the operator looking for a server that never went away.
+
 If the client is terminated without cleanup, such as with `kill -9`, its lease
 expires within 90 seconds. A later managed run starts from the last committed
 adapter cursor, so already linked native sessions can import the missing tail

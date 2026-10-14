@@ -2030,6 +2030,24 @@ async fn capture_interrupts(interrupted: CancellationToken) {
     }
 }
 
+/// The operator-facing line for one failed heartbeat.
+///
+/// Only a heartbeat that never reached the server may claim the server is
+/// unavailable. A rejection the server answered — the 90s lease a sleeping
+/// machine outlived, a run already finished — is actionable and names its
+/// own reason, instead of being reported as an outage the operator would
+/// go looking for in the server.
+fn heartbeat_failure_notice(error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some())
+    {
+        format!("ai-memory: managed workstream heartbeat rejected: {error:#}; retrying quietly")
+    } else {
+        "ai-memory: server unavailable; managed workstream heartbeat will retry quietly".to_string()
+    }
+}
+
 async fn send_managed_heartbeat(
     endpoint: &ServerEndpoint,
     run_path: &str,
@@ -2058,9 +2076,7 @@ async fn send_managed_heartbeat_with_timeout(
         Ok(()) => {}
         Err(error) if health.record_failure() => {
             tracing::debug!(error = %error, "managed workstream heartbeat became unavailable");
-            eprintln!(
-                "ai-memory: server unavailable; managed workstream heartbeat will retry quietly"
-            );
+            eprintln!("{}", heartbeat_failure_notice(error));
         }
         Err(_) => {}
     }
@@ -5241,6 +5257,68 @@ mod tests {
         assert!(health.record_success());
         assert!(!health.record_success());
         assert!(health.record_failure());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_notice_names_a_rejection_the_server_answered() {
+        let app = Router::new().route(
+            "/workstream/runs/{run_id}/heartbeat",
+            post(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    r#"{"error":"managed run lease is not active"}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+        let mut health = HeartbeatHealth::default();
+
+        let error = send_managed_heartbeat_with_timeout(
+            &endpoint,
+            "/workstream/runs/test",
+            &mut health,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a 409 must fail the heartbeat");
+        let notice = heartbeat_failure_notice(&error);
+
+        assert!(
+            notice.contains("managed run lease is not active"),
+            "the operator must see the server's own reason, got: {notice}"
+        );
+        assert!(
+            !notice.contains("server unavailable"),
+            "a server that answered in milliseconds is not unavailable, got: {notice}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_notice_reports_an_unreachable_server_as_unavailable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+        let mut health = HeartbeatHealth::default();
+
+        let error = send_managed_heartbeat_with_timeout(
+            &endpoint,
+            "/workstream/runs/test",
+            &mut health,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a closed port must fail the heartbeat");
+
+        assert!(
+            heartbeat_failure_notice(&error).contains("server unavailable"),
+            "an unreachable server keeps the quiet-retry wording"
+        );
     }
 
     #[tokio::test]
