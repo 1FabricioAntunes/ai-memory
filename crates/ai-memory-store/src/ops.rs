@@ -13942,7 +13942,11 @@ pub(crate) mod tests {
                 "SELECT COUNT(*) FROM profile_candidates \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND source_kind = 'prompt' AND source_ref = ?3",
-                params![here.0.as_bytes(), here.1.as_bytes(), format!("session:{sid}")],
+                params![
+                    here.0.as_bytes(),
+                    here.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
                 |r| r.get(0),
             )
             .unwrap();
@@ -13955,7 +13959,11 @@ pub(crate) mod tests {
                 "SELECT COUNT(*) FROM profile_candidates \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND source_kind = 'prompt' AND source_ref = ?3",
-                params![gone.0.as_bytes(), gone.1.as_bytes(), format!("session:{sid}")],
+                params![
+                    gone.0.as_bytes(),
+                    gone.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
                 |r| r.get(0),
             )
             .unwrap();
@@ -14497,23 +14505,32 @@ pub(crate) mod tests {
         let (moved_sid, _) = seed_session(&mut conn, src_ws, src_proj, "moved");
         let (sibling_sid, _) = seed_session(&mut conn, src_ws, src_proj, "sibling");
 
-        let insert_candidate = |ws: WorkspaceId,
-                                proj: ProjectId,
-                                kind: &str,
-                                source_ref: &str,
-                                topic: &str| {
-            conn.execute(
-                "INSERT INTO profile_candidates \
-                 (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
-                  statement, quote, observed_at, generality) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'workflow', 'statement', 'quote', 1, 'general')",
-                params![ws.as_bytes(), proj.as_bytes(), kind, source_ref, topic],
-            )
-            .unwrap();
-        };
+        let insert_candidate =
+            |ws: WorkspaceId, proj: ProjectId, kind: &str, source_ref: &str, topic: &str| {
+                conn.execute(
+                    "INSERT INTO profile_candidates \
+                     (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+                      statement, quote, observed_at, generality) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'workflow', 'statement', 'quote', 1, 'general')",
+                    params![ws.as_bytes(), proj.as_bytes(), kind, source_ref, topic],
+                )
+                .unwrap();
+            };
 
-        insert_candidate(src_ws, src_proj, "prompt", &format!("session:{moved_sid}"), "topic1");
-        insert_candidate(src_ws, src_proj, "prompt", &format!("session:{sibling_sid}"), "topic1");
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{moved_sid}"),
+            "topic1",
+        );
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{sibling_sid}"),
+            "topic1",
+        );
         insert_candidate(src_ws, src_proj, "page", "page:_rules/keep.md", "topic1");
 
         let insert_ingest_key = |proj: ProjectId, key: &str, sid: Option<SessionId>| {
@@ -14552,7 +14569,11 @@ pub(crate) mod tests {
                 "SELECT COUNT(*) FROM profile_candidates \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND source_kind = 'prompt' AND source_ref = ?3",
-                params![dst_ws.as_bytes(), dst_proj.as_bytes(), format!("session:{moved_sid}")],
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
                 |r| r.get(0),
             )
             .unwrap();
@@ -14563,7 +14584,11 @@ pub(crate) mod tests {
                 "SELECT COUNT(*) FROM profile_candidates \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND source_kind = 'prompt' AND source_ref = ?3",
-                params![src_ws.as_bytes(), src_proj.as_bytes(), format!("session:{moved_sid}")],
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
                 |r| r.get(0),
             )
             .unwrap();
@@ -14575,7 +14600,11 @@ pub(crate) mod tests {
                 "SELECT COUNT(*) FROM profile_candidates \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND source_kind = 'prompt' AND source_ref = ?3",
-                params![src_ws.as_bytes(), src_proj.as_bytes(), format!("session:{sibling_sid}")],
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sibling_sid}")
+                ],
                 |r| r.get(0),
             )
             .unwrap();
@@ -14727,7 +14756,11 @@ pub(crate) mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM profile_candidates \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
-                params![dst_ws.as_bytes(), dst_proj.as_bytes(), format!("session:{sid}")],
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
                 |r| r.get(0),
             )
             .unwrap();
@@ -14736,7 +14769,11 @@ pub(crate) mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM profile_candidates \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
-                params![src_ws.as_bytes(), src_proj.as_bytes(), format!("session:{sid}")],
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
                 |r| r.get(0),
             )
             .unwrap();
