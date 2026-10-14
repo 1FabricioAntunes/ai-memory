@@ -11,7 +11,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+- Added shell completions (bash, fish, zsh) to the Nix package output via
+  `installShellFiles`.
+
 ### Fixed
+- Fixed bundled hook discovery when `ai-memory` is installed in a standard Unix
+  prefix layout (such as Nix), probing `<prefix>/share/ai-memory/hooks/` from
+  `<prefix>/bin/ai-memory`.
+- Fixed `ai-memory install-hooks` and `setup-agent` failing when staging
+  support scripts over existing read-only copies from a read-only store.
+- Avoided baking absolute `/nix/store/...` paths into generated hook scripts,
+  resolving `ai-memory` dynamically via `$PATH` so hooks survive Nix garbage
+  collection.
+- Wrapped the `ai-memory` binary in the Nix flake package with `git` on `PATH`.
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
