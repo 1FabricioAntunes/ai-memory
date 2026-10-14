@@ -4141,48 +4141,8 @@ impl ReaderPool {
         exact_session_id: Option<SessionId>,
     ) -> StoreResult<Vec<SessionSummary>> {
         self.with_conn(move |conn| {
-            // The point lookup lets the primary key narrow first so the scope
-            // test is one indexed probe; the listing materializes the scope's
-            // session ids once instead of probing every session in the table.
-            let membership = if exact_session_id.is_some() {
-                " AND s.id = :sid \
-                  AND ((s.workspace_id = :ws AND s.project_id = :proj) \
-                       OR EXISTS (SELECT 1 FROM observations o \
-                                  WHERE o.session_id = s.id \
-                                    AND o.workspace_id = :ws AND o.project_id = :proj))"
-            } else {
-                " AND s.id IN (SELECT id FROM sessions \
-                               WHERE workspace_id = :ws AND project_id = :proj \
-                               UNION \
-                               SELECT session_id FROM observations \
-                               WHERE workspace_id = :ws AND project_id = :proj)"
-            };
-            let owner_clause = match &owner_filter {
-                OwnerFilter::Any => "",
-                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
-                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
-            };
-            let ended_clause = if include_open {
-                ""
-            } else {
-                " AND s.ended_at IS NOT NULL"
-            };
-            let sql = format!(
-                "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
-                        (SELECT COUNT(*) FROM observations o \
-                         WHERE o.session_id = s.id \
-                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
-                        j.state, j.attempts \
-                 FROM sessions s \
-                 LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
-                   AND j.workspace_id = :ws AND j.project_id = :proj \
-                   AND j.generation = (SELECT MAX(latest.generation) \
-                     FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
-                       AND latest.workspace_id = :ws AND latest.project_id = :proj) \
-                 WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
-                 ORDER BY s.started_at DESC, s.id DESC \
-                 LIMIT :limit OFFSET :offset"
-            );
+            let sql =
+                sessions_for_scope_sql(exact_session_id.is_some(), &owner_filter, include_open);
             let mut stmt = conn.prepare_cached(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
@@ -11624,6 +11584,64 @@ fn session_counts_by_agent_sql(has_since: bool, owner_filter: &OwnerFilter) -> S
     )
 }
 
+/// Build the scoped session listing query (or its point lookup).
+///
+/// The per-session observation count and the point lookup's membership
+/// probe filter observations by session, workspace and project, the same
+/// shape as the by-agent capture probe in
+/// [`session_counts_by_agent_sql`]: without `sqlite_stat1` the planner
+/// answers them from `idx_observations_project_created` and rescans the
+/// project once per listed session. `INDEXED BY` pins both to the session
+/// index.
+fn sessions_for_scope_sql(
+    exact_session: bool,
+    owner_filter: &OwnerFilter,
+    include_open: bool,
+) -> String {
+    // The point lookup lets the primary key narrow first so the scope
+    // test is one indexed probe; the listing materializes the scope's
+    // session ids once instead of probing every session in the table.
+    let membership = if exact_session {
+        " AND s.id = :sid \
+          AND ((s.workspace_id = :ws AND s.project_id = :proj) \
+               OR EXISTS (SELECT 1 FROM observations o INDEXED BY idx_observations_session \
+                          WHERE o.session_id = s.id \
+                            AND o.workspace_id = :ws AND o.project_id = :proj))"
+    } else {
+        " AND s.id IN (SELECT id FROM sessions \
+                       WHERE workspace_id = :ws AND project_id = :proj \
+                       UNION \
+                       SELECT session_id FROM observations \
+                       WHERE workspace_id = :ws AND project_id = :proj)"
+    };
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+        OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+    };
+    let ended_clause = if include_open {
+        ""
+    } else {
+        " AND s.ended_at IS NOT NULL"
+    };
+    format!(
+        "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
+                (SELECT COUNT(*) FROM observations o INDEXED BY idx_observations_session \
+                 WHERE o.session_id = s.id \
+                   AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
+                j.state, j.attempts \
+         FROM sessions s \
+         LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
+           AND j.workspace_id = :ws AND j.project_id = :proj \
+           AND j.generation = (SELECT MAX(latest.generation) \
+             FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
+               AND latest.workspace_id = :ws AND latest.project_id = :proj) \
+         WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
+         ORDER BY s.started_at DESC, s.id DESC \
+         LIMIT :limit OFFSET :offset"
+    )
+}
+
 /// Build the bounded history query and its optional owner binding.
 ///
 /// A named operator reads two disjoint ranges: shared (`NULL`) and their own
@@ -12948,8 +12966,28 @@ mod tests {
         );
     }
 
+    /// Every query plan step that reads observations through alias `o`.
+    fn observation_probe_plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        named: &[(&str, &dyn rusqlite::ToSql)],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let details = stmt
+            .query_map(named, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let probes = details
+            .iter()
+            .filter(|detail| detail.starts_with("SEARCH o "))
+            .cloned()
+            .collect();
+        (details, probes)
+    }
+
     #[test]
-    fn session_counts_by_agent_probes_observations_through_the_session_index() {
+    fn session_observation_probes_use_the_session_index() {
         // A fresh store has no `sqlite_stat1`, the same state in which a
         // production store picked the project index and rescanned the whole
         // project per session.
@@ -12958,42 +12996,62 @@ mod tests {
         let conn = rusqlite::Connection::open(store.db_path()).unwrap();
         let ws = WorkspaceId::new();
         let proj = ProjectId::new();
-        let (ws_bytes, proj_bytes) = (ws.as_bytes(), proj.as_bytes());
-        let (since, actor) = (0_i64, "user:alice");
+        let sid = SessionId::new();
+        let (ws_bytes, proj_bytes, sid_bytes) = (ws.as_bytes(), proj.as_bytes(), sid.as_bytes());
+        let (since, actor, limit, offset) = (0_i64, "user:alice", 50_i64, 0_i64);
         let owners = [
             OwnerFilter::Any,
             OwnerFilter::User(actor.into()),
             OwnerFilter::Unattributed,
         ];
-        for has_since in [false, true] {
-            for owner in &owners {
-                let sql = super::session_counts_by_agent_sql(has_since, owner);
-                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-                let mut named: Vec<(&str, &dyn rusqlite::ToSql)> =
-                    vec![(":ws", &ws_bytes), (":proj", &proj_bytes)];
-                if has_since {
-                    named.push((":since", &since));
-                }
-                if matches!(owner, OwnerFilter::User(_)) {
-                    named.push((":actor", &actor));
-                }
-                let details = stmt
-                    .query_map(named.as_slice(), |row| row.get::<_, String>(3))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
-                let probes: Vec<&String> = details
-                    .iter()
-                    .filter(|detail| detail.starts_with("SEARCH o "))
-                    .collect();
+        let assert_session_bounded =
+            |label: String, sql: &str, named: &[(&str, &dyn rusqlite::ToSql)]| {
+                let (details, probes) = observation_probe_plan(&conn, sql, named);
                 assert!(
                     !probes.is_empty()
                         && probes
                             .iter()
                             .all(|detail| detail.contains("idx_observations_session")),
-                    "since={has_since} owner={owner:?}: the capture probe must be bounded \
-                     by session, not by project: {details:?}"
+                    "{label}: the observation probe must be bounded by session, not by \
+                 project: {details:?}"
                 );
+            };
+        for owner in &owners {
+            let mut base: Vec<(&str, &dyn rusqlite::ToSql)> =
+                vec![(":ws", &ws_bytes), (":proj", &proj_bytes)];
+            if matches!(owner, OwnerFilter::User(_)) {
+                base.push((":actor", &actor));
+            }
+            for has_since in [false, true] {
+                let mut named = base.clone();
+                if has_since {
+                    named.push((":since", &since));
+                }
+                assert_session_bounded(
+                    format!("by-agent since={has_since} owner={owner:?}"),
+                    &super::session_counts_by_agent_sql(has_since, owner),
+                    &named,
+                );
+            }
+            for exact in [false, true] {
+                for include_open in [false, true] {
+                    let mut named = base.clone();
+                    named.push((":limit", &limit));
+                    named.push((":offset", &offset));
+                    if exact {
+                        named.push((":sid", &sid_bytes));
+                    }
+                    let sql = super::sessions_for_scope_sql(exact, owner, include_open);
+                    let label =
+                        format!("sessions exact={exact} open={include_open} owner={owner:?}");
+                    // The point lookup has two probes (count and membership);
+                    // both must use the session index.
+                    if exact {
+                        let (details, probes) = observation_probe_plan(&conn, &sql, &named);
+                        assert_eq!(probes.len(), 2, "{label}: {details:?}");
+                    }
+                    assert_session_bounded(label, &sql, &named);
+                }
             }
         }
     }

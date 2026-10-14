@@ -22,7 +22,9 @@ version in [`docs/changelog/`](docs/changelog/):
   sessions over 185k observations). Without planner statistics SQLite
   answered each session's capture probe from the project-wide index and
   rescanned the whole project once per session; the probe now always uses the
-  session index (0.3 s on the same store). The store also refreshes SQLite's
+  session index (0.3 s on the same store). The session list and session
+  detail reads behind `/web`, `/api/v1` and `memory_read_session_observations`
+  ran the same per-session probes and are pinned the same way. The store also refreshes SQLite's
   planner statistics on every start (`PRAGMA optimize`), which it had never
   done. The first start of an existing store analyzes it once (about 12 s for
   a 1.6 GB store); later starts only check table sizes. (#1257)
