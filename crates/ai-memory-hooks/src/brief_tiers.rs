@@ -370,4 +370,112 @@ mod tests {
         assert_eq!(plan.tiers, Vec::<BriefTier>::new());
         assert_eq!(plan.omitted_from, 0);
     }
+
+    /// Randomized invariants over the assignment, driven by a fixed-seed
+    /// xorshift (the seed is in every failure message). The `stress_`
+    /// prefix keeps it out of the everyday `cargo t` profile; `cargo tf`,
+    /// the pre-push hook and CI run it.
+    mod stress_assignment {
+        use super::*;
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        fn random_page(rng: &mut Rng) -> PageCosts {
+            let l0 = 20 + rng.below(320);
+            let l1 = l0 + [0, rng.below(300)][rng.below(2)];
+            let l2 = [
+                l1,
+                l1 + rng.below(SHORT_BODY_SLACK * 2),
+                l1 + rng.below(20_000),
+            ][rng.below(3)];
+            PageCosts {
+                privileged: rng.below(4) == 0,
+                title_only: 10 + rng.below(60),
+                tiers: (rng.below(10) != 0).then_some([l0, l1, l2]),
+            }
+        }
+
+        fn plan(pages: &[PageCosts], ceiling: usize, recent_full: usize) -> BriefPlan {
+            assign_tiers(
+                pages,
+                BriefBudget {
+                    prefix: 100,
+                    content_ceiling: ceiling,
+                    recent_full,
+                    recent_first: recent_full.min(RECENT_FIRST),
+                },
+                |from| 40 + LISTED * (pages.len() - from),
+                |_| COUNT_ONLY,
+            )
+        }
+
+        #[test]
+        fn assignment_invariants_hold_for_random_pages_and_budgets() {
+            let seed = 0x5eed_b41e_f00d_u64;
+            let mut rng = Rng(seed);
+            for case in 0..3_000 {
+                let pages: Vec<_> = (0..rng.below(25)).map(|_| random_page(&mut rng)).collect();
+                let ceiling = 300 + rng.below(20_000);
+                let recent_full = [0, 50 + rng.below(800)][rng.below(2)];
+                let p = plan(&pages, ceiling, recent_full);
+                let ctx =
+                    format!("seed {seed:#x} case {case}: {pages:?} ceiling {ceiling} -> {p:?}");
+
+                // Pages and the reserves never exceed the ceiling.
+                assert!(
+                    100 + spent(&pages, &p) + p.recent_reserve <= ceiling.max(100),
+                    "{ctx}"
+                );
+                // Omitted pages are exactly a suffix.
+                assert!(
+                    p.tiers[..p.omitted_from].iter().all(|t| *t != Omitted),
+                    "{ctx}"
+                );
+                assert!(
+                    p.tiers[p.omitted_from..].iter().all(|t| *t == Omitted),
+                    "{ctx}"
+                );
+                // A page with no excerpt is never deepened.
+                for (page, tier) in pages.iter().zip(&p.tiers) {
+                    if page.tiers.is_none() {
+                        assert!(matches!(tier, TitleOnly | Omitted), "{ctx}");
+                    }
+                }
+                // While some page still waits for an L1 that would add
+                // something, an unprivileged body is shown whole only when it
+                // was within the short-body slack.
+                let gate_closed = pages[..p.omitted_from]
+                    .iter()
+                    .zip(&p.tiers)
+                    .any(|(page, tier)| *tier == L0 && page.l1_adds());
+                if gate_closed {
+                    for (page, tier) in pages.iter().zip(&p.tiers) {
+                        if *tier == L2 && !page.privileged {
+                            let [l0, l1, l2] = page.tiers.unwrap();
+                            assert!(l2 <= l0.max(l1) + SHORT_BODY_SLACK, "{ctx}");
+                        }
+                    }
+                }
+                // More budget never covers fewer pages.
+                let wider = plan(&pages, ceiling + 1 + rng.below(4_000), recent_full);
+                assert!(
+                    wider.omitted_from >= p.omitted_from,
+                    "{ctx} wider {wider:?}"
+                );
+            }
+        }
+    }
 }

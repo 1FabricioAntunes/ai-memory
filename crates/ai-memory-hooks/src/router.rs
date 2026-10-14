@@ -16726,6 +16726,182 @@ mod tests {
         }
     }
 
+    /// Randomized end-to-end invariants of the rendered brief, driven by a
+    /// fixed-seed xorshift (the seed and case are in every failure). The
+    /// `stress_` prefix keeps it out of the everyday `cargo t` profile.
+    mod stress_session_brief {
+        use super::*;
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        const PIECES: &[&str] = &[
+            "rule",
+            "keep",
+            "it",
+            "boring.",
+            "🦀",
+            "émoji",
+            "`code`",
+            "- bullet",
+            "\n",
+            "\n\n",
+            "\r\n",
+            "# Heading",
+            "**Status:** Accepted",
+            "---",
+            UNTRUSTED_HISTORY_START,
+            UNTRUSTED_HISTORY_END,
+            "<!--",
+            "-->",
+        ];
+
+        fn text(rng: &mut Rng, max_words: usize) -> String {
+            let words = rng.below(max_words + 1);
+            let mut out = String::new();
+            for _ in 0..words {
+                out.push_str(PIECES[rng.below(PIECES.len())]);
+                out.push(' ');
+            }
+            out
+        }
+
+        fn random_core(rng: &mut Rng) -> Vec<ai_memory_store::BriefPageBody> {
+            let families = ["_rules", "_slots", "gotchas", "decisions", "notes"];
+            (0..rng.below(BRIEF_CORE_PAGES_LIMIT + 1))
+                .map(|i| {
+                    let mut frontmatter = serde_json::Map::new();
+                    if rng.below(3) == 0 {
+                        frontmatter.insert("abstract".into(), text(rng, 60).into());
+                    }
+                    if rng.below(3) == 0 {
+                        frontmatter.insert("summary".into(), text(rng, 120).into());
+                    }
+                    let body_words = [0, 8, 80, 800, 6_000][rng.below(5)];
+                    ai_memory_store::BriefPageBody {
+                        path: format!("{}/p{i:02}-page.md", families[rng.below(families.len())]),
+                        title: text(rng, 4),
+                        body: text(rng, body_words),
+                        pinned: rng.below(4) == 0,
+                        updated_at: "2026-10-13T00:00:00Z".into(),
+                        frontmatter_json: serde_json::Value::Object(frontmatter),
+                    }
+                })
+                .collect()
+        }
+
+        /// How many core pages the omitted section accounts for: the paths it
+        /// lists plus any "…and N more" or bare count.
+        fn omitted_accounted(section: &str, core: &[ai_memory_store::BriefPageBody]) -> usize {
+            let listed = core
+                .iter()
+                .filter(|p| section.contains(&format!("- `{}`", p.path)))
+                .count();
+            let number_after = |marker: &str| {
+                section.find(marker).and_then(|at| {
+                    section[at + marker.len()..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse::<usize>()
+                        .ok()
+                })
+            };
+            listed
+                + number_after("- …and ").unwrap_or(0)
+                + number_after("\n**").filter(|_| listed == 0).unwrap_or(0)
+        }
+
+        #[test]
+        fn rendered_brief_invariants_hold_for_random_hostile_pages() {
+            let seed = 0x000b_41ef_5eed_u64;
+            let mut rng = Rng(seed);
+            for case in 0..600 {
+                let core = random_core(&mut rng);
+                let recent: Vec<_> = (0..rng.below(BRIEF_RECENT_PAGES_LIMIT + 1))
+                    .map(|i| ai_memory_store::BriefingPage {
+                        path: format!("notes/r{i:02}.md"),
+                        title: text(&mut rng, 6),
+                        kind: "fact".into(),
+                        updated_at: "2026-10-13T00:00:00Z".into(),
+                    })
+                    .collect();
+                let budget = BRIEF_BUDGET_MIN + rng.below(BRIEF_BUDGET_MAX - BRIEF_BUDGET_MIN + 1);
+                let ctx = format!("seed {seed:#x} case {case} budget {budget}");
+                let Some(out) = render_session_brief(&core, &recent, budget) else {
+                    assert!(core.is_empty() && recent.is_empty(), "{ctx}");
+                    continue;
+                };
+
+                assert!(out.len() <= budget, "{ctx}: {} bytes", out.len());
+                assert!(
+                    out.contains(ai_memory_core::UNTRUSTED_MEMORY_NOTICE),
+                    "{ctx}"
+                );
+                assert_eq!(out.matches(UNTRUSTED_HISTORY_START).count(), 1, "{ctx}");
+                assert_eq!(out.matches(UNTRUSTED_HISTORY_END).count(), 1, "{ctx}");
+                assert!(out.ends_with(BRIEF_AGENT_FOOTER), "{ctx}");
+                assert!(!out.contains("[truncated by"), "{ctx}");
+                assert_eq!(
+                    render_session_brief(&core, &recent, budget).as_deref(),
+                    Some(out.as_str()),
+                    "{ctx}: not deterministic"
+                );
+
+                // Every core page is accounted for exactly once: shown in
+                // the page region, or reported by the omitted section.
+                let fence_end = out.find(UNTRUSTED_HISTORY_END).unwrap();
+                let omitted_at = out[..fence_end]
+                    .find("omitted by budget")
+                    .map(|at| out[..at].rfind("\n**").unwrap());
+                let recent_at = out[..fence_end].find(BRIEF_RECENT_HEADER);
+                let pages_end = omitted_at.or(recent_at).unwrap_or(fence_end);
+                let pages_region = &out[..pages_end];
+                let shown: Vec<usize> = core
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        pages_region.contains(&format!("(`{}`)\n", p.path))
+                            || pages_region.contains(&format!("- `{}`", p.path))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(
+                    shown,
+                    (0..shown.len()).collect::<Vec<_>>(),
+                    "{ctx}: shown pages must be a prefix of the core"
+                );
+                let omitted = omitted_at.map_or(0, |at| {
+                    omitted_accounted(&out[at..recent_at.unwrap_or(fence_end)], &core)
+                });
+                assert_eq!(
+                    shown.len() + omitted,
+                    core.len(),
+                    "{ctx}: shown {} + omitted {omitted} != core {}\n{out}",
+                    shown.len(),
+                    core.len()
+                );
+                if !recent.is_empty() && omitted == 0 && shown.len() == core.len() {
+                    // Nothing crowded out: the recent pointers had their
+                    // share and the first one always fits at these budgets.
+                    assert!(recent_at.is_some(), "{ctx}: recent pointers dropped\n{out}");
+                }
+            }
+        }
+    }
+
     /// A short page is one section of its full text, not an excerpt plus
     /// the same text again.
     #[test]
