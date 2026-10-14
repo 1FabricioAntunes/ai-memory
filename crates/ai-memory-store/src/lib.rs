@@ -1929,6 +1929,46 @@ mod tests {
         );
     }
 
+    /// The brief's L0/L1 excerpts come from frontmatter the core rows carry,
+    /// and the A2 marker tells the renderer a short body is already the
+    /// compacted one.
+    #[tokio::test]
+    async fn session_brief_pages_carry_frontmatter_and_the_compacted_marker() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        let mut summarized = sample_page(ws, proj, "_rules/a-summarized.md", "full body");
+        summarized.frontmatter_json =
+            serde_json::json!({"abstract": "one-line pointer", "summary": "longer summary"});
+        store.writer.upsert_page(summarized).await.unwrap();
+        let mut compacted = sample_page(ws, proj, "_rules/b-compacted.md", "L1 line");
+        compacted.frontmatter_json = serde_json::json!({"compacted": true});
+        store.writer.upsert_page(compacted).await.unwrap();
+
+        let (core, _) = store
+            .reader
+            .session_brief_pages(ws, proj, 24, 10)
+            .await
+            .unwrap();
+        let by_path = |path: &str| core.iter().find(|p| p.path == path).unwrap();
+
+        let summarized = by_path("_rules/a-summarized.md");
+        assert_eq!(summarized.frontmatter_json["abstract"], "one-line pointer");
+        assert_eq!(summarized.frontmatter_json["summary"], "longer summary");
+        assert!(!summarized.compacted, "a normal write is not compacted");
+        assert!(by_path("_rules/b-compacted.md").compacted);
+    }
+
     #[tokio::test]
     async fn cross_project_links_surface_in_graph_briefing_and_lint() {
         let tmp = TempDir::new().unwrap();

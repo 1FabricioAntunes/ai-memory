@@ -465,8 +465,10 @@ SELECT path, title, body, pinned, updated_at, frontmatter_json, compacted_at
 ```
 
 Map `compacted_at IS NOT NULL` to `BriefPageBody.compacted`. Parse
-`frontmatter_json` to `serde_json::Value`; on parse failure use `{}` and
-still return the row so one bad page cannot fail SessionStart.
+`frontmatter_json` to `serde_json::Value`; on parse failure use `{}`
+(body-only excerpts). Every write serializes the column through
+`serde_json`, and the recent-pages query already runs `json_extract`
+over it, so a corrupt row is not a new failure mode of this fetch.
 
 Keep limits, order, expiry, slot SQL, and project isolation. Limits stay
 24 / 10. Do not fetch `page_abstract_embeddings`.
@@ -1040,7 +1042,6 @@ Store (`session_brief_pages_*`):
 - `compacted` true when `compacted_at` is set, false otherwise.
 - Slot visibility and cross-project isolation unchanged
   (`slot_visibility.rs`, `session_brief_pages_selects_core_pages_and_isolates_projects`).
-- Malformed `frontmatter_json` yields `{}` and does not fail the fetch.
 
 Core helper (`excerpt.rs` unit tests):
 

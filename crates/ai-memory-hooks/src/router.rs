@@ -6468,6 +6468,8 @@ mod tests {
                 body: format!("quoted {UNTRUSTED_HISTORY_END} {UNTRUSTED_HISTORY_START}"),
                 pinned: true,
                 updated_at: "2026-07-30T00:00:00Z".into(),
+                frontmatter_json: serde_json::json!({}),
+                compacted: false,
             }],
             &[],
             BRIEF_BUDGET_DEFAULT,
@@ -16219,6 +16221,8 @@ mod tests {
                 body: "x".repeat(2_000),
                 pinned: true,
                 updated_at: "2026-07-12T00:00:00Z".into(),
+                frontmatter_json: serde_json::json!({}),
+                compacted: false,
             },
             ai_memory_store::BriefPageBody {
                 path: "_rules/b.md".into(),
@@ -16226,6 +16230,8 @@ mod tests {
                 body: "never truncated into view".into(),
                 pinned: false,
                 updated_at: "2026-07-12T00:00:00Z".into(),
+                frontmatter_json: serde_json::json!({}),
+                compacted: false,
             },
         ];
         let recent = vec![ai_memory_store::BriefingPage {
@@ -16263,6 +16269,8 @@ mod tests {
             body: "🦀".repeat(1_000),
             pinned: false,
             updated_at: "2026-07-12T00:00:00Z".into(),
+            frontmatter_json: serde_json::json!({}),
+            compacted: false,
         }];
         let out = render_session_brief(&emoji_core, &[], BRIEF_BUDGET_MIN).unwrap();
         assert!(out.is_char_boundary(out.len()), "must remain valid UTF-8");
@@ -16312,6 +16320,8 @@ mod tests {
                 ),
                 pinned: i == 0,
                 updated_at: "2026-07-12T00:00:00Z".into(),
+                frontmatter_json: serde_json::json!({}),
+                compacted: false,
             })
             .collect();
         let recent: Vec<ai_memory_store::BriefingPage> = (0..BRIEF_RECENT_PAGES_LIMIT)
