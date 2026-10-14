@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   prompt `profile_candidates` (`source_ref = 'session:<id>'`) and `ingest_keys`
   were not re-stamped into the target project, which distorted cross-project
   profile convergence and caused a subsequent `purge-project` of the source
-  project to destroy them via cascade. They now re-stamp in the same transaction.
+  project to destroy them via cascade. They now re-stamp in the same transaction. (#1265)
 
 ## [3.0.0] - 2026-10-13
 
