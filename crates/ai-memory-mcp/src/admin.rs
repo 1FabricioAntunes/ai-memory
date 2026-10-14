@@ -1702,6 +1702,37 @@ fn default_search_limit() -> usize {
     10
 }
 
+/// One hit of a cross-project `GET /admin/search` (no `workspace`/`project`).
+///
+/// The fields a global hit always carried (`id`, `path`, `title`, `snippet`,
+/// `rank`) plus the workspace and project the page lives in, so a caller can
+/// tell which repository each hit came from. A project-scoped search keeps
+/// returning plain [`ai_memory_store::PageHit`]s.
+#[derive(Debug, Serialize)]
+struct GlobalSearchHit {
+    id: ai_memory_core::PageId,
+    path: ai_memory_core::PagePath,
+    title: String,
+    snippet: String,
+    rank: f64,
+    workspace: String,
+    project: String,
+}
+
+impl From<ai_memory_store::PageHitWithMeta> for GlobalSearchHit {
+    fn from(hit: ai_memory_store::PageHitWithMeta) -> Self {
+        Self {
+            id: hit.id,
+            path: hit.path,
+            title: hit.title,
+            snippet: hit.snippet,
+            rank: hit.rank,
+            workspace: hit.workspace_name,
+            project: hit.project_name,
+        }
+    }
+}
+
 async fn handle_search(
     State(state): State<Arc<AdminState>>,
     Query(query): Query<SearchQuery>,
@@ -1713,12 +1744,11 @@ async fn handle_search(
     ) {
         (Some(workspace), Some(project)) => {
             match lookup_ws_proj_no_create(&state, workspace, project).await {
-                Ok((ws, proj)) => {
-                    state
-                        .reader
-                        .search_pages_for_project(ws, proj, query.q, limit, None)
-                        .await
-                }
+                Ok((ws, proj)) => state
+                    .reader
+                    .search_pages_for_project(ws, proj, query.q, limit, None)
+                    .await
+                    .and_then(|hits| Ok(serde_json::to_value(&hits)?)),
                 Err(e) => return e,
             }
         }
@@ -1730,13 +1760,20 @@ async fn handle_search(
                 })),
             );
         }
-        _ => state.reader.search_pages(query.q, limit, OPERATOR).await,
+        // Cross-project: every hit names its repository. `OPERATOR` reads
+        // every project because this route is root-only once the deployment
+        // distinguishes operators (`require_root_for_multiuser_admin`).
+        _ => state
+            .reader
+            .search_pages_with_meta(query.q, limit, None, OPERATOR)
+            .await
+            .and_then(|hits| {
+                let hits: Vec<GlobalSearchHit> = hits.into_iter().map(Into::into).collect();
+                Ok(serde_json::to_value(&hits)?)
+            }),
     };
     match search_result {
-        Ok(hits) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([]))),
-        ),
+        Ok(hits) => (StatusCode::OK, Json(hits)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),

@@ -1225,6 +1225,12 @@ pub struct PageVersionBody {
 /// per-hit metadata lookups after a global search.
 #[derive(Debug, Clone, Serialize)]
 pub struct PageHitWithMeta {
+    /// Stable identifier for this page version. Not serialized, so the MCP
+    /// `global_hits` and web shapes stay as they were; `GET /admin/search`
+    /// copies it into its own response to keep the `id` field its global
+    /// branch always returned.
+    #[serde(skip)]
+    pub id: PageId,
     /// Name of the workspace containing the page.
     pub workspace_name: String,
     /// Name of the project containing the page.
@@ -2551,7 +2557,7 @@ impl ReaderPool {
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
-                        pages.frontmatter_json, {kind_expr} AS kind \
+                        pages.frontmatter_json, {kind_expr} AS kind, pages.id \
                  FROM pages_fts \
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  JOIN projects ON projects.id = pages.project_id \
@@ -2580,7 +2586,9 @@ impl ReaderPool {
                 let pinned = row.get::<_, i64>(7)? != 0;
                 let frontmatter_json: String = row.get(8)?;
                 let kind: String = row.get(9)?;
+                let id_bytes: Vec<u8> = row.get(10)?;
                 Ok((
+                    id_bytes,
                     workspace_name,
                     project_name,
                     path,
@@ -2597,6 +2605,7 @@ impl ReaderPool {
             let mut candidates = Vec::new();
             for row in rows {
                 let (
+                    id_bytes,
                     workspace_name,
                     project_name,
                     path,
@@ -2612,6 +2621,7 @@ impl ReaderPool {
                     PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter_json);
                 candidates.push((
                     PageHitWithMeta {
+                        id: PageId::from_slice(&id_bytes)?,
                         workspace_name,
                         project_name,
                         path: PagePath::new(path)?,
@@ -3500,7 +3510,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
-                        CAST(pages.updated_at AS REAL) AS rank \
+                        CAST(pages.updated_at AS REAL) AS rank, pages.id \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
@@ -3521,12 +3531,22 @@ impl ReaderPool {
                 let title: String = row.get(3)?;
                 let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
                 let rank: f64 = row.get(5)?;
-                Ok((workspace_name, project_name, path, title, snippet, rank))
+                let id_bytes: Vec<u8> = row.get(6)?;
+                Ok((
+                    id_bytes,
+                    workspace_name,
+                    project_name,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                ))
             })?;
             let mut hits = Vec::new();
             for row in rows {
-                let (workspace_name, project_name, path, title, snippet, rank) = row?;
+                let (id_bytes, workspace_name, project_name, path, title, snippet, rank) = row?;
                 hits.push(PageHitWithMeta {
+                    id: PageId::from_slice(&id_bytes)?,
                     workspace_name,
                     project_name,
                     path: PagePath::new(path)?,

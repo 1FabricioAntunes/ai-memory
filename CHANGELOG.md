@@ -11,6 +11,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory search --global`, which searches the wiki pages of every
+  project from the terminal instead of only the current one. Each hit shows
+  its `workspace/project` in the text output and carries `workspace` and
+  `project` fields in `--json`. The flag cannot be combined with
+  `--workspace` or `--project`, and a search without it still resolves its
+  scope from the current directory. The server side is `GET /admin/search`
+  with no `workspace`/`project`: its hits now include `workspace` and
+  `project` next to the fields they already had, and the route stays
+  root-only on a multi-user server. Global search covers wiki pages only;
+  raw observations and a search limited to one workspace are not part of
+  this change. (#1253)
+
 ## [3.0.0] - 2026-10-13
 
 ### Added

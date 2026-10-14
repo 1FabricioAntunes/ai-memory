@@ -2114,6 +2114,10 @@ pub struct SearchArgs {
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
+    /// Search the wiki pages of every project instead of the current one.
+    /// Each hit is labelled with its `workspace/project`.
+    #[arg(long, conflicts_with_all = ["workspace", "project"])]
+    pub global: bool,
     /// Maximum number of hits to return.
     #[arg(short = 'n', long, default_value_t = 10)]
     pub limit: usize,
@@ -3494,6 +3498,36 @@ mod tests {
         };
         assert_eq!(args.applies_to, ["rust", "typescript"]);
         assert_eq!(args.enforced_by.as_deref(), Some("pre-push hook"));
+    }
+
+    /// `search --global` drops the scope entirely, so naming one alongside it
+    /// is a contradiction clap rejects rather than one flag silently winning.
+    #[test]
+    fn search_global_parses_and_conflicts_with_an_explicit_scope() {
+        let parsed = Cli::try_parse_from(["ai-memory", "search", "wal", "--global"])
+            .expect("search --global parses");
+        let Command::Search(args) = parsed.command else {
+            panic!("expected search command");
+        };
+        assert!(args.global);
+        assert!(args.workspace.is_none() && args.project.is_none());
+
+        let default = Cli::try_parse_from(["ai-memory", "search", "wal"]).expect("search parses");
+        let Command::Search(args) = default.command else {
+            panic!("expected search command");
+        };
+        assert!(!args.global, "global search stays opt-in");
+
+        for flag in [["--workspace", "acme"], ["--project", "api"]] {
+            let error =
+                Cli::try_parse_from(["ai-memory", "search", "wal", "--global", flag[0], flag[1]])
+                    .expect_err("--global must conflict with an explicit scope");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag:?}"
+            );
+        }
     }
 
     #[test]
