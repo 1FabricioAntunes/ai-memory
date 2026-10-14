@@ -83,22 +83,44 @@ pub fn leading_prose(body: &str) -> Option<String> {
             continue;
         }
         for line in block.lines().map(str::trim) {
-            if line.is_empty() || line.starts_with('#') || line == "---" || is_metadata_field(line)
+            if line.is_empty()
+                || line.starts_with('#')
+                || line == "---"
+                || is_metadata_field(line_head(line))
             {
                 continue;
             }
-            for word in line.split_whitespace() {
-                if !prose.is_empty() {
-                    prose.push(' ');
+            // Collapse whitespace while copying, and stop one byte past the
+            // longest clip: the clip only needs to know there is more.
+            let mut space = !prose.is_empty();
+            for ch in line.chars() {
+                if ch.is_whitespace() {
+                    space = !prose.is_empty();
+                    continue;
                 }
-                prose.push_str(word);
-            }
-            if prose.len() > BRIEF_L1_MAX_BYTES {
-                return Some(prose);
+                if space {
+                    prose.push(' ');
+                    space = false;
+                }
+                prose.push(ch);
+                if prose.len() > BRIEF_L1_MAX_BYTES {
+                    return Some(prose);
+                }
             }
         }
     }
     (!prose.is_empty()).then_some(prose)
+}
+
+/// The start of a line, long enough for any metadata label: whether a line
+/// is `**Status:** …` is decided by its first few words, and checking a
+/// whole multi-kilobyte line would cost more than the excerpt.
+fn line_head(line: &str) -> &str {
+    let mut end = line.len().min(256);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 /// A frontmatter string value, trimmed, or `None` when the key is absent,
@@ -306,6 +328,14 @@ mod tests {
             started.elapsed()
         );
         assert!(e.l1.unwrap().len() <= BRIEF_L1_MAX_BYTES);
+    }
+
+    #[test]
+    fn leading_prose_returns_no_more_than_the_longest_clip_needs() {
+        let long_word = "z".repeat(50_000);
+        let prose = leading_prose(&format!("Lead.\n\n{long_word}")).unwrap();
+        assert!(prose.len() <= BRIEF_L1_MAX_BYTES + 4, "{}", prose.len());
+        assert!(prose.starts_with("Lead. zzz"));
     }
 
     #[test]
