@@ -413,9 +413,19 @@ fn run_entry_data_dir(data: &str) -> Option<String> {
         .strip_prefix("--data-dir")?
         .trim_start()
         .strip_prefix('"')?;
-    let (dir, _) = quoted.split_once('"')?;
-    // `windows_arg` doubled the backslashes that end the path.
+    let (dir, after) = quoted.split_once('"')?;
+    // The quote must end the whole argument, as `windows_arg` writes it:
+    // Windows reads `"C:\d"\other` as one argument, `C:\d\other`.
+    if !(after.is_empty() || after.starts_with(' ')) {
+        return None;
+    }
+    // `windows_arg` doubles the backslashes that end the path, so their count
+    // is even; an odd count means the quote was escaped and the argument goes
+    // on past it.
     let trailing = dir.len() - dir.trim_end_matches('\\').len();
+    if trailing % 2 != 0 {
+        return None;
+    }
     Some(dir[..dir.len() - trailing / 2].to_owned())
 }
 
@@ -1402,6 +1412,21 @@ mod tests {
             "only the query ran: {:?}",
             other_install.calls.borrow()
         );
+
+        // Windows reads this data dir as `C:\d\other`: another install's.
+        let past_the_quote = FakeRunner {
+            stdout: vec![(
+                "reg query",
+                "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \"C:\\d\"\\other \
+                 --config \"C:\\d\\config.toml\" service-host\r\n",
+            )],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(ServiceManager::WindowsRun, &path, data_dir, &past_the_quote).unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(past_the_quote.calls.borrow().len(), 1, "only the query ran");
         assert!(
             ours.calls
                 .borrow()
@@ -1515,6 +1540,29 @@ mod windows_entry_tests {
             &entry,
             Path::new(r"C:\Users\me\AppData\Local\ai-memory")
         ));
+    }
+
+    /// A data dir argument that does not end at its closing quote names a
+    /// different directory to Windows: `"C:\d"\other` is `C:\d\other`, and
+    /// `"C:\d\" …"` escapes the quote. Neither may claim `C:\d`'s entry.
+    #[test]
+    fn a_data_dir_that_runs_past_its_quote_is_not_ours() {
+        let data_dir = Path::new(r"C:\d");
+        for entry in [
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d"\other --config "C:\c.toml" service-host"#,
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d"x --config "C:\c.toml" service-host"#,
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d\" --config "C:\c.toml" service-host"#,
+        ] {
+            assert!(!is_setup_run_entry_for(entry, data_dir), "{entry}");
+        }
+        // Control: the entry `setup` renders for `C:\d` is ours.
+        let ours = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", r"C:\d").unwrap(),
+            windows_arg("config", r"C:\c.toml").unwrap(),
+        );
+        assert!(is_setup_run_entry_for(&ours, data_dir), "{ours}");
     }
 
     /// The test that found this: an `uninstall` run against a temporary data
