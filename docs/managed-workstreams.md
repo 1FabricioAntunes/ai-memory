@@ -1106,11 +1106,16 @@ cancel, finish, or destructive operation remains terminal for the old run.
 
 The outage wording is reserved for a server the launcher could not reach. When
 the server answers a heartbeat and rejects it, the notice carries the server's
-own reason instead. The common case is a lease the machine slept through: the
-launcher stops probing while the host is suspended, the 90-second lease lapses,
-and the first heartbeat after wake is answered with `managed run lease is not
-active` rather than being lost in transit. Reporting that as an outage would
-send the operator looking for a server that never went away.
+own reason instead. A lapsed timestamp alone is not that case: `heartbeat`
+renews any run whose state is still `active`, so the original launcher recovers
+its own lease after an outage or a host suspend. The rejection arrives once the
+run stops being active, because it was finished, cancelled, or expired by a
+later prepare. That last one is the common path on a workstation, since the
+first statement of every prepare expires each active run whose lease has
+already passed. A launcher that was suspended past its lease keeps renewing
+until any other `run` prepares a workstream, and then reads `managed run lease
+is not active` from a server that is reachable and idle. Reporting that as an
+outage would send the operator looking for a server that never went away.
 
 If the client is terminated without cleanup, such as with `kill -9`, its lease
 expires within 90 seconds. A later managed run starts from the last committed

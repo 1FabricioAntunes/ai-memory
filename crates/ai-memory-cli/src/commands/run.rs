@@ -2033,10 +2033,10 @@ async fn capture_interrupts(interrupted: CancellationToken) {
 /// The operator-facing line for one failed heartbeat.
 ///
 /// Only a heartbeat that never reached the server may claim the server is
-/// unavailable. A rejection the server answered — the 90s lease a sleeping
-/// machine outlived, a run already finished — is actionable and names its
-/// own reason, instead of being reported as an outage the operator would
-/// go looking for in the server.
+/// unavailable. A rejection the server answered names its own reason instead.
+/// That reason is actionable: the run stopped being active, because it was
+/// finished, cancelled, or expired by a later prepare. Reporting it as an
+/// outage sends the operator looking for a server that never went away.
 fn heartbeat_failure_notice(error: &anyhow::Error) -> String {
     if error
         .chain()
