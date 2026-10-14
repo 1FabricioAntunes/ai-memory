@@ -738,6 +738,10 @@ once and hands the same embedder and rerank stage to the MCP server and to
 `WebState` (`ai_memory_web::Recall`); the stage's four-call concurrency gate is
 shared, so the web search cannot add provider calls past it. A search with no
 scope stays the cross-project FTS5 ranker, as `memory_query(global=true)` is.
+The web search also takes `kind` and `tier` filters, which every stream applies
+in its own query (`PageFilter`), so a filtered search narrows each stream
+before fusion and the reranker only sees pages the filter keeps;
+`memory_query` and `/api/v1/search` pass no filter.
 `ai-memory-mcp/tests/suite/web_search_parity.rs` holds the orders together.
 `explain=1` on a project search renders, per hit, each stream's rank, raw score
 and RRF contribution, the fused score, the authority multiplier, the intent
