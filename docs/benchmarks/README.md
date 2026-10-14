@@ -100,6 +100,8 @@ baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.00
   LLM answers from retrieved context and an LLM judges the answer; those are
   a different metric from `hit@5`. [comparison.md](../comparison.md) lists
   each setup.
-- **Regression gate.** Roadmap items 2-6 re-run this benchmark; a change
-  that lowers a slice materially is a regression to fix, not a note to
-  publish.
+- **Release policy.** A release that touches retrieval re-runs this
+  benchmark once, on the final release candidate, and compares every slice
+  with the previous release (AGENTS.md, project maintenance rules). A drop
+  does not block the release: the numbers are published and an issue opens
+  for the next release to decide whether it is a regression.

@@ -2437,6 +2437,7 @@ impl AiMemoryServer {
                     include_superseded: options.include_superseded,
                     explain: options.explain,
                     owner: options.owner,
+                    filter: ai_memory_store::PageFilter::default(),
                 },
             )
             .await
@@ -2677,6 +2678,7 @@ impl AiMemoryServer {
                     limit,
                     include_expired.then_some(i64::MIN),
                     Self::viewer_from_parts(Some(&parts)),
+                    ai_memory_store::PageFilter::default(),
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;

@@ -177,6 +177,12 @@ Options evaluated:
 The implemented choice is status plus scheduled backfill. It preserves the
 durable FTS path, exposes vector gaps, and keeps backfill opt-in.
 
+Since #1258, `apply_batch`, auto-improvement approvals and
+checkpoint restores also embed each written version after the batch commits
+and the mutation guard is released, through the same best-effort helper as
+`write_page`. Backfill now covers only provider failures and configuration
+changes, not every page a batch writes.
+
 ### Implemented: Graph/Link Retrieval
 
 The schema has a `links` table with nullable `to_page_id`. Markdown

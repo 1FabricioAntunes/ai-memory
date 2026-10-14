@@ -406,7 +406,8 @@ async fn search_with_request(
                 .iter()
                 .map(|scope| (scope.workspace_id, scope.project_id))
                 .collect();
-            crate::recall::search_scopes(state, &scopes, &term, limit, false, owner)
+            let filter = ai_memory_store::PageFilter::default();
+            crate::recall::search_scopes(state, &scopes, &term, limit, false, owner, filter)
                 .await
                 .map(|result| result.hits.into_iter().map(|(hit, _)| hit).collect())
         }

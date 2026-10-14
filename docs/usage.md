@@ -200,6 +200,33 @@ a page: a query aimed at a session-specific term can still return that session.
 `pinned` remains primarily a retention and automation-mutation control, not an
 unconditional search override.
 
+## Search from the terminal
+
+`ai-memory search` runs an FTS5 query against the wiki from a shell. It skips
+the entity, vector and graph streams and the raw-observation fallback that the
+agent's hybrid `memory_query` uses.
+
+```bash
+ai-memory search "wal mode"                           # current project (cwd / marker)
+ai-memory search "wal mode" --workspace acme --project api
+ai-memory search "wal mode" --global                  # every project
+ai-memory search "wal mode" --global --json -n 20
+```
+
+Without a flag the scope comes from the current directory, the same way as
+every other client command (see [marker-file.md](marker-file.md)).
+`--global` sends no scope and searches the wiki pages of every project; each
+hit is printed with its `workspace/project`, and `--json` adds `workspace` and
+`project` fields to each hit. `--global` cannot be combined with `--workspace`
+or `--project`. It covers compiled wiki pages only, not raw observations.
+
+The command calls `GET /admin/search`, so on a multi-user server only the root
+operator can run it. A DB user searches across the projects they may read with
+`memory_query(global=true)` or the web search page instead. A repository's
+`[recall] default_global` marker setting changes what an agent's unscoped
+`memory_query` reads; it does not change this command, which stays
+project-scoped unless you pass `--global`.
+
 ## Historical memory and live code intelligence
 
 ai-memory can run beside CodeGraph, an LSP-backed service, a SCIP/LSIF index,
@@ -545,7 +572,8 @@ breadcrumbs, rendered markdown, metadata, and search. On a project, page,
 namespace, history or session view the header search box searches that project;
 elsewhere it searches every project with FTS5, like
 `memory_query(global=true)`, and the search page's "Search in" selector picks
-a project. A page shows an outline of its headings, the pages that cite it and
+a project, and its "Kind" and "Tier" selects (`kind=` and `tier=`) keep only
+the pages of that kind or tier. A page shows an outline of its headings, the pages that cite it and
 the pages it cites; a folder's namespace listing sorts by recent update or by
 title and shows 25 pages at a time. The search on a project page ranks with
 the same hybrid ranker as `memory_query` for that project, and its "Explain

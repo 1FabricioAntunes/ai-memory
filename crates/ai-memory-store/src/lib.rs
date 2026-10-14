@@ -88,8 +88,8 @@ pub use reader::{
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
     GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
     ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview,
-    PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
+    PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter, PageHit, PageHitWithMeta,
+    PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
     ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
     ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
     ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
@@ -2449,7 +2449,7 @@ mod tests {
 
         let global = store
             .reader
-            .search_pages_with_meta(query.into(), 10, None, None)
+            .search_pages_with_meta(query.into(), 10, None, None, crate::PageFilter::default())
             .await
             .unwrap();
         assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");

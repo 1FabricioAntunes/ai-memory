@@ -201,24 +201,85 @@ fn readable_repository_sql(
     )
 }
 
+/// Path prefix to kind, in match order: the kind a page has when its
+/// frontmatter names none.
+const PATH_KINDS: [(&str, &str); 9] = [
+    ("_rules/", "rule"),
+    ("_slots/", "slot"),
+    ("sessions/", "session"),
+    ("decisions/", "decision"),
+    ("gotchas/", "gotcha"),
+    ("concepts/", "concept"),
+    ("procedures/", "procedure"),
+    ("notes/", "note"),
+    ("profile/", "preference"),
+];
+
+/// Kind of a page whose frontmatter names none and whose path matches no
+/// [`PATH_KINDS`] prefix.
+const DEFAULT_PAGE_KIND: &str = "fact";
+
+/// Every kind a page can have without custom frontmatter, as
+/// `page_kind_expr` derives it.
+pub const PAGE_KINDS: [&str; 10] = [
+    "rule",
+    "slot",
+    "session",
+    "decision",
+    "gotcha",
+    "concept",
+    "procedure",
+    "note",
+    "preference",
+    DEFAULT_PAGE_KIND,
+];
+
 fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
+    let arms: String = PATH_KINDS
+        .iter()
+        .map(|(prefix, kind)| {
+            // `_` is a LIKE wildcard; escape it so `_rules/` matches only itself.
+            let prefix = prefix.replace('_', "\\_");
+            format!("WHEN {path_column} LIKE '{prefix}%' ESCAPE '\\' THEN '{kind}' ")
+        })
+        .collect();
+    // The cast keeps a non-string frontmatter `kind` (`kind: 5`) readable as
+    // text instead of failing the row.
     format!(
         "COALESCE( \
-            json_extract({frontmatter_column}, '$.kind'), \
-            CASE \
-                WHEN {path_column} LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
-                WHEN {path_column} LIKE '\\_slots/%' ESCAPE '\\' THEN 'slot' \
-                WHEN {path_column} LIKE 'sessions/%' THEN 'session' \
-                WHEN {path_column} LIKE 'decisions/%' THEN 'decision' \
-                WHEN {path_column} LIKE 'gotchas/%' THEN 'gotcha' \
-                WHEN {path_column} LIKE 'concepts/%' THEN 'concept' \
-                WHEN {path_column} LIKE 'procedures/%' THEN 'procedure' \
-                WHEN {path_column} LIKE 'notes/%' THEN 'note' \
-                WHEN {path_column} LIKE 'profile/%' THEN 'preference' \
-                ELSE 'fact' \
-            END \
+            CAST(json_extract({frontmatter_column}, '$.kind') AS TEXT), \
+            CASE {arms}ELSE '{DEFAULT_PAGE_KIND}' END \
         )"
     )
+}
+
+#[cfg(test)]
+mod page_kind_tests {
+    use super::*;
+
+    #[test]
+    fn page_kinds_lists_every_path_kind_and_the_default() {
+        let mut expected: Vec<&str> = PATH_KINDS.iter().map(|(_, kind)| *kind).collect();
+        expected.push(DEFAULT_PAGE_KIND);
+        assert_eq!(PAGE_KINDS.to_vec(), expected);
+    }
+
+    #[test]
+    fn page_kind_expr_resolves_paths_and_non_string_kinds() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "SELECT {} FROM (SELECT ?1 AS path, ?2 AS fm)",
+            page_kind_expr("path", "fm")
+        );
+        let kind = |path: &str, fm: &str| -> String {
+            conn.query_row(&sql, [path, fm], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(kind("_rules/a.md", "{}"), "rule");
+        assert_eq!(kind("xrules/a.md", "{}"), "fact");
+        assert_eq!(kind("profile/a.md", "{}"), "preference");
+        assert_eq!(kind("sessions/a.md", r#"{"kind":"custom"}"#), "custom");
+        assert_eq!(kind("sessions/a.md", r#"{"kind":5}"#), "5");
+    }
 }
 
 /// Leading body characters scanned when a page carries no frontmatter
@@ -808,6 +869,61 @@ pub struct VectorQuery<'a> {
     pub dim: u32,
 }
 
+/// Narrows a search to pages of one kind and/or tier.
+///
+/// Every stream applies it in its own SQL, so each returns only pages the
+/// filter keeps and a rare kind cannot be crowded out by other kinds. Entity
+/// frequencies are still counted over every page, so the filter leaves an
+/// entity's weight unchanged. Graph expansion seeds from the kept hits only.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageFilter<'a> {
+    /// Semantic kind to keep, compared ASCII case-insensitively; `None`
+    /// keeps every kind.
+    pub kind: Option<&'a str>,
+    /// Memory tier to keep; `None` keeps every tier.
+    pub tier: Option<&'a str>,
+}
+
+impl PageFilter<'_> {
+    /// An ` AND …` predicate over the pages row `alias`, taking each bound
+    /// value's placeholder from `placeholder`, and those values in order.
+    fn sql(&self, alias: &str, mut placeholder: impl FnMut() -> String) -> (String, Vec<Value>) {
+        let mut clause = String::new();
+        let mut values = Vec::new();
+        if let Some(kind) = self.kind {
+            let kind_expr = page_kind_expr(
+                &format!("{alias}.path"),
+                &format!("{alias}.frontmatter_json"),
+            );
+            clause.push_str(&format!(
+                " AND {kind_expr} = {} COLLATE NOCASE",
+                placeholder()
+            ));
+            values.push(Value::Text(kind.to_owned()));
+        }
+        if let Some(tier) = self.tier {
+            clause.push_str(&format!(" AND {alias}.tier = {}", placeholder()));
+            values.push(Value::Text(tier.to_owned()));
+        }
+        (clause, values)
+    }
+}
+
+/// Placeholders `?first`, `?first+1`, … for [`PageFilter::sql`] in a
+/// statement that numbers its parameters.
+fn numbered_placeholders(first: usize) -> impl FnMut() -> String {
+    let mut next = first;
+    move || {
+        next += 1;
+        format!("?{}", next - 1)
+    }
+}
+
+/// Placeholder for [`PageFilter::sql`] in a statement of anonymous `?`s.
+fn anonymous_placeholder() -> String {
+    "?".to_owned()
+}
+
 /// One [`ReaderPool::hybrid_search_scopes`] request.
 #[derive(Debug, Clone, Copy)]
 pub struct HybridSearch<'a> {
@@ -826,6 +942,8 @@ pub struct HybridSearch<'a> {
     /// Who is asking, as the session timeline sees them: an observation
     /// excerpt is attached only from a session this filter admits.
     pub owner: &'a OwnerFilter,
+    /// Keep only pages of this kind and/or tier; the default keeps all.
+    pub filter: PageFilter<'a>,
 }
 
 /// Per-query wall time of each retrieval stream, in milliseconds, for an
@@ -1225,6 +1343,12 @@ pub struct PageVersionBody {
 /// per-hit metadata lookups after a global search.
 #[derive(Debug, Clone, Serialize)]
 pub struct PageHitWithMeta {
+    /// Stable identifier for this page version. Not serialized, so the MCP
+    /// `global_hits` and web shapes stay as they were; `GET /admin/search`
+    /// copies it into its own response to keep the `id` field its global
+    /// branch always returned.
+    #[serde(skip)]
+    pub id: PageId,
     /// Name of the workspace containing the page.
     pub workspace_name: String,
     /// Name of the project containing the page.
@@ -2528,6 +2652,8 @@ impl ReaderPool {
     ///
     /// `viewer` restricts the hits to repositories that user may read — see
     /// [`readable_repository_filter`]. `None` searches every repository.
+    /// `filter` keeps only pages of a kind and/or tier, before the cut to
+    /// `limit`.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2537,26 +2663,28 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         viewer: Option<UserId>,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (visible, visible_params) = readable_repository_filter("pages.project_id", viewer, 4);
+        let (kept, kept_params) =
+            filter.sql("pages", numbered_placeholders(4 + visible_params.len()));
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
-            let (visible, visible_params) =
-                readable_repository_filter("pages.project_id", viewer, 4);
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
-                        pages.frontmatter_json, {kind_expr} AS kind \
+                        pages.frontmatter_json, {kind_expr} AS kind, pages.id \
                  FROM pages_fts \
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible} \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible}{kept} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?2",
                 not_expired = not_expired("pages", "?3"),
@@ -2569,6 +2697,7 @@ impl ReaderPool {
                 Value::Integer(cutoff),
             ];
             bound.extend(visible_params);
+            bound.extend(kept_params);
             let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
@@ -2580,7 +2709,9 @@ impl ReaderPool {
                 let pinned = row.get::<_, i64>(7)? != 0;
                 let frontmatter_json: String = row.get(8)?;
                 let kind: String = row.get(9)?;
+                let id_bytes: Vec<u8> = row.get(10)?;
                 Ok((
+                    id_bytes,
                     workspace_name,
                     project_name,
                     path,
@@ -2597,6 +2728,7 @@ impl ReaderPool {
             let mut candidates = Vec::new();
             for row in rows {
                 let (
+                    id_bytes,
                     workspace_name,
                     project_name,
                     path,
@@ -2612,6 +2744,7 @@ impl ReaderPool {
                     PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter_json);
                 candidates.push((
                     PageHitWithMeta {
+                        id: PageId::from_slice(&id_bytes)?,
                         workspace_name,
                         project_name,
                         path: PagePath::new(path)?,
@@ -2655,11 +2788,13 @@ impl ReaderPool {
                 authority_candidate_limit(limit),
                 expiry_cutoff_us,
                 false,
+                PageFilter::default(),
             )
             .await?;
         Ok(rerank_page_hits(candidates, limit))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn search_page_candidates_for_project(
         &self,
         workspace_id: WorkspaceId,
@@ -2668,12 +2803,14 @@ impl ReaderPool {
         candidate_limit: usize,
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (kept, kept_params) = filter.sql("pages", numbered_placeholders(6));
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
@@ -2685,7 +2822,7 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  WHERE pages_fts MATCH ?1 \
                    AND pages.workspace_id = ?2 \
-                   AND pages.project_id = ?3{latest}{not_expired} \
+                   AND pages.project_id = ?3{latest}{not_expired}{kept} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?4",
                 latest = latest_only("pages", include_superseded),
@@ -2693,37 +2830,36 @@ impl ReaderPool {
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![
-                    fts_query,
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    candidate_limit as i64,
-                    cutoff
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let path: String = row.get(1)?;
-                    let title: String = row.get(2)?;
-                    let snippet: String = row.get(3)?;
-                    let rank: f64 = row.get(4)?;
-                    let tier: String = row.get(5)?;
-                    let pinned = row.get::<_, i64>(6)? != 0;
-                    let frontmatter_json: String = row.get(7)?;
-                    let kind: String = row.get(8)?;
-                    Ok((
-                        id_bytes,
-                        path,
-                        title,
-                        snippet,
-                        rank,
-                        tier,
-                        pinned,
-                        frontmatter_json,
-                        kind,
-                    ))
-                },
-            )?;
+            let mut bound = vec![
+                Value::Text(fts_query),
+                Value::Blob(workspace_id.as_bytes().to_vec()),
+                Value::Blob(project_id.as_bytes().to_vec()),
+                Value::Integer(candidate_limit as i64),
+                Value::Integer(cutoff),
+            ];
+            bound.extend(kept_params);
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: String = row.get(3)?;
+                let rank: f64 = row.get(4)?;
+                let tier: String = row.get(5)?;
+                let pinned = row.get::<_, i64>(6)? != 0;
+                let frontmatter_json: String = row.get(7)?;
+                let kind: String = row.get(8)?;
+                Ok((
+                    id_bytes,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    tier,
+                    pinned,
+                    frontmatter_json,
+                    kind,
+                ))
+            })?;
 
             let mut candidates = Vec::new();
             for row in rows {
@@ -3134,6 +3270,7 @@ impl ReaderPool {
     /// unexpired page in this scope contributes nothing; the raw-observation
     /// fallback still covers live sessions. The two reads share one read
     /// transaction so the mapping sees a single snapshot. Read-only.
+    #[allow(clippy::too_many_arguments)]
     async fn observation_stream_votes(
         &self,
         workspace_id: WorkspaceId,
@@ -3142,11 +3279,14 @@ impl ReaderPool {
         candidate_limit: usize,
         cutoff: i64,
         owner_filter: OwnerFilter,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<ObservationVote>> {
         let fts_query = normalize_fts_query(query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
+        // The session pages' lookup takes anonymous `?`s after its IN list.
+        let (kept, kept_params) = filter.sql("pages", anonymous_placeholder);
         let row_limit = candidate_limit
             .saturating_mul(OBSERVATION_STREAM_ROWS_PER_CANDIDATE)
             .min(OBSERVATION_STREAM_MAX_ROWS);
@@ -3243,13 +3383,14 @@ impl ReaderPool {
                 placeholders.push('?');
                 sql_params.push(Value::Text(format!("sessions/{session_id}.md")));
             }
+            sql_params.extend(kept_params);
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title \
                  FROM pages \
                  WHERE pages.workspace_id = ?1 \
                    AND pages.project_id = ?2 \
                    AND pages.is_latest = 1{not_expired} \
-                   AND pages.path IN ({placeholders})",
+                   AND pages.path IN ({placeholders}){kept}",
                 not_expired = not_expired("pages", "?3"),
             );
             let mut pages: std::collections::HashMap<String, (PageId, String)> =
@@ -3500,7 +3641,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
-                        CAST(pages.updated_at AS REAL) AS rank \
+                        CAST(pages.updated_at AS REAL) AS rank, pages.id \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
@@ -3521,12 +3662,22 @@ impl ReaderPool {
                 let title: String = row.get(3)?;
                 let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
                 let rank: f64 = row.get(5)?;
-                Ok((workspace_name, project_name, path, title, snippet, rank))
+                let id_bytes: Vec<u8> = row.get(6)?;
+                Ok((
+                    id_bytes,
+                    workspace_name,
+                    project_name,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                ))
             })?;
             let mut hits = Vec::new();
             for row in rows {
-                let (workspace_name, project_name, path, title, snippet, rank) = row?;
+                let (id_bytes, workspace_name, project_name, path, title, snippet, rank) = row?;
                 hits.push(PageHitWithMeta {
+                    id: PageId::from_slice(&id_bytes)?,
                     workspace_name,
                     project_name,
                     path: PagePath::new(path)?,
@@ -3850,7 +4001,8 @@ impl ReaderPool {
     /// `since_us` is an inclusive lower bound on `started_at`; `None` counts
     /// the project's whole history. The scan rides
     /// `idx_sessions_recent (workspace_id, project_id, started_at DESC)`, so
-    /// it stays bounded by scope rather than table-wide.
+    /// it stays bounded by scope rather than table-wide, and the per-session
+    /// capture probe is pinned to `idx_observations_session`.
     ///
     /// Ordering is count-descending with an agent-name tiebreak, so equal
     /// counts do not reorder between calls.
@@ -3865,31 +4017,7 @@ impl ReaderPool {
         since_us: Option<i64>,
     ) -> StoreResult<Vec<AgentSessionCount>> {
         self.with_conn(move |conn| {
-            // Same reasoning as `open_sessions_for_scope_agent`: without the
-            // owner predicate a shared server reports a teammate's activity as
-            // the caller's own.
-            let owner_clause = match &owner_filter {
-                OwnerFilter::Any => "",
-                OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = :actor)",
-                OwnerFilter::Unattributed => " AND actor_user IS NULL",
-            };
-            let since_clause = if since_us.is_some() {
-                " AND started_at >= :since"
-            } else {
-                ""
-            };
-            let sql = format!(
-                "SELECT agent_kind, COUNT(*) AS n, \
-                 SUM((SELECT COUNT(DISTINCT CASE WHEN o.extension IS NULL \
-                     THEN 'native' ELSE 'extension:' || o.extension END) \
-                     FROM observations o WHERE o.session_id = sessions.id \
-                       AND o.workspace_id = :ws AND o.project_id = :proj) > 1) \
-                 FROM sessions \
-                 WHERE workspace_id = :ws AND project_id = :proj\
-                 {since_clause}{owner_clause} \
-                 GROUP BY agent_kind \
-                 ORDER BY n DESC, agent_kind ASC"
-            );
+            let sql = session_counts_by_agent_sql(since_us.is_some(), &owner_filter);
             let mut stmt = conn.prepare_cached(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
@@ -4164,48 +4292,8 @@ impl ReaderPool {
         exact_session_id: Option<SessionId>,
     ) -> StoreResult<Vec<SessionSummary>> {
         self.with_conn(move |conn| {
-            // The point lookup lets the primary key narrow first so the scope
-            // test is one indexed probe; the listing materializes the scope's
-            // session ids once instead of probing every session in the table.
-            let membership = if exact_session_id.is_some() {
-                " AND s.id = :sid \
-                  AND ((s.workspace_id = :ws AND s.project_id = :proj) \
-                       OR EXISTS (SELECT 1 FROM observations o \
-                                  WHERE o.session_id = s.id \
-                                    AND o.workspace_id = :ws AND o.project_id = :proj))"
-            } else {
-                " AND s.id IN (SELECT id FROM sessions \
-                               WHERE workspace_id = :ws AND project_id = :proj \
-                               UNION \
-                               SELECT session_id FROM observations \
-                               WHERE workspace_id = :ws AND project_id = :proj)"
-            };
-            let owner_clause = match &owner_filter {
-                OwnerFilter::Any => "",
-                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
-                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
-            };
-            let ended_clause = if include_open {
-                ""
-            } else {
-                " AND s.ended_at IS NOT NULL"
-            };
-            let sql = format!(
-                "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
-                        (SELECT COUNT(*) FROM observations o \
-                         WHERE o.session_id = s.id \
-                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
-                        j.state, j.attempts \
-                 FROM sessions s \
-                 LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
-                   AND j.workspace_id = :ws AND j.project_id = :proj \
-                   AND j.generation = (SELECT MAX(latest.generation) \
-                     FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
-                       AND latest.workspace_id = :ws AND latest.project_id = :proj) \
-                 WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
-                 ORDER BY s.started_at DESC, s.id DESC \
-                 LIMIT :limit OFFSET :offset"
-            );
+            let sql =
+                sessions_for_scope_sql(exact_session_id.is_some(), &owner_filter, include_open);
             let mut stmt = conn.prepare_cached(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
@@ -4987,6 +5075,7 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: i64,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         self.top_embedding_hits_in_table(
             EmbeddingTable::Body,
@@ -4999,6 +5088,7 @@ impl ReaderPool {
             limit,
             expiry_cutoff_us,
             include_superseded,
+            filter,
         )
         .await
     }
@@ -5019,18 +5109,20 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: i64,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let table = table.name();
+        let (kept, kept_params) = filter.sql("pages", numbered_placeholders(7));
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT {table}.page_id, {table}.vector, pages.path \
                  FROM {table} \
                  JOIN pages ON pages.id = {table}.page_id \
                  WHERE pages.workspace_id = ?1 \
-                   AND pages.project_id = ?2{latest}{not_expired} \
+                   AND pages.project_id = ?2{latest}{not_expired}{kept} \
                    AND {table}.provider = ?3 \
                    AND {table}.model = ?4 \
                    AND {table}.dim = ?5",
@@ -5038,22 +5130,21 @@ impl ReaderPool {
                 not_expired = not_expired("pages", "?6"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(
-                params![
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    provider,
-                    model,
-                    dim,
-                    expiry_cutoff_us,
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let vec_bytes: Vec<u8> = row.get(1)?;
-                    let path: String = row.get(2)?;
-                    Ok((id_bytes, vec_bytes, path))
-                },
-            )?;
+            let mut bound = vec![
+                Value::Blob(workspace_id.as_bytes().to_vec()),
+                Value::Blob(project_id.as_bytes().to_vec()),
+                Value::Text(provider),
+                Value::Text(model),
+                Value::Integer(i64::from(dim)),
+                Value::Integer(expiry_cutoff_us),
+            ];
+            bound.extend(kept_params);
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let vec_bytes: Vec<u8> = row.get(1)?;
+                let path: String = row.get(2)?;
+                Ok((id_bytes, vec_bytes, path))
+            })?;
 
             let mut out = Vec::new();
             for row in rows {
@@ -5423,6 +5514,7 @@ impl ReaderPool {
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
+    #[cfg(test)]
     pub(crate) async fn entity_hits_for_project(
         &self,
         workspace_id: WorkspaceId,
@@ -5460,11 +5552,39 @@ impl ReaderPool {
         as_of_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<Vec<EntityHit>> {
+        self.entity_hits_filtered(
+            workspace_id,
+            project_id,
+            query,
+            limit,
+            expiry_cutoff_us,
+            as_of_us,
+            include_superseded,
+            PageFilter::default(),
+        )
+        .await
+    }
+
+    /// [`Self::entity_hits_for_project_at`] returning only pages `filter`
+    /// keeps. Entity frequencies still count every page.
+    #[allow(clippy::too_many_arguments)]
+    async fn entity_hits_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        as_of_us: Option<i64>,
+        include_superseded: bool,
+        filter: PageFilter<'_>,
+    ) -> StoreResult<Vec<EntityHit>> {
         let tokens = entity_query_tokens(query);
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (kept, kept_params) = filter.sql("pg", anonymous_placeholder);
         self.with_conn(move |conn| {
             let mut placeholders = String::with_capacity(tokens.len() * 96);
             let mut sql_params: Vec<Value> = Vec::with_capacity(tokens.len() * 5 + 7);
@@ -5509,6 +5629,7 @@ impl ReaderPool {
                     sql_params.push(Value::Integer(cutoff));
                 }
             }
+            sql_params.extend(kept_params);
             sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
 
             let mut sql = String::with_capacity(placeholders.len() + 1_200);
@@ -5537,7 +5658,7 @@ impl ReaderPool {
                  FROM freq f \
                  JOIN entity_page_links l ON l.entity_id = f.entity_id \
                  JOIN pages pg ON pg.id = l.page_id \
-                 WHERE pg.workspace_id = ? AND pg.project_id = ?{version_filter} \
+                 WHERE pg.workspace_id = ? AND pg.project_id = ?{version_filter}{kept} \
                  GROUP BY pg.id, pg.path, pg.title \
                  ORDER BY weight DESC, matches DESC, pg.path ASC \
                  LIMIT ?",
@@ -5683,6 +5804,7 @@ impl ReaderPool {
                 limit,
                 expiry_cutoff_us,
                 false,
+                PageFilter::default(),
             )
             .await?
             .into_iter()
@@ -5694,6 +5816,7 @@ impl ReaderPool {
     /// produced each neighbour (`seed_ord` indexes into the caller's
     /// `seed_ids`) and in which direction the link points. Feeds the
     /// `memory_query` explain surface.
+    #[allow(clippy::too_many_arguments)]
     async fn graph_neighbors_for_project_explained(
         &self,
         workspace_id: WorkspaceId,
@@ -5702,11 +5825,14 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<GraphNeighbor>> {
         if seed_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let (out_kept, out_kept_params) = filter.sql("tp", anonymous_placeholder);
+        let (in_kept, in_kept_params) = filter.sql("fp", anonymous_placeholder);
         self.with_conn(move |conn| {
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
@@ -5725,9 +5851,11 @@ impl ReaderPool {
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(now));
+            sql_params.extend(out_kept_params);
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(now));
+            sql_params.extend(in_kept_params);
 
             let out_descriptor = page_descriptor_expr("tp.body", "tp.frontmatter_json");
             let in_descriptor = page_descriptor_expr("fp.body", "fp.frontmatter_json");
@@ -5747,7 +5875,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
                    JOIN pages tp ON tp.id = l.to_page_id \
-                   WHERE tp.workspace_id = ? AND tp.project_id = ?{out_latest}{out_not_expired} \
+                   WHERE tp.workspace_id = ? AND tp.project_id = ?{out_latest}{out_not_expired}{out_kept} \
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
                           {in_descriptor} AS snippet, \
@@ -5756,7 +5884,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
                    JOIN pages fp ON fp.id = l.from_page_id \
-                   WHERE fp.workspace_id = ? AND fp.project_id = ?{in_latest}{in_not_expired} \
+                   WHERE fp.workspace_id = ? AND fp.project_id = ?{in_latest}{in_not_expired}{in_kept} \
                  ) \
                  SELECT id, path, title, snippet, stream_ord, link_type \
                  FROM neighbors \
@@ -6071,6 +6199,7 @@ impl ReaderPool {
                 false,
                 include_superseded,
                 &OwnerFilter::Any,
+                PageFilter::default(),
             )
             .await?
             .0
@@ -6149,6 +6278,7 @@ impl ReaderPool {
                 true,
                 include_superseded,
                 &OwnerFilter::Any,
+                PageFilter::default(),
             )
             .await?;
         // Belief-strength fields (`evidence_count`, `confidence`,
@@ -6213,6 +6343,7 @@ impl ReaderPool {
                     search.explain,
                     search.include_superseded,
                     search.owner,
+                    search.filter,
                 )
                 .await?;
             if search.explain {
@@ -6296,6 +6427,7 @@ impl ReaderPool {
         explain: bool,
         include_superseded: bool,
         owner_filter: &OwnerFilter,
+        filter: PageFilter<'_>,
     ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings)> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Stream timings exist only for explain: `explain.then(Instant::now)`
@@ -6315,27 +6447,18 @@ impl ReaderPool {
         // The default path uses the latest-only entry; the opt-in path reaches
         // superseded versions through the `_at` entry with no `as_of` instant.
         let started = explain.then(std::time::Instant::now);
-        let entity_hits = if include_superseded {
-            self.entity_hits_for_project_at(
+        let entity_hits = self
+            .entity_hits_filtered(
                 workspace_id,
                 project_id,
                 &query,
                 candidate_limit,
                 Some(cutoff),
                 None,
-                true,
+                include_superseded,
+                filter,
             )
-            .await?
-        } else {
-            self.entity_hits_for_project(
-                workspace_id,
-                project_id,
-                &query,
-                candidate_limit,
-                Some(cutoff),
-            )
-            .await?
-        };
+            .await?;
         timings.entity_ms = elapsed_ms(started);
         // The stream-off hot path keeps moving the query without a clone.
         let observation_query = if tuning.observation_stream {
@@ -6352,6 +6475,7 @@ impl ReaderPool {
                 candidate_limit,
                 Some(cutoff),
                 include_superseded,
+                filter,
             )
             .await?;
         timings.fts_ms = elapsed_ms(started);
@@ -6380,6 +6504,7 @@ impl ReaderPool {
                         candidate_limit,
                         cutoff,
                         include_superseded,
+                        filter,
                     )
                     .await?;
             }
@@ -6394,6 +6519,7 @@ impl ReaderPool {
                     candidate_limit,
                     cutoff,
                     include_superseded,
+                    filter,
                 )
                 .await?;
             timings.vector_ms = elapsed_ms(started);
@@ -6435,6 +6561,7 @@ impl ReaderPool {
                 candidate_limit,
                 Some(cutoff),
                 include_superseded,
+                filter,
             )
             .await?;
         timings.graph_ms = elapsed_ms(started);
@@ -6450,6 +6577,7 @@ impl ReaderPool {
                     candidate_limit,
                     cutoff,
                     owner_filter.clone(),
+                    filter,
                 )
                 .await?;
             timings.observation_ms = elapsed_ms(started);
@@ -11606,6 +11734,105 @@ impl ReaderPool {
     }
 }
 
+/// Build the per-agent session count query for one scope.
+///
+/// The capture probe keeps its workspace/project predicates because one
+/// session id can carry observations in several projects, and only the
+/// counted project's rows may decide whether a session mixed capture paths.
+/// Those same predicates match the leading columns of
+/// `idx_observations_project_created`, and without `sqlite_stat1` the planner
+/// prefers that two-column equality over the one-column session index. It
+/// then rescans the whole project's observations once per session: 144 s for
+/// 780 sessions over 185k observations, against 0.3 s through the session
+/// index. `INDEXED BY` pins the probe to the index that bounds it by session
+/// whatever the statistics say.
+fn session_counts_by_agent_sql(has_since: bool, owner_filter: &OwnerFilter) -> String {
+    // Same reasoning as `open_sessions_for_scope_agent`: without the owner
+    // predicate a shared server reports a teammate's activity as the
+    // caller's own.
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = :actor)",
+        OwnerFilter::Unattributed => " AND actor_user IS NULL",
+    };
+    let since_clause = if has_since {
+        " AND started_at >= :since"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT agent_kind, COUNT(*) AS n, \
+         SUM((SELECT COUNT(DISTINCT CASE WHEN o.extension IS NULL \
+             THEN 'native' ELSE 'extension:' || o.extension END) \
+             FROM observations o INDEXED BY idx_observations_session \
+             WHERE o.session_id = sessions.id \
+               AND o.workspace_id = :ws AND o.project_id = :proj) > 1) \
+         FROM sessions \
+         WHERE workspace_id = :ws AND project_id = :proj\
+         {since_clause}{owner_clause} \
+         GROUP BY agent_kind \
+         ORDER BY n DESC, agent_kind ASC"
+    )
+}
+
+/// Build the scoped session listing query (or its point lookup).
+///
+/// The per-session observation count and the point lookup's membership
+/// probe filter observations by session, workspace and project, the same
+/// shape as the by-agent capture probe in
+/// [`session_counts_by_agent_sql`]: without `sqlite_stat1` the planner
+/// answers them from `idx_observations_project_created` and rescans the
+/// project once per listed session. `INDEXED BY` pins both to the session
+/// index.
+fn sessions_for_scope_sql(
+    exact_session: bool,
+    owner_filter: &OwnerFilter,
+    include_open: bool,
+) -> String {
+    // The point lookup lets the primary key narrow first so the scope
+    // test is one indexed probe; the listing materializes the scope's
+    // session ids once instead of probing every session in the table.
+    let membership = if exact_session {
+        " AND s.id = :sid \
+          AND ((s.workspace_id = :ws AND s.project_id = :proj) \
+               OR EXISTS (SELECT 1 FROM observations o INDEXED BY idx_observations_session \
+                          WHERE o.session_id = s.id \
+                            AND o.workspace_id = :ws AND o.project_id = :proj))"
+    } else {
+        " AND s.id IN (SELECT id FROM sessions \
+                       WHERE workspace_id = :ws AND project_id = :proj \
+                       UNION \
+                       SELECT session_id FROM observations \
+                       WHERE workspace_id = :ws AND project_id = :proj)"
+    };
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+        OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+    };
+    let ended_clause = if include_open {
+        ""
+    } else {
+        " AND s.ended_at IS NOT NULL"
+    };
+    format!(
+        "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
+                (SELECT COUNT(*) FROM observations o INDEXED BY idx_observations_session \
+                 WHERE o.session_id = s.id \
+                   AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
+                j.state, j.attempts \
+         FROM sessions s \
+         LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
+           AND j.workspace_id = :ws AND j.project_id = :proj \
+           AND j.generation = (SELECT MAX(latest.generation) \
+             FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
+               AND latest.workspace_id = :ws AND latest.project_id = :proj) \
+         WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
+         ORDER BY s.started_at DESC, s.id DESC \
+         LIMIT :limit OFFSET :offset"
+    )
+}
+
 /// Build the bounded history query and its optional owner binding.
 ///
 /// A named operator reads two disjoint ranges: shared (`NULL`) and their own
@@ -12791,6 +13018,7 @@ mod tests {
                 explain,
                 false,
                 &OwnerFilter::Any,
+                super::PageFilter::default(),
             )
         };
         let (_, off) = search(false).await.unwrap();
@@ -12928,6 +13156,96 @@ mod tests {
             2,
             "shared and owned ranges must both use the owner index: {details:?}"
         );
+    }
+
+    /// Every query plan step that reads observations through alias `o`.
+    fn observation_probe_plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        named: &[(&str, &dyn rusqlite::ToSql)],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let details = stmt
+            .query_map(named, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let probes = details
+            .iter()
+            .filter(|detail| detail.starts_with("SEARCH o "))
+            .cloned()
+            .collect();
+        (details, probes)
+    }
+
+    #[test]
+    fn session_observation_probes_use_the_session_index() {
+        // A fresh store has no `sqlite_stat1`, the same state in which a
+        // production store picked the project index and rescanned the whole
+        // project per session.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let sid = SessionId::new();
+        let (ws_bytes, proj_bytes, sid_bytes) = (ws.as_bytes(), proj.as_bytes(), sid.as_bytes());
+        let (since, actor, limit, offset) = (0_i64, "user:alice", 50_i64, 0_i64);
+        let owners = [
+            OwnerFilter::Any,
+            OwnerFilter::User(actor.into()),
+            OwnerFilter::Unattributed,
+        ];
+        let assert_session_bounded =
+            |label: String, sql: &str, named: &[(&str, &dyn rusqlite::ToSql)]| {
+                let (details, probes) = observation_probe_plan(&conn, sql, named);
+                assert!(
+                    !probes.is_empty()
+                        && probes
+                            .iter()
+                            .all(|detail| detail.contains("idx_observations_session")),
+                    "{label}: the observation probe must be bounded by session, not by \
+                 project: {details:?}"
+                );
+            };
+        for owner in &owners {
+            let mut base: Vec<(&str, &dyn rusqlite::ToSql)> =
+                vec![(":ws", &ws_bytes), (":proj", &proj_bytes)];
+            if matches!(owner, OwnerFilter::User(_)) {
+                base.push((":actor", &actor));
+            }
+            for has_since in [false, true] {
+                let mut named = base.clone();
+                if has_since {
+                    named.push((":since", &since));
+                }
+                assert_session_bounded(
+                    format!("by-agent since={has_since} owner={owner:?}"),
+                    &super::session_counts_by_agent_sql(has_since, owner),
+                    &named,
+                );
+            }
+            for exact in [false, true] {
+                for include_open in [false, true] {
+                    let mut named = base.clone();
+                    named.push((":limit", &limit));
+                    named.push((":offset", &offset));
+                    if exact {
+                        named.push((":sid", &sid_bytes));
+                    }
+                    let sql = super::sessions_for_scope_sql(exact, owner, include_open);
+                    let label =
+                        format!("sessions exact={exact} open={include_open} owner={owner:?}");
+                    // The point lookup has two probes (count and membership);
+                    // both must use the session index.
+                    if exact {
+                        let (details, probes) = observation_probe_plan(&conn, &sql, &named);
+                        assert_eq!(probes.len(), 2, "{label}: {details:?}");
+                    }
+                    assert_session_bounded(label, &sql, &named);
+                }
+            }
+        }
     }
 
     #[test]
