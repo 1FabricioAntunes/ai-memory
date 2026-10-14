@@ -91,6 +91,13 @@ The research's best new target, ahead of the RFC's `.mcpb`:
   `server_profiles` inheritance, native-runner path stability, no PATH
   stomping).
 - Signing/notarization costs as in RFC #878 (unchanged).
+- Status (3.1, #1273): the installer half exists as
+  `companions/ai-memory-desktop`, on Tauri v2. It installs or reuses the
+  binary following these coexistence rules and shows `ai-memory setup --web`
+  in its window; detect-before-spawn and `server_profiles` come from `setup`
+  itself. CI builds unsigned installers on dispatch. Still open: signing and
+  notarization, and the tray (status light, start and stop) that would let it
+  replace the Swift companion.
 
 ## Explicitly deferred / rejected
 

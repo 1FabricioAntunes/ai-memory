@@ -288,6 +288,7 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
             flags,
             super::service_host::install_args(config, config_path),
             !args.no_open,
+            args.stop_on_stdin_eof,
         )
         .await;
     }

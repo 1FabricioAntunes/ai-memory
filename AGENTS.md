@@ -216,6 +216,8 @@ companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace mem
                            and `./companions/ai-memory-macos/build.sh`.
 companions/ai-memory-ts/        optional TypeScript client SDK (npm, Node 22+); NOT a workspace
                            member and never shipped with the server.
+companions/ai-memory-desktop/   Tauri v2 desktop installer (plain HTML, no npm) that installs the
+                           binary and runs `setup --web` in a window; own workspace.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 plugins/                   generated Claude Code + Codex marketplace plugins (catalogs in
                            `.claude-plugin/`, `.agents/plugins/`); edit the templates in
@@ -307,6 +309,12 @@ covers the same tests, slower, no tiers.
   `swift test --package-path companions/ai-memory-macos`
   (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
   Root `--workspace` commands do not cover it.
+- Run the desktop installer separately (Linux needs the `webkit2gtk-4.1`,
+  `gtk3`, `librsvg` and `libsoup3` development packages): `cargo fmt --check`,
+  `cargo clippy --locked --all-targets -- -D warnings` and `cargo test
+  --locked`, each with `--manifest-path companions/ai-memory-desktop/Cargo.toml`.
+  `.github/workflows/desktop.yml` runs them on a pull request that touches it
+  and builds unsigned installers on dispatch.
 - Run the TypeScript SDK separately, from `companions/ai-memory-ts`:
   `npm ci --ignore-scripts`, `npm run check` (typecheck, unit tests, schema
   and generated-docs checks, TypeDoc) and

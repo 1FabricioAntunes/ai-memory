@@ -21,8 +21,10 @@
 //!   reach the child's argument list;
 //! - responses forbid caching, framing and referrers, and the page runs under
 //!   a Content-Security-Policy with a per-run nonce and no outside sources;
-//! - it stops on Finish, after [`IDLE_TIMEOUT`] without a request, or on
-//!   Ctrl-C.
+//! - it stops on Finish, after [`IDLE_TIMEOUT`] without a request, on
+//!   Ctrl-C, or, with `--stop-on-stdin-eof`, when the process that started it
+//!   closes its standard input (the desktop installer, so the page never
+//!   outlives the app).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -152,6 +154,7 @@ pub(crate) async fn serve(
     setup_flags: Vec<OsString>,
     install_args: Vec<OsString>,
     open_browser: bool,
+    stop_on_stdin_eof: bool,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -191,6 +194,14 @@ pub(crate) async fn serve(
             }
         }
     });
+
+    if stop_on_stdin_eof {
+        let watcher = Arc::clone(&wizard);
+        tokio::spawn(async move {
+            stdin_closed(tokio::io::stdin()).await;
+            watcher.shutdown.notify_one();
+        });
+    }
 
     let stop = Arc::clone(&wizard);
     axum::serve(listener, router(Arc::clone(&wizard)))
@@ -454,6 +465,14 @@ fn strip_ansi(line: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Resolve once `input` reaches end of file or fails; whatever it carries
+/// before that is ignored.
+async fn stdin_closed(mut input: impl tokio::io::AsyncRead + Unpin) {
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = [0_u8; 256];
+    while matches!(input.read(&mut buffer).await, Ok(read) if read > 0) {}
 }
 
 async fn finish(State(wizard): State<Arc<Wizard>>) -> Response {
@@ -736,6 +755,22 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         let (status, _, _) = send(&wizard, legit(&wizard, "finish", "{}")).await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// The stdin watcher waits through input and returns at end of file.
+    #[tokio::test]
+    async fn the_stdin_watcher_returns_when_the_writer_closes() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let watcher = tokio::spawn(stdin_closed(reader));
+        writer.write_all(b"still here\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!watcher.is_finished(), "input alone must not stop it");
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("the watcher returns at end of file")
+            .unwrap();
     }
 
     #[test]

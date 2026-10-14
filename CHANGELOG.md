@@ -59,6 +59,13 @@ version in [`docs/changelog/`](docs/changelog/):
   requests with another `Host`, without the address's secret, or, for a
   change, without the page's own `Origin` and CSRF token, and holds no token.
   It stops on Finish, after 15 minutes without a request, or on Ctrl-C. (#1272)
+- Added a desktop installer preview, `companions/ai-memory-desktop`: a Tauri
+  app that uses an existing `ai-memory` install or copies its bundled one into
+  the same per-user location as `install.sh` and `install.ps1`, then shows the
+  `ai-memory setup --web` page in its own window. CI builds unsigned Linux,
+  macOS and Windows installers on manual dispatch; they are not attached to
+  releases until the project signs them. `setup --web` gained a hidden
+  `--stop-on-stdin-eof` flag so the page stops when the app does. (#1273)
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question

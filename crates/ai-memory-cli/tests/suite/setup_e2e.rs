@@ -289,6 +289,60 @@ fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
     assert_eq!(progress["ok"] == true, status.success(), "{lines}");
 }
 
+/// `setup --web --stop-on-stdin-eof` stops on its own once the process that
+/// started it closes its stdin (the desktop installer going away), with no
+/// Finish and no signal; without the flag, closing stdin does not stop it.
+#[test]
+fn setup_web_stops_when_its_stdin_closes_only_when_asked() {
+    use std::io::BufRead as _;
+    let sandbox = Sandbox::new();
+    let port = crate::e2e_support::free_port();
+    let start = |flag: Option<&str>| {
+        let mut cmd = sandbox.cmd(Some(port));
+        cmd.args(["setup", "--web", "--no-open", "--no-service"]);
+        if let Some(flag) = flag {
+            cmd.arg(flag);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        for line in std::io::BufReader::new(stdout).lines() {
+            if line.unwrap().trim().starts_with("http://127.0.0.1:") {
+                break;
+            }
+        }
+        child
+    };
+    let wait = |child: &mut std::process::Child, within: std::time::Duration| {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    };
+
+    let mut watched = start(Some("--stop-on-stdin-eof"));
+    drop(watched.stdin.take());
+    assert!(
+        wait(&mut watched, std::time::Duration::from_secs(20)),
+        "the page outlived its parent"
+    );
+
+    let mut unwatched = start(None);
+    drop(unwatched.stdin.take());
+    let stopped = wait(&mut unwatched, std::time::Duration::from_secs(2));
+    let _ = unwatched.kill();
+    let _ = unwatched.wait();
+    assert!(!stopped, "without the flag, closing stdin must not stop it");
+}
+
 /// Spawns a server through the fake service manager: the slow tier.
 #[cfg(target_os = "linux")]
 mod slow {

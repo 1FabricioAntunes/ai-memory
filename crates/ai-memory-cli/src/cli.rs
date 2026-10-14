@@ -1997,6 +1997,10 @@ pub struct SetupArgs {
     /// With `--web`, print the page's address without opening a browser.
     #[arg(long, requires = "web")]
     pub no_open: bool,
+    /// With `--web`, stop when standard input closes. The desktop installer
+    /// holds the write end, so the page goes away with the app.
+    #[arg(long, requires = "web", hide = true)]
+    pub stop_on_stdin_eof: bool,
 }
 
 /// Arguments for `status`.
