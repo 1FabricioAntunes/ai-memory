@@ -22,6 +22,12 @@ pub const BRIEF_L0_MAX_BYTES: usize = 256;
 /// line A2 compaction writes, so a compacted page's L1 is never re-clipped.
 pub const BRIEF_L1_MAX_BYTES: usize = 500;
 
+/// How much of a body the prose walk looks at. An excerpt is at most
+/// [`BRIEF_L1_MAX_BYTES`] long, so the walk never needs the rest of a large
+/// page, and bounding it keeps every session start cheap however big the
+/// standing pages grow.
+const PROSE_SCAN_MAX_BYTES: usize = 16 * 1024;
+
 /// Prefix of the footer A2 compaction stamps on a compacted body. It is
 /// chrome about the page, not the page's prose, so the walk skips it.
 const COMPACTION_FOOTER_PREFIX: &str = "_Extractively compacted from a cold episodic page";
@@ -61,12 +67,17 @@ pub fn excerpt_from_page(frontmatter: &serde_json::Value, body: &str) -> PageExc
 /// The prose `body` opens with, whitespace collapsed to single spaces and
 /// read across paragraphs and list items. Headings, lone `---` rules and ADR
 /// metadata fields (`**Status:** Accepted`) are skipped wherever they sit, and
-/// so is the A2 compaction footer. Reading stops once there is more than the
-/// longest clip can carry.
+/// so is the A2 compaction footer. Only the first [`PROSE_SCAN_MAX_BYTES`]
+/// are read, and reading stops once there is more than the longest clip can
+/// carry.
 #[must_use]
 pub fn leading_prose(body: &str) -> Option<String> {
+    let mut end = body.len().min(PROSE_SCAN_MAX_BYTES);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
     let mut prose = String::new();
-    for block in body.split("\n\n") {
+    for block in body[..end].split("\n\n") {
         let block = block.trim();
         if block.starts_with(COMPACTION_FOOTER_PREFIX) {
             continue;
@@ -277,6 +288,24 @@ mod tests {
         let exact = "a".repeat(BRIEF_L0_MAX_BYTES);
         let e = excerpt(json!({"abstract": exact.clone()}), "");
         assert_eq!(e.l0.as_deref(), Some(exact.as_str()));
+    }
+
+    #[test]
+    fn a_huge_page_costs_no_more_than_its_clip() {
+        // Excerpting runs on every session start, for every core page; a
+        // multi-megabyte line must not be copied and collapsed in full only
+        // to be cut to 500 bytes. Reading the whole line takes about half a
+        // second in a debug build; the bounded walk takes microseconds, so
+        // the bound below leaves slow CI runners plenty of slack.
+        let body = format!("Lead.\n\n{}", "z".repeat(5_000_000));
+        let started = std::time::Instant::now();
+        let e = excerpt(json!({}), &body);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(e.l1.unwrap().len() <= BRIEF_L1_MAX_BYTES);
     }
 
     #[test]

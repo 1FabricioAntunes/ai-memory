@@ -2350,7 +2350,13 @@ struct BriefCandidate<'a> {
     heading: String,
     l0: Option<String>,
     l1: Option<String>,
-    body: String,
+    /// The escaped body, kept only when it could ever fit whole: a body
+    /// longer than the largest budget is never shown, so it is neither
+    /// escaped nor copied.
+    body: Option<String>,
+    /// What the body costs whole. For a body too long to fit, its raw
+    /// length, which escaping could only grow.
+    body_len: usize,
 }
 
 impl<'a> BriefCandidate<'a> {
@@ -2359,6 +2365,8 @@ impl<'a> BriefCandidate<'a> {
         let path = escape_untrusted_history(&page.path);
         let excerpt =
             ai_memory_core::excerpt::excerpt_from_page(&page.frontmatter_json, &page.body);
+        let trimmed = page.body.trim();
+        let body = (trimmed.len() <= BRIEF_BUDGET_MAX).then(|| escape_untrusted_history(trimmed));
         Self {
             page,
             heading: format!(
@@ -2368,7 +2376,8 @@ impl<'a> BriefCandidate<'a> {
             path,
             l0: excerpt.l0.as_deref().map(escape_untrusted_history),
             l1: excerpt.l1.as_deref().map(escape_untrusted_history),
-            body: escape_untrusted_history(page.body.trim()),
+            body_len: body.as_ref().map_or(trimmed.len(), String::len),
+            body,
         }
     }
 
@@ -2376,13 +2385,16 @@ impl<'a> BriefCandidate<'a> {
         match tier {
             brief_tiers::BriefTier::L0 => self.l0.as_deref().unwrap_or_default(),
             brief_tiers::BriefTier::L1 => self.l1.as_deref().unwrap_or_default(),
-            brief_tiers::BriefTier::L2 => &self.body,
+            brief_tiers::BriefTier::L2 => self.body.as_deref().unwrap_or_default(),
             brief_tiers::BriefTier::Omitted | brief_tiers::BriefTier::TitleOnly => "",
         }
     }
 
     /// The page as it renders on its own at `tier`.
     fn section(&self, tier: brief_tiers::BriefTier) -> String {
+        // A body too long to keep costs more than any budget, so it can
+        // never be assigned whole.
+        debug_assert!(tier != brief_tiers::BriefTier::L2 || self.body.is_some());
         match tier {
             brief_tiers::BriefTier::Omitted => String::new(),
             brief_tiers::BriefTier::TitleOnly => format!("\n- `{}`\n", self.path),
@@ -2397,15 +2409,21 @@ impl<'a> BriefCandidate<'a> {
         self.page.pinned || ai_memory_core::is_slot_path(&self.page.path)
     }
 
+    /// Priced without building the sections: a whole body may be large, and
+    /// most bodies are never rendered whole.
     fn costs(&self) -> brief_tiers::PageCosts {
-        use brief_tiers::BriefTier::{L0, L1, L2, TitleOnly};
+        use brief_tiers::BriefTier::{L0, L1, TitleOnly};
+        let with_heading = |text_len: usize| self.heading.len() + text_len + 1;
         brief_tiers::PageCosts {
             privileged: self.privileged(),
             title_only: self.section(TitleOnly).len(),
-            tiers: self
-                .l0
-                .is_some()
-                .then(|| [L0, L1, L2].map(|tier| self.section(tier).len())),
+            tiers: self.l0.is_some().then(|| {
+                [
+                    with_heading(self.text(L0).len()),
+                    with_heading(self.text(L1).len()),
+                    with_heading(self.body_len),
+                ]
+            }),
         }
     }
 
@@ -16900,6 +16918,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Rendering stays cheap however large the stored bodies are: only the
+    /// pages that end up whole are escaped and copied. The bound is loose
+    /// on purpose (debug build, shared CI runners).
+    #[test]
+    fn render_session_brief_cost_does_not_grow_with_unshown_bodies() {
+        let core: Vec<_> = (0..BRIEF_CORE_PAGES_LIMIT)
+            .map(|i| {
+                brief_core_page(
+                    &format!("_rules/huge-{i:02}.md"),
+                    &format!("Lead sentence {i}.\n\n{}", "z".repeat(1_000_000)),
+                    i % 4 == 0,
+                    serde_json::json!({}),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let out = render_session_brief(&core, &[], BRIEF_BUDGET_MAX).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.len() <= BRIEF_BUDGET_MAX);
     }
 
     /// A short page is one section of its full text, not an excerpt plus
