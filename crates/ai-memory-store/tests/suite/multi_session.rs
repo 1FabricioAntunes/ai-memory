@@ -3550,6 +3550,7 @@ async fn explained_search_as(
                 include_superseded: false,
                 explain: true,
                 owner,
+                filter: ai_memory_store::PageFilter::default(),
             },
         )
         .await

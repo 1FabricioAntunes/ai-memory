@@ -23,6 +23,15 @@ version in [`docs/changelog/`](docs/changelog/):
   root-only on a multi-user server. Global search covers wiki pages only;
   raw observations and a search limited to one workspace are not part of
   this change. (#1253)
+- Added kind and tier filters to the web search. The search page in `/web`
+  has "Kind" and "Tier" selects, and `/web/search` accepts `kind` and `tier`
+  for both a project search and a cross-project one. Every retrieval stream
+  applies the filter in its own query, so other kinds cannot crowd out a rare
+  one, a filtered search asks the streams for no more candidates than an
+  unfiltered one, and the reranker scores only pages the filter keeps. Kind
+  and tier both ignore case, a nonstandard kind is flagged on an empty
+  result, and "Search all projects" keeps the filters. An unknown `tier` is
+  a 400. (#1248)
 
 ## [3.0.0] - 2026-10-13
 
