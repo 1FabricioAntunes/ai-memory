@@ -173,6 +173,122 @@ fn setup_plan_json_prints_the_plan_and_changes_nothing() {
     assert_eq!(sandbox.snapshot(), before, "a refused setup wrote");
 }
 
+/// `setup --web` through the binary: the printed address serves the page and
+/// plan, a foreign Host is refused, Apply runs `setup --yes --agent
+/// claude-code` (which writes Claude Code's hooks), and Finish stops the
+/// process. No server runs here, so that setup reports its failed self-check
+/// and the wizard exits non-zero after Finish.
+#[test]
+fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::net::TcpStream;
+
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.home.join(".claude/projects")).unwrap();
+    let port = crate::e2e_support::free_port();
+    let mut child = sandbox
+        .cmd(Some(port))
+        .args(["setup", "--web", "--no-open", "--no-service"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let stdout = child.stdout.take().unwrap();
+    let mut child = Kill(child);
+    let mut url = String::new();
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if let Some(found) = line.trim().strip_prefix("http://127.0.0.1:") {
+            url = format!("http://127.0.0.1:{found}");
+            break;
+        }
+    }
+    assert!(url.ends_with('/'), "no address printed: {url:?}");
+    let authority = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let path = url
+        .trim_start_matches(&format!("http://{authority}"))
+        .to_owned();
+
+    let request = |method: &str, rest: &str, host: &str, extra: &str, body: &str| -> String {
+        let mut stream = TcpStream::connect(&authority).unwrap();
+        write!(
+            stream,
+            "{method} {path}{rest} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer
+    };
+    let page = request("GET", "", &authority, "", "");
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.contains("ai-memory setup"), "{page}");
+    let rebound = request("GET", "", "attacker.example", "", "");
+    assert!(rebound.starts_with("HTTP/1.1 403"), "{rebound}");
+
+    let plan = request("GET", "plan", &authority, "", "");
+    let json: serde_json::Value =
+        serde_json::from_str(plan.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(json["plan"]["agents"][0]["agent"], "claude-code", "{json}");
+    let csrf = json["csrf"].as_str().unwrap().to_owned();
+    let headers = format!("Origin: http://{authority}\r\nx-ai-memory-setup: {csrf}\r\n");
+
+    let applied = request(
+        "POST",
+        "apply",
+        &authority,
+        &headers,
+        r#"{"agents":["claude-code"]}"#,
+    );
+    assert!(applied.starts_with("HTTP/1.1 202"), "{applied}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let progress = loop {
+        let answer = request("GET", "progress?from=0", &authority, "", "");
+        let json: serde_json::Value =
+            serde_json::from_str(answer.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        if json["done"] == true {
+            break json;
+        }
+        assert!(std::time::Instant::now() < deadline, "setup never finished");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let lines = progress["lines"].to_string();
+    assert!(lines.contains("== claude-code"), "{lines}");
+    assert!(
+        sandbox.home.join(".claude/settings.json").is_file(),
+        "{lines}"
+    );
+
+    let finished = request("POST", "finish", &authority, &headers, "{}");
+    assert!(finished.starts_with("HTTP/1.1 204"), "{finished}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the wizard did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(progress["ok"] == true, status.success(), "{lines}");
+}
+
 /// Spawns a server through the fake service manager: the slow tier.
 #[cfg(target_os = "linux")]
 mod slow {

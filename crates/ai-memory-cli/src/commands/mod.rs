@@ -107,6 +107,7 @@ pub mod server;
 pub mod service_host;
 pub mod setup;
 pub mod setup_agent;
+pub(crate) mod setup_web;
 pub mod show;
 pub mod status;
 pub mod transcript_capture;

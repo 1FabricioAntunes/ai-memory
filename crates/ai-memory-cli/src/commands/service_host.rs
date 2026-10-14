@@ -180,7 +180,7 @@ fn supervise(
 }
 
 /// The global arguments that point a child at this install.
-fn install_args(config: &Config, config_path: Option<&Path>) -> Vec<std::ffi::OsString> {
+pub(crate) fn install_args(config: &Config, config_path: Option<&Path>) -> Vec<std::ffi::OsString> {
     let mut args = vec![
         "--data-dir".into(),
         config.data_dir.clone().into_os_string(),

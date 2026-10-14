@@ -75,6 +75,8 @@ rmcp = { workspace = true, features = [
 rustls = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
+parking_lot.workspace = true
 toml_edit.workspace = true
 sysinfo.workspace = true
 tar.workspace = true

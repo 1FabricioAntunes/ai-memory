@@ -117,7 +117,7 @@ Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
 failure under `iex` leaves your PowerShell window open. Details are in
 [`docs/windows.md`](windows.md).
 
-`ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]]`
+`ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]] [--web [--no-open]]`
 runs, in order, the commands a native install otherwise needs one by one:
 
 1. `init`. On a fresh data dir this mints the root bearer token into
@@ -171,7 +171,20 @@ naming a number outside the plan changes nothing. With no terminal (a script,
 an agent's tool call) it changes nothing and exits non-zero, asking for
 `--yes`. `--plan` prints the plan and exits without changing anything;
 `--plan --json` prints it as a JSON document for a script or front end, with a
-`format` field that is bumped only when a field changes meaning or is removed. Each step is idempotent: a second run rewrites no
+`format` field that is bumped only when a field changes meaning or is removed.
+
+`ai-memory setup --web` shows the same plan as a page in your browser instead
+of the terminal. It prints a one-time address on `127.0.0.1` (and opens it,
+unless `--no-open` or there is no desktop), where you tick the agents to wire
+and press Apply. Apply runs `ai-memory setup --yes --agent <each one you
+picked>` and streams its output to the page, so the result is the same as the
+terminal command; `--no-service` is passed through. The page answers only
+requests that name its own address, carry the secret part of the URL, and,
+for a change, come from the page itself, so another site open in the same
+browser cannot drive it. It holds no token. It stops when you press Finish,
+after 15 minutes without a request, or on Ctrl-C. On a remote machine,
+forward the port it prints (`ssh -L <port>:127.0.0.1:<port> <host>`) and open
+the same address locally. Each step is idempotent: a second run rewrites no
 file and leaves a running service alone. A step that fails does not stop the
 others; `setup` lists each `problem:` at the end and exits non-zero. When every step
 passed it ends by naming the agents to restart and the question to ask one of

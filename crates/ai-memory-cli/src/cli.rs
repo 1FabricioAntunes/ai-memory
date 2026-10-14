@@ -1989,6 +1989,14 @@ pub struct SetupArgs {
     /// names the layout version) for a script or front end to render.
     #[arg(long, requires = "plan")]
     pub json: bool,
+    /// Show the plan as a page in your browser, served on 127.0.0.1 behind a
+    /// one-time address printed here, and apply the agents you pick there.
+    /// Nothing changes until you press Apply.
+    #[arg(long, conflicts_with_all = ["yes", "plan"])]
+    pub web: bool,
+    /// With `--web`, print the page's address without opening a browser.
+    #[arg(long, requires = "web")]
+    pub no_open: bool,
 }
 
 /// Arguments for `status`.

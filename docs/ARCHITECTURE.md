@@ -818,6 +818,11 @@ Windows, only a `Run` value with the shape `setup` writes).
 `install.sh` and, for Windows, `install.ps1` are release assets with their own
 `.sha256` files; each installs the release archive after checking it against
 the published checksum, under `~/.local` or `%LOCALAPPDATA%\Programs`.
+`setup --web` serves the plan from a one-shot axum router in the CLI
+(`commands/setup_web.rs`), separate from the read-only `/web` UI: loopback
+only, a one-time path secret, an exact `Host` check, `Origin` plus CSRF on
+every POST, and an Apply that runs `setup --yes --agent ...` as a child
+process (security-boundaries row 17).
 
 The hidden `render-plugins --out <dir>` generates the Claude Code and Codex
 marketplace plugins under `plugins/` and their catalogs

@@ -51,6 +51,14 @@ version in [`docs/changelog/`](docs/changelog/):
   failure, giving up after five failures within ten seconds of starting.
   `ai-memory uninstall --apply` stops the host and removes the value when it
   still has the shape `setup` writes. (#1271)
+- Added `ai-memory setup --web`, which shows the setup plan as a page in
+  your browser and applies the agents you tick there by running `ai-memory
+  setup --yes --agent ...` and streaming its output to the page. The page is
+  served on `127.0.0.1` behind a one-time address printed in the terminal
+  (opened in the browser unless `--no-open` or there is no desktop), refuses
+  requests with another `Host`, without the address's secret, or, for a
+  change, without the page's own `Origin` and CSRF token, and holds no token.
+  It stops on Finish, after 15 minutes without a request, or on Ctrl-C. (#1272)
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question

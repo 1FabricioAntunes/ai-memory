@@ -27,7 +27,8 @@
 //! operator can also pick which of the planned agents to wire; with no
 //! terminal to ask on, `setup` changes nothing and exits non-zero. `--plan`
 //! prints the plan (as JSON with `--json`, for a front end to render) and
-//! changes nothing.
+//! changes nothing. `--web` shows the same plan as a local page and applies
+//! the agents picked there through `setup --yes` ([`super::setup_web`]).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -269,6 +270,26 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
     if args.json {
         println!("{}", serde_json::to_string_pretty(&plan_document(&plan))?);
         return Ok(());
+    }
+    if args.web {
+        use clap::ValueEnum as _;
+        let accepted = AgentChoice::value_variants()
+            .iter()
+            .map(|agent| agent_name(*agent))
+            .collect();
+        let flags = if args.no_service {
+            vec!["--no-service".into()]
+        } else {
+            Vec::new()
+        };
+        return super::setup_web::serve(
+            serde_json::to_value(plan_document(&plan))?,
+            accepted,
+            flags,
+            super::service_host::install_args(config, config_path),
+            !args.no_open,
+        )
+        .await;
     }
     print_plan(&plan);
     if args.plan {
@@ -687,6 +708,12 @@ fn next_step(agents: &[AgentPlan]) -> String {
         .iter()
         .map(|agent| agent.agent.kind().as_str())
         .collect();
+    next_step_for_names(&names)
+}
+
+/// [`next_step`] for agents given by name.
+pub(crate) fn next_step_for_names(names: &[impl AsRef<str>]) -> String {
+    let names: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
     match names.as_slice() {
         [] => "ai-memory is set up, but no agent is wired; run `ai-memory setup --agent <name>`."
             .to_owned(),

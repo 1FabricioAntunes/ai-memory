@@ -213,7 +213,8 @@ directory with a bearer token in an owner-only file, starts a per-user service
 Skills for every agent it finds, or the ones you name with `--agent`. It shows
 the plan, with where it found each agent, and asks first: answer `y`, or type
 the numbers of the agents to wire. `--plan` prints the plan and changes
-nothing, `--yes` skips the question, and running it again changes nothing.
+nothing, `--web` shows the plan as a page in your browser and applies the agents
+you tick there, `--yes` skips the question, and running it again changes nothing.
 Afterwards, restart your agents and ask one of them "What do you remember
 about this project?" to see it answer through ai-memory. Details, the environment
 variables and how to verify the script before running it are in
