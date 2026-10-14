@@ -790,6 +790,14 @@ Feature flag: none. Briefing itself is the flag.
 - CPU: extract + pack over ≤24 pages, each body already in memory for
   L2. Target: well under 50 ms added, so the whole `GET /handoff`
   (handoff + brief + profile digest) stays inside the 1s shell budget.
+  The work per page is bounded by the budget, not by the page: the prose
+  walk reads at most the first 16 KiB and stops one byte past the L1
+  clip, sections are priced arithmetically, and a body longer than
+  `BRIEF_BUDGET_MAX` (which can never fit whole) is neither escaped nor
+  copied. An isolated stress run (200 concurrent briefs over 24 core
+  pages of 200 KB, debug build) caught an earlier version at p50 4.9 s;
+  with these bounds it matches the pre-change renderer (p50 ~0.37 s,
+  p99 ~0.58 s, dominated by the fetch). Two complexity tests pin it.
 - Storage: zero new bytes on disk.
 - Tokens: default 4000 bytes remains ~1k tokens at the project's ~4
   chars/token heuristic. Those tokens hold many L0s, with L2 only while
