@@ -238,6 +238,11 @@ pub enum Command {
     /// Hidden hook spool drainer used by native session-end hooks.
     #[command(hide = true, name = "hook-drain")]
     HookDrain(HookDrainArgs),
+    /// Hidden Windows background host the logon entry `setup` installs
+    /// starts: it runs `serve` with no console window and restarts it after
+    /// a failure.
+    #[command(hide = true, name = "service-host")]
+    ServiceHost(ServiceHostArgs),
     /// Generate the marketplace plugins under `plugins/` and their catalogs
     /// (maintainer tool: `bin/release` and the drift test call it).
     #[command(hide = true, name = "render-plugins")]
@@ -3106,6 +3111,14 @@ pub struct HookArgs {
 /// Arguments for hidden `hook-drain`.
 #[derive(Debug, Args)]
 pub struct HookDrainArgs {}
+
+/// Arguments for hidden `service-host`.
+#[derive(Debug, Args)]
+pub struct ServiceHostArgs {
+    /// Run the supervisor in this process instead of starting it detached.
+    #[arg(long)]
+    pub supervise: bool,
+}
 
 /// Arguments for hidden `render-plugins`.
 #[derive(Debug, Args)]

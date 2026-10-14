@@ -232,6 +232,23 @@ codex plugin marketplace add akitaonrails/ai-memory && codex plugin add ai-memor
 Codex then asks you to trust the hooks in `/hooks`. See
 [Marketplace plugins](docs/install.md#marketplace-plugins).
 
+### Windows (two commands, no admin)
+
+In PowerShell:
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+ai-memory setup
+```
+
+`install.ps1` checks the release zip against its published SHA-256 checksum,
+unpacks it under `%LOCALAPPDATA%\Programs\ai-memory` and adds that directory
+to your user `PATH`. `ai-memory setup` then does what it does on Linux and
+macOS, with a logon entry in place of the service: the server starts when you
+sign in, with no console window, and restarts if it fails. Details and the
+other Windows setups (WSL2, Docker Desktop, a real Windows service) are in
+[`docs/windows.md`](docs/windows.md).
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install

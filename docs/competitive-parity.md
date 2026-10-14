@@ -190,7 +190,10 @@ implemented without a separate decision.** Ordered by leverage.
    1.2 s from the first command to a returned memory, in a clean temporary
    home with a debug build served as a local release and no model download.
    That run drives the service step through a stand-in `systemctl`/`launchctl`,
-   not a real systemd or launchd, and Windows has no service step. Still open:
+   not a real systemd or launchd. 3.1 brings native Windows to the same two
+   commands: `install.ps1` (checksum-verified, no administrator rights) and a
+   `setup` service step that registers a per-user logon entry running the
+   server with no console window and restarting it after a failure. Still open:
    no npm package, and a "coming from Claude built-in?" importer (the
    `~/.claude/.../memory/` format is nearly identical markdown + `type`
    frontmatter, which makes it a cheap, strong on-ramp).

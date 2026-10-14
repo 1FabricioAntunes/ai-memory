@@ -1,5 +1,6 @@
 //! The per-user service `ai-memory setup` installs: a systemd `--user` unit on
-//! Linux, a launchd LaunchAgent on macOS.
+//! Linux, a launchd LaunchAgent on macOS, and on Windows an `ai-memory` value
+//! under the per-user `Run` key that starts [`super::service_host`] at logon.
 //!
 //! Both are rendered from the packaged templates
 //! (`packaging/systemd/ai-memory-user.service` and
@@ -10,8 +11,8 @@
 //! hooks and MCP entries `setup` writes would present it.
 //!
 //! The service manager is driven through [`CommandRunner`], so tests render
-//! into a temp dir and record the `systemctl` / `launchctl` calls instead of
-//! touching a real user session. Windows has no service step.
+//! into a temp dir and record the `systemctl` / `launchctl` / `reg` calls
+//! instead of touching a real user session.
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,13 @@ const SYSTEMD_CONFIG: &str = "%h/.config/ai-memory/config.toml";
 const LAUNCHD_BIN: &str = "<string>__AI_MEMORY_BIN__</string>";
 const LAUNCHD_HOME: &str = "<string>__HOME__/";
 
+/// The per-user key whose values Windows runs at logon, and the value name.
+/// No elevation is needed to write it, unlike a Windows service.
+pub(crate) const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+pub(crate) const RUN_VALUE: &str = "ai-memory";
+/// The subcommand the logon entry runs.
+const SERVICE_HOST: &str = "service-host";
+
 /// Start of the identity line `setup` writes into every unit it renders. The
 /// rest of the line is the SHA-256 of the file without that line, so
 /// `uninstall` can tell a unit `setup` wrote, and nobody edited since, from a
@@ -51,16 +59,19 @@ const IDENTITY_PREFIX: &str = "ai-memory-setup-unit sha256:";
 pub(crate) enum ServiceManager {
     SystemdUser,
     Launchd,
+    WindowsRun,
 }
 
 impl ServiceManager {
     /// The manager for the platform this binary was built for; `None` on
-    /// Windows and anything else without a supported per-user manager.
+    /// anything without a supported per-user manager.
     pub(crate) const fn current() -> Option<Self> {
         if cfg!(target_os = "linux") {
             Some(Self::SystemdUser)
         } else if cfg!(target_os = "macos") {
             Some(Self::Launchd)
+        } else if cfg!(windows) {
+            Some(Self::WindowsRun)
         } else {
             None
         }
@@ -70,6 +81,7 @@ impl ServiceManager {
         match self {
             Self::SystemdUser => "systemd user unit",
             Self::Launchd => "launchd LaunchAgent",
+            Self::WindowsRun => "Windows logon entry",
         }
     }
 }
@@ -87,18 +99,40 @@ pub(crate) struct ServiceSpec {
     pub(crate) xdg_config_home: Option<PathBuf>,
 }
 
-/// A rendered service file and where it goes.
+/// A rendered service file and where it goes. For [`ServiceManager::WindowsRun`]
+/// `path` names the registry value (`HKCU\...\Run\ai-memory`) and `contents`
+/// is its data, the command line Windows runs at logon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServiceUnit {
     pub(crate) manager: ServiceManager,
     pub(crate) path: PathBuf,
     pub(crate) contents: String,
+    /// How to start the Windows host now, without waiting for a logon.
+    pub(crate) host: Option<HostLaunch>,
+}
+
+/// The command that starts the Windows background host, and the state file
+/// it keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostLaunch {
+    pub(crate) exe: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) state_file: PathBuf,
 }
 
 impl ServiceUnit {
     /// Whether the file on disk already holds exactly this unit.
     pub(crate) fn is_current(&self) -> bool {
         std::fs::read_to_string(&self.path).is_ok_and(|text| text == self.contents)
+    }
+
+    /// Whether a unit of ours is in place: the file, or on Windows the
+    /// registry value.
+    pub(crate) fn exists(&self, runner: &dyn CommandRunner) -> bool {
+        match self.manager {
+            ServiceManager::WindowsRun => run_value(runner).is_some(),
+            _ => self.path.exists(),
+        }
     }
 }
 
@@ -120,6 +154,7 @@ pub(crate) fn render(manager: ServiceManager, spec: &ServiceSpec) -> Result<Serv
     match manager {
         ServiceManager::SystemdUser => render_systemd(spec),
         ServiceManager::Launchd => render_launchd(spec),
+        ServiceManager::WindowsRun => render_windows(spec),
     }
 }
 
@@ -194,6 +229,7 @@ fn render_systemd(spec: &ServiceSpec) -> Result<ServiceUnit> {
             spec.xdg_config_home.as_deref(),
         ),
         contents: stamp(ServiceManager::SystemdUser, &unstamped),
+        host: None,
     })
 }
 
@@ -215,13 +251,16 @@ pub(crate) fn unit_path(
             .join("Library")
             .join("LaunchAgents")
             .join(format!("{LAUNCHD_LABEL}.plist")),
+        ServiceManager::WindowsRun => PathBuf::from(format!("{RUN_KEY}\\{RUN_VALUE}")),
     }
 }
 
 fn identity_line(manager: ServiceManager, digest: &str) -> String {
     match manager {
         ServiceManager::SystemdUser => format!("# {IDENTITY_PREFIX}{digest}"),
-        ServiceManager::Launchd => format!("<!-- {IDENTITY_PREFIX}{digest} -->"),
+        ServiceManager::Launchd | ServiceManager::WindowsRun => {
+            format!("<!-- {IDENTITY_PREFIX}{digest} -->")
+        }
     }
 }
 
@@ -235,7 +274,7 @@ fn sha256_hex(text: &str) -> String {
 fn stamp(manager: ServiceManager, unstamped: &str) -> String {
     let line = identity_line(manager, &sha256_hex(unstamped));
     match manager {
-        ServiceManager::SystemdUser => format!("{line}\n{unstamped}"),
+        ServiceManager::SystemdUser | ServiceManager::WindowsRun => format!("{line}\n{unstamped}"),
         ServiceManager::Launchd => match unstamped.split_once('\n') {
             Some((declaration, rest)) => format!("{declaration}\n{line}\n{rest}"),
             None => format!("{line}\n{unstamped}"),
@@ -303,6 +342,82 @@ fn render_launchd(spec: &ServiceSpec) -> Result<ServiceUnit> {
         manager: ServiceManager::Launchd,
         path: unit_path(ServiceManager::Launchd, &spec.home, None),
         contents: stamp(ServiceManager::Launchd, &contents),
+        host: None,
+    })
+}
+
+/// One argument of a Windows command line, quoted the way
+/// `CommandLineToArgvW` (and Rust's own argument parser) reads it back: in
+/// double quotes, with the backslashes before the closing quote doubled. A
+/// Windows path cannot hold `"`, so one that does is refused.
+fn windows_arg(what: &str, text: &str) -> Result<String> {
+    if text.contains('"') {
+        bail!("the {what} path {text} contains a double quote");
+    }
+    let trailing = text.len() - text.trim_end_matches('\\').len();
+    Ok(format!("\"{text}{}\"", "\\".repeat(trailing)))
+}
+
+/// The logon entry: the binary `setup` ran from, the data dir and config it
+/// used, and `service-host`, as one command line.
+fn render_windows(spec: &ServiceSpec) -> Result<ServiceUnit> {
+    let exe = checked_path("binary", &spec.exe)?;
+    let data_dir = checked_path("data dir", &spec.data_dir)?;
+    let config = checked_path("config file", &spec.config_path)?;
+    let contents = format!(
+        "{} --data-dir {} --config {} {SERVICE_HOST}",
+        windows_arg("binary", exe)?,
+        windows_arg("data dir", data_dir)?,
+        windows_arg("config file", config)?,
+    );
+    Ok(ServiceUnit {
+        manager: ServiceManager::WindowsRun,
+        path: unit_path(ServiceManager::WindowsRun, &spec.home, None),
+        contents,
+        host: Some(HostLaunch {
+            exe: spec.exe.clone(),
+            args: ["--data-dir", data_dir, "--config", config, SERVICE_HOST]
+                .map(str::to_owned)
+                .to_vec(),
+            state_file: super::service_host::state_file(&spec.data_dir),
+        }),
+    })
+}
+
+/// Whether a `Run` value is a logon entry `setup` wrote: a quoted
+/// `ai-memory.exe` followed by arguments that end in `service-host`. Anything
+/// else under the name was written by someone else and is left alone.
+pub(crate) fn is_setup_run_entry(data: &str) -> bool {
+    let Some(rest) = data.strip_prefix('"') else {
+        return false;
+    };
+    let Some((program, args)) = rest.split_once('"') else {
+        return false;
+    };
+    let file = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    file.eq_ignore_ascii_case("ai-memory.exe")
+        && args.trim_end().ends_with(&format!(" {SERVICE_HOST}"))
+        && !args.contains('&')
+        && !args.contains('|')
+}
+
+/// The data of the `ai-memory` value under the `Run` key, read with
+/// `reg query`; `None` when it is absent or cannot be read.
+pub(crate) fn run_value(runner: &dyn CommandRunner) -> Option<String> {
+    let outcome = runner
+        .run("reg", &["query", RUN_KEY, "/v", RUN_VALUE])
+        .ok()
+        .filter(|outcome| outcome.success)?;
+    parse_reg_query(&outcome.stdout, RUN_VALUE)
+}
+
+/// Pick the data out of `reg query <key> /v <name>`, which prints the key,
+/// then `    <name>    REG_SZ    <data>`.
+fn parse_reg_query(stdout: &str, name: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix(name)?;
+        let rest = rest.trim_start().strip_prefix("REG_SZ")?;
+        Some(rest.trim_start().trim_end_matches('\r').to_owned())
     })
 }
 
@@ -325,6 +440,13 @@ pub(crate) struct CommandOutcome {
 pub(crate) trait CommandRunner {
     /// Run `program` with `args`; an `Err` means it could not be started.
     fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutcome>;
+
+    /// Run a launcher that leaves a background process behind, with no
+    /// captured output. A pipe [`Self::run`] reads would be inherited by that
+    /// process and held open, so reading it to the end would never return.
+    fn run_launcher(&self, program: &str, args: &[&str]) -> Result<CommandOutcome> {
+        self.run(program, args)
+    }
 }
 
 /// Runs commands for real, resolved through `PATH`.
@@ -341,6 +463,21 @@ impl CommandRunner for SystemRunner {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn run_launcher(&self, program: &str, args: &[&str]) -> Result<CommandOutcome> {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| format!("running {program}"))?;
+        Ok(CommandOutcome {
+            success: status.success(),
+            stdout: String::new(),
+            stderr: format!("exited with {status}"),
         })
     }
 }
@@ -366,11 +503,15 @@ pub(crate) enum ServiceChange {
 /// A failed write, or a service-manager command that could not be run or
 /// failed; the error carries its output.
 pub(crate) fn install(unit: &ServiceUnit, runner: &dyn CommandRunner) -> Result<ServiceChange> {
+    if unit.manager == ServiceManager::WindowsRun {
+        return install_windows(unit, runner);
+    }
     let existed = unit.path.exists();
     let current = unit.is_current();
     let running = match unit.manager {
         ServiceManager::SystemdUser => systemd_running(runner),
         ServiceManager::Launchd => launchd_loaded(runner, &launchd_domain(runner)?),
+        ServiceManager::WindowsRun => false,
     };
     if current && running {
         return Ok(ServiceChange::Unchanged);
@@ -381,8 +522,57 @@ pub(crate) fn install(unit: &ServiceUnit, runner: &dyn CommandRunner) -> Result<
     match unit.manager {
         ServiceManager::SystemdUser => start_systemd(runner)?,
         ServiceManager::Launchd => start_launchd(unit, runner, running)?,
+        ServiceManager::WindowsRun => {}
     }
     Ok(match (existed, current) {
+        (false, _) => ServiceChange::Installed,
+        (true, false) => ServiceChange::Updated,
+        (true, true) => ServiceChange::Started,
+    })
+}
+
+/// Write the logon entry when it differs, then (re)start the host now so the
+/// server answers before the next logon. A current entry whose host runs is
+/// left alone.
+fn install_windows(unit: &ServiceUnit, runner: &dyn CommandRunner) -> Result<ServiceChange> {
+    let host = unit
+        .host
+        .as_ref()
+        .context("the Windows logon entry has no host command")?;
+    let existing = run_value(runner);
+    let current = existing.as_deref() == Some(unit.contents.as_str());
+    if current && super::service_host::running(&host.state_file).is_some() {
+        return Ok(ServiceChange::Unchanged);
+    }
+    if !current {
+        require(
+            runner,
+            "reg",
+            &[
+                "add",
+                RUN_KEY,
+                "/v",
+                RUN_VALUE,
+                "/t",
+                "REG_SZ",
+                "/d",
+                &unit.contents,
+                "/f",
+            ],
+        )?;
+    }
+    super::service_host::stop(&host.state_file, runner)?;
+    let exe = host.exe.to_string_lossy();
+    let args: Vec<&str> = host.args.iter().map(String::as_str).collect();
+    let started = runner.run_launcher(&exe, &args)?;
+    if !started.success {
+        bail!(
+            "`{exe} {}` failed: {}",
+            args.join(" "),
+            started.stderr.trim()
+        );
+    }
+    Ok(match (existing.is_some(), current) {
         (false, _) => ServiceChange::Installed,
         (true, false) => ServiceChange::Updated,
         (true, true) => ServiceChange::Started,
@@ -503,6 +693,23 @@ pub(crate) enum Removal {
     NotOurs(PathBuf),
 }
 
+/// Whether `manager`'s unit at `path` is one `uninstall` would remove; reads
+/// only (on Windows, through `reg query`).
+pub(crate) fn planned_removal_for(
+    manager: ServiceManager,
+    path: &Path,
+    runner: &dyn CommandRunner,
+) -> Removal {
+    if manager != ServiceManager::WindowsRun {
+        return planned_removal(path);
+    }
+    match run_value(runner) {
+        None => Removal::Absent,
+        Some(data) if is_setup_run_entry(&data) => Removal::Removed(path.to_path_buf()),
+        Some(_) => Removal::NotOurs(path.to_path_buf()),
+    }
+}
+
 /// Whether the unit at `path` is one `uninstall` would remove; reads only.
 pub(crate) fn planned_removal(path: &Path) -> Removal {
     match std::fs::read_to_string(path) {
@@ -521,9 +728,10 @@ pub(crate) fn planned_removal(path: &Path) -> Removal {
 pub(crate) fn remove(
     manager: ServiceManager,
     path: &Path,
+    data_dir: &Path,
     runner: &dyn CommandRunner,
 ) -> Result<Removal> {
-    let planned = planned_removal(path);
+    let planned = planned_removal_for(manager, path, runner);
     if !matches!(planned, Removal::Removed(_)) {
         return Ok(planned);
     }
@@ -547,6 +755,10 @@ pub(crate) fn remove(
                 )?;
             }
             delete_unit(path)?;
+        }
+        ServiceManager::WindowsRun => {
+            super::service_host::stop(&super::service_host::state_file(data_dir), runner)?;
+            require(runner, "reg", &["delete", RUN_KEY, "/v", RUN_VALUE, "/f"])?;
         }
     }
     Ok(planned)
@@ -857,7 +1069,13 @@ mod tests {
         write_unit(&unit).unwrap();
         let runner = FakeRunner::default();
         assert_eq!(
-            remove(ServiceManager::SystemdUser, &unit.path, &runner).unwrap(),
+            remove(
+                ServiceManager::SystemdUser,
+                &unit.path,
+                Path::new("/unused"),
+                &runner
+            )
+            .unwrap(),
             Removal::Removed(unit.path.clone())
         );
         assert!(!unit.path.exists());
@@ -872,7 +1090,13 @@ mod tests {
         // A second removal finds nothing and calls nothing.
         let again = FakeRunner::default();
         assert_eq!(
-            remove(ServiceManager::SystemdUser, &unit.path, &again).unwrap(),
+            remove(
+                ServiceManager::SystemdUser,
+                &unit.path,
+                Path::new("/unused"),
+                &again
+            )
+            .unwrap(),
             Removal::Absent
         );
         assert!(again.calls.borrow().is_empty());
@@ -893,7 +1117,13 @@ mod tests {
             std::fs::write(&unit.path, &text).unwrap();
             let runner = FakeRunner::default();
             assert_eq!(
-                remove(ServiceManager::SystemdUser, &unit.path, &runner).unwrap(),
+                remove(
+                    ServiceManager::SystemdUser,
+                    &unit.path,
+                    Path::new("/unused"),
+                    &runner
+                )
+                .unwrap(),
                 Removal::NotOurs(unit.path.clone())
             );
             assert_eq!(std::fs::read_to_string(&unit.path).unwrap(), text);
@@ -910,7 +1140,15 @@ mod tests {
             failing: vec!["systemctl --user disable"],
             ..FakeRunner::default()
         };
-        assert!(remove(ServiceManager::SystemdUser, &unit.path, &runner).is_err());
+        assert!(
+            remove(
+                ServiceManager::SystemdUser,
+                &unit.path,
+                Path::new("/unused"),
+                &runner
+            )
+            .is_err()
+        );
         assert!(unit.is_current());
     }
 
@@ -924,7 +1162,13 @@ mod tests {
             ..FakeRunner::default()
         };
         assert_eq!(
-            remove(ServiceManager::Launchd, &unit.path, &runner).unwrap(),
+            remove(
+                ServiceManager::Launchd,
+                &unit.path,
+                Path::new("/unused"),
+                &runner
+            )
+            .unwrap(),
             Removal::Removed(unit.path.clone())
         );
         assert!(!unit.path.exists());
@@ -935,6 +1179,212 @@ mod tests {
                 "launchctl print gui/501/com.github.akitaonrails.ai-memory",
                 "launchctl bootout gui/501/com.github.akitaonrails.ai-memory",
             ]
+        );
+    }
+
+    /// The logon entry: an unchanged entry whose host runs is left alone; a
+    /// missing one is written with `reg add` and the host started now; a
+    /// current one whose host died is only restarted.
+    #[test]
+    fn the_windows_logon_entry_is_written_once_and_the_host_started() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = render(ServiceManager::WindowsRun, &spec(root.path())).unwrap();
+        let host = unit.host.clone().unwrap();
+        let exe = host.exe.display().to_string();
+
+        let fresh = FakeRunner {
+            failing: vec!["reg query"],
+            ..FakeRunner::default()
+        };
+        assert_eq!(install(&unit, &fresh).unwrap(), ServiceChange::Installed);
+        let calls = fresh.calls.borrow();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(calls[0].starts_with("reg query"));
+        assert!(
+            calls[1].starts_with(&format!("reg add {RUN_KEY} /v ai-memory /t REG_SZ /d ")),
+            "{calls:?}"
+        );
+        assert!(calls[1].ends_with(" service-host /f"), "{calls:?}");
+        assert!(
+            calls[2].starts_with(&exe) && calls[2].ends_with(" service-host"),
+            "{calls:?}"
+        );
+        drop(calls);
+
+        let reg_output: &'static str = Box::leak(
+            format!(
+                "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    \
+                 ai-memory    REG_SZ    {}\r\n\r\n",
+                unit.contents
+            )
+            .into_boxed_str(),
+        );
+        let current = FakeRunner {
+            stdout: vec![("reg query", reg_output)],
+            ..FakeRunner::default()
+        };
+        assert_eq!(install(&unit, &current).unwrap(), ServiceChange::Started);
+        assert!(
+            !current
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("reg add")),
+            "a current entry is not rewritten: {:?}",
+            current.calls.borrow()
+        );
+        assert!(unit.exists(&current));
+        assert!(!unit.exists(&fresh));
+    }
+
+    /// `reg add` failing stops the install before the host is started.
+    #[test]
+    fn a_refused_registry_write_starts_no_host() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = render(ServiceManager::WindowsRun, &spec(root.path())).unwrap();
+        let runner = FakeRunner {
+            failing: vec!["reg query", "reg add"],
+            ..FakeRunner::default()
+        };
+        let error = install(&unit, &runner).unwrap_err().to_string();
+        assert!(error.contains("reg add"), "{error}");
+        assert_eq!(runner.calls.borrow().len(), 2);
+    }
+
+    /// Uninstall removes only an entry `setup` wrote; someone else's value
+    /// under the same name is left, and an absent one is nothing to do.
+    #[test]
+    fn uninstall_removes_only_setups_logon_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = unit_path(ServiceManager::WindowsRun, root.path(), None);
+        let ours = FakeRunner {
+            stdout: vec![(
+                "reg query",
+                "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \"C:\\d\" \
+                 --config \"C:\\d\\config.toml\" service-host\r\n",
+            )],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(ServiceManager::WindowsRun, &path, root.path(), &ours).unwrap(),
+            Removal::Removed(path.clone())
+        );
+        assert!(
+            ours.calls
+                .borrow()
+                .iter()
+                .any(|c| c == &format!("reg delete {RUN_KEY} /v ai-memory /f")),
+            "{:?}",
+            ours.calls.borrow()
+        );
+
+        let theirs = FakeRunner {
+            stdout: vec![(
+                "reg query",
+                "    ai-memory    REG_SZ    \"C:\\tools\\other.exe\" --start\r\n",
+            )],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(ServiceManager::WindowsRun, &path, root.path(), &theirs).unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(theirs.calls.borrow().len(), 1, "only the query ran");
+
+        let absent = FakeRunner {
+            failing: vec!["reg query"],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(ServiceManager::WindowsRun, &path, root.path(), &absent).unwrap(),
+            Removal::Absent
+        );
+    }
+}
+
+/// The Windows command-line pieces are plain text handling; they run on every
+/// platform.
+#[cfg(test)]
+mod windows_entry_tests {
+    use super::*;
+
+    #[test]
+    fn windows_args_are_quoted_so_argv_parsing_reads_them_back() {
+        assert_eq!(
+            windows_arg("data dir", r"C:\Users\me\AppData\Local\ai-memory").unwrap(),
+            r#""C:\Users\me\AppData\Local\ai-memory""#
+        );
+        // A trailing backslash would otherwise escape the closing quote.
+        assert_eq!(windows_arg("data dir", r"D:\").unwrap(), r#""D:\\""#);
+        assert_eq!(
+            windows_arg("data dir", r"C:\with space\dir").unwrap(),
+            r#""C:\with space\dir""#
+        );
+        assert!(windows_arg("data dir", r#"C:\a"b"#).is_err());
+    }
+
+    #[test]
+    fn reg_query_output_yields_the_value_data() {
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    \
+                   ai-memory    REG_SZ    \"C:\\a b\\ai-memory.exe\" --data-dir \"C:\\d\" service-host\r\n\r\n";
+        assert_eq!(
+            parse_reg_query(out, "ai-memory").as_deref(),
+            Some("\"C:\\a b\\ai-memory.exe\" --data-dir \"C:\\d\" service-host")
+        );
+        assert_eq!(
+            parse_reg_query("    other    REG_SZ    x\r\n", "ai-memory"),
+            None
+        );
+        assert_eq!(
+            parse_reg_query("    ai-memory    REG_EXPAND_SZ    x\r\n", "ai-memory"),
+            None
+        );
+    }
+
+    /// Only a quoted `ai-memory.exe` ending in `service-host` is ours; a
+    /// value pointing elsewhere, an unquoted one, or one chaining another
+    /// command is not, and uninstall leaves it.
+    #[test]
+    fn only_setups_entry_shape_counts_as_ours() {
+        assert!(is_setup_run_entry(
+            r#""C:\x\ai-memory.exe" --data-dir "C:\d" --config "C:\d\c.toml" service-host"#
+        ));
+        assert!(is_setup_run_entry(r#""C:\X\AI-MEMORY.EXE" service-host"#));
+        for theirs in [
+            r#""C:\x\other.exe" service-host"#,
+            r#"C:\x\ai-memory.exe service-host"#,
+            r#""C:\x\ai-memory.exe" serve"#,
+            r#""C:\x\ai-memory.exe" service-host & calc"#,
+            r#""C:\x\ai-memory.exe" x | y service-host"#,
+            "",
+        ] {
+            assert!(!is_setup_run_entry(theirs), "{theirs}");
+        }
+    }
+
+    /// The rendered entry is one setup recognises as its own, names the
+    /// install's data dir and config, and its host command matches it.
+    #[test]
+    fn the_rendered_entry_is_recognised_as_setups() {
+        let root = std::env::temp_dir().join("ai-memory-entry-test");
+        let spec = ServiceSpec {
+            exe: root.join("ai-memory.exe"),
+            data_dir: root.join("data"),
+            config_path: root.join("data").join("config.toml"),
+            home: root.clone(),
+            xdg_config_home: None,
+        };
+        let unit = render(ServiceManager::WindowsRun, &spec).unwrap();
+        assert!(is_setup_run_entry(&unit.contents), "{}", unit.contents);
+        assert!(
+            unit.contents
+                .contains(&format!("--data-dir \"{}\"", spec.data_dir.display()))
+        );
+        let host = unit.host.unwrap();
+        assert_eq!(host.args.last().map(String::as_str), Some("service-host"));
+        assert_eq!(
+            host.state_file,
+            super::super::service_host::state_file(&spec.data_dir)
         );
     }
 }

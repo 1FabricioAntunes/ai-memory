@@ -39,6 +39,18 @@ version in [`docs/changelog/`](docs/changelog/):
   directory), numbers the agents, and lists the other agents `--agent`
   accepts. At the prompt you can type the numbers of the agents to wire
   instead of `y`; a number outside the plan changes nothing. (#1270)
+- Added a native Windows path to the two-command install. `install.ps1`,
+  published with each release next to its own `.sha256`, checks the release
+  zip against that checksum, refuses archive entries that are absolute or
+  hold `..`, unpacks it under `%LOCALAPPDATA%\Programs\ai-memory` and adds
+  that directory to the user `PATH` (`AI_MEMORY_NO_MODIFY_PATH=1` skips it),
+  with no administrator rights. `ai-memory setup` now has a service step on
+  Windows: it writes an `ai-memory` value under the per-user `Run` key that
+  starts a hidden `ai-memory service-host` at logon, and starts it right away.
+  The host runs the server with no console window and restarts it after a
+  failure, giving up after five failures within ten seconds of starting.
+  `ai-memory uninstall --apply` stops the host and removes the value when it
+  still has the shape `setup` writes. (#1271)
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question

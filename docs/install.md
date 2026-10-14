@@ -96,7 +96,25 @@ sh install.sh
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
-Windows is not covered by the script; use the zip in
+Native Windows has its own script, `install.ps1`, published next to
+`install.sh` with its own `install.ps1.sha256`. In PowerShell (no
+administrator rights needed):
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+ai-memory setup
+```
+
+It downloads `ai-memory-windows-x86_64.zip` and its `.sha256`, stops before
+unpacking when the checksum file is missing, names another asset, or does not
+match, and refuses an archive entry that is absolute or holds `..`. The
+release goes to `%LOCALAPPDATA%\Programs\ai-memory` (`AI_MEMORY_INSTALL_DIR`
+overrides it), which is added to your user `PATH` unless
+`AI_MEMORY_NO_MODIFY_PATH=1`. An existing install there is left alone; update it
+with `ai-memory upgrade`. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
+work as for `install.sh`. On Windows on Arm it installs the x86_64 build, which
+Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
+failure under `iex` leaves your PowerShell window open. Details are in
 [`docs/windows.md`](windows.md).
 
 `ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]]`
@@ -119,10 +137,19 @@ runs, in order, the commands a native install otherwise needs one by one:
    link that resolves to the same file instead: the path as invoked, an
    `ai-memory` on `PATH` such as `~/.nix-profile/bin/ai-memory`, or Homebrew's
    `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`. With no such link it names
-   the versioned path, and you re-run `setup` after upgrading. The step is skipped when a server already answers at the configured
-   URL and no unit of ours exists yet (Docker, a packaged system unit, a
-   foreground `serve`), when the configured server is not on this machine,
-   with `--no-service`, and on Windows.
+   the versioned path, and you re-run `setup` after upgrading.
+   On Windows there is no per-user service manager, so `setup` writes an
+   `ai-memory` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+   (no administrator rights needed) that runs `ai-memory service-host` at
+   logon, and starts that host right away. The host runs `serve --transport
+   http --enable-web` on the same data dir and config with no console window
+   and restarts it after a failure, giving up after five failures within ten
+   seconds of starting; see
+   [`docs/windows.md`](windows.md#scenario-e-keep-the-server-running-native-windows-service).
+   The step is skipped when a server already answers at the configured
+   URL and no unit or logon entry of ours exists yet (Docker, a packaged system
+   unit, a foreground `serve`), when the configured server is not on this
+   machine, and with `--no-service`.
 3. For each agent: `install-mcp --apply`, `install-hooks --apply` and
    `install-skills --scope global`. With no `--agent`, `setup` wires every
    harness whose session store or MCP config exists under your home, using the

@@ -56,7 +56,7 @@ detect_target() {
         Linux) os=linux ;;
         Darwin) os=macos ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
-            die "Windows is not supported by this script; download ai-memory-windows-x86_64.zip from the release page and follow docs/windows.md"
+            die "Windows is not supported by this script; in PowerShell run: irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex"
             ;;
         *) die "unsupported operating system: $os" ;;
     esac

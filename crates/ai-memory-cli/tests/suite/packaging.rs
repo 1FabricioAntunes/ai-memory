@@ -680,6 +680,7 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
         "ai-memory-install-hooks",
         "ai-memory-hooks.tar.gz",
         "install.sh",
+        "install.ps1",
     ] {
         assert!(release.contains(asset), "release must publish {asset}");
         assert!(
@@ -710,6 +711,32 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
     assert!(hook_installer.contains("tar -xOf"));
     assert!(!hook_installer.contains("tar -xzf"));
     assert!(!hook_installer.contains("raw.githubusercontent.com"));
+}
+
+/// `install.ps1` runs only on Windows CI; these source checks keep its safety
+/// properties visible to every platform's gate: the checksum is compared
+/// before anything is unpacked, archive entries escaping the install dir are
+/// refused, it never `exit`s (which would close the shell under `iex`), and
+/// it runs from one function called on the last line.
+#[test]
+fn install_ps1_keeps_its_safety_checks() {
+    let script = read_repo("install.ps1");
+    let hash = script.find("Get-FileHash").expect("checksum computed");
+    let mismatch = script.find("checksum mismatch").expect("mismatch refused");
+    let unsafe_entry = script.find("unsafe path").expect("unsafe entries refused");
+    let expand = script.find("Expand-Archive").expect("archive unpacked");
+    assert!(hash < expand && mismatch < expand && unsafe_entry < expand);
+    assert!(script.contains("$parts -contains '..'"));
+    assert!(script.contains("ai-memory-windows-x86_64.zip"));
+    assert!(script.contains("AI_MEMORY_NO_MODIFY_PATH"));
+    assert!(
+        !script
+            .lines()
+            .any(|line| line.trim_start().starts_with("exit")),
+        "install.ps1 must throw, not exit"
+    );
+    assert_eq!(script.trim_end().lines().last(), Some("Install-AiMemory"));
+    assert!(!script.contains("raw.githubusercontent.com"));
 }
 
 #[test]

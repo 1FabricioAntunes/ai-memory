@@ -806,12 +806,18 @@ path filled in, then `install-mcp`, `install-hooks` and global
 session store or MCP config (the stores `doctor` scans). It finishes with a
 read-only self-check: `/healthz`, a `memory_status` call over MCP, and
 `doctor`. The service manager is reached through an injectable runner, so the
-unit rendering and the `systemctl`/`launchctl` calls are tested without a real
-session. Windows has no service step. A second run changes no file. Each
+unit rendering and the `systemctl`/`launchctl`/`reg` calls are tested without a
+real session. On Windows the "unit" is an `ai-memory` value under the per-user
+`HKCU\...\CurrentVersion\Run` key that runs the hidden `service-host`
+command at logon; `service-host` detaches from the console and supervises
+`serve` with a hidden console, restarting it after a failure, and records both
+pids in `<data_dir>/service-host.json`. A second run changes no file. Each
 rendered unit carries an identity line with the SHA-256 of the rest of the
-file; `uninstall` stops and removes only a unit whose digest still matches.
-`install.sh`, a release asset with its own `.sha256`, installs the release
-tarball under `~/.local` after checking it against the published checksum.
+file; `uninstall` stops and removes only a unit whose digest still matches (on
+Windows, only a `Run` value with the shape `setup` writes).
+`install.sh` and, for Windows, `install.ps1` are release assets with their own
+`.sha256` files; each installs the release archive after checking it against
+the published checksum, under `~/.local` or `%LOCALAPPDATA%\Programs`.
 
 The hidden `render-plugins --out <dir>` generates the Claude Code and Codex
 marketplace plugins under `plugins/` and their catalogs

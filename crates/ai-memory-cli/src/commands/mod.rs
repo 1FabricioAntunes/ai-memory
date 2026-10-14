@@ -104,6 +104,7 @@ pub mod run_autowire;
 pub mod search;
 pub mod serve;
 pub mod server;
+pub mod service_host;
 pub mod setup;
 pub mod setup_agent;
 pub mod show;

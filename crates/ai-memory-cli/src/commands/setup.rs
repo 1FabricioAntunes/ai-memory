@@ -7,7 +7,9 @@
 //!    `<data_dir>/auth-tokens/default` and records `[auth] bearer_token_file`;
 //! 2. a per-user service running `serve` on that install
 //!    ([`super::user_service`]): a systemd `--user` unit or a launchd
-//!    LaunchAgent, rendered from the packaged templates. Windows has none;
+//!    LaunchAgent, rendered from the packaged templates, or on Windows a
+//!    logon entry under the per-user `Run` key that starts
+//!    [`super::service_host`];
 //! 3. for each agent (named with `--agent`, else detected from its session
 //!    store or MCP config under the home, the way `doctor` finds them):
 //!    `install-mcp --apply`, `install-hooks --apply` and global
@@ -249,6 +251,7 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
             &spec,
             &config.server_url,
             reachable,
+            &user_service::SystemRunner,
         )
     };
     let mut plan = SetupPlan {
@@ -443,11 +446,12 @@ fn plan_service(
     spec: &user_service::ServiceSpec,
     server_url: &str,
     reachable: bool,
+    runner: &dyn CommandRunner,
 ) -> ServicePlan {
     let Some(manager) = manager else {
         return ServicePlan::Skip(
-            "not supported on this platform (Windows has no service step); start the server \
-             with `ai-memory serve --transport http` and see docs/windows.md"
+            "not supported on this platform; start the server with `ai-memory serve \
+             --transport http`"
                 .to_owned(),
         );
     };
@@ -457,7 +461,7 @@ fn plan_service(
         ));
     }
     match user_service::render(manager, spec) {
-        Ok(unit) if reachable && !unit.path.exists() => ServicePlan::Skip(format!(
+        Ok(unit) if reachable && !unit.exists(runner) => ServicePlan::Skip(format!(
             "a server already answers at {server_url}; leaving it in charge (pass --no-service \
              to skip this check)"
         )),
@@ -484,9 +488,15 @@ fn print_plan(plan: &SetupPlan) {
     }
     match &plan.service {
         ServicePlan::Install(unit) => println!(
-            "  - install and start a {} at {}",
+            "  - install and start a {} at {}{}",
             unit.manager.describe(),
-            unit.path.display()
+            unit.path.display(),
+            if unit.manager == ServiceManager::WindowsRun {
+                " (it starts `ai-memory service-host` at logon, which runs the server with no \
+                 console window and restarts it after a failure)"
+            } else {
+                ""
+            }
         ),
         ServicePlan::Skip(reason) => println!("  - service: {reason}"),
     }
@@ -1385,14 +1395,60 @@ mod tests {
     }
 
     #[test]
-    fn windows_has_no_service_step_and_says_so() {
+    fn a_platform_without_a_manager_has_no_service_step_and_says_so() {
         let tmp = tempfile::tempdir().unwrap();
-        let ServicePlan::Skip(reason) =
-            plan_service(None, &spec(tmp.path()), "http://127.0.0.1:49374", false)
-        else {
+        let ServicePlan::Skip(reason) = plan_service(
+            None,
+            &spec(tmp.path()),
+            "http://127.0.0.1:49374",
+            false,
+            &user_service::SystemRunner,
+        ) else {
             panic!("expected a skip");
         };
-        assert!(reason.contains("Windows"), "{reason}");
+        assert!(reason.contains("not supported"), "{reason}");
+    }
+
+    /// The Windows logon entry is planned like a unit: installed when nothing
+    /// answers, left alone when a server answers and no entry of ours exists
+    /// (`reg query` finds none), and managed once the entry is there.
+    #[test]
+    fn the_windows_logon_entry_is_planned_like_a_unit() {
+        struct Reg(Option<&'static str>);
+        impl CommandRunner for Reg {
+            fn run(&self, program: &str, _args: &[&str]) -> Result<user_service::CommandOutcome> {
+                assert_eq!(program, "reg");
+                Ok(user_service::CommandOutcome {
+                    success: self.0.is_some(),
+                    stdout: self.0.map_or_else(String::new, |data| {
+                        format!("\r\nHKEY_CURRENT_USER\\...\\Run\r\n    ai-memory    REG_SZ    {data}\r\n")
+                    }),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let url = "http://127.0.0.1:49374";
+        let manager = Some(ServiceManager::WindowsRun);
+        let spec = spec(tmp.path());
+        assert!(matches!(
+            plan_service(manager, &spec, url, false, &Reg(None)),
+            ServicePlan::Install(unit) if unit.manager == ServiceManager::WindowsRun
+        ));
+        assert!(matches!(
+            plan_service(manager, &spec, url, true, &Reg(None)),
+            ServicePlan::Skip(reason) if reason.contains("already answers")
+        ));
+        assert!(matches!(
+            plan_service(
+                manager,
+                &spec,
+                url,
+                true,
+                &Reg(Some("\"C:\\ai\\ai-memory.exe\" service-host"))
+            ),
+            ServicePlan::Install(_)
+        ));
     }
 
     #[test]
@@ -1403,6 +1459,7 @@ mod tests {
             &spec(tmp.path()),
             "https://memory.example.com",
             true,
+            &user_service::SystemRunner,
         );
         assert!(
             matches!(plan, ServicePlan::Skip(reason) if reason.contains("not on this machine"))
@@ -1419,18 +1476,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spec = spec(tmp.path());
         let url = "http://127.0.0.1:49374";
-        let plan = plan_service(Some(ServiceManager::SystemdUser), &spec, url, true);
+        let plan = plan_service(
+            Some(ServiceManager::SystemdUser),
+            &spec,
+            url,
+            true,
+            &user_service::SystemRunner,
+        );
         assert!(matches!(plan, ServicePlan::Skip(reason) if reason.contains("already answers")));
 
-        let ServicePlan::Install(unit) =
-            plan_service(Some(ServiceManager::SystemdUser), &spec, url, false)
-        else {
+        let ServicePlan::Install(unit) = plan_service(
+            Some(ServiceManager::SystemdUser),
+            &spec,
+            url,
+            false,
+            &user_service::SystemRunner,
+        ) else {
             panic!("expected an install when nothing answers");
         };
         std::fs::create_dir_all(unit.path.parent().unwrap()).unwrap();
         std::fs::write(&unit.path, &unit.contents).unwrap();
         assert!(matches!(
-            plan_service(Some(ServiceManager::SystemdUser), &spec, url, true),
+            plan_service(
+                Some(ServiceManager::SystemdUser),
+                &spec,
+                url,
+                true,
+                &user_service::SystemRunner
+            ),
             ServicePlan::Install(_)
         ));
     }
