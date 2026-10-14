@@ -339,9 +339,8 @@ Restated from `AGENTS.md` because they bound the packing:
    in git. Latest migration is V76; we do not need V77.
 
 8. **Semver: minor (3.1).** CHANGELOG `### Changed` (the opted-in
-   brief packs differently). The work targets the next minor's
-   `release/3.1` once it exists; until then the PR is opened against
-   `main` for the maintainer to retarget.
+   brief packs differently). The work targets `release/3.1`, the
+   standing branch for the next minor.
 
 9. **Omitted standing-rule pointers stay reserved after the L0 pass.**
    Today's renderer gives omitted first call because a crowded-out
@@ -1202,8 +1201,7 @@ No remaining blocker that needs a new fact from the codebase.
 
 One pull request, five commits, each green on its own so the series
 bisects and reviews commit by commit. Commit 4 is the behavior change.
-Base: `main`, for the maintainer to retarget to `release/3.1` once that
-branch exists.
+Base: `release/3.1`.
 
 ### Commit 1: Land the design doc
 
