@@ -26,7 +26,7 @@ use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 /// points at the `_global` project in the default workspace. Wikilinks
 /// inside fenced code blocks and inline code are left as literal text.
 #[must_use]
-pub fn render(body: &str, workspace: &str, project: &str) -> String {
+pub fn render_document(body: &str, workspace: &str, project: &str) -> Rendered {
     // Rewrite `[[wikilinks]]` into ordinary markdown links BEFORE parsing.
     // pulldown-cmark consumes `[...]` as reference-link syntax, so the brackets
     // never survive as a single text node — preprocessing the source is the
@@ -35,11 +35,40 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
     let body = preprocess_wikilinks(body, workspace, project);
 
     let parser = Parser::new_ext(&body, options());
-    let with_headings = HeadingIdAssigner::new(parser);
-    let sanitized = with_headings.map(|event| sanitize_event(event, workspace, project));
+    let mut with_headings = HeadingIdAssigner::new(parser);
+    let sanitized = with_headings
+        .by_ref()
+        .map(|event| sanitize_event(event, workspace, project));
     let mut out = String::with_capacity(body.len() + body.len() / 4);
     html::push_html(&mut out, sanitized);
-    out
+    Rendered {
+        html: out,
+        outline: with_headings.outline,
+    }
+}
+
+/// [`render_document`] without the outline.
+#[cfg(test)]
+fn render(body: &str, workspace: &str, project: &str) -> String {
+    render_document(body, workspace, project).html
+}
+
+/// A rendered page body and the headings it contains.
+pub struct Rendered {
+    /// The sanitized HTML.
+    pub html: String,
+    /// Every heading in document order, with the `id` the HTML carries.
+    pub outline: Vec<OutlineEntry>,
+}
+
+/// One heading of a rendered page.
+pub struct OutlineEntry {
+    /// Heading level, 1 to 6.
+    pub level: u8,
+    /// Plain text of the heading.
+    pub text: String,
+    /// The `id` attribute rendered on the heading.
+    pub id: String,
 }
 
 /// The GFM-ish parser options the page renders with. The wikilink
@@ -351,6 +380,7 @@ struct HeadingIdAssigner<'a, I> {
     iter: I,
     slugger: HeadingSlugger,
     queue: VecDeque<Event<'a>>,
+    outline: Vec<OutlineEntry>,
 }
 
 impl<'a, I: Iterator<Item = Event<'a>>> HeadingIdAssigner<'a, I> {
@@ -359,6 +389,7 @@ impl<'a, I: Iterator<Item = Event<'a>>> HeadingIdAssigner<'a, I> {
             iter,
             slugger: HeadingSlugger::default(),
             queue: VecDeque::new(),
+            outline: Vec::new(),
         }
     }
 }
@@ -415,6 +446,11 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
                     Some(custom) => self.slugger.deduplicate(custom.as_ref()),
                     None => self.slugger.slugify(&text),
                 };
+                self.outline.push(OutlineEntry {
+                    level: level as u8,
+                    text: text.trim().to_owned(),
+                    id: id_str.clone(),
+                });
                 self.queue.push_back(Event::Start(Tag::Heading {
                     level,
                     id: Some(CowStr::Boxed(id_str.into_boxed_str())),
@@ -1384,6 +1420,24 @@ mod tests {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
             "heading id must match ^[a-z0-9_-]+$, got: {id}"
         );
+    }
+
+    #[test]
+    fn outline_ids_are_the_ids_rendered_on_the_headings() {
+        let md = "## Intro\n\ntext\n\n### Intro\n\n## Intro\n\n## `Code` & more";
+        let rendered = render_document(md, "default", "scratch");
+        let ids: Vec<&str> = rendered.outline.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["intro", "intro-1", "intro-2", "code-more"]);
+        let levels: Vec<u8> = rendered.outline.iter().map(|h| h.level).collect();
+        assert_eq!(levels, [2, 3, 2, 2]);
+        assert_eq!(rendered.outline[3].text, "Code & more");
+        for id in ids {
+            assert!(
+                rendered.html.contains(&format!(r#" id="{id}">"#)),
+                "id {id} missing: {}",
+                rendered.html
+            );
+        }
     }
 
     #[test]

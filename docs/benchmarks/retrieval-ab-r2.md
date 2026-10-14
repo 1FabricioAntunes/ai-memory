@@ -97,12 +97,23 @@ cargo run --release -p ai-memory-eval -- retrieval --candidate-embeddings local
 cargo run --release -p ai-memory-eval -- retrieval --candidate
 ```
 
+### Observation stream (3.0)
+
+The full-set A/B for the 3.0 observation stream (stream off → on, zero-LLM
+FTS, 470 scored) is published with its provenance in
+[`longmemeval-s-decomposition-2026-10-12.md`](longmemeval-s-decomposition-2026-10-12.md#what-the-observation-stream-recovered):
+`hit@5` 0.662 → 0.951, hit@1 0.511 → 0.857, hit@10 0.687 → 0.972, 139
+questions gained and 3 lost; local embeddings 0.800 → 0.945 on the full set
+(corrected harness, 2026-10-13). The stream is on by default in 3.0, so a baseline run
+of the 2.4 configuration on a 3.0 build needs
+`--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
+
 ### Illustrative sample-20 run (triple + QA-accuracy, NOT a baseline)
 
 Recorded to show the triple + QA columns on a real run. **`--sample 20`, 20
 LongMemEval-S questions: illustrative, NOT the full-500 baseline.** The
-published baseline stays 0.823 hit@5 (local) / 0.668 zero-LLM in
-[README.md](README.md); do not cite the numbers below as a baseline.
+published baselines are in [README.md](README.md); do not cite the numbers
+below as a baseline.
 
 Retrieval (zero-LLM):
 

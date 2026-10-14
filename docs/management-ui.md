@@ -1,173 +1,113 @@
 # Management console
 
-The optional React/Tailwind console gives a shared server's operators a browser
-interface for user accounts, captured sessions, and MCP API keys. It reuses the
-engine's human authentication and SQLite storage. It does not introduce another
-identity provider, credential format, or database.
+The optional console at `/manage` is server-rendered by askama in
+`ai-memory-web`, using the existing vendored Tailwind stylesheet. Ordinary
+Cargo builds require no Node, npm, bundler, or JavaScript framework. A small
+hash-authorized inline script enhances theme selection and password validation;
+login, account management, and session/key operations also work without JavaScript.
 
 ## Enable it
-
-Build the console into the binary, then enable it when starting the HTTP server:
 
 ```bash
 cargo build --locked --release -p ai-memory-cli --features management-ui
 ./target/release/ai-memory serve --transport http --enable-management-ui
 ```
 
-The equivalent runtime setting is `AI_MEMORY_ENABLE_MANAGEMENT_UI=true`.
-The console follows the [ai-memory website](https://aimemorybr.netlify.app/)
-visual style: light and dark surfaces, amber controls, and locally served
-Instrument Sans, Bricolage Grotesque, and Commit Mono fonts. Font notices are
-bundled under `management-ui/licenses/` and served at
-`/manage/assets/font-licenses.txt`.
-The theme follows your system by default. The header offers System, Light, and
-Dark; explicit choices are saved in your browser.
-The password form requires at least 12 characters, counting Unicode code points;
-the existing engine password policy and authentication endpoints are unchanged.
+The runtime setting is `AI_MEMORY_ENABLE_MANAGEMENT_UI=true`. Both build and
+runtime switches default to off. Without either, the console is absent. The UI
+build includes the independently reviewable `session-management` and
+`self-service-keys` features; enabling the UI also enables their HTTP routes.
+They can instead be built and enabled individually without a UI; see
+[session management](session-management.md) and [self-service keys](self-service-keys.md).
 
-Both switches are off by default. A binary built without `management-ui` has
-neither the console assets nor its management endpoints. A feature-enabled
-binary with the runtime switch off exposes neither surface. The existing CLI,
-MCP tools, auth endpoints, and wiki browser keep their existing behavior.
+With `AI_MEMORY_BASE_PATH=/memory`, open `/memory/manage`. No `--enable-web` or
+`--enable-api` is required. If the wiki browser is also enabled, its `--web-slug`
+must differ from `/manage`.
 
-Open `/manage` on the server. With `AI_MEMORY_BASE_PATH=/memory`, open
-`/memory/manage`. The console has its own mount and does not require
-`--enable-web` or `--enable-api`. If the wiki browser is also enabled, its
-`--web-slug` must differ from `/manage`.
+For Docker source builds, pass `--build-arg AI_MEMORY_FEATURES=management-ui` and
+set `AI_MEMORY_ENABLE_MANAGEMENT_UI=true` when running the image. The standard
+release image does not include the optional console.
 
-For a Docker source build:
+## Authentication and deployment
 
-```bash
-docker build -f docker/Dockerfile \
-  --build-arg AI_MEMORY_FEATURES=management-ui -t ai-memory-management .
-```
+Use the existing human-password bootstrap/recovery described in
+[installation](install.md#human-password-bootstrap-and-recovery). The console
+reuses Argon2id verification, browser sessions, CSRF hashes, native credential
+hashing, capability gates, and the same SQLite database. It adds no identity
+provider, credential format, authentication implementation, or database schema.
 
-Set `AI_MEMORY_ENABLE_MANAGEMENT_UI=true` when running that image. The standard
-release image is unchanged; it does not include this optional feature.
+The existing `root` role is labeled Admin and `user` is labeled User. Admins
+create users, change roles, reset passwords, disable/enable accounts, issue and
+revoke keys, and inspect or purge any session. Users inspect their own and shared
+legacy sessions, purge exactly owned sessions with current project write access,
+change passwords, and manage their own keys. The last-enabled-root safeguard
+remains in force. New users must replace the temporary password before using
+the console. The password form requires 12 Unicode code points; the engine's
+underlying UTF-8 byte policy is unchanged.
 
-## Authentication and roles
+Browser credentials cannot authenticate MCP or hooks. Use a personal `aim_` key
+from MCP connection. Native keys remain User-level even for an Admin owner.
+Disabling an account removes browser access but leaves existing machine keys
+active until explicitly revoked, as with the existing CLI.
 
-Use the existing [human password bootstrap and recovery](install.md#human-password-bootstrap-and-recovery)
-to create the initial root operator. Password verification uses the engine's
-RustCrypto Argon2id implementation. Browser sessions and CSRF hashes live in the
-same SQLite database as user identities and native API credentials.
+Use the existing [HTTPS reverse-proxy setup](https-via-proxy.md), secure cookies,
+and `AI_MEMORY_ALLOWED_HOSTS`. A VPN is optional. Forward the original `Host`
+header: plain POST forms require an HTTP(S) Origin with the same authority and
+reject cross-site fetch metadata. This preserves the login-CSRF barrier when
+converting HTML form data to the existing JSON authentication handler. Mutation
+forms also carry the existing CSRF token. Machine bearers cannot use the console.
 
-The UI labels the existing `root` role **Admin** and the existing `user` role
-**User**. There is no third role or change to machine-key authority.
-
-- **Admins** add users, reset passwords, change roles, disable or enable
-  accounts, issue and revoke users' API keys, inspect sessions, and purge any
-  session. The existing last-enabled-root safeguard remains in force.
-- **Users** inspect their own and shared legacy sessions, delete sessions with
-  their exact recorded owner, change their password, and create or revoke their
-  own MCP API keys. They cannot reach the admin operations.
-
-New users receive a temporary password shown once and must change it before
-using the console. New API keys are also shown once. Neither is saved to browser
-storage. Disabling an account revokes browser access; its existing machine keys
-remain active until revoked separately, as in the existing CLI.
-
-Browser cookies cannot authenticate MCP or lifecycle hooks. Configure each agent
-with the remote `/mcp` endpoint and a personal `aim_` API key from **MCP
-connection**. The same user can use that key for lifecycle hooks. Native keys
-remain User-level even when their owner is an Admin.
-
-The CLI already provides the corresponding administration commands:
-`ai-memory user add-human/list/reset-password/disable/enable/patch` and
-`ai-memory api-key add/list/rotate/revoke`. The console uses their existing
-backend operations.
-
-## Public deployment
-
-Use the project's [HTTPS reverse-proxy deployment](https-via-proxy.md).
-A VPN is optional. Terminate HTTPS at Caddy or another supported proxy, keep the
-engine's port reachable only by that proxy, configure `AI_MEMORY_ALLOWED_HOSTS`
-for the public hostname, and set `AI_MEMORY_AUTH__SECURE_COOKIE=true`.
-
-Keep the existing root bearer for machine administration; use personal API keys
-for remote agents. Do not expose an anonymous engine or use
-`--allow-insecure-no-auth`. The console does not add TLS termination or change
-the server's existing public-bind safeguards.
-
-Browser mutations require both a valid session and CSRF token. Console data
-responses use `Cache-Control: private, no-store`. The static shell contains no
-user data and refuses framing. Project access is checked through the existing
-scope resolver; pages remain shared within an authorized project.
+Templates autoescape stored text. Forms select from fixed operations and typed
+session/key ids, and delegate in-process to the same authenticated engine
+routers. Only transport peer identity is forwarded in request extensions, so
+login rate limits retain the real peer and stale route/auth metadata cannot
+change the delegated request. No localhost HTTP proxy is created. Every console
+response denies framing and uses `private, no-store`; the inline enhancement has
+a CSP SHA-256 hash. Passwords and new keys never appear in URLs or browser storage.
 
 ## Session deletion
 
-The console previews deletion counts and requires an explicit confirmation.
-A preview never writes files, tombstones, or audit events. Confirmation runs the
-existing wiki mutation path, admission webhooks, and pre/post git checkpoints.
+Deletion first previews counts and then requires an explicit confirmation.
+Previews have no file, tombstone, audit, or admission effects. Confirmation uses
+the existing wiki mutation guard, admission webhooks, pre/post git checkpoints,
+and the single-writer transaction. Ownership and current write access are
+rechecked in that transaction. Shared ownerless sessions and cross-project
+collateral require an Admin; only an Admin receives their collateral preview.
+Both collateral observations and handoffs appear in the preview.
 
-A session purge removes its captured observations, authored handoffs, generated
-session-page versions, and associated review records. It preserves maintained
-knowledge pages and later manual versions of a session page. Handoffs accepted
-by this session but authored by another session are preserved. Git history,
-backups, and native harness transcripts can still contain earlier content; this
-operation is not an erasure guarantee.
+Purging removes captured observations, authored handoffs, generated session-page
+versions, and review records. Maintained knowledge and later manual page versions
+remain, as do handoffs accepted by the session but authored elsewhere. Git
+history, backups, and native transcripts may retain earlier content. A partial
+file cleanup cannot roll back the database purge; the UI reports it and replay
+and reindex respect the purge tombstone.
 
-A regular user's purge checks exact ownership and current project write access
-again in the SQLite deletion transaction. Ownerless legacy sessions are shared
-for reading but require an Admin to delete. A session whose deletion would
-cascade into another project also requires an Admin. An Admin's preview reports
-both collateral observations and handoffs. A regular user's preview is refused
-for these sessions. The existing purge tombstone prevents hook replay from
-recreating a deleted session.
+## Interface and development
 
-## Management endpoints
+The console follows the public website's light/dark palette, typography, and
+amber controls. System is the default theme; explicit Light/Dark preferences
+persist locally. Fonts and their license notice are embedded under
+`static/management/` and served only by the optional console.
 
-All `/management/v1/*` routes require a human browser session. Machine bearers
-are refused on this surface, including the root bearer. Password-change-required
-sessions cannot use it. Mutations also require the existing CSRF cookie/header
-pair. Existing `/admin/*` routes retain their existing dual-auth and root gates.
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/management/v1/projects` | List readable projects. |
-| GET | `/management/v1/sessions?workspace=…&project=…&offset=…` | List up to 50 visible sessions; Admins see all owners. |
-| GET | `/management/v1/sessions/{id}/observations?workspace=…&project=…&offset=…` | Read up to 50 scoped events after an owner check. |
-| POST | `/management/v1/sessions/{id}/purge` | Preview with `dry_run: true`, or delete with `confirm: true`; body includes `workspace` and `project`. |
-| GET / POST | `/management/v1/credentials` | List own keys / create an own key with a `label`. |
-| POST | `/management/v1/credentials/{id}/revoke` | Revoke an own key. |
-
-Session and observation listings return `page_size`, currently 50. The console
-uses that value for offsets instead of keeping a separate pagination limit.
-
-## Frontend development and checks
-
-Sources and vendored production assets live in
-`crates/ai-memory-web/management-ui`. Cargo embeds the production assets only
-when the feature is enabled; ordinary Rust builds do not need Node or npm.
-`src/App.jsx` owns authentication and navigation; `Sessions.jsx`, `Users.jsx`,
-and `Keys.jsx` own their respective screens. Shared controls live in `ui.jsx`,
-authentication forms in `auth.jsx`, theme selection in `theme.jsx`, and the
-browser password/username constraints in `policy.js`. `api.js` owns HTTP requests
-and server URLs, including subpath handling.
+Templates live in `templates/management/`. `src/management/views.rs` builds
+escaped view models, `forms.rs` maps plain POST operations, and `backend.rs`
+delegates to engine routers. The normal wiki browser remains read-only. Session
+and event pagination uses the page size returned by the engine API.
 
 ```bash
-npm ci --prefix crates/ai-memory-web/management-ui --ignore-scripts
-npm run build --prefix crates/ai-memory-web/management-ui
-npm test --prefix crates/ai-memory-web/management-ui
-npm run format:check --prefix crates/ai-memory-web/management-ui
-cargo t --features ai-memory-cli/management-ui
+TAILWIND_BUILD=1 cargo build -p ai-memory-web --features management-ui
+cargo fmt --all -- --check
+git diff --check
+cargo clippy --workspace --all-targets --features ai-memory-cli/management-ui -- -D warnings
+cargo tf --features ai-memory-cli/management-ui
 ```
 
-Commit refreshed `dist/` assets with source changes. CI rebuilds them and checks
-for drift, runs the ownership/security tests, and drives the real console in
-Chromium against a temporary feature-enabled server:
+Commit regenerated `static/tailwind.css` when templates or styles change.
+The pinned standalone Tailwind CLI is the project's existing regeneration
+exception; normal builds copy the vendored CSS and need no downloads.
 
-```bash
-cargo build --locked -p ai-memory-cli --features management-ui
-npm exec --prefix crates/ai-memory-web/management-ui -- playwright install chromium
-npm run test:e2e --prefix crates/ai-memory-web/management-ui
-```
-
-The browser test covers user creation, password reset, role changes, disabling
-and enabling accounts, Admin and personal API-key issuance and revocation,
-forced password change, account switching, theme selection, authenticated
-machine identity, hook capture, event pagination, session inspection/deletion,
-subpath hosting, and absence of console routes when the runtime switch is off.
-It creates and removes its own temporary data directory. Rust tests also cover
-wrong and partial scopes, admission rejection, and owned-purge cleanup failures
-and recovery.
+Rust integration tests exercise real human sessions, cookie forwarding, same-
+origin plain login, CSRF refusal, pending-password gates, foreign sessions/scopes/
+credentials, HTML escaping, typed action ids, admission rejection, owned-purge
+cleanup/recovery, optional assets, and subpath mounting. The same tests are run
+in the feature-enabled CI job; no JavaScript toolchain is required there.

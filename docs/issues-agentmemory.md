@@ -1,5 +1,15 @@
 # agentmemory - Issue & PR Pain-Point Synthesis
 
+> **Snapshot as of 2026-05-21; superseded in part.** This records agentmemory
+> as it was then and is kept as history: the invariant citations in
+> `ARCHITECTURE.md` and `design-decisions.md` point at the bugs listed here.
+> As of 2026-10-10 (v0.9.30): the iii engine is a public repository
+> (Apache-2.0 and Elastic License 2.0; the engine directory is ELv2), #303,
+> #309 and #519 are closed, the two-config-paths bug was fixed in 0.9.29, and
+> idle sessions now end. Current state:
+> [`research-2026-landscape.md`](research-2026-landscape.md) §2 and
+> [`competitive-parity.md`](competitive-parity.md).
+
 > Source: GitHub `rohitg00/agentmemory`, captured 2026-05-21.
 > Repo health: 15.7k stars, very active. ~50 merged PRs in last week.
 > Architecture: TypeScript MCP server over a native Rust `iii-engine` KV.

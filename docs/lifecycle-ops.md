@@ -26,6 +26,16 @@ on a homelab box where mistakes are harder to undo.
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
 
+`purge-project`, `rename-project` and `move-project` also take `--project-id
+<uuid>` instead of the name (`project_id` on the admin endpoints), for a project
+whose name is ambiguous: an empty legacy twin row left by an older migration
+can carry another project's old name, and the name lookup refuses it.
+`list-projects` prints each project's id. The id is looked up inside the
+workspace the command names. Sending both the name and the id, or neither, is
+a `400`, so is a malformed UUID, and an id that names no project in that
+workspace is a `404`. `--confirm`, the preview and every other guard behave
+the same as with a name.
+
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See

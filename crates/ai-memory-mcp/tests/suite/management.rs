@@ -7,7 +7,8 @@ use ai_memory_mcp::{
     HumanAuthRuntime,
     auth::AuthState,
     human_auth::LoginLimiter,
-    management::{ManagementState, router},
+    self_service_keys::{SelfServiceKeysState, router as key_router},
+    session_management::{SessionManagementState, router as session_router},
 };
 use ai_memory_store::{Store, TokenPepper, hash_session_secret};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -114,15 +115,27 @@ async fn harness_with_chain(chain: Option<ai_memory_wiki::AdmissionChain>) -> Ha
             limiter: Arc::new(LoginLimiter::default()),
         }),
     );
-    let router = router(
-        ManagementState {
+    let router = session_router(
+        SessionManagementState {
             reader: store.reader.clone(),
             writer: store.writer.clone(),
             wiki: wiki.clone(),
+        },
+        auth.clone(),
+    )
+    .merge(key_router(
+        SelfServiceKeysState {
+            reader: store.reader.clone(),
+            writer: store.writer.clone(),
             pepper: Some(TokenPepper::new("test-pepper")),
         },
-        auth,
-    );
+        auth.clone(),
+    ));
+    let backend = router
+        .clone()
+        .merge(ai_memory_mcp::public_auth_router(auth.clone()))
+        .merge(ai_memory_mcp::session_auth_router(auth));
+    let router = router.merge(ai_memory_web::management::router("/memory", backend));
     Harness {
         _tmp: tmp,
         store,
@@ -786,4 +799,328 @@ async fn management_pagination_reports_its_limit_and_keeps_pages_disjoint() {
             .iter()
             .all(|row| &row["id"] != next_id)
     );
+}
+
+async fn html_request(
+    h: &Harness,
+    browser: Option<&Browser>,
+    method: &str,
+    uri: &str,
+    body: &str,
+    origin: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "memory.example")
+        .header("origin", origin)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(browser) = browser {
+        request = request.header("cookie", &browser.cookie);
+    }
+    if let Some(bearer) = bearer {
+        request = request.header("authorization", format!("Bearer {bearer}"));
+    }
+    let response = h
+        .router
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert_eq!(response.headers()["x-frame-options"], "DENY");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn management_html_plain_forms_preserve_csrf_owner_and_machine_boundaries() {
+    let h = harness().await;
+    let alice = session(&h, Some("alice")).await;
+    let bob = session(&h, Some("bob")).await;
+    let origin = "https://memory.example";
+    let own_events = html_request(
+        &h,
+        Some(&h.alice),
+        "GET",
+        &format!("/manage/session?workspace=default&project=app&session={alice}"),
+        "",
+        origin,
+        None,
+    )
+    .await;
+    assert_eq!(own_events.0, StatusCode::OK);
+    assert!(own_events.1.contains("Session events"));
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.alice),
+            "GET",
+            &format!("/manage/session?workspace=default&project=app&session={bob}"),
+            "",
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let form = format!(
+        "action=preview-purge&workspace=default&project=app&session={bob}&csrf={}",
+        h.alice.csrf
+    );
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.alice),
+            "POST",
+            "/manage/action",
+            &form,
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let own_form = form.replace(&bob.to_string(), &alice.to_string());
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.alice),
+            "POST",
+            "/manage/action",
+            &own_form.replace(&h.alice.csrf, "forged"),
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.alice),
+            "POST",
+            "/manage/action",
+            &own_form,
+            "https://evil.example",
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.root),
+            "POST",
+            "/manage/action",
+            &own_form,
+            origin,
+            Some("root-bearer")
+        )
+        .await
+        .0,
+        StatusCode::SEE_OTHER
+    );
+    let (status, preview) = html_request(
+        &h,
+        Some(&h.alice),
+        "POST",
+        "/manage/action",
+        &own_form,
+        origin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(preview.contains("Handoffs unlinked in other projects"));
+    assert!(
+        h.store
+            .reader
+            .find_session_scope(alice)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let purging = own_form.replace("preview-purge", "purge");
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.alice),
+            "POST",
+            "/manage/action",
+            &purging,
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.alice),
+            "POST",
+            "/manage/action",
+            &(purging + "&confirm=true"),
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::SEE_OTHER
+    );
+    assert!(
+        h.store
+            .reader
+            .find_session_scope(alice)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.store
+            .reader
+            .find_session_scope(bob)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let pending = browser(&h.store, "html-pending", UserRole::User, true).await;
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&pending),
+            "POST",
+            "/manage/action",
+            &format!("action=create-key&label=refused&csrf={}", pending.csrf),
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let key_form = format!(
+        "action=create-key&label=%3Cscript%3Eattack%3C%2Fscript%3E&csrf={}",
+        h.alice.csrf
+    );
+    let (status, secret) = html_request(
+        &h,
+        Some(&h.alice),
+        "POST",
+        "/manage/action",
+        &key_form,
+        origin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(secret.contains("issued-secret"));
+    let keys = html_request(&h, Some(&h.alice), "GET", "/manage/keys", "", origin, None).await;
+    assert_eq!(keys.0, StatusCode::OK);
+    assert!(keys.1.contains("&lt;script&gt;attack&lt;/script&gt;"));
+    assert!(!keys.1.contains("<script>attack</script>"));
+    let key = h
+        .store
+        .reader
+        .list_api_credentials_for_user(h.alice.user)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.bob),
+            "POST",
+            "/manage/action",
+            &format!(
+                "action=revoke-key&credential={}&csrf={}",
+                key.id, h.bob.csrf
+            ),
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        html_request(
+            &h,
+            Some(&h.alice),
+            "POST",
+            "/manage/action",
+            &format!(
+                "action=revoke-key&credential={}&csrf={}",
+                key.id, h.alice.csrf
+            ),
+            origin,
+            None
+        )
+        .await
+        .0,
+        StatusCode::SEE_OTHER
+    );
+}
+
+#[tokio::test]
+async fn management_html_login_rejects_cross_origin_forms_and_preserves_session_cookies() {
+    let h = harness().await;
+    let body = "action=login&username=alice&password=password-for-test";
+    for origin in ["https://evil.example", "null", ""] {
+        assert_eq!(
+            html_request(&h, None, "POST", "/manage/action", body, origin, None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/manage/action")
+                .header("host", "memory.example")
+                .header("origin", "https://memory.example")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/memory/manage/sessions");
+    assert!(
+        response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .any(|cookie| cookie.to_str().unwrap().starts_with("ai_memory_session="))
+    );
+    let page = html_request(
+        &h,
+        None,
+        "GET",
+        "/manage/login",
+        "",
+        "https://memory.example",
+        None,
+    )
+    .await;
+    assert_eq!(page.0, StatusCode::OK);
+    assert!(page.1.contains(r#"method="post""#));
+    assert!(!page.1.contains("fetch("));
 }

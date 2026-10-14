@@ -5,7 +5,7 @@
 ai-memory runs without an LLM: hooks still capture sessions, search uses
 FTS5 + declared entities + graph neighbors, and summaries fall back to
 rule-based output. Add an LLM provider
-when you want LLM consolidation (on PreCompact, on demand via
+when you want LLM consolidation (on PreCompact / PostCompaction, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
 Substantive session ends always write a rule-based summary page + handoff either
@@ -13,10 +13,17 @@ way. A session containing only `SessionStart` / `SessionEnd` boundaries is
 closed without a page, handoff, or provider job. When that empty session had
 accepted startup context, its session-bound handoff is returned to the open
 pool for the next receiver instead of being lost.
-When the session-end opt-in is enabled, provider work is durably queued after
-those deterministic writes and handled by one bounded server worker, so hook
-drain latency does not cancel it. Failed jobs retry with backoff and survive a
-server restart. A resumed native session is ended again only after its
+PreCompact / PostCompaction write a rule-based checkpoint on the hook request.
+Provider work for those checkpoints, and for opt-in SessionEnd, is durably
+queued after those deterministic writes and handled by one bounded server
+worker, so hook drain latency does not cancel it. The worker starts whenever a
+consolidator is configured; SessionEnd enqueue stays behind the opt-in flag.
+A checkpoint rewrite still queued when the session ends runs once anyway, even
+with the flag off. One already running when the session ends finishes after the
+SessionEnd summary and replaces it, so with the flag off the latest page can
+leave out the end of the session; the summary stays reachable as the superseded
+version. Every queued job runs as the session owner recorded at session start,
+not anonymously. Failed jobs retry with backoff and survive a server restart. A resumed native session is ended again only after its
 observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and
@@ -47,6 +54,7 @@ Recommended defaults:
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
+| `cursor` | `cursor-grok-4.6-high` | Cursor subscription via the logged-in `agent` CLI. Runs `agent --print --mode ask` (read-only). Does not pass `--yolo`. The default id is the one `agent --list-models` labels "Grok 4.6". |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
 | `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
@@ -73,6 +81,30 @@ export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
 export AI_MEMORY_LLM_REASONING_EFFORT=medium
 ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
 ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
+```
+
+`cursor` uses the Cursor Agent already logged in on this machine. Set
+`AI_MEMORY_LLM_PROVIDER=cursor`. The default model is `cursor-grok-4.6-high`
+("Grok 4.6" in `agent --list-models`); any other id from that list works.
+`AI_MEMORY_CURSOR_AGENT` overrides the binary. The provider writes the prompt
+into a temporary workspace and calls `agent --print --mode ask --trust`. It
+does not pass `--yolo` or `--force`: consolidation text is untrusted captured
+content, and those flags would allow tool execution. The Cursor CLI has no
+JSON-schema mode, so the schema travels in the prompt. The answer is parsed
+leniently (code fences and surrounding prose are stripped) and then
+deserialised into the expected type; nothing checks it against the schema
+itself, so a value that deserialises is accepted even if it breaks a constraint
+serde does not enforce. The `agent` process does not inherit the server's
+environment. It gets `PATH`, `HOME`, user and locale variables (`LANG`,
+`LC_*`), temp and XDG directories, `DBUS_SESSION_BUS_ADDRESS`, proxy and CA
+settings, the Windows process basics, and every `CURSOR_*` variable, so
+`AI_MEMORY_AUTH_TOKEN` and other providers' keys never reach it. The per-call
+workspace is created under the system temp directory captured at startup.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=cursor
+export AI_MEMORY_LLM_MODEL=cursor-grok-4.6-high
+ai-memory llm-test --provider cursor --model cursor-grok-4.6-high --prompt "Reply with OK"
 ```
 
 Codex credential storage mode `file` is supported. `auto` works only when its
@@ -349,6 +381,22 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
+> [!TIP]
+> **Thinking-capable local engines (vLLM / SGLang serving Qwen3-class
+> models).** Such engines spend the output budget on a reasoning pass before
+> the structured payload and can truncate the JSON mid-object
+> (`finish_reason = "length"`). Set
+> `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING=true` to send
+> `chat_template_kwargs: {"enable_thinking": false}` on every openai-compat
+> request so the engine spends the budget on the payload instead. The knob is
+> opt-in, openai-compat only, and off by default: existing vLLM / Ollama /
+> LM Studio setups are unchanged unless it is set, and every other provider
+> ignores it. When the engine still truncates a structured response, or
+> returns HTTP 2xx with an empty `message.content`, the call fails fast
+> with the terminal errors `truncated-response` / `empty-content`. There is
+> no retry and no second HTTP call, and the error text carries no response
+> content.
+
 For small-context local models, configure both consolidation limits. The input
 target accounts for the complete rendered prompt, including bounded slot and
 current-page context plus the structured-output schema; the output limit is
@@ -357,7 +405,7 @@ headroom because provider tokenizers differ:
 
 ```toml
 [consolidation]
-max_input_tokens = 6500
+max_input_tokens = 10000
 max_output_tokens = 1000
 ```
 
@@ -366,7 +414,9 @@ The equivalent environment variables are
 `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`. Provider failures during an
 automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
 rule-based page; admission, storage, and scope errors still fail closed. The
-validated minimums are 6,500 input and 1,000 output tokens.
+validated minimums are 8,350 input and 1,000 output tokens at the default
+`input_token_safety_margin` of 0.8; a lower margin shrinks the character budget
+and needs a proportionally larger input target.
 
 Every chat provider bounds each completion request at 300 seconds
 (`AI_MEMORY_LLM_TIMEOUT_SECS` to override, or `llm_timeout_secs = 900` in

@@ -527,6 +527,62 @@ pub fn agent_from_payload(raw: &serde_json::Value) -> Option<AgentKind> {
     extract_string(raw, &["cursor_version"]).map(|_| AgentKind::Cursor)
 }
 
+/// Session and checkout fields extracted from the canonical hook payload shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookPayloadContext {
+    /// Harness-native session identity.
+    pub session_id: Option<String>,
+    /// Current checkout directory.
+    pub cwd: Option<String>,
+}
+
+/// Extract the session and checkout exactly as [`HookEnvelope`] does.
+#[must_use]
+pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
+    let session_id = extract_string(
+        raw,
+        &[
+            "session_id",
+            "sessionId",
+            "sessionID",
+            "session",
+            "conversationId",
+        ],
+    )
+    .or_else(|| {
+        extract_string_path(
+            raw,
+            &[
+                &["info", "id"],
+                &["properties", "sessionID"],
+                &["properties", "info", "id"],
+                &["event", "properties", "sessionID"],
+                &["event", "properties", "info", "id"],
+                &["payload", "info", "id"],
+                &["payload", "properties", "sessionID"],
+                &["payload", "properties", "info", "id"],
+            ],
+        )
+    });
+    let cwd = extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"])
+        .or_else(|| extract_first_string_array_item(raw, &["workspacePaths", "workspace_roots"]))
+        .or_else(|| {
+            extract_string_path(
+                raw,
+                &[
+                    &["path", "cwd"],
+                    &["info", "directory"],
+                    &["properties", "info", "directory"],
+                    &["event", "properties", "info", "directory"],
+                    &["payload", "path", "cwd"],
+                    &["payload", "info", "directory"],
+                    &["payload", "properties", "info", "directory"],
+                ],
+            )
+        });
+    HookPayloadContext { session_id, cwd }
+}
+
 impl HookEnvelope {
     /// Build an envelope from the parsed query + the body JSON. Performs
     /// best-effort extraction of `session_id` / `cwd` / a body excerpt
@@ -537,66 +593,14 @@ impl HookEnvelope {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
-        // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
-        // tool.execute.*/session.* events; Claude Code and native Codex use
-        // `session_id`, older Codex bridges `sessionId`, and Antigravity CLI
-        // uses `conversationId`.
-        // JSON keys are case-sensitive, so all spellings must be listed
-        // or tool events fail the router's "missing session_id" check.
-        let body_session_id = extract_string(
-            &raw,
-            &[
-                "session_id",
-                "sessionId",
-                "sessionID",
-                "session",
-                "conversationId",
-            ],
-        )
-        .or_else(|| {
-            extract_string_path(
-                &raw,
-                &[
-                    &["info", "id"],
-                    &["properties", "sessionID"],
-                    &["properties", "info", "id"],
-                    &["event", "properties", "sessionID"],
-                    &["event", "properties", "info", "id"],
-                    &["payload", "info", "id"],
-                    &["payload", "properties", "sessionID"],
-                    &["payload", "properties", "info", "id"],
-                ],
-            )
-        });
-        let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
-        // Cursor spells the workspace directory `workspace_roots` (an array,
-        // normally one entry; multi-root workspaces carry several) and never
-        // sends a usable top-level `cwd`: its `sessionStart` / `sessionEnd`
-        // payloads omit `cwd` entirely, and its tool events send `cwd: ""`.
-        // Without this spelling every Cursor session resolved to no cwd at all
-        // and landed in the server-default `default/scratch` bucket.
-        let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
-            .or_else(|| {
-                extract_first_string_array_item(&raw, &["workspacePaths", "workspace_roots"])
-            })
-            .or_else(|| {
-                extract_string_path(
-                    &raw,
-                    &[
-                        &["path", "cwd"],
-                        &["info", "directory"],
-                        &["properties", "info", "directory"],
-                        &["event", "properties", "info", "directory"],
-                        &["payload", "path", "cwd"],
-                        &["payload", "info", "directory"],
-                        &["payload", "properties", "info", "directory"],
-                    ],
-                )
-            });
+        let context = hook_payload_context(&raw);
+        let session_id = context
+            .session_id
+            .or_else(|| query.session_id.filter(|s| !s.is_empty()));
         // Body cwd wins over the query-string fallback: the body is
         // what agent CLIs natively send, so any query-string `cwd` is
         // a bridge / test override that should defer to live data.
-        let cwd = body_cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
+        let cwd = context.cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
@@ -827,6 +831,8 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Zcode
             | AgentKind::CopilotCli
             | AgentKind::Grizzybot
+            | AgentKind::Droid
+            | AgentKind::Muse
     )
 }
 
@@ -951,6 +957,16 @@ fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option
         args,
         &["ReplacementContent", "CodeContent", "ReplacementChunks"],
     )
+}
+
+/// The tool a tool event names, under the keys the observation title uses.
+pub(crate) fn event_tool_name(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool", "tool_name", "name"])
+}
+
+/// The tool-use id a tool event carries (Claude-family payloads).
+pub(crate) fn event_tool_use_id(raw: &serde_json::Value) -> Option<String> {
+    extract_string(raw, &["tool_use_id"])
 }
 
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -1162,6 +1178,12 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
         }
         HookEvent::Notification => extract_content(raw, &["message", "text"]),
         HookEvent::PostCompaction => extract_content(raw, &["summary"]),
+        // Why the session ended (#1225): a string only, first line only, so
+        // consolidation and the zero-LLM page can tell a normal quit from
+        // anything else.
+        HookEvent::SessionEnd => extract_string(raw, &["reason"])
+            .and_then(first_line)
+            .map(|reason| format!("reason: {reason}")),
         _ => None,
     }
 }
@@ -2443,6 +2465,86 @@ mod tests {
         assert_eq!(env.cwd.as_deref(), Some("/bot/home"));
     }
 
+    /// Factory Droid's PostToolUse is Claude-shaped with no tool-call id
+    /// (0.240.0 tool schemas, #1240): a `Create` is a closed `file` family and
+    /// its `tool_response` is the captured output.
+    #[test]
+    fn droid_create_post_tool_use_is_a_closed_file_family_without_call_id() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "permission_mode": "auto-low",
+            "tool_name": "Create",
+            "tool_input": {"file_path": "/repo/notes.md", "content": "hello"},
+            "tool_response": {"filePath": "/repo/notes.md", "success": true},
+            "session_id": "droid-session",
+            "transcript_path": "/home/u/.factory/sessions/x.jsonl",
+            "cwd": "/repo"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("droid".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Droid);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("droid-session"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(!body.contains("tool_call_id"), "{body}");
+        assert!(body.contains("/repo/notes.md"), "{body}");
+    }
+
+    /// Meta Muse Code's PostToolUse and PostToolUseFailure, as captured
+    /// offline from Muse Code 1.4.7 (paths rewritten): a `write_file` is a
+    /// closed `file` family that keeps its `tool_use_id`, the session id is
+    /// the payload's UUIDv7, and a failure aliases to `post-tool-use`.
+    #[test]
+    fn muse_post_tool_use_is_a_closed_file_family_with_call_id() {
+        let raw = serde_json::json!({
+            "cwd": "/repo",
+            "hook_event_name": "PostToolUse",
+            "model": "muse-wonder-1.0",
+            "model_provider": "meta",
+            "permission_mode": "bypassPermissions",
+            "session_id": "01a13669-dc61-7a72-b5ec-ad2f300ffd26",
+            "tool_input": {"content": "alpha\n", "path": "notes.txt"},
+            "tool_name": "write_file",
+            "tool_response": {
+                "filePath": "/repo/notes.txt",
+                "structuredPatch": [{"lines": ["+alpha"], "newLines": 1, "newStart": 1, "oldLines": 0, "oldStart": 1}]
+            },
+            "tool_use_id": "call_30a33793ad9c",
+            "transcript_path": null,
+            "turn_id": "ccfe4a87-c654-49f5-b5e9-473015c7a90b"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("muse".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Muse);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("01a13669-dc61-7a72-b5ec-ad2f300ffd26")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("call_30a33793ad9c"), "{body}");
+
+        assert_eq!(
+            HookEvent::parse("PostToolUseFailure"),
+            HookEvent::PostToolUse
+        );
+    }
+
     /// Body is well-formed JSON but the expected `session_id` /
     /// `cwd` keys are missing — extraction returns None per key.
     #[test]
@@ -2497,6 +2599,31 @@ mod tests {
         };
         let env = HookEnvelope::from_query_and_body(q, serde_json::json!({}));
         assert_eq!(env.agent, AgentKind::Other);
+    }
+
+    /// #1225: a SessionEnd's `reason` becomes the observation body (first
+    /// line, string only), so why a session ended survives capture. An
+    /// absent, empty or non-string reason leaves the body empty as before.
+    #[test]
+    fn session_end_reason_becomes_the_observation_body() {
+        let q = HookQuery {
+            event: "session-end".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let body = |raw| HookEnvelope::from_query_and_body(q.clone(), raw).body_excerpt;
+        assert_eq!(
+            body(serde_json::json!({ "reason": "prompt_input_exit" })).as_deref(),
+            Some("reason: prompt_input_exit")
+        );
+        assert_eq!(
+            body(serde_json::json!({ "reason": "logout\ninjected second line" })).as_deref(),
+            Some("reason: logout")
+        );
+        assert_eq!(body(serde_json::json!({})), None);
+        assert_eq!(body(serde_json::json!({ "reason": "" })), None);
+        assert_eq!(body(serde_json::json!({ "reason": 7 })), None);
+        assert_eq!(body(serde_json::json!({ "reason": { "kind": "x" } })), None);
     }
 
     /// Title-hint extraction must truncate at the first newline (the

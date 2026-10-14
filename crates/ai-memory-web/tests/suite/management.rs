@@ -7,17 +7,18 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn management_assets_work_under_a_prefix_and_deny_framing() {
-    let router = axum::Router::new().nest("/memory", ai_memory_web::management::router("/memory"));
+    let router = axum::Router::new().nest(
+        "/memory",
+        ai_memory_web::management::router("/memory", axum::Router::new()),
+    );
     for uri in [
-        "/memory/manage",
-        "/memory/manage/",
-        "/memory/manage/assets/app.js",
-        "/memory/manage/assets/app.css",
-        "/memory/manage/assets/logo.webp",
-        "/memory/manage/assets/instrument-sans-latin-wdth-normal.woff2",
-        "/memory/manage/assets/bricolage-grotesque-latin-standard-normal.woff2",
-        "/memory/manage/assets/commit-mono-latin-400-normal.woff2",
-        "/memory/manage/assets/font-licenses.txt",
+        "/memory/manage/login",
+        "/memory/manage/static/tailwind.css",
+        "/memory/manage/static/logo.png",
+        "/memory/manage/static/instrument-sans-latin-wdth-normal.woff2",
+        "/memory/manage/static/bricolage-grotesque-latin-standard-normal.woff2",
+        "/memory/manage/static/commit-mono-latin-400-normal.woff2",
+        "/memory/manage/static/font-licenses.txt",
     ] {
         let response = router
             .clone()
@@ -36,19 +37,20 @@ async fn management_assets_work_under_a_prefix_and_deny_framing() {
         let bytes = axum::body::to_bytes(response.into_body(), 400_000)
             .await
             .unwrap();
-        if uri.ends_with("manage") {
+        if uri.ends_with("login") {
             let html = String::from_utf8(bytes.to_vec()).unwrap();
-            assert!(html.contains("<base href=\"/memory/manage/\">"));
-            assert!(html.contains("content=\"/memory\""));
+            assert!(html.contains("action=\"/memory/manage/action\""));
+            assert!(html.contains("method=\"post\""));
             assert!(!html.contains("aim_"));
         }
     }
     // Only explicit vendored assets exist; no filesystem-backed wildcard.
     for uri in [
-        "/memory/manage/assets/config.toml",
-        "/memory/manage/assets/fonts.txt",
-        "/memory/manage/assets/%2e%2e%2fconfig.toml",
-        "/memory/manage/assets/../../db/memory.sqlite",
+        "/memory/manage/static/app.js",
+        "/memory/manage/static/config.toml",
+        "/memory/manage/static/fonts.txt",
+        "/memory/manage/static/%2e%2e%2fconfig.toml",
+        "/memory/manage/static/../../db/memory.sqlite",
     ] {
         let response = router
             .clone()

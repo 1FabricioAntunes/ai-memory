@@ -431,6 +431,18 @@ pub fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
     hook_scope_from_selection(cwd, default_strategy, routing_selection(cwd).ok().flatten())
 }
 
+/// [`hook_scope`] resolved against `home` instead of the operator's home
+/// directory, so tests can keep a developer's `~/.ai-memory.toml` out.
+#[cfg(test)]
+pub(crate) fn hook_scope_with_home(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> HookScope {
+    let selection = crate::marker::routing_selection_with_home(cwd, cwd, home, false);
+    hook_scope_from_selection(cwd, default_strategy, selection.ok().flatten())
+}
+
 pub(crate) fn inspect_repository_coordinate(
     identity_cwd: &str,
     marker: &crate::marker::MarkerInspection,
@@ -840,6 +852,13 @@ pub async fn post_hook(
 /// edge auth hop over the whole batch instead of paying it per event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOutcome {
+    /// Modern server returned one terminal result for each acknowledged item.
+    Detailed {
+        /// Per-item processing outcomes in request order.
+        outcomes: Vec<String>,
+        /// Item that failed after any earlier acknowledged items.
+        failed_index: Option<usize>,
+    },
     /// Server committed the leading `usize` items (contiguous prefix, oldest
     /// first). Equals the request length on full success; a smaller value means
     /// the server stopped on that item (fail-fast) — the caller deletes the
@@ -905,7 +924,12 @@ pub async fn post_batch(
             if status.is_success() {
                 match resp.json::<serde_json::Value>().await {
                     Ok(v) => {
-                        if let Some(indices) = accepted_indices(&v) {
+                        if let Some(outcomes) = batch_outcomes(&v) {
+                            BatchOutcome::Detailed {
+                                outcomes,
+                                failed_index: failed_index(&v),
+                            }
+                        } else if let Some(indices) = accepted_indices(&v) {
                             BatchOutcome::AcceptedIndices {
                                 indices,
                                 failed_index: failed_index(&v),
@@ -946,6 +970,18 @@ pub async fn post_batch(
         }
         Err(_) => BatchOutcome::Unreachable,
     }
+}
+
+fn batch_outcomes(v: &serde_json::Value) -> Option<Vec<String>> {
+    let results = v.get("results")?.as_array()?;
+    let mut outcomes = Vec::with_capacity(results.len());
+    for (position, result) in results.iter().enumerate() {
+        if result.get("index")?.as_u64()? as usize != position {
+            return None;
+        }
+        outcomes.push(result.get("outcome")?.as_str()?.to_owned());
+    }
+    Some(outcomes)
 }
 
 fn failed_index(v: &serde_json::Value) -> Option<usize> {
@@ -1015,6 +1051,32 @@ pub async fn get_handoff(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Shadows [`super::marker_query_suffix`] for every test in this module,
+    /// resolving against an empty operator home: the real one reads
+    /// `home_dir()`, and a developer's own `~/.ai-memory.toml` applies to
+    /// every cwd, so it would leak into the assertions. Tests that exercise a
+    /// home marker pass one to `routing_selection_with_home` themselves.
+    fn marker_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
+        let home = tempfile::TempDir::new().unwrap();
+        match super::super::super::marker::routing_selection_with_home(
+            cwd,
+            cwd,
+            Some(home.path()),
+            false,
+        ) {
+            Ok(selection) => {
+                marker_query_suffix_impl_from_selection(cwd, default_strategy, true, selection)
+            }
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Shadows [`super::hook_scope`] the same way, for the same reason.
+    fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
+        let home = tempfile::TempDir::new().unwrap();
+        hook_scope_with_home(cwd, default_strategy, Some(home.path()))
+    }
 
     async fn serve_once(status: &'static str, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

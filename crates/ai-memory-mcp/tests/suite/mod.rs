@@ -8,6 +8,7 @@ mod access_reinforcement;
 mod admin_audit_log;
 mod admin_backup;
 mod admin_bootstrap;
+mod admin_metrics;
 mod admin_move;
 mod admin_move_session;
 mod admin_pending_writes_session;
@@ -30,6 +31,7 @@ mod handoff_admission;
 mod handoff_identity;
 mod mcp_stateless_http;
 mod query_answer;
+mod query_observation_stream;
 mod query_pin_first;
 mod query_reasoning;
 mod query_superseded;
@@ -40,3 +42,4 @@ mod stress_autoscope;
 
 #[cfg(feature = "management-ui")]
 mod management;
+mod web_search_parity;

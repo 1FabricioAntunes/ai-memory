@@ -2,9 +2,25 @@
 
 > The full security model. Moved from the README front page; the README keeps a summary.
 
-Loopback-only (`127.0.0.1:49374`) with no auth is the default because
-it is safe for a single-user laptop: no process outside the machine can
-reach the server.
+A new install requires a bearer token. `ai-memory init` on a fresh data
+dir writes a random root bearer to `<data_dir>/auth-tokens/default` (owner
+only) and records `[auth].bearer_token_file`; the server then refuses every
+route except `/healthz` without it. The hooks, the CLI and the
+`ai-memory mcp-bridge` stdio bridge read it from the data dir, so the token is
+never pasted into a harness config or passed on a command line. Claude Code
+and Meta Muse Code run the session-aware bridge, Codex, Prime Agent and Factory Droid reference
+the token as `$AI_MEMORY_AUTH_TOKEN`, and every other MCP client `install-mcp` supports
+runs `ai-memory mcp-bridge --no-session-id` as a local stdio server. ZCode,
+which takes only HTTP entries, is the exception and needs a manual entry.
+
+An install created before this default keeps its loopback-only
+(`127.0.0.1:49374`), no-auth behaviour. That stays safe from the network, but
+every local process and browser page can reach the server. `ai-memory status`
+and `ai-memory doctor` show `auth: none (loopback)` with the fix,
+`ai-memory auth enable`, which mints the token, records it in config, gives
+the hooks the token and re-registers every MCP client that points at this
+server. Restart
+the server afterwards.
 
 Unauthenticated non-loopback HTTP now fails closed. Set
 `AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
@@ -106,6 +122,14 @@ Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
 second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to
 bound one runaway session without blocking unrelated hook sources. Unset or `0`
 rate leaves the limiter disabled.
+
+To stop the server from storing particular tool calls whatever the client
+sends, list them in `[ingest]`: `drop_tool_use_id_prefixes` (for example
+`["toolu_plugin_"]`, the id prefix Claude Code gives plugin tool calls) and
+`drop_tool_names` (exact names). The id and name are read from each
+harness's own fields, such as OpenCode's `callID`. A matching PreToolUse or
+PostToolUse event is acknowledged and discarded before it is sanitized,
+rate-limited or stored. The lists apply to every project on the server.
 
 For shared servers where each developer should authenticate their own hook
 writes, native Claude Code hooks can use a stored OIDC device token instead of

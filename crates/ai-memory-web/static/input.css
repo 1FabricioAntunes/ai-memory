@@ -1,3 +1,24 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Management palette mirrors the public website. Both themes share one definition. */
+@font-face { font-family: "Management Sans"; src: url("instrument-sans-latin-wdth-normal.woff2") format("woff2"); font-weight: 400 700; font-display: swap; }
+@font-face { font-family: "Management Display"; src: url("bricolage-grotesque-latin-standard-normal.woff2") format("woff2"); font-weight: 200 800; font-display: swap; }
+@font-face { font-family: "Management Mono"; src: url("commit-mono-latin-400-normal.woff2") format("woff2"); font-display: swap; }
+:root:has(.management) { color-scheme: light; }
+:root[data-theme="dark"]:has(.management) { color-scheme: dark; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]):has(.management) { color-scheme: dark; } }
+.management { --mg-bg: light-dark(oklch(98.5% .006 285),oklch(15.5% .035 282)); --mg-surface: light-dark(white,oklch(20% .04 282)); --mg-text: light-dark(oklch(21% .045 282),oklch(95.5% .012 285)); --mg-muted: light-dark(oklch(45% .035 282),oklch(74% .03 285)); --mg-line: light-dark(oklch(88.5% .02 285),oklch(33% .045 282)); color: var(--mg-text); background: radial-gradient(ellipse at 80% 0%,oklch(78% .13 195 / .13),transparent 50%),var(--mg-bg); font-family: "Management Sans",system-ui,sans-serif; font-size: 17px; }
+.management-header { background: var(--mg-surface); border-color: var(--mg-line); }
+.management h1,.management h2,.management-brand strong { font-family: "Management Display",system-ui,sans-serif; font-weight: 650; letter-spacing: -.035em; }
+.management h1 { font-size: 2rem; margin-bottom: .6rem; } .management h2 { font-size: 1.25rem; }
+.management-brand strong { font-size: 1.5rem; } .management-muted { color: var(--mg-muted); } .management-mono { font-family: "Management Mono",monospace; }
+.management-panel { padding: 1.5rem; border: 1px solid var(--mg-line); border-radius: 1.25rem; background: var(--mg-surface); box-shadow: 0 12px 32px -12px oklch(21% .045 282 / .1); }
+.management button,.management-button { display: inline-block; padding: .6rem 1rem; border: 1px solid var(--mg-line); border-radius: 999px; background: var(--mg-surface); font-size: .875rem; font-weight: 600; cursor: pointer; }
+.management .management-primary { background: oklch(81% .16 75); color: oklch(20% .05 60); border-color: transparent; } .management-danger { color: light-dark(oklch(47% .17 355),oklch(83% .1 355)); }
+.management label { display: block; font-size: .875rem; } .management input:not([type="hidden"]):not([type="checkbox"]),.management select { display: block; width: 100%; margin-top: .4rem; padding: .65rem .75rem; border: 1px solid var(--mg-line); border-radius: .75rem; background: var(--mg-surface); }
+.management input:focus-visible,.management button:focus-visible,.management a:focus-visible,.management select:focus-visible { outline: 2px solid light-dark(oklch(47% .09 205),oklch(83% .11 205)); outline-offset: 3px; }
+.management td,.management th { padding: 1rem .75rem; border-bottom: 1px solid var(--mg-line); }
+.management-themes { display: flex; gap: .25rem; padding: .25rem; border: 1px solid var(--mg-line); border-radius: 999px; }
+.management-themes button { border-color: transparent; color: var(--mg-muted); padding: .35rem .75rem; font-size: .75rem; } .management-themes button[aria-pressed="true"] { border-color: var(--mg-line); color: var(--mg-text); }

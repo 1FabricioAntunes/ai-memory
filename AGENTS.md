@@ -78,7 +78,7 @@ install or refresh work.
 If you're about to write a durable project rule ("always X", "never
 Y", "all PRs must ..."), write it in the project's canonical agent instruction file.
 Many projects use CLAUDE.md for Claude Code and
-AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
+AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
 Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
@@ -100,7 +100,7 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
+  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code / Copilot CLI / Muse Code -> `AGENTS.md`),
   uses its Write / Edit tool to replace or append the returned
   `markered_block` while preserving
   non-ai-memory user content, then writes or updates each returned
@@ -143,13 +143,15 @@ Core design:
   compiles session observations into durable wiki pages (Karpathy-style
   "compile, not retrieve").
 - **Retrieval** is FTS5 + lexical entity-match + link-neighbor RRF, with
-  optional vector RRF when an embedding provider is configured, plus bounded
+  optional vector RRF when an embedding provider is configured, an
+  observation-evidence stream over `observations_fts` that votes for session
+  pages (on by default, `[retrieval] observation_stream`), plus bounded
   raw-observation fallback.
 - **LLM is opt-in.** Zero-LLM mode still captures, searches (FTS5), and
   writes rule-based summaries. Providers (Anthropic, Anthropic OAuth,
   OpenAI, OpenAI/Codex OAuth, GitHub Copilot, Gemini, OpenCode,
-  OpenAI-compatible endpoints) enable
-  consolidation, lint, and the auto-improvement loop.
+  OpenAI-compatible endpoints, Cursor Agent CLI) enable consolidation, lint,
+  and the auto-improvement loop.
 - **Per-project isolation by construction**: every row and page is keyed
   by `(workspace_id, project_id, path)`, resolved from the caller's cwd,
   a `.ai-memory.toml` marker file, or explicit scope arguments.
@@ -203,16 +205,25 @@ crates/
 ├── ai-memory-test-support/ shared test helpers (dev-dependency only, no test binary).
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 evals/                     live A/B harness; workspace member, not shipped.
-companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
+companions/ai-memory-importer/  standalone OMC, external-conversation and agentmemory importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
 companions/ai-memory-client/    capture-privacy helpers shared by relay + importer; own workspace.
 companions/ai-memory-relay/     durable external-lifecycle event relay (POST /hook/batch); own workspace.
+companions/ai-memory-wikisync/  team-wiki git sync through the public MCP tools; own workspace.
 companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace member —
                            `swift test --package-path companions/ai-memory-macos`
                            and `./companions/ai-memory-macos/build.sh`.
+companions/ai-memory-ts/        optional TypeScript client SDK (npm, Node 22+); NOT a workspace
+                           member and never shipped with the server.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
+plugins/                   generated Claude Code + Codex marketplace plugins (catalogs in
+                           `.claude-plugin/`, `.agents/plugins/`); edit the templates in
+                           `crates/ai-memory-cli/templates/plugin/` and re-run
+                           `ai-memory render-plugins --out .` — a test fails on drift.
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
+install.sh                 two-command native install, step one (release asset).
+INSTALL_FOR_AGENTS.md      how an AI agent installs ai-memory for its user.
 docker/                    Dockerfile, compose files, TLS proxy templates.
 packaging/                 AUR/RPM/systemd/launchd/sysusers/tmpfiles/env native packaging assets.
 nix/, flake.nix            Nix package + NixOS module.
@@ -285,15 +296,14 @@ covers the same tests, slower, no tiers.
   ai-memory-web` downloads the pinned Tailwind CLI and rewrites
   `static/tailwind.css`; commit the result. CI regenerates it on Linux and
   fails if the committed file is stale, so nothing else needs the download.
-- **Management console.** When changing its frontend or management routes,
-  follow [`docs/management-ui.md`](docs/management-ui.md) for feature-enabled
-  Rust, frontend, and Chromium checks. Regenerate and commit
-  `crates/ai-memory-web/management-ui/dist/` with frontend source changes;
-  Cargo embeds these artifacts so ordinary builds remain self-contained.
+- **Management console.** Its askama templates and plain POST form adapters
+  live in `ai-memory-web`. Follow [`docs/management-ui.md`](docs/management-ui.md)
+  for feature-enabled checks. Regenerate the vendored Tailwind stylesheet
+  when changing templates or styles; no JavaScript toolchain is needed.
 - Run each Cargo companion separately (`ai-memory-client`,
-  `ai-memory-importer`, `ai-memory-relay`, and on `release/2.7`
-  `ai-memory-wikisync`): `cargo fmt --check`, `cargo clippy --locked
-  --all-targets -- -D warnings` and `cargo test --locked`, each with
+  `ai-memory-importer`, `ai-memory-relay` and `ai-memory-wikisync`):
+  `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
+  and `cargo test --locked`, each with
   `--manifest-path companions/<name>/Cargo.toml`. CI also builds the relay
   and runs `uv run --no-project python tests/e2e/external_relay_smoke.py`
   against the real server. Root `--workspace` commands cover none of them.
@@ -301,13 +311,26 @@ covers the same tests, slower, no tiers.
   `swift test --package-path companions/ai-memory-macos`
   (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
   Root `--workspace` commands do not cover it.
+- Run the TypeScript SDK separately, from `companions/ai-memory-ts`:
+  `npm ci --ignore-scripts`, `npm run check` (typecheck, unit tests, schema
+  and generated-docs checks, TypeDoc) and
+  `AI_MEMORY_BIN=../../target/debug/ai-memory npm run test:integration`
+  (real server, schema drift test, examples). npm tooling and its lockfile
+  stay inside that directory; nothing in the core workspace or the server
+  distribution depends on Node.
 
 ### Platform notes
 
 - **All.** `target/` grows without bound: every edit to a shared crate leaves
   the previous copy of each 100-180 MB test binary behind (seen at 157 GiB).
-  `cargo install cargo-sweep --locked` once, then `cargo sweep --time 7`
-  weekly. Give rust-analyzer its own target dir
+  Run `cargo clean` in the checkout you build in when it grows (weekly is
+  plenty; the next build takes a few minutes). For stale worktrees and extra
+  `CARGO_TARGET_DIR`s, `cargo install cargo-clean-all --locked` once, then
+  `cargo clean-all --keep-days 7 <dir>` lists every target directory under
+  `<dir>` not built in the last week and deletes them after you confirm. It
+  removes whole target directories, so it never trims the one you are
+  actively building. (`cargo-sweep`, which this note used to recommend, is
+  unmaintained.) Give rust-analyzer its own target dir
   (`rust-analyzer.cargo.targetDir = true`) so a save-triggered check never
   holds the lock a `cargo t` is waiting on.
 - **macOS.** `SSL_CERT_FILE=/etc/ssl/cert.pem cargo t` stops reqwest
@@ -332,9 +355,11 @@ covers the same tests, slower, no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
+  `tests/hooks/test_plugin_launcher.sh`, `tests/install_sh.sh`,
   `tests/e2e/handoff_smoke.sh`, `tests/wrapper_upgrade.sh`,
   `tests/e2e/external_relay_smoke.py`, `scripts/check-native-packaging.sh`,
   `scripts/check-nix-packaging.sh` (Nix flake output),
+  `scripts/onboarding-acceptance.sh` (clean home to first returned memory),
   `scripts/check-changelog-sections.sh` and
   `scripts/check-changelog-frozen.sh origin/<base>`.
 - `.github/workflows/macos-app.yml` builds and tests the Swift companion on
@@ -378,6 +403,17 @@ covers the same tests, slower, no tiers.
 - Typed boundaries are load-bearing: IDs, `PagePath`, `AgentKind`,
   sanitization, workspace/project resolution, auth capability, and
   provider dialects are parsed/normalized once and reused.
+- **The core stays Rust-only.** The root workspace and everything the server
+  ships (the binary, its built-in `/web` UI, Docker, native packages) build
+  with Cargo alone: no Node, npm, bundler or JavaScript framework, and no
+  build step outside Cargo (the vendored Tailwind CLI is the one pinned
+  exception, run only to regenerate `static/tailwind.css`). The web UI is
+  server-rendered from askama templates; a page may carry a small inline
+  vanilla script for progressive enhancement, never a framework. A UI or
+  console that needs a JavaScript toolchain belongs in a companion, and
+  another language appears only where its target ecosystem requires it
+  (a TypeScript client SDK, the Swift macOS app, the TS plugins generated for
+  JS-based harnesses), always under `companions/` or as generated output.
 - Keep CLI commands thin: parse args, resolve config once, call typed
   library functions, render output. Provider-specific behavior belongs in
   `ai-memory-llm`, not in CLI/admin handlers.
@@ -524,8 +560,10 @@ Additional boundary rules:
 
 ## Security considerations
 
-- **Default posture:** loopback-only bind (`127.0.0.1:49374`), no auth —
-  safe for a single-user machine. Any non-loopback bind should set a
+- **Default posture:** loopback-only bind (`127.0.0.1:49374`). A fresh
+  `ai-memory init` mints a root bearer into `<data_dir>/auth-tokens/default`
+  (`[auth].bearer_token_file`); an install created before that keeps no
+  auth until `ai-memory auth enable`. Any non-loopback bind should set a
   bearer token (`AI_MEMORY_AUTH_TOKEN`) and `AI_MEMORY_ALLOWED_HOSTS`
   (DNS-rebinding guard). TLS is deliberately delegated to a reverse
   proxy (see `docs/https-via-proxy.md`).
@@ -564,6 +602,10 @@ Additional boundary rules:
   test-only churn are exempt. CI rejects a duplicated heading
   (`scripts/check-changelog-sections.sh`) and any edit to an already
   released section (`scripts/check-changelog-frozen.sh`).
+  `CHANGELOG.md` holds the current major line; when a new major ships,
+  `bin/release` moves the previous major's sections and compare links to
+  `docs/changelog/<major>.x.md` (`scripts/changelog_sections.py archive`).
+  Archived sections stay frozen, and the frozen check reads both places.
 - **Run the humanizer on new or heavily edited prose.** New documentation,
   and any large rewrite of existing text (a new doc section, a rewritten guide,
   a long CHANGELOG entry, an RFC or design note), goes through the `humanizer`
@@ -608,6 +650,34 @@ Additional boundary rules:
   wrong hash makes `brew install` fail for everyone. This is a mandatory,
   recurring post-release step (it has been forgotten repeatedly); do not rely
   on a contributor PR to the tap to remember it.
+- **A release that touches retrieval re-runs the retrieval benchmark once,
+  on the final release candidate, and compares it with the previous
+  release.** The full run takes hours, so it is never run speculatively:
+  - *Only when needed.* First diff the range against the last tag for
+    retrieval code (store reader and ranking, the hook capture to
+    observation path, consolidation output that pages are built from,
+    embeddings, the `evals/` harness). When nothing there changed, carry the
+    previous published numbers forward and say so in the release notes,
+    with that diff as the evidence.
+  - *Once, after code freeze.* Run it a single time on the final
+    release-candidate tree, after the last code change including audit
+    fixes; later docs-only or version-only commits do not invalidate it.
+    Never run it on intermediate branches or pull request heads.
+  - *What to run and compare.* The LongMemEval-S harness (`evals/`, see
+    `docs/benchmarks/README.md`) on the full 470-question set for zero-LLM
+    FTS and for the default local embeddings, with the same flags as the last
+    published run. Diff every slice, not only the overall number, against the
+    previous release's published report for accuracy (`hit@k`, `recall@k`),
+    latency (query p50/p95), context tokens (raw and top-five) and ingest
+    throughput, and say for each material change whether it is a deliberate
+    trade the CHANGELOG states or a possible regression. Run-to-run noise is
+    about ±0.005 overall and ±0.02–0.03 on small slices.
+  - *A drop does not block the release.* Publish the honest numbers in
+    `docs/benchmarks/`, keep `docs/comparison.md` and
+    `docs/competitive-parity.md` in step, and open an issue for the next
+    release with the slice deltas, run dirs and suspected commits, to decide
+    there whether it is a regression, noise or a warranted trade. A release
+    that touches retrieval should still aim to improve these numbers.
 - **Reclaim build storage after every release — run `cargo clean`.** The
   multi-worktree, multi-target-dir release flow (integration worktrees, per-agent
   worktrees, separate `CARGO_TARGET_DIR`s) leaves many stale 100–180 MB test
@@ -616,7 +686,8 @@ Additional boundary rules:
   `cargo clean` (and `cargo clean` in each release worktree / extra target dir
   you created, then remove finished `git worktree`s). This is a mandatory
   post-release cleanup step, not optional housekeeping — treat it like the tap
-  bump above. During normal development, `cargo sweep --time 7` weekly is the
+  bump above. During normal development, the weekly `cargo clean` and
+  `cargo clean-all --keep-days 7` described under Platform notes are the
   lighter-touch equivalent.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.
@@ -634,7 +705,13 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 23 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 23 (see `docs/ARCHITECTURE.md`). They also
+  update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
+  the schema snapshot (`npm run schema:update`), the wrapper or its
+  classification in `src/coverage.ts`, types, tests and docs. The SDK's
+  schema drift test in CI fails until they do. Changes to the `/api/v1`
+  routes the SDK wraps follow the same rule, enforced by its integration
+  tests.
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys, a new agent harness or LLM
   provider); major = breaking (on-disk format without migration, removed
@@ -647,8 +724,9 @@ Additional boundary rules:
   and version milestones.
 - **Branch model.** `main` is the patch line: it takes fixes and docs only
   (`[Unreleased]` holds only `### Fixed`), and patch tags are cut from it.
-  Additive work targets the standing `release/X.Y` branch for the next minor
-  (currently `release/2.7`). Keep `main` an ancestor of it by forward-merging
+  Additive work targets the standing `release/X.Y` branch for the next
+  minor or major (currently `release/3.1`; 3.0.0 shipped from `main`). Keep `main` an
+  ancestor of it by forward-merging
   `main` into it after every fix lands, never the reverse; when a patch
   release ships, rebuild the branch's `[Unreleased]` as only its own entries
   so released sections stay identical to `main`'s. A fix lands on `main`
