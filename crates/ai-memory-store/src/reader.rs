@@ -3850,7 +3850,8 @@ impl ReaderPool {
     /// `since_us` is an inclusive lower bound on `started_at`; `None` counts
     /// the project's whole history. The scan rides
     /// `idx_sessions_recent (workspace_id, project_id, started_at DESC)`, so
-    /// it stays bounded by scope rather than table-wide.
+    /// it stays bounded by scope rather than table-wide, and the per-session
+    /// capture probe is pinned to `idx_observations_session`.
     ///
     /// Ordering is count-descending with an agent-name tiebreak, so equal
     /// counts do not reorder between calls.
@@ -3865,31 +3866,7 @@ impl ReaderPool {
         since_us: Option<i64>,
     ) -> StoreResult<Vec<AgentSessionCount>> {
         self.with_conn(move |conn| {
-            // Same reasoning as `open_sessions_for_scope_agent`: without the
-            // owner predicate a shared server reports a teammate's activity as
-            // the caller's own.
-            let owner_clause = match &owner_filter {
-                OwnerFilter::Any => "",
-                OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = :actor)",
-                OwnerFilter::Unattributed => " AND actor_user IS NULL",
-            };
-            let since_clause = if since_us.is_some() {
-                " AND started_at >= :since"
-            } else {
-                ""
-            };
-            let sql = format!(
-                "SELECT agent_kind, COUNT(*) AS n, \
-                 SUM((SELECT COUNT(DISTINCT CASE WHEN o.extension IS NULL \
-                     THEN 'native' ELSE 'extension:' || o.extension END) \
-                     FROM observations o WHERE o.session_id = sessions.id \
-                       AND o.workspace_id = :ws AND o.project_id = :proj) > 1) \
-                 FROM sessions \
-                 WHERE workspace_id = :ws AND project_id = :proj\
-                 {since_clause}{owner_clause} \
-                 GROUP BY agent_kind \
-                 ORDER BY n DESC, agent_kind ASC"
-            );
+            let sql = session_counts_by_agent_sql(since_us.is_some(), &owner_filter);
             let mut stmt = conn.prepare_cached(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
@@ -11606,6 +11583,47 @@ impl ReaderPool {
     }
 }
 
+/// Build the per-agent session count query for one scope.
+///
+/// The capture probe keeps its workspace/project predicates because one
+/// session id can carry observations in several projects, and only the
+/// counted project's rows may decide whether a session mixed capture paths.
+/// Those same predicates match the leading columns of
+/// `idx_observations_project_created`, and without `sqlite_stat1` the planner
+/// prefers that two-column equality over the one-column session index. It
+/// then rescans the whole project's observations once per session: 144 s for
+/// 780 sessions over 185k observations, against 0.3 s through the session
+/// index. `INDEXED BY` pins the probe to the index that bounds it by session
+/// whatever the statistics say.
+fn session_counts_by_agent_sql(has_since: bool, owner_filter: &OwnerFilter) -> String {
+    // Same reasoning as `open_sessions_for_scope_agent`: without the owner
+    // predicate a shared server reports a teammate's activity as the
+    // caller's own.
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = :actor)",
+        OwnerFilter::Unattributed => " AND actor_user IS NULL",
+    };
+    let since_clause = if has_since {
+        " AND started_at >= :since"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT agent_kind, COUNT(*) AS n, \
+         SUM((SELECT COUNT(DISTINCT CASE WHEN o.extension IS NULL \
+             THEN 'native' ELSE 'extension:' || o.extension END) \
+             FROM observations o INDEXED BY idx_observations_session \
+             WHERE o.session_id = sessions.id \
+               AND o.workspace_id = :ws AND o.project_id = :proj) > 1) \
+         FROM sessions \
+         WHERE workspace_id = :ws AND project_id = :proj\
+         {since_clause}{owner_clause} \
+         GROUP BY agent_kind \
+         ORDER BY n DESC, agent_kind ASC"
+    )
+}
+
 /// Build the bounded history query and its optional owner binding.
 ///
 /// A named operator reads two disjoint ranges: shared (`NULL`) and their own
@@ -12928,6 +12946,56 @@ mod tests {
             2,
             "shared and owned ranges must both use the owner index: {details:?}"
         );
+    }
+
+    #[test]
+    fn session_counts_by_agent_probes_observations_through_the_session_index() {
+        // A fresh store has no `sqlite_stat1`, the same state in which a
+        // production store picked the project index and rescanned the whole
+        // project per session.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let (ws_bytes, proj_bytes) = (ws.as_bytes(), proj.as_bytes());
+        let (since, actor) = (0_i64, "user:alice");
+        let owners = [
+            OwnerFilter::Any,
+            OwnerFilter::User(actor.into()),
+            OwnerFilter::Unattributed,
+        ];
+        for has_since in [false, true] {
+            for owner in &owners {
+                let sql = super::session_counts_by_agent_sql(has_since, owner);
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                let mut named: Vec<(&str, &dyn rusqlite::ToSql)> =
+                    vec![(":ws", &ws_bytes), (":proj", &proj_bytes)];
+                if has_since {
+                    named.push((":since", &since));
+                }
+                if matches!(owner, OwnerFilter::User(_)) {
+                    named.push((":actor", &actor));
+                }
+                let details = stmt
+                    .query_map(named.as_slice(), |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let probes: Vec<&String> = details
+                    .iter()
+                    .filter(|detail| detail.starts_with("SEARCH o "))
+                    .collect();
+                assert!(
+                    !probes.is_empty()
+                        && probes
+                            .iter()
+                            .all(|detail| detail.contains("idx_observations_session")),
+                    "since={has_since} owner={owner:?}: the capture probe must be bounded \
+                     by session, not by project: {details:?}"
+                );
+            }
+        }
     }
 
     #[test]

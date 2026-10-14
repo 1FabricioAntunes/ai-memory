@@ -419,7 +419,10 @@ prunable rather than only after it ages in place.
   reconciles outside edits.
 * `<data_dir>/db/memory.sqlite`: derived index. WAL mode. One
   writer actor owns the writer `Connection`; reads go through a
-  cloneable read-only pool.
+  cloneable read-only pool. Every open runs `PRAGMA optimize=0x10002`
+  before the pool opens, so planner statistics exist and follow tenfold
+  table growth; the first open of a never-analyzed store pays a one-time
+  limited ANALYZE.
 * `<data_dir>/raw/`: immutable sanitized managed-workstream JSONL segments.
   Legacy raw fallback recall searches the durable `observations` table via
   FTS5; lifecycle HookEnvelope JSON is not a complete transcript archive.
