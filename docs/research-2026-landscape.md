@@ -847,7 +847,7 @@ summary + L2 keep-token shape for cold episodic pages
 brief* landed after 3.0
 ([`design-tiered-session-brief.md`](design-tiered-session-brief.md)): every
 core page gets an extractive L0 excerpt (`abstract:`, else `summary:`, else
-the first paragraph), and the leftover budget buys L1 excerpts and whole
+the prose it opens with), and the leftover budget buys L1 excerpts and whole
 bodies, pinned and `_slots/` pages first, with crowded `_rules/` excerpts
 under one heading (Letta-code MemFS's directory deferral, done at render
 time). It needs no LLM, no new tool and no migration. Directory-scoped retrieval

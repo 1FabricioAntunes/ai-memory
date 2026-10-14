@@ -7,8 +7,10 @@
 //!
 //! L0 prefers the frontmatter `abstract:` (the page's own one-line pointer),
 //! L1 prefers `summary:` (the longer operator summary). Both fall back to the
-//! first paragraph of prose, which is the same walk A2 compaction uses for its
-//! L1 line, plus the profile digest's skip of ADR metadata fields.
+//! prose the page opens with, read across paragraphs and lists up to the clip,
+//! skipping headings and the ADR metadata fields the profile digest skips. A
+//! rules page often opens with a sentence about itself; reading on is what
+//! puts its first rules in the excerpt.
 
 use crate::profile::is_metadata_field;
 use crate::sanitize::truncate_utf8_bytes;
@@ -28,10 +30,10 @@ const COMPACTION_FOOTER_PREFIX: &str = "_Extractively compacted from a cold epis
 /// no frontmatter pointer and no prose to fall back on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PageExcerpt {
-    /// Short pointer: `abstract`, else `summary`, else the first paragraph,
+    /// Short pointer: `abstract`, else `summary`, else the leading prose,
     /// clipped to [`BRIEF_L0_MAX_BYTES`].
     pub l0: Option<String>,
-    /// Longer pointer: `summary`, else `abstract`, else the first paragraph,
+    /// Longer pointer: `summary`, else `abstract`, else the leading prose,
     /// clipped to [`BRIEF_L1_MAX_BYTES`].
     pub l1: Option<String>,
 }
@@ -42,7 +44,7 @@ pub struct PageExcerpt {
 pub fn excerpt_from_page(frontmatter: &serde_json::Value, body: &str) -> PageExcerpt {
     let abstract_ = frontmatter_nonempty(frontmatter, "abstract");
     let summary = frontmatter_nonempty(frontmatter, "summary");
-    let paragraph = || first_prose_paragraph(body);
+    let paragraph = || leading_prose(body);
     let l0 = abstract_
         .or(summary)
         .map(str::to_owned)
@@ -56,30 +58,36 @@ pub fn excerpt_from_page(frontmatter: &serde_json::Value, body: &str) -> PageExc
     PageExcerpt { l0, l1 }
 }
 
-/// The first paragraph of prose in `body`, whitespace collapsed to single
-/// spaces. Within each blank-line-separated block, leading headings, lone
-/// `---` rules and ADR metadata fields (`**Status:** Accepted`) are skipped;
-/// a block with nothing left moves the walk on to the next one.
+/// The prose `body` opens with, whitespace collapsed to single spaces and
+/// read across paragraphs and list items. Headings, lone `---` rules and ADR
+/// metadata fields (`**Status:** Accepted`) are skipped wherever they sit, and
+/// so is the A2 compaction footer. Reading stops once there is more than the
+/// longest clip can carry.
 #[must_use]
-pub fn first_prose_paragraph(body: &str) -> Option<String> {
-    body.split("\n\n").find_map(|block| {
-        let trimmed = block.trim();
-        if trimmed.starts_with(COMPACTION_FOOTER_PREFIX) {
-            return None;
+pub fn leading_prose(body: &str) -> Option<String> {
+    let mut prose = String::new();
+    for block in body.split("\n\n") {
+        let block = block.trim();
+        if block.starts_with(COMPACTION_FOOTER_PREFIX) {
+            continue;
         }
-        let prose: Vec<&str> = trimmed
-            .lines()
-            .map(str::trim)
-            .skip_while(|line| {
-                line.is_empty()
-                    || line.starts_with('#')
-                    || *line == "---"
-                    || is_metadata_field(line)
-            })
-            .collect();
-        let collapsed = collapse_whitespace(&prose.join(" "));
-        (!collapsed.is_empty()).then_some(collapsed)
-    })
+        for line in block.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') || line == "---" || is_metadata_field(line)
+            {
+                continue;
+            }
+            for word in line.split_whitespace() {
+                if !prose.is_empty() {
+                    prose.push(' ');
+                }
+                prose.push_str(word);
+            }
+            if prose.len() > BRIEF_L1_MAX_BYTES {
+                return Some(prose);
+            }
+        }
+    }
+    (!prose.is_empty()).then_some(prose)
 }
 
 /// A frontmatter string value, trimmed, or `None` when the key is absent,
@@ -198,7 +206,45 @@ mod tests {
             json!({}),
             "First line\n  wraps   here.\n\nSecond paragraph.",
         );
-        assert_eq!(e.l0.as_deref(), Some("First line wraps here."));
+        assert_eq!(
+            e.l0.as_deref(),
+            Some("First line wraps here. Second paragraph.")
+        );
+    }
+
+    #[test]
+    fn rules_after_a_preface_reach_the_excerpt() {
+        // A rules page that opens with a sentence about itself: the rules
+        // are what an agent needs, so the excerpt runs on into the list.
+        let body = "# Security\n\nThis page collects the security rules.\n\n\
+                    - NEVER commit secrets to git\n- Rotate tokens monthly\n";
+        let e = excerpt(json!({}), body);
+        assert_eq!(
+            e.l0.as_deref(),
+            Some(
+                "This page collects the security rules. \
+                 - NEVER commit secrets to git - Rotate tokens monthly"
+            )
+        );
+    }
+
+    #[test]
+    fn headings_and_metadata_inside_the_page_are_not_prose() {
+        let body = "Intro sentence.\n\n## Rules\n\n**Status:** Accepted\n- keep it boring";
+        let e = excerpt(json!({}), body);
+        assert_eq!(e.l0.as_deref(), Some("Intro sentence. - keep it boring"));
+    }
+
+    #[test]
+    fn l1_carries_more_of_a_long_page_than_l0() {
+        let body = (0..60)
+            .map(|i| format!("Sentence number {i}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let e = excerpt(json!({}), &body);
+        let (l0, l1) = (e.l0.unwrap(), e.l1.unwrap());
+        assert!(l1.len() > l0.len() + 200, "L1 must add depth: {l0} / {l1}");
+        assert!(l1.starts_with(l0.trim_end_matches('…')));
     }
 
     #[test]
@@ -243,9 +289,10 @@ mod tests {
             "The writer actor owns every SQLite write.\n\n## Retained facts\n\n- `WriterHandle`\n\n{footer_only}"
         );
         let e = excerpt(json!({"compacted": true}), &compacted);
+        // The retained facts are prose to the excerpt; the footer is not.
         assert_eq!(
             e.l0.as_deref(),
-            Some("The writer actor owns every SQLite write.")
+            Some("The writer actor owns every SQLite write. - `WriterHandle`")
         );
     }
 }

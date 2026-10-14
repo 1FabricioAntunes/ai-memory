@@ -178,7 +178,7 @@ inject_on_session_start = "true"
 
 # Optional. Char budget for the WHOLE brief (~4 chars per token), headers
 # and footers included. Every core page first gets a short excerpt (its
-# frontmatter `abstract:` or `summary:`, else its first paragraph); what is
+# frontmatter `abstract:` or `summary:`, else the prose it opens with); what is
 # left deepens pages to longer excerpts and then whole bodies, pinned and
 # `_slots/` pages first. A body is shown whole or not at all.
 # Four or more unpinned excerpts from one folder (`_rules/`, `gotchas/`,

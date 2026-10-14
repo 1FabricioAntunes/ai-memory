@@ -278,10 +278,10 @@ Restated from `AGENTS.md` because they bound the packing:
 ## Key Decisions
 
 1. **L0/L1 extractive source and clips.** L0: frontmatter `abstract:` if
-   nonempty, else `summary:` if nonempty, else first prose paragraph,
+   nonempty, else `summary:` if nonempty, else the leading prose,
    clipped to **256 UTF-8 bytes** with `truncate_utf8_bytes` (ellipsis
-   inside the cap). L1: `summary:` then `abstract:` then first prose
-   paragraph, clipped to **500 UTF-8 bytes**, matching A2
+   inside the cap). L1: `summary:` then `abstract:` then the leading
+   prose, clipped to **500 UTF-8 bytes**, matching A2
    `MAX_SUMMARY_LEN`. Do not raise `MAX_PAGE_ABSTRACT_LEN`. Brief-side
    clip only. L2: current `pages.body` (already frontmatter-stripped).
    Rationale: OpenViking L0 is the abstract; the operator `summary:` is
@@ -383,7 +383,7 @@ pub fn excerpt_from_page(
     body: &str,
 ) -> PageExcerpt { /* … */ }
 
-pub fn first_prose_paragraph(body: &str) -> Option<String> { /* … */ }
+pub fn leading_prose(body: &str) -> Option<String> { /* … */ }
 
 pub fn frontmatter_nonempty<'a>(
     frontmatter: &'a serde_json::Value,
@@ -392,19 +392,22 @@ pub fn frontmatter_nonempty<'a>(
 ```
 
 **L0:** `abstract` if nonempty, else `summary` if nonempty, else
-`first_prose_paragraph(body)`. Clip with `truncate_utf8_bytes(..., 256)`.
+`leading_prose(body)`. Clip with `truncate_utf8_bytes(..., 256)`.
 
 **L1:** `summary` if nonempty, else `abstract` if nonempty, else
-`first_prose_paragraph(body)`. Clip with `truncate_utf8_bytes(..., 500)`.
+`leading_prose(body)`. Clip with `truncate_utf8_bytes(..., 500)`.
 
-`first_prose_paragraph` walks every `\n\n` block, like A2 `summary_line`
-(`compaction.rs` ~79-89). Inside a block it skips *leading* lines that
-are `#` headings, a lone `---`, or `is_metadata_field` (already `pub` in
-`profile.rs`; call it, do not relocate `ADR_METADATA_LABELS`). Collapse
-the remainder the way A2 already does (`split_whitespace` joined by
-spaces). If that remainder is empty, **continue to the next block**.
-The first nonempty remainder is the excerpt: `# Title\n\nUse nextest.`
-yields `Use nextest.`
+`leading_prose` walks every `\n\n` block, like A2 `summary_line`
+(`compaction.rs` ~79-89), and keeps reading across blocks until it has
+more than the L1 clip can carry. It skips every line that is a `#`
+heading, a lone `---`, or `is_metadata_field` (already `pub` in
+`profile.rs`; call it, do not relocate `ADR_METADATA_LABELS`), wherever
+it sits, and collapses the rest the way A2 already does
+(`split_whitespace` joined by spaces). `# Title\n\nUse nextest.` yields
+`Use nextest.`. An earlier draft stopped at the first paragraph; the
+risk review found rules pages that open with a sentence about
+themselves ("This page collects the security rules.") and lost every
+rule after it, so the walk reads on into lists.
 
 Also skip a block whose trimmed text starts with
 `_Extractively compacted from a cold episodic page` (the A2 footer
@@ -444,7 +447,8 @@ body, so a compacted page needs no flag for nonempty L0/L1. A2 left `abstract:` 
 frontmatter and put the L1 line at the top of the body, then
 keep-tokens, then `COMPACTION_FOOTER`. Typical result: L0 from abstract
 (or summary, or the L1 line clipped to 256), L1 from
-summary/abstract/first paragraph (the A2 line), L2 the whole compacted
+summary/abstract/leading prose (the A2 line, then the retained facts),
+L2 the whole compacted
 body including keep-tokens. Promoting to L2 is how keep-tokens reach
 the agent. Never treat a compacted page as "skip extraction" (that is
 how a page becomes an empty section).
@@ -997,7 +1001,7 @@ existing three):
   at least the count-only omitted line, and still fit the budget.
 - Extractive fallbacks: abstract present (L0 uses it even when summary
   exists); summary present and abstract absent (L0 and L1 both use
-  summary; zero-delta if it is ≤256 bytes); neither (first paragraph);
+  summary; zero-delta if it is ≤256 bytes); neither (leading prose);
   empty / whitespace abstract and summary do not inject blank sections.
 - Compacted A2 body (L1 line + keep-tokens + footer, `compacted: true`)
   still yields nonempty L0/L1 and, when promoted to L2, still contains
@@ -1113,7 +1117,7 @@ Released CHANGELOG sections stay frozen.
 | Agents that relied on a full first `_rules/` page now see its L0/L1 | Medium | Pin that page (privileged L2). Raise `max_chars`. Footer names `memory_read_page`. Small wikis still L2-fit. |
 | L0 of 256 × 24 plus headings still omits a tail at 4000 bytes | Medium | Expected as coverage math. After the L0 pass, reserve at least the count-only omitted line so those standing rules still appear as a count. Test at `BRIEF_BUDGET_DEFAULT` with 24 max-size L0s. Typical abstracts are <120 bytes (~15-20 pages). Raising the 24-row fetch limit is a follow-up. |
 | Denser brief = more injection surface | Medium | Fence, notice, footer, escape, clamp unchanged. Abstracts are short. |
-| Extractive first paragraph is a useless heading-like sentence | Low | Skip `#` headings and ADR metadata. Operators can set `abstract:`. |
+| Extractive leading prose is a useless heading-like sentence | Low | Skip `#` headings and ADR metadata. Operators can set `abstract:`. |
 | A2 compacted page double-summarized to empty | High if shipped | Explicit test; extraction never skips a compacted page, and L2 carries its keep-tokens. |
 | Footer growth breaks `BRIEF_BUDGET_MIN` | Low | Scaffold is 816 bytes today, leftover 684; +22 for `memory_read_page` leaves 662, still ≥500. Re-measure from `brief_scaffold_len()` in commit 4. |
 | `BriefPageBody` struct-literal tests fail to compile | Low | commit 3 updates every literal (hooks tests around 6465 and 16216+). |
@@ -1219,7 +1223,7 @@ Base: `release/3.1`.
 - **Dependencies:** commit 1.
 - **Description:** Pure helper: L0 256 (`abstract` then `summary` then
   paragraph) / L1 500 (`summary` then `abstract` then paragraph),
-  `first_prose_paragraph` skipping leading metadata / `#` / `---` lines
+  `leading_prose` skipping metadata / `#` / `---` lines
   inside a block via `is_metadata_field` and continuing to the next
   `\n\n` block when the remainder is empty (A2's loop). Tests for
   `# Title\n\nUse nextest.` and the `profile.rs` ~1066 ADR template.

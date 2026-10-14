@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Changed how the opt-in session-start brief (`[briefing]
   inject_on_session_start`) spends `max_chars`. Every pinned, `_rules/` and
   `_slots/` page now gets a short excerpt first, taken from its frontmatter
-  `abstract:` or `summary:` or else its first paragraph, and the budget left
+  `abstract:` or `summary:` or else the prose it opens with, and the budget left
   deepens pages to a longer excerpt and then the whole body, pinned and
   `_slots/` pages first. Before, the brief printed whole bodies in order, so one
   long `_rules/` page was cut with a `[truncated by ...]` note and every page

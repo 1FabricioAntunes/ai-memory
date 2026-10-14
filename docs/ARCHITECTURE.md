@@ -224,7 +224,8 @@ from hook paths.
 project's pinned, `_rules/` and `_slots/` pages, packed into `[briefing]
 max_chars` (clamped to 1500-20000) with no LLM call. Every page first gets an
 extractive L0 excerpt (`ai_memory_core::excerpt`: frontmatter `abstract`, else
-`summary`, else the first prose paragraph, 256 bytes); the bytes left deepen
+`summary`, else the leading prose read across paragraphs and lists, 256
+bytes); the bytes left deepen
 pages to an L1 excerpt (`summary` first, 500 bytes, the same clip as A2
 compaction) and then to the whole body, pinned and `_slots/` pages before the
 rest (`ai_memory_hooks::brief_tiers`). A body is included whole or not at all.
