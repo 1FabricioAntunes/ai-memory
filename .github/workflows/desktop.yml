@@ -3,11 +3,12 @@ name: desktop
 # The Tauri desktop installer in companions/ai-memory-desktop. It is its own
 # Cargo workspace with a webview toolchain (webkit2gtk on Linux), so nothing
 # in the core workflows builds it. A pull request touching it runs the check
-# job; the bundle job runs on manual dispatch and produces UNSIGNED preview
-# installers (signing needs the project's own certificates; see the
-# companion's README).
+# job; the bundle job runs on manual dispatch or on a pull request labelled
+# `desktop`, and produces UNSIGNED preview installers (signing needs the
+# project's own certificates; see the companion's README).
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'companions/ai-memory-desktop/**'
       - '.github/workflows/desktop.yml'
@@ -42,7 +43,9 @@ jobs:
   bundle:
     name: unsigned bundle (${{ matrix.os }})
     needs: check
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'desktop')
     strategy:
       fail-fast: false
       matrix:
