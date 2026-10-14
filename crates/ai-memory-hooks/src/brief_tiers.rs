@@ -64,6 +64,9 @@ pub(crate) struct BriefBudget {
     pub content_ceiling: usize,
     /// The recent-pages section at full length.
     pub recent_full: usize,
+    /// The shortest recent-pages section that shows anything: its header and
+    /// first line. A reserve below this buys nothing.
+    pub recent_first: usize,
 }
 
 /// The assignment: a tier per core page and what is held back for the
@@ -92,7 +95,10 @@ pub(crate) fn assign_tiers(
 ) -> BriefPlan {
     let mut tiers = vec![BriefTier::Omitted; pages.len()];
     let variable = budget.content_ceiling.saturating_sub(budget.prefix);
-    let recent_cap = budget.recent_full.min(variable / 4);
+    // Recent titles are held to a quarter of what is left, but never to
+    // less than one line: a share too small to render is not a reserve.
+    let recent_share = |left: usize| budget.recent_full.min((left / 4).max(budget.recent_first));
+    let recent_cap = recent_share(variable);
     // A crowded-out page is a standing rule the agent did not receive, so
     // the count of omitted pages is reserved before coverage starts. It is
     // sized for every page being omitted, which is the most digits it needs.
@@ -131,9 +137,8 @@ pub(crate) fn assign_tiers(
             .max(count_only(pages.len() - omitted_from))
             .min(remaining)
     };
-    let recent_reserve = budget
-        .recent_full
-        .min(remaining.saturating_sub(omitted_reserve) / 4);
+    let after_omitted = remaining.saturating_sub(omitted_reserve);
+    let recent_reserve = recent_share(after_omitted).min(after_omitted);
     let mut room = remaining.saturating_sub(omitted_reserve + recent_reserve);
 
     let included = &pages[..omitted_from];
@@ -180,6 +185,7 @@ mod tests {
     use BriefTier::{L0, L1, L2, Omitted, TitleOnly};
 
     const COUNT_ONLY: usize = 60;
+    const RECENT_FIRST: usize = 120;
     const LISTED: usize = 30;
 
     fn page(privileged: bool, l0: usize, l1: usize, l2: usize) -> PageCosts {
@@ -197,6 +203,7 @@ mod tests {
                 prefix: 100,
                 content_ceiling,
                 recent_full,
+                recent_first: recent_full.min(RECENT_FIRST),
             },
             |from| 40 + LISTED * (pages.len() - from),
             |_| COUNT_ONLY,
@@ -301,6 +308,21 @@ mod tests {
         assert_eq!(
             plan.recent_reserve, 0,
             "nothing held back when nothing is recent"
+        );
+    }
+
+    #[test]
+    fn the_recent_reserve_holds_at_least_one_line() {
+        // A quarter of what is left would be 87 bytes, less than the 120 a
+        // first recent line needs: such a reserve buys nothing, and the
+        // promotion that eats the rest leaves the recent section empty.
+        let pages = [page(true, 280, 520, 5_000)];
+        let ceiling = 100 + 280 + 350;
+        let plan = assign(&pages, ceiling, 400);
+        assert!(plan.recent_reserve >= RECENT_FIRST, "{plan:?}");
+        assert!(
+            100 + spent(&pages, &plan) + plan.recent_reserve <= ceiling,
+            "{plan:?}"
         );
     }
 

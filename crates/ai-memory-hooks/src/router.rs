@@ -2550,6 +2550,8 @@ fn render_session_brief(
             prefix: buf.len(),
             content_ceiling,
             recent_full: render_brief_recent_section(recent, usize::MAX).len(),
+            recent_first: render_brief_recent_section(&recent[..recent.len().min(1)], usize::MAX)
+                .len(),
         },
         |from| render_brief_omitted_section(&core[from..], usize::MAX).len(),
         |n| brief_omitted_count_line(n).len(),
