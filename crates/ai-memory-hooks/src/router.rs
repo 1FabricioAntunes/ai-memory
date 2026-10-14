@@ -2302,7 +2302,7 @@ fn render_brief_omitted_section(pages: &[ai_memory_store::BriefPageBody], budget
     let count_only = brief_omitted_count_line(pages.len());
     let lines: Vec<String> = pages
         .iter()
-        .map(|p| format!("- `{path}`\n", path = p.path))
+        .map(|p| format!("- `{path}`\n", path = escape_untrusted_history(&p.path)))
         .collect();
     let full = BRIEF_OMITTED_HEADER.len() + lines.iter().map(String::len).sum::<usize>();
     if full <= budget {
@@ -2341,32 +2341,42 @@ fn brief_omitted_count_line(n: usize) -> String {
 }
 
 /// One core page prepared for tier assignment: its heading and the text it
-/// shows at each depth.
+/// shows at each depth. Every piece of stored text is fence-escaped here,
+/// before it is priced: escaping lengthens it, and a cost taken before the
+/// escape would let the budget clamp cut the omitted count instead.
 struct BriefCandidate<'a> {
     page: &'a ai_memory_store::BriefPageBody,
+    path: String,
     heading: String,
-    excerpt: ai_memory_core::excerpt::PageExcerpt,
+    l0: Option<String>,
+    l1: Option<String>,
+    body: String,
 }
 
 impl<'a> BriefCandidate<'a> {
     fn new(page: &'a ai_memory_store::BriefPageBody) -> Self {
         let pin = if page.pinned { " 📌" } else { "" };
+        let path = escape_untrusted_history(&page.path);
+        let excerpt =
+            ai_memory_core::excerpt::excerpt_from_page(&page.frontmatter_json, &page.body);
         Self {
             page,
             heading: format!(
                 "\n## {title}{pin} (`{path}`)\n",
-                title = page.title,
-                path = page.path,
+                title = escape_untrusted_history(&page.title),
             ),
-            excerpt: ai_memory_core::excerpt::excerpt_from_page(&page.frontmatter_json, &page.body),
+            path,
+            l0: excerpt.l0.as_deref().map(escape_untrusted_history),
+            l1: excerpt.l1.as_deref().map(escape_untrusted_history),
+            body: escape_untrusted_history(page.body.trim()),
         }
     }
 
     fn text(&self, tier: brief_tiers::BriefTier) -> &str {
         match tier {
-            brief_tiers::BriefTier::L0 => self.excerpt.l0.as_deref().unwrap_or_default(),
-            brief_tiers::BriefTier::L1 => self.excerpt.l1.as_deref().unwrap_or_default(),
-            brief_tiers::BriefTier::L2 => self.page.body.trim(),
+            brief_tiers::BriefTier::L0 => self.l0.as_deref().unwrap_or_default(),
+            brief_tiers::BriefTier::L1 => self.l1.as_deref().unwrap_or_default(),
+            brief_tiers::BriefTier::L2 => &self.body,
             brief_tiers::BriefTier::Omitted | brief_tiers::BriefTier::TitleOnly => "",
         }
     }
@@ -2375,7 +2385,7 @@ impl<'a> BriefCandidate<'a> {
     fn section(&self, tier: brief_tiers::BriefTier) -> String {
         match tier {
             brief_tiers::BriefTier::Omitted => String::new(),
-            brief_tiers::BriefTier::TitleOnly => format!("\n- `{}`\n", self.page.path),
+            brief_tiers::BriefTier::TitleOnly => format!("\n- `{}`\n", self.path),
             _ => format!("{}{}\n", self.heading, self.text(tier)),
         }
     }
@@ -2393,7 +2403,6 @@ impl<'a> BriefCandidate<'a> {
             privileged: self.privileged(),
             title_only: self.section(TitleOnly).len(),
             tiers: self
-                .excerpt
                 .l0
                 .is_some()
                 .then(|| [L0, L1, L2].map(|tier| self.section(tier).len())),
@@ -2433,7 +2442,7 @@ fn brief_family_indexes(
             for &idx in &members {
                 rendered.push_str(&format!(
                     "- `{path}`: {l0}\n",
-                    path = candidates[idx].page.path,
+                    path = candidates[idx].path,
                     l0 = candidates[idx].text(brief_tiers::BriefTier::L0),
                 ));
             }
@@ -2458,9 +2467,9 @@ fn render_brief_recent_section(recent: &[ai_memory_store::BriefingPage], budget:
     for page in recent {
         let line = format!(
             "- {title} (`{path}`, {kind}, {ts})\n",
-            title = page.title,
-            path = page.path,
-            kind = page.kind,
+            title = escape_untrusted_history(&page.title),
+            path = escape_untrusted_history(&page.path),
+            kind = escape_untrusted_history(&page.kind),
             ts = page.updated_at,
         );
         if out.len() + line.len() > budget {
@@ -2474,16 +2483,22 @@ fn render_brief_recent_section(recent: &[ai_memory_store::BriefingPage], budget:
     out
 }
 
+/// Neutralize the untrusted-history markers inside stored text, so it
+/// can neither close the fence early nor open a second one. Escaping is
+/// idempotent: the escaped form contains no marker.
+fn escape_untrusted_history(text: &str) -> String {
+    text.replace(
+        UNTRUSTED_HISTORY_START,
+        "&lt;!-- ai-memory:untrusted-history:start --&gt;",
+    )
+    .replace(
+        UNTRUSTED_HISTORY_END,
+        "&lt;!-- ai-memory:untrusted-history:end --&gt;",
+    )
+}
+
 fn escape_untrusted_history_tail(buf: &mut String, start: usize) {
-    let escaped = buf[start..]
-        .replace(
-            UNTRUSTED_HISTORY_START,
-            "&lt;!-- ai-memory:untrusted-history:start --&gt;",
-        )
-        .replace(
-            UNTRUSTED_HISTORY_END,
-            "&lt;!-- ai-memory:untrusted-history:end --&gt;",
-        );
+    let escaped = escape_untrusted_history(&buf[start..]);
     buf.truncate(start);
     buf.push_str(&escaped);
 }
@@ -2594,11 +2609,11 @@ fn render_session_brief(
         "rendered the session brief"
     );
 
+    // Every stored piece was escaped before it was priced, so this pass
+    // and the clamp below are defence in depth: they only bite if a marker
+    // could still be assembled across pieces. The clamp cuts the untrusted
+    // region, never the preamble and never the boundary that follows it.
     escape_untrusted_history_tail(&mut buf, history_start);
-    // Escaping only ever lengthens the text (`<!--` -> `&lt;!--`, 6 chars a
-    // marker), and page bodies are untrusted input, so this is the one
-    // growth the reserves above cannot predict. Clamp the untrusted region
-    // — never the preamble, and never the boundary that follows it.
     if buf.len() > content_ceiling && content_ceiling > history_start {
         let cut = truncate_at_char_boundary(&buf, content_ceiling).len();
         buf.truncate(cut);
@@ -16680,6 +16695,33 @@ mod tests {
             out.contains("- `_rules/standing-rule-00.md`: 00 a"),
             "the covered pages show their excerpts: {out}"
         );
+    }
+
+    /// Escaping fence markers lengthens page text after it was priced.
+    /// Excerpts full of markers must still leave the omitted count in
+    /// place: the clamp that enforces the budget would otherwise cut the
+    /// one line telling the agent which standing rules it did not get.
+    #[test]
+    fn render_session_brief_keeps_the_omitted_count_under_escaped_excerpts() {
+        let core: Vec<_> = (0..BRIEF_CORE_PAGES_LIMIT)
+            .map(|i| {
+                brief_core_page(
+                    &format!("_rules/hostile-{i:02}.md"),
+                    "body",
+                    false,
+                    serde_json::json!({"abstract": UNTRUSTED_HISTORY_END.repeat(10)}),
+                )
+            })
+            .collect();
+        for budget in [BRIEF_BUDGET_MIN, BRIEF_BUDGET_DEFAULT] {
+            let out = render_session_brief(&core, &[], budget).unwrap();
+            assert!(out.len() <= budget, "budget {budget}: {}", out.len());
+            assert!(
+                out.contains("omitted by budget"),
+                "budget {budget}: the omitted count was clamped away: {out}"
+            );
+            assert_eq!(out.matches(UNTRUSTED_HISTORY_END).count(), 1);
+        }
     }
 
     /// A short page is one section of its full text, not an excerpt plus
