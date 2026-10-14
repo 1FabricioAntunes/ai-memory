@@ -429,17 +429,27 @@ fn run_entry_data_dir(data: &str) -> Option<String> {
     Some(dir[..dir.len() - trailing / 2].to_owned())
 }
 
-/// Whether two Windows paths name the same directory: the verbatim prefix
-/// (`\\?\C:\…`, `\\?\UNC\server\share\…`), trailing separators and letter
-/// case do not count.
+/// Whether two absolute Windows paths name the same directory: the verbatim
+/// prefix (`\\?\C:\…`, `\\?\UNC\server\share\…`), trailing separators and
+/// letter case do not count. A path that is not absolute matches nothing:
+/// `C:` is the current directory on drive C, not its root `C:\`, and would
+/// otherwise compare equal once trailing separators are gone.
 fn same_windows_dir(left: &str, right: &str) -> bool {
     let plain = |path: &str| {
         let path = path.replace('/', "\\");
-        super::path_util::strip_windows_verbatim_prefix(&path)
-            .trim_end_matches('\\')
-            .to_owned()
+        let path = super::path_util::strip_windows_verbatim_prefix(&path).into_owned();
+        let bytes = path.as_bytes();
+        let drive_absolute = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
+        let unc = path.starts_with(r"\\") && !path.starts_with(r"\\?\");
+        (drive_absolute || unc).then(|| path.trim_end_matches('\\').to_owned())
     };
-    plain(left).eq_ignore_ascii_case(&plain(right))
+    match (plain(left), plain(right)) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(&right),
+        _ => false,
+    }
 }
 
 /// Whether the logon entry `data` is the one `setup` wrote for `data_dir`.
@@ -1427,6 +1437,28 @@ mod tests {
             Removal::NotOurs(path.clone())
         );
         assert_eq!(past_the_quote.calls.borrow().len(), 1, "only the query ran");
+
+        // `C:` is the current directory on drive C, not the root being
+        // uninstalled: nothing is stopped or deleted.
+        let drive_relative = FakeRunner {
+            stdout: vec![(
+                "reg query",
+                "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \"C:\" \
+                 --config \"C:\\other\\config.toml\" service-host\r\n",
+            )],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(
+                ServiceManager::WindowsRun,
+                &path,
+                Path::new(r"C:\"),
+                &drive_relative
+            )
+            .unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(drive_relative.calls.borrow().len(), 1, "only the query ran");
         assert!(
             ours.calls
                 .borrow()
@@ -1521,6 +1553,29 @@ mod windows_entry_tests {
             r"\\?\UNC\server\share\ai-memory",
             r"\\server\other\ai-memory"
         ));
+        // `C:` is the current directory on drive C, not its root.
+        assert!(!same_windows_dir("C:", r"\\?\C:\"));
+        assert!(!same_windows_dir("C:", "C:"));
+        assert!(!same_windows_dir(r"ai-memory", r"ai-memory"));
+        assert!(same_windows_dir(r"C:\", r"\\?\C:\"));
+    }
+
+    /// A drive-relative `--data-dir "C:"` names the current directory on C,
+    /// so uninstalling the drive root must not claim it.
+    #[test]
+    fn a_drive_relative_data_dir_is_not_the_drive_root() {
+        let root = Path::new(r"C:\");
+        let foreign = r#""C:\bin\ai-memory.exe" --data-dir "C:" --config "C:\other\config.toml" service-host"#;
+        assert!(!is_setup_run_entry_for(foreign, root));
+        assert!(!is_setup_run_entry_for(foreign, Path::new(r"\\?\C:\")));
+        // Control: the entry `setup` renders for the drive root is ours.
+        let ours = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", r"C:\").unwrap(),
+            windows_arg("config", r"C:\config.toml").unwrap(),
+        );
+        assert!(is_setup_run_entry_for(&ours, root), "{ours}");
     }
 
     /// A `--data-dir` inside the executable's path is not the option.
