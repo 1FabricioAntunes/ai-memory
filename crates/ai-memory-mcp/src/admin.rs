@@ -1765,7 +1765,13 @@ async fn handle_search(
         // distinguishes operators (`require_root_for_multiuser_admin`).
         _ => state
             .reader
-            .search_pages_with_meta(query.q, limit, None, OPERATOR)
+            .search_pages_with_meta(
+                query.q,
+                limit,
+                None,
+                OPERATOR,
+                ai_memory_store::PageFilter::default(),
+            )
             .await
             .and_then(|hits| {
                 let hits: Vec<GlobalSearchHit> = hits.into_iter().map(Into::into).collect();
