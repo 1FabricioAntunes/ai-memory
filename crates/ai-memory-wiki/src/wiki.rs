@@ -1604,6 +1604,51 @@ impl Wiki {
         author_id: Option<UserId>,
         compaction: ai_memory_store::Compaction,
     ) -> WikiResult<PurgeSessionOutcome> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
+            None,
+        )
+        .await
+    }
+
+    /// Purge an operator's own session through the canonical disk/SQL mutation path.
+    /// Shared sessions and cross-project cascades require the admin path.
+    ///
+    /// # Errors
+    /// Returns store ownership/scope failures before removing files.
+    pub async fn purge_owned_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        owner: ai_memory_core::IdentityKey,
+        author_id: Option<UserId>,
+    ) -> WikiResult<PurgeSessionOutcome> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            ai_memory_store::Compaction::Skip,
+            Some(owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn purge_session_with_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<UserId>,
+        compaction: ai_memory_store::Compaction,
+        owner: Option<ai_memory_core::IdentityKey>,
+    ) -> WikiResult<PurgeSessionOutcome> {
         self.inspect_project_tree(workspace_id, project_id)?;
         let _guard = self.mutation_lock.write().await;
         self.inspect_project_tree(workspace_id, project_id)?;
@@ -1612,17 +1657,29 @@ impl Wiki {
         // `WriterHandle::purge_session` instead, bypassing this wrapper
         // entirely, so the file-removal loop below never runs over paths
         // that a preview only *predicts* would be removed.
-        let summary = self
-            .writer
-            .purge_session(
-                workspace_id,
-                project_id,
-                session_id,
-                author_id,
-                compaction,
-                ai_memory_store::PurgeMode::Commit,
-            )
-            .await?;
+        let summary = if let Some(owner) = owner {
+            self.writer
+                .purge_owned_session(
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    owner,
+                    author_id,
+                    ai_memory_store::PurgeMode::Commit,
+                )
+                .await?
+        } else {
+            self.writer
+                .purge_session(
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    author_id,
+                    compaction,
+                    ai_memory_store::PurgeMode::Commit,
+                )
+                .await?
+        };
         let mut files_deleted = Vec::with_capacity(summary.removed_paths.len());
         let mut files_failed = Vec::new();
         for path in &summary.removed_paths {
@@ -7980,6 +8037,180 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "disk and index agree after the guard is released"
+        );
+    }
+
+    async fn owned_session_with_page(
+        tmp: &TempDir,
+    ) -> (
+        Store,
+        Wiki,
+        WorkspaceId,
+        ProjectId,
+        UserId,
+        SessionId,
+        PagePath,
+    ) {
+        let (store, wiki, ws, proj) = scoped(tmp).await;
+        let user = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "purge-owner".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: Some("user:purge-owner".into()),
+            })
+            .await
+            .unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let page = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "owned session body",
+                serde_json::json!({"title":"Owned session"}),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(sid, Some(page)).await.unwrap();
+        (store, wiki, ws, proj, user, sid, path)
+    }
+
+    #[tokio::test]
+    async fn owned_session_purge_authorization_failure_preserves_page_and_index() {
+        use ai_memory_core::IdentityKey;
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, user, sid, path) = owned_session_with_page(&tmp).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        let before = std::fs::read(&abs).unwrap();
+        assert!(matches!(
+            wiki.purge_owned_session(
+                ws,
+                proj,
+                sid,
+                IdentityKey::User("foreign".into()),
+                Some(user)
+            )
+            .await,
+            Err(WikiError::Store(ai_memory_store::StoreError::NotFound(_)))
+        ));
+        store
+            .writer
+            .set_access_mode(proj, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        assert!(matches!(
+            wiki.purge_owned_session(
+                ws,
+                proj,
+                sid,
+                IdentityKey::User("purge-owner".into()),
+                Some(user)
+            )
+            .await,
+            Err(WikiError::Store(ai_memory_store::StoreError::Forbidden(_)))
+        ));
+        assert_eq!(std::fs::read(&abs).unwrap(), before);
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !store
+                .reader
+                .search_pages("owned".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(wiki.purged_sessions(ws, proj).await.unwrap().is_empty());
+        // Removing the restriction provides a legitimate control for the same file.
+        store
+            .writer
+            .set_access_mode(proj, ai_memory_store::AccessMode::Open)
+            .await
+            .unwrap();
+        let outcome = wiki
+            .purge_owned_session(
+                ws,
+                proj,
+                sid,
+                IdentityKey::User("purge-owner".into()),
+                Some(user),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.files_deleted, vec![path]);
+        assert!(!abs.exists());
+    }
+
+    #[tokio::test]
+    async fn owned_session_purge_cleanup_failure_is_reported_and_tombstoned() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, user, sid, path) = owned_session_with_page(&tmp).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        let before = std::fs::read(&abs).unwrap();
+        // A directory in place of a file forces cleanup failure on every platform,
+        // including privileged test runners that ignore read-only permissions.
+        std::fs::remove_file(&abs).unwrap();
+        std::fs::create_dir(&abs).unwrap();
+        let outcome = wiki
+            .purge_owned_session(
+                ws,
+                proj,
+                sid,
+                ai_memory_core::IdentityKey::User("purge-owner".into()),
+                Some(user),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.files_failed, vec![path.clone()]);
+        assert!(outcome.files_deleted.is_empty());
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(wiki.purged_sessions(ws, proj).await.unwrap().contains(&sid));
+        // Simulate the leftover file returning during recovery. Reindex must
+        // honor the tombstone instead of resurrecting the deleted summary.
+        std::fs::remove_dir(&abs).unwrap();
+        std::fs::write(&abs, before).unwrap();
+        let summary = wiki.reindex_all().await.unwrap();
+        assert_eq!(summary.skipped_purged_sessions, 1);
+        assert!(
+            store
+                .reader
+                .search_pages("owned".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

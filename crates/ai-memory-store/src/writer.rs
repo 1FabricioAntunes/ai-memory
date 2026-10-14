@@ -489,6 +489,7 @@ pub(crate) enum WriteCmd {
         /// [`crate::ops::PurgeMode::Preview`] stops right after counting and
         /// never issues the delete — see [`crate::ops::PurgeMode`]'s doc.
         mode: crate::ops::PurgeMode,
+        owner: Option<IdentityKey>,
         reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
     },
     /// Reclaim free pages on demand: rebuild the FTS indexes and `VACUUM`,
@@ -2314,6 +2315,55 @@ impl WriterHandle {
         compaction: crate::ops::Compaction,
         mode: crate::ops::PurgeMode,
     ) -> StoreResult<crate::ops::PurgeSessionSummary> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
+            mode,
+            None,
+        )
+        .await
+    }
+
+    /// Purge only a session stamped with this exact operator, never shared legacy rows.
+    /// Cross-project cascades are refused. Ownership is checked by the writer transaction.
+    ///
+    /// # Errors
+    /// Returns NotFound for a foreign/shared session, or propagates store failures.
+    pub async fn purge_owned_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        owner: IdentityKey,
+        author_id: Option<UserId>,
+        mode: crate::ops::PurgeMode,
+    ) -> StoreResult<crate::ops::PurgeSessionSummary> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            crate::ops::Compaction::Skip,
+            mode,
+            Some(owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn purge_session_with_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<UserId>,
+        compaction: crate::ops::Compaction,
+        mode: crate::ops::PurgeMode,
+        owner: Option<IdentityKey>,
+    ) -> StoreResult<crate::ops::PurgeSessionSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeSession {
             workspace_id,
@@ -2322,6 +2372,7 @@ impl WriterHandle {
             author_id,
             compaction,
             mode,
+            owner,
             reply: tx,
         })
         .await?;
@@ -4227,9 +4278,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 author_id,
                 compaction,
                 mode,
+                owner,
                 reply,
             } => {
-                let result = ops::purge_session(
+                let result = ops::purge_session_with_owner(
                     &mut conn,
                     workspace_id,
                     project_id,
@@ -4237,6 +4289,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     author_id,
                     compaction,
                     mode,
+                    owner.as_ref(),
                 );
                 send_or_warn(reply, result, "purge_session");
             }

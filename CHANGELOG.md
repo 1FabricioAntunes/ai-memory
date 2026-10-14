@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+- Added optional human-session session inspection and owned purging, gated by the
+  `session-management` build feature and runtime switch. Reused existing human
+  authentication, authorization, and SQLite storage. (#1231)
+
 ## [3.0.0] - 2026-10-13
 
 ### Added
