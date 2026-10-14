@@ -1430,7 +1430,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = "http://127.0.0.1:49374";
         let manager = Some(ServiceManager::WindowsRun);
-        let spec = spec(tmp.path());
+        // The shared spec names a Unix binary path, which is not absolute on
+        // Windows; this one is absolute on every platform.
+        let spec = user_service::ServiceSpec {
+            exe: tmp.path().join("ai-memory.exe"),
+            ..spec(tmp.path())
+        };
         assert!(matches!(
             plan_service(manager, &spec, url, false, &Reg(None)),
             ServicePlan::Install(unit) if unit.manager == ServiceManager::WindowsRun
