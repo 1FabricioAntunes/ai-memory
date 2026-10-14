@@ -33,6 +33,31 @@ version in [`docs/changelog/`](docs/changelog/):
   result, and "Search all projects" keeps the filters. An unknown `tier` is
   a 400. (#1248)
 
+### Fixed
+- Fixed Windows capture dropping the body of file and shell tool events
+  the client had kept. With `[capture] ignore_paths` active, server
+  re-inspection compiled a POSIX never-match sentinel and treated the
+  policy as invalid, so a kept Read or Bash became metadata-only. The
+  sentinel now follows the event cwd's path flavor. (#1250)
+- Fixed `GET /admin/sessions/by-agent`, and so `ai-memory doctor` and
+  `ai-memory backfill`, taking minutes on a large project (178 s for 780
+  sessions over 185k observations). Without planner statistics SQLite
+  answered each session's capture probe from the project-wide index and
+  rescanned the whole project once per session; the probe now always uses the
+  session index (0.3 s on the same store). The session list and session
+  detail reads behind `/web`, `/api/v1` and `memory_read_session_observations`
+  ran the same per-session probes and are pinned the same way. (#1257)
+- Fixed pages written by an auto-improvement approval, a batch write or a
+  checkpoint restore getting no embedding. An approval (through
+  `pending-writes approve`, the `memory_auto_improve` tool,
+  `POST /admin/auto-improve` or the scheduler), the batch writes behind
+  consolidation, the forget sweep, dream and bootstrap, and
+  `ai-memory restore-page` wrote and indexed the page but never embedded
+  it, so it stayed out of the vector stream of hybrid search until an
+  embedding backfill ran, which by default is only at the next server
+  start. These paths now embed each written page the same way
+  `memory_write_page` does. (#1258)
+
 ## [3.0.0] - 2026-10-13
 
 ### Added

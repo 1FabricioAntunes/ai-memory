@@ -887,7 +887,16 @@ that touch the relevant area.
    client instead: the server snapshots SQLite with its online backup API while
    the writer remains live. (basic-memory #765.)
 10. **Atomic file writes** (tmp + rename + fsync). Watcher ignores
-    own writes by filename prefix.
+    own writes by filename prefix. On Windows, an antivirus scanner, the
+    indexer or a concurrent process can hold a file for a moment, so file
+    operations that race with them treat specific Windows errors as
+    transient: a bounded retry or a skip, never an unbounded wait, and never
+    a weaker check for a file that stays inaccessible. Each site keeps its
+    own policy because their deadlines differ (the hook path stays inside its
+    200 ms budget); the sites are listed in
+    [design-windows-ci.md](design-windows-ci.md#windows-transient-file-errors).
+    New file-I/O code with the same race follows the same pattern, with a
+    test that injects the error so it also runs off Windows.
 11. **Absolute canonical data dir** default; logged loudly on
     startup. (agentmemory #303.)
 12. **No global singletons / `lazy_static` configs.** All deps
