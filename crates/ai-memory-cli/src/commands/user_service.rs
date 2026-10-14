@@ -444,7 +444,18 @@ fn same_windows_dir(left: &str, right: &str) -> bool {
             && bytes[1] == b':'
             && bytes[2] == b'\\';
         let unc = path.starts_with(r"\\") && !path.starts_with(r"\\?\");
-        (drive_absolute || unc).then(|| path.trim_end_matches('\\').to_owned())
+        // `\\?\Volume{GUID}\…` names a volume by its GUID; it keeps the
+        // verbatim prefix and is as absolute as a drive path.
+        const VOLUME: &str = r"\\?\Volume{";
+        let volume = path
+            .get(..VOLUME.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(VOLUME))
+            && path[VOLUME.len()..]
+                .split_once('}')
+                .is_some_and(|(guid, rest)| {
+                    !guid.is_empty() && (rest.is_empty() || rest.starts_with('\\'))
+                });
+        (drive_absolute || unc || volume).then(|| path.trim_end_matches('\\').to_owned())
     };
     match (plain(left), plain(right)) {
         (Some(left), Some(right)) => left.eq_ignore_ascii_case(&right),
@@ -1459,6 +1470,41 @@ mod tests {
             Removal::NotOurs(path.clone())
         );
         assert_eq!(drive_relative.calls.borrow().len(), 1, "only the query ran");
+
+        // A volume GUID data dir removes its own entry and leaves another
+        // volume's alone.
+        let volume_entry = "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \
+             \"\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\ai-memory\" \
+             --config \"C:\\c.toml\" service-host\r\n";
+        let other_volume = FakeRunner {
+            stdout: vec![("reg query", volume_entry)],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(
+                ServiceManager::WindowsRun,
+                &path,
+                Path::new(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}\ai-memory"),
+                &other_volume
+            )
+            .unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(other_volume.calls.borrow().len(), 1, "only the query ran");
+        let own_volume = FakeRunner {
+            stdout: vec![("reg query", volume_entry)],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(
+                ServiceManager::WindowsRun,
+                &path,
+                Path::new(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\ai-memory"),
+                &own_volume
+            )
+            .unwrap(),
+            Removal::Removed(path.clone())
+        );
         assert!(
             ours.calls
                 .borrow()
@@ -1558,6 +1604,40 @@ mod windows_entry_tests {
         assert!(!same_windows_dir("C:", "C:"));
         assert!(!same_windows_dir(r"ai-memory", r"ai-memory"));
         assert!(same_windows_dir(r"C:\", r"\\?\C:\"));
+        // A volume GUID path is absolute and matches itself, not another
+        // volume; a malformed one matches nothing.
+        let volume = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\ai-memory";
+        assert!(same_windows_dir(
+            volume,
+            &format!(r"{}\", volume.to_uppercase())
+        ));
+        assert!(!same_windows_dir(
+            volume,
+            r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}\ai-memory"
+        ));
+        assert!(!same_windows_dir(
+            r"\\?\Volume{}\ai-memory",
+            r"\\?\Volume{}\ai-memory"
+        ));
+        assert!(!same_windows_dir(r"\\?\Volume{x", r"\\?\Volume{x"));
+    }
+
+    /// The entry `setup` renders for a volume GUID data dir is that
+    /// install's, and not another volume's.
+    #[test]
+    fn a_volume_guid_data_dir_owns_its_entry() {
+        let dir = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\ai-memory";
+        let entry = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", dir).unwrap(),
+            windows_arg("config", r"C:\c.toml").unwrap(),
+        );
+        assert!(is_setup_run_entry_for(&entry, Path::new(dir)), "{entry}");
+        assert!(!is_setup_run_entry_for(
+            &entry,
+            Path::new(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}\ai-memory")
+        ));
     }
 
     /// A drive-relative `--data-dir "C:"` names the current directory on C,
