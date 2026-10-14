@@ -913,7 +913,12 @@ fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Remov
     let path = user_service::unit_path(manager, &home, xdg_config_home.as_deref());
     Some((
         manager,
-        user_service::planned_removal_for(manager, &path, &user_service::SystemRunner),
+        user_service::planned_removal_for(
+            manager,
+            &path,
+            &config.data_dir,
+            &user_service::SystemRunner,
+        ),
     ))
 }
 
