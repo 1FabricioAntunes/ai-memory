@@ -3619,6 +3619,28 @@ mod tests {
         }
     }
 
+    /// The shipped `config.default.toml` must actually load.
+    ///
+    /// It is `include_str!`-ed by `init` and written as-is, so a template
+    /// that does not parse would only surface when someone ran `init` and
+    /// started the server. Comments added by #1269 are the kind of edit that
+    /// can break it silently (a stray quote, a line that stops being a
+    /// comment), and nothing tested the file itself.
+    #[test]
+    fn the_shipped_default_config_parses() {
+        const TEMPLATE: &str = include_str!("../templates/config.default.toml");
+        let cfg = load_with_toml(TEMPLATE).expect("config.default.toml must load");
+        assert_eq!(cfg.bind, DEFAULT_BIND);
+        assert_eq!(
+            cfg.server_url, DEFAULT_SERVER_URL,
+            "the template leaves server_url unset, so the default bind derives the default URL"
+        );
+        assert!(
+            !cfg.server_url_derived_from_bind,
+            "the default bind short-circuits the derivation, so nothing is marked derived"
+        );
+    }
+
     /// #1269: a thin client must reach the server the SAME config starts.
     ///
     /// `server_url` defaulted to a constant and was never derived from `bind`,

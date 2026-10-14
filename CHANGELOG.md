@@ -12,6 +12,22 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the thin-client commands ignoring a custom `bind`, which could write
+  into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
+  and was never derived from `bind`, so `ai-memory --data-dir X status` (and
+  `write-page`, `search`, `purge-project`, ...) called the default port
+  whatever `bind` said. With nothing listening there the command failed; with
+  another server listening there it operated on that server's data, and one
+  reporter wrote test pages into their real store this way. When neither
+  `config.toml` nor `AI_MEMORY_SERVER_URL` sets `server_url`, it is now
+  derived from `bind`: an unspecified address maps to loopback (`0.0.0.0` to
+  `127.0.0.1`, `[::]` to `[::1]`) and any other host is used as given,
+  hostname included. An explicit value in the file or the environment still
+  wins, a `bind` that is not a `host:port` leaves the default URL alone, and
+  the default `bind` resolves to the same URL as before, so an install that
+  never changed either key is unaffected. A derived URL is not reported as an
+  operator-configured one, so `install-hooks` and `install-mcp` behave as
+  they always have for someone who only edited `bind`. (#1269)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
