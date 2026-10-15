@@ -73,7 +73,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory uninstall --apply` stops the host and removes the value when it
   still has the shape `setup` writes and names this install's data dir, so an
   uninstall against another data dir (a second install, a test's temporary
-  one) leaves the entry alone. (#1271, #1280)
+  one) leaves the entry alone. `ai-memory doctor` and `ai-memory status`
+  warn (`logon_binary_missing`, also in their `--json` output and when
+  `status` cannot reach the server) when that entry names an
+  `ai-memory.exe` that no longer exists, which is what an antivirus
+  quarantine leaves behind, and say how to restore the binary or remove the
+  entry. (#1271, #1280, #1300, #1311)
 - Added `ai-memory setup --web`, which shows the setup plan as a page in
   your browser and applies the agents you tick there by running `ai-memory
   setup --yes --agent ...` and streaming its output to the page. The page is

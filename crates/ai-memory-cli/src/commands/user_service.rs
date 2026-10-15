@@ -395,10 +395,7 @@ fn render_windows(spec: &ServiceSpec) -> Result<ServiceUnit> {
 /// `ai-memory.exe` followed by arguments that end in `service-host`. Anything
 /// else under the name was written by someone else and is left alone.
 pub(crate) fn is_setup_run_entry(data: &str) -> bool {
-    let Some(rest) = data.strip_prefix('"') else {
-        return false;
-    };
-    let Some((program, args)) = rest.split_once('"') else {
+    let Some((program, args)) = split_run_entry(data) else {
         return false;
     };
     let file = program.rsplit(['\\', '/']).next().unwrap_or(program);
@@ -408,13 +405,21 @@ pub(crate) fn is_setup_run_entry(data: &str) -> bool {
         && !args.contains('|')
 }
 
+/// A `Run` value split into the executable inside its leading quotes and the
+/// arguments after them; `None` when the value does not start with a quoted
+/// program. The executable needs no unescaping: `is_setup_run_entry` only
+/// accepts one ending in `ai-memory.exe`, so no backslash precedes its quote.
+fn split_run_entry(data: &str) -> Option<(&str, &str)> {
+    data.strip_prefix('"')?.split_once('"')
+}
+
 /// The `--data-dir` a `setup` logon entry names, unquoted the way
 /// [`windows_arg`] quoted it; `None` when the entry names none. Only the
 /// first argument after the quoted executable is read, as `render_windows`
 /// writes it, so a `--data-dir` inside the executable's own path never
 /// counts.
 fn run_entry_data_dir(data: &str) -> Option<String> {
-    let (_program, args) = data.strip_prefix('"')?.split_once('"')?;
+    let (_program, args) = split_run_entry(data)?;
     let quoted = args
         .trim_start()
         .strip_prefix("--data-dir")?
@@ -484,6 +489,78 @@ fn is_setup_run_entry_for(data: &str, data_dir: &Path) -> bool {
 /// absent or cannot be read.
 pub(crate) fn run_value(runner: &dyn CommandRunner) -> Option<String> {
     runner.run_key_value()
+}
+
+/// `doctor`'s and `status`' token for [`MissingLogonBinary`], so a script can
+/// match one string.
+pub(crate) const LOGON_BINARY_MISSING: &str = "logon_binary_missing";
+
+/// The logon entry `setup` wrote for this data dir names an `ai-memory.exe`
+/// that is no longer on disk. Antivirus that quarantines the binary leaves the
+/// `Run` value behind (#1280): the server then never starts at logon and every
+/// hook calls a path that is gone, with nothing else saying why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct MissingLogonBinary {
+    /// Always [`LOGON_BINARY_MISSING`].
+    pub(crate) classification: &'static str,
+    /// The executable the logon entry names, as written in the value.
+    pub(crate) executable: String,
+    /// What happened, in one sentence.
+    pub(crate) detail: String,
+    /// What to do about it.
+    pub(crate) fix: &'static str,
+}
+
+const MISSING_LOGON_BINARY_FIX: &str = "restore ai-memory.exe (or allow it in your antivirus) \
+     and re-run `ai-memory setup`; or remove the logon entry with `ai-memory uninstall --apply` \
+     (which removes all of ai-memory's wiring) or `Remove-ItemProperty -Path \
+     HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run -Name ai-memory`";
+
+impl MissingLogonBinary {
+    /// The warning `doctor` and `status` print.
+    pub(crate) fn render_human(&self) -> String {
+        format!(
+            "⚠ {}: {}\n  Fix: {}. See docs/windows.md (Antivirus / EDR).\n",
+            self.classification, self.detail, self.fix
+        )
+    }
+}
+
+/// The logon entry `setup` wrote for `data_dir`, when the `ai-memory.exe` it
+/// names is not a file. An entry of another shape, or another data dir's, is
+/// not this install's and says nothing.
+pub(crate) fn missing_logon_binary(
+    runner: &dyn CommandRunner,
+    data_dir: &Path,
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<MissingLogonBinary> {
+    let data = run_value(runner)?;
+    if !is_setup_run_entry_for(&data, data_dir) {
+        return None;
+    }
+    let (executable, _args) = split_run_entry(&data)?;
+    if is_file(Path::new(executable)) {
+        return None;
+    }
+    Some(MissingLogonBinary {
+        classification: LOGON_BINARY_MISSING,
+        executable: executable.to_owned(),
+        detail: format!(
+            "the Windows logon entry for this data dir runs {executable}, which no longer \
+             exists (likely quarantined by antivirus), so the server does not start at logon"
+        ),
+        fix: MISSING_LOGON_BINARY_FIX,
+    })
+}
+
+/// [`missing_logon_binary`] against the signed-in user's registry, on
+/// Windows only: elsewhere there is no `Run` key, and asking would spawn a
+/// `reg` that does not exist.
+pub(crate) fn check_logon_binary(data_dir: &Path) -> Option<MissingLogonBinary> {
+    if ServiceManager::current() != Some(ServiceManager::WindowsRun) {
+        return None;
+    }
+    missing_logon_binary(&SystemRunner, data_dir, &Path::is_file)
 }
 
 /// Pick the data out of `reg query <key> /v <name>`, which prints the key,
@@ -1880,5 +1957,116 @@ mod user_registry_tests {
             &unit.contents,
             std::path::Path::new(r"C:\tools")
         ));
+    }
+}
+
+// Pure string and injected-runner checks, so they run on every platform.
+#[cfg(test)]
+mod logon_binary_tests {
+    use super::*;
+
+    /// A runner whose `Run` value is fixed and which never runs anything.
+    struct FixedRunValue(Option<String>);
+
+    impl CommandRunner for FixedRunValue {
+        fn run(&self, program: &str, _args: &[&str]) -> Result<CommandOutcome> {
+            bail!("{program} must not run in this test")
+        }
+
+        fn run_key_value(&self) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    const DATA_DIR: &str = r"C:\Users\me\AppData\Local\ai-memory";
+    const EXE: &str = r"C:\Users\me\AppData\Local\Programs\ai-memory\ai-memory.exe";
+
+    fn entry(exe: &str, data_dir: &str) -> String {
+        format!(r#""{exe}" --data-dir "{data_dir}" --config "{data_dir}\config.toml" service-host"#)
+    }
+
+    fn check(value: Option<String>, present: bool) -> Option<MissingLogonBinary> {
+        missing_logon_binary(&FixedRunValue(value), Path::new(DATA_DIR), &|_| present)
+    }
+
+    #[test]
+    fn a_quarantined_binary_in_this_data_dirs_entry_is_reported() {
+        let problem = check(Some(entry(EXE, DATA_DIR)), false).expect("binary is gone");
+        assert_eq!(problem.classification, LOGON_BINARY_MISSING);
+        assert_eq!(problem.executable, EXE);
+        assert!(problem.detail.contains(EXE), "{}", problem.detail);
+        assert!(problem.detail.contains("quarantined"), "{}", problem.detail);
+
+        let json = serde_json::to_value(&problem).unwrap();
+        assert_eq!(json["classification"], LOGON_BINARY_MISSING);
+        assert_eq!(json["executable"], EXE);
+        assert_eq!(json["fix"], problem.fix);
+    }
+
+    #[test]
+    fn the_executable_is_the_one_the_is_file_check_sees() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let value = entry(r"\\?\C:\Program Files\ai memory\ai-memory.exe", DATA_DIR);
+        let problem =
+            missing_logon_binary(&FixedRunValue(Some(value)), Path::new(DATA_DIR), &|path| {
+                seen.borrow_mut().push(path.to_path_buf());
+                false
+            })
+            .expect("binary is gone");
+        assert_eq!(
+            seen.into_inner(),
+            vec![PathBuf::from(
+                r"\\?\C:\Program Files\ai memory\ai-memory.exe"
+            )]
+        );
+        assert_eq!(
+            problem.executable,
+            r"\\?\C:\Program Files\ai memory\ai-memory.exe"
+        );
+    }
+
+    #[test]
+    fn a_present_binary_or_no_entry_says_nothing() {
+        assert_eq!(check(Some(entry(EXE, DATA_DIR)), true), None);
+        assert_eq!(check(None, false), None);
+    }
+
+    #[test]
+    fn only_setups_entry_for_this_data_dir_counts() {
+        let cases = [
+            entry(EXE, r"D:\another\data-dir"),
+            format!(r#""C:\x\other.exe" --data-dir "{DATA_DIR}" service-host"#),
+            format!(r#""{EXE}" --data-dir "{DATA_DIR}" serve"#),
+            format!(r#""{EXE}" --data-dir "{DATA_DIR}" x & calc service-host"#),
+            format!(r#"{EXE} --data-dir "{DATA_DIR}" service-host"#),
+        ];
+        for value in cases {
+            assert_eq!(check(Some(value.clone()), false), None, "{value}");
+        }
+    }
+
+    /// The hint must point at commands that remove or repair the entry;
+    /// `setup --no-service` leaves an existing entry in place.
+    #[test]
+    fn the_fix_names_commands_that_act_on_the_entry() {
+        let human = check(Some(entry(EXE, DATA_DIR)), false)
+            .unwrap()
+            .render_human();
+        for needle in [
+            LOGON_BINARY_MISSING,
+            "re-run `ai-memory setup`",
+            "`ai-memory uninstall --apply`",
+            r"Remove-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name ai-memory",
+            "Antivirus / EDR",
+        ] {
+            assert!(human.contains(needle), "missing {needle:?} in {human}");
+        }
+        assert!(!human.contains("--no-service"), "{human}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_live_check_is_quiet_off_windows() {
+        assert_eq!(check_logon_binary(Path::new(DATA_DIR)), None);
     }
 }

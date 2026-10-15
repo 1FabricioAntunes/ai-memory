@@ -210,6 +210,24 @@ fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool
     );
 }
 
+/// The missing logon binary while the server is down, on stderr like the
+/// spool block, so `--json` consumers' stdout stays a single object.
+fn report_offline_logon_binary(
+    problem: Option<&super::user_service::MissingLogonBinary>,
+    json: bool,
+) {
+    let Some(problem) = problem else {
+        return;
+    };
+    if json {
+        if let Ok(rendered) = serde_json::to_string(problem) {
+            eprintln!("windows logon (server unreachable): {rendered}");
+        }
+        return;
+    }
+    eprint!("{}", problem.render_human());
+}
+
 /// Which capture mode the hook would enforce for this install (#446).
 ///
 /// Reads the same file the hook reads rather than keeping a second source of
@@ -238,12 +256,16 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     // the one question this section exists for could not be asked in the one
     // situation that prompts it.
     let spool = spool_health(&spool_dir(&config.data_dir));
+    // Also local, and for the same reason: a quarantined binary (#1280)
+    // usually means nothing is listening.
+    let windows_logon = super::user_service::check_logon_binary(&config.data_dir);
 
     let report: Report = match get_json::<Report>(&ep, "/admin/status", &[]).await {
         Ok(report) => report,
         Err(err) => {
             report_offline_spool(&spool, args.json);
             report_offline_recovery_hint(config, &spool, args.json);
+            report_offline_logon_binary(windows_logon.as_ref(), args.json);
             return Err(err);
         }
     };
@@ -266,6 +288,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 capture_mode,
                 &ep,
                 auth_posture,
+                windows_logon.as_ref(),
             ))?
         );
     } else {
@@ -275,6 +298,9 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         println!("  db:           {}", report.db_path);
         println!("  bind:         {}", report.bind);
         println!("  auth:         {}", auth_posture.line());
+        if let Some(problem) = &windows_logon {
+            print!("{}", problem.render_human());
+        }
         println!(
             "  pages:        {} (all versions: {})",
             report.counts.pages_latest, report.counts.pages_all
@@ -496,8 +522,9 @@ fn json_report(
     capture_mode: &str,
     endpoint: &ServerEndpoint,
     auth_posture: crate::local_auth::AuthPosture,
+    windows_logon: Option<&super::user_service::MissingLogonBinary>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "version": report.version,
         "data_dir": report.data_dir,
         "bind": report.bind,
@@ -522,7 +549,13 @@ fn json_report(
         "ingest": report.ingest,
         "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
         "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
-    })
+    });
+    // Absent when there is nothing to say, so the shape consumers read is
+    // unchanged.
+    if let Some(problem) = windows_logon {
+        value["windows_logon"] = serde_json::json!(problem);
+    }
+    value
 }
 
 fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
@@ -581,7 +614,7 @@ mod tests {
 
     #[test]
     fn status_json_keeps_existing_fields_and_adds_recovery_compatibly() {
-        let report: Report = serde_json::from_value(serde_json::json!({
+        let report_json = serde_json::json!({
             "version": "2.6.0",
             "data_dir": "/data",
             "bind": "127.0.0.1:49374",
@@ -604,8 +637,8 @@ mod tests {
             "ingest": null,
             "write_queue": null,
             "wiki_format": null
-        }))
-        .unwrap();
+        });
+        let report: Report = serde_json::from_value(report_json.clone()).unwrap();
         let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
         let value = json_report(
             report,
@@ -617,7 +650,9 @@ mod tests {
             "denylist",
             &endpoint,
             crate::local_auth::AuthPosture::NoneLoopback,
+            None,
         );
+        assert!(value.get("windows_logon").is_none(), "{value}");
         assert_eq!(value["auth_posture"]["posture"], "none_loopback");
         assert_eq!(value["auth_posture"]["fix"], "ai-memory auth enable");
         for key in [
@@ -638,6 +673,38 @@ mod tests {
         }
         assert_eq!(value["recovery"]["journal_pending"], 2);
         assert_eq!(value["counts"]["observations"], 4);
+
+        // A missing logon binary (#1280) adds one key and changes no other.
+        let problem = super::super::user_service::MissingLogonBinary {
+            classification: super::super::user_service::LOGON_BINARY_MISSING,
+            executable: r"C:\bin\ai-memory.exe".into(),
+            detail: "gone".into(),
+            fix: "restore it",
+        };
+        let warned = json_report(
+            serde_json::from_value(report_json).unwrap(),
+            SpoolHealth::default(),
+            2,
+            1,
+            1,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            Some(&problem),
+        );
+        assert_eq!(
+            warned["windows_logon"]["classification"],
+            "logon_binary_missing"
+        );
+        assert_eq!(
+            warned["windows_logon"]["executable"],
+            r"C:\bin\ai-memory.exe"
+        );
+        assert_eq!(warned["windows_logon"]["fix"], "restore it");
+        let mut without = warned.clone();
+        without.as_object_mut().unwrap().remove("windows_logon");
+        assert_eq!(without, value);
     }
 
     #[test]

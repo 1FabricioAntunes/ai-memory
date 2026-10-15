@@ -394,6 +394,51 @@ user unit without lingering and a macOS LaunchAgent. For a server that runs
 before anyone signs in, or for other users of the machine, use a real Windows
 service through WinSW, below, and pass `--no-service` to `setup`.
 
+### Antivirus / EDR
+
+Behaviour-based endpoint protection watches for programs that make
+themselves start at logon, and `ai-memory.exe` is unsigned. Bitdefender's
+Advanced Threat Control has quarantined it after `setup` wrote the logon
+entry ([#1280](https://github.com/akitaonrails/ai-memory/issues/1280)).
+`setup` avoids the signals known to weigh in that decision:
+
+- It writes and reads the `Run` value through the registry API. It never
+  runs `reg.exe add` on the `Run` key.
+- The value holds plain paths, without the `\\?\` prefix a canonical path
+  carries.
+- Stopping the host is cooperative (#1300): the host stops the server through
+  a request file in the data dir, as described above, and `taskkill` runs
+  only as the fallback for a host that does not answer.
+
+That lowers the odds but guarantees nothing; a product can still flag an
+unsigned binary on its own rules.
+
+**How to tell.** A quarantine removes `ai-memory.exe` and leaves the `Run`
+value behind. The server then never starts at logon, and the hooks keep
+calling a path that is gone. `ai-memory doctor` and `ai-memory status` (from
+any copy of the binary that still exists) check the entry `setup` wrote for
+their data dir and warn with `logon_binary_missing` when the
+`ai-memory.exe` it names is no longer there. The warning is also in their
+`--json` output, and `status` prints it even when it cannot reach the
+server, which is the usual state once the binary is gone. Your antivirus
+console or quarantine list shows the detection itself.
+
+**What to do.** Restore the binary from quarantine, or put it back by
+reinstalling, and ask whoever runs the antivirus to allow it (on a managed
+machine that is an administrator change). Then re-run `ai-memory setup`,
+which points the entry at the binary you ran it from and starts the host.
+To stop using the logon entry instead, remove it: `ai-memory uninstall
+--apply` removes it along with the rest of ai-memory's wiring, or delete
+only the value:
+
+```powershell
+Remove-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name ai-memory
+```
+
+`setup --no-service` skips writing the entry but does not remove one that
+already exists. Without the entry, run `ai-memory serve --transport http`
+in a terminal or use the WinSW service below.
+
 ### A real Windows service
 
 A Windows service, unlike the logon entry, runs without anyone signed in. It
