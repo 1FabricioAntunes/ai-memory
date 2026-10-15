@@ -2181,6 +2181,11 @@ struct Inner {
     db_path: PathBuf,
     pool: Mutex<Pool>,
     soft_cap: usize,
+    /// Observation rows deserialized by the whole-session reads
+    /// ([`ReaderPool::observations_for_session`] and
+    /// [`ReaderPool::read_session_observations`]); see
+    /// [`ReaderPool::session_observation_rows_loaded`].
+    session_rows_loaded: std::sync::atomic::AtomicU64,
 }
 
 /// The idle connections and whether the pool still hands out new ones. One
@@ -2206,6 +2211,7 @@ impl ReaderPool {
                     closed: false,
                 }),
                 soft_cap: soft_cap.max(1),
+                session_rows_loaded: std::sync::atomic::AtomicU64::new(0),
             }),
             tuning: RetrievalTuning::default(),
             fts_stopwords: FtsStopwords::default(),
@@ -2226,6 +2232,19 @@ impl ReaderPool {
         let mut pool = self.inner.pool.lock();
         pool.closed = true;
         pool.idle.clear();
+    }
+
+    /// Observation rows the whole-session reads have deserialized since this
+    /// pool (or any clone of it) was created: every row
+    /// [`Self::observations_for_session`] returned, plus the rows
+    /// [`Self::read_session_observations`] snapshots read. A SessionEnd on a
+    /// session far larger than its raw-observation window must move this by no
+    /// more than that window, which is what the bound tests assert.
+    #[must_use]
+    pub fn session_observation_rows_loaded(&self) -> u64 {
+        self.inner
+            .session_rows_loaded
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Configure the opt-in ranking signals used by [`Self::hybrid_search`].
@@ -3576,6 +3595,7 @@ impl ReaderPool {
         &self,
         session_id: SessionId,
     ) -> StoreResult<Vec<Observation>> {
+        let inner = self.inner.clone();
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
@@ -3589,7 +3609,70 @@ impl ReaderPool {
             for r in rows {
                 out.push(r??);
             }
+            inner
+                .session_rows_loaded
+                .fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Ok(out)
+        })
+        .await
+    }
+
+    /// Whether the session holds at least one prompt or tool use: the positive
+    /// "real work" predicate ([`SUBSTANTIVE_OBSERVATION_KIND_SQL`]) the writer's
+    /// lifecycle-only end applies in its own transaction, asked as one
+    /// short-circuiting existence query instead of loading the rows.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_has_substantive_observation(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM observations WHERE session_id = ?1 AND {})",
+                SUBSTANTIVE_OBSERVATION_KIND_SQL
+            );
+            Ok(conn.query_row(&sql, params![session_id.as_bytes()], |row| row.get(0))?)
+        })
+        .await
+    }
+
+    /// Read one session's observations through bounded queries, all inside one
+    /// read transaction so every answer describes the same set of rows.
+    ///
+    /// This is the SessionEnd path's alternative to
+    /// [`Self::observations_for_session`]: that call deserializes every row
+    /// (a session can hold hundreds of thousands), while `read` gets a
+    /// [`SessionObservationSnapshot`] whose queries are aggregates, `LIMIT`ed
+    /// windows and streamed scans. `read` runs on a blocking thread and must
+    /// not wait on anything async.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error, and whatever `read` returns.
+    pub async fn read_session_observations<F, T>(
+        &self,
+        session_id: SessionId,
+        read: F,
+    ) -> StoreResult<T>
+    where
+        F: FnOnce(&SessionObservationSnapshot<'_>) -> StoreResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let snapshot = SessionObservationSnapshot {
+                conn: &tx,
+                session_id: session_id.as_bytes().to_vec(),
+                rows_read: std::cell::Cell::new(0),
+            };
+            let result = read(&snapshot);
+            inner.session_rows_loaded.fetch_add(
+                snapshot.rows_read() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            result
         })
         .await
     }
@@ -11812,6 +11895,342 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
         expires_at,
         expired,
     }))
+}
+
+/// The observations of one session, read through bounded queries inside one
+/// read transaction (see [`ReaderPool::read_session_observations`]).
+///
+/// A session can hold hundreds of thousands of rows, and the SessionEnd path
+/// only needs a handful of facts about them: counts, a few "last of a kind"
+/// markers, the rows a page prints, and the first or last row that passes a
+/// predicate. Every method here answers one of those needs with an aggregate,
+/// a `LIMIT`ed query or a streamed scan that keeps one row resident, so the
+/// memory a caller spends does not grow with the session. Every query orders
+/// rows by `created_at` and then `rowid`, which is the order
+/// [`ReaderPool::observations_for_session`] returns them in (the
+/// `(session_id, created_at)` index carries the rowid as its last key).
+pub struct SessionObservationSnapshot<'c> {
+    conn: &'c Connection,
+    session_id: Vec<u8>,
+    rows_read: std::cell::Cell<usize>,
+}
+
+/// Counts and "last of a kind" markers for one session, from one aggregate
+/// pass. A `*_at` field is the newest `created_at` of that kind (microseconds
+/// since the epoch), which is enough to seek straight to the row with an
+/// indexed `created_at <= ?` range instead of walking the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionKindSummary {
+    /// Every row of the session.
+    pub total: usize,
+    /// User prompts.
+    pub prompts: usize,
+    /// At least one prompt or tool use: the positive "real work" predicate
+    /// [`SUBSTANTIVE_OBSERVATION_KIND_SQL`] also gives the writer.
+    pub substantive: bool,
+    /// Newest `session-start`.
+    pub last_session_start_at: Option<i64>,
+    /// Newest `session-end`.
+    pub last_session_end_at: Option<i64>,
+    /// Newest `stop`.
+    pub last_stop_at: Option<i64>,
+    /// Newest `stop` whose body is not the empty string.
+    pub last_stop_with_body_at: Option<i64>,
+    /// Newest `post-tool-use`.
+    pub last_post_tool_at: Option<i64>,
+    /// Newest `user-prompt`.
+    pub last_prompt_at: Option<i64>,
+}
+
+/// Tool names a session used, grouped in SQL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionToolTitles {
+    /// Completed calls (`post-tool-use`) per non-empty title.
+    pub completed: Vec<(String, usize)>,
+    /// Every distinct non-empty title carried by a `pre-tool-use` or
+    /// `post-tool-use` row.
+    pub titles: Vec<String>,
+}
+
+/// A user prompt's title, plus its body when the caller asked for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPromptTitle {
+    /// The prompt's stored title.
+    pub title: String,
+    /// The body, loaded only for a title containing the `body_for_titles_like`
+    /// marker the caller passed (a superset the caller filters exactly).
+    pub body: Option<String>,
+}
+
+/// What a page prints about one observation, without the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLine {
+    /// Event classification.
+    pub kind: ObservationKind,
+    /// Extension namespace, if any.
+    pub extension: Option<String>,
+    /// Source event name, if any.
+    pub source_event: Option<String>,
+    /// The first [`SESSION_LINE_TITLE_CHARS`] characters of the title.
+    pub title: String,
+    /// When the observation happened.
+    pub created_at: Timestamp,
+}
+
+/// Title characters a [`SessionLine`] keeps.
+pub const SESSION_LINE_TITLE_CHARS: usize = 80;
+
+/// The kinds that make a session worth a summary page: a user prompt or a tool
+/// use. The writer's lifecycle-only end
+/// (`end_lifecycle_only_session_in_tx`) and the reader's
+/// [`SessionKindSummary::substantive`] both build their query from this one
+/// predicate, and the router's `is_ephemeral_session` is its Rust twin (a test
+/// pins the three together).
+pub const SUBSTANTIVE_OBSERVATION_KIND_SQL: &str =
+    "kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use')";
+
+impl SessionObservationSnapshot<'_> {
+    /// Rows this snapshot has deserialized into an [`Observation`] or a
+    /// [`SessionLine`] so far. Aggregates and the prompt-title projection are
+    /// not counted: they return counters and strings, not rows.
+    #[must_use]
+    pub fn rows_read(&self) -> usize {
+        self.rows_read.get()
+    }
+
+    /// Counts and newest-of-kind markers in one pass over the session.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn kind_summary(&self) -> StoreResult<SessionKindSummary> {
+        let sql = format!(
+            "SELECT COUNT(*), \
+                    COALESCE(SUM(kind = ?2), 0), \
+                    COALESCE(MAX({SUBSTANTIVE_OBSERVATION_KIND_SQL}), 0), \
+                    MAX(CASE WHEN kind = ?3 THEN created_at END), \
+                    MAX(CASE WHEN kind = ?4 THEN created_at END), \
+                    MAX(CASE WHEN kind = ?5 THEN created_at END), \
+                    MAX(CASE WHEN kind = ?5 AND body <> '' THEN created_at END), \
+                    MAX(CASE WHEN kind = ?6 THEN created_at END), \
+                    MAX(CASE WHEN kind = ?2 THEN created_at END) \
+             FROM observations WHERE session_id = ?1"
+        );
+        let summary = self.conn.query_row(
+            &sql,
+            params![
+                self.session_id,
+                ObservationKind::UserPrompt.as_str(),
+                ObservationKind::SessionStart.as_str(),
+                ObservationKind::SessionEnd.as_str(),
+                ObservationKind::Stop.as_str(),
+                ObservationKind::PostToolUse.as_str(),
+            ],
+            |row| {
+                Ok(SessionKindSummary {
+                    total: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                    prompts: usize::try_from(row.get::<_, i64>(1)?).unwrap_or(usize::MAX),
+                    substantive: row.get::<_, i64>(2)? != 0,
+                    last_session_start_at: row.get(3)?,
+                    last_session_end_at: row.get(4)?,
+                    last_stop_at: row.get(5)?,
+                    last_stop_with_body_at: row.get(6)?,
+                    last_post_tool_at: row.get(7)?,
+                    last_prompt_at: row.get(8)?,
+                })
+            },
+        )?;
+        Ok(summary)
+    }
+
+    /// The tool names the session used, grouped in SQL.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn tool_titles(&self) -> StoreResult<SessionToolTitles> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT kind, title, COUNT(*) FROM observations \
+             WHERE session_id = ?1 AND kind IN (?2, ?3) AND title <> '' \
+             GROUP BY kind, title",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                self.session_id,
+                ObservationKind::PreToolUse.as_str(),
+                ObservationKind::PostToolUse.as_str(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        let mut out = SessionToolTitles::default();
+        let mut titles = std::collections::BTreeSet::new();
+        for row in rows {
+            let (kind, title, count) = row?;
+            if kind == ObservationKind::PostToolUse.as_str() {
+                out.completed
+                    .push((title.clone(), usize::try_from(count).unwrap_or(usize::MAX)));
+            }
+            titles.insert(title);
+        }
+        out.titles = titles.into_iter().collect();
+        Ok(out)
+    }
+
+    /// Every user prompt's title in capture order, with the body only for a
+    /// title that contains `body_for_titles_like`.
+    ///
+    /// The titles are the one part of a SessionEnd that grows with the
+    /// session: the page it renders lists each of them, so the output cannot
+    /// be smaller than this. A title is short by construction (the router
+    /// truncates it for display); the bodies, which are not, stay in the
+    /// database.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn prompt_titles(
+        &self,
+        body_for_titles_like: &str,
+    ) -> StoreResult<Vec<SessionPromptTitle>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END \
+             FROM observations \
+             WHERE session_id = ?1 AND kind = ?2 \
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                self.session_id,
+                ObservationKind::UserPrompt.as_str(),
+                body_for_titles_like,
+            ],
+            |row| {
+                Ok(SessionPromptTitle {
+                    title: row.get(0)?,
+                    body: row.get(1)?,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The first `limit` rows of the session, oldest first, as page lines.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn first_lines(&self, limit: usize) -> StoreResult<Vec<SessionLine>> {
+        self.lines(limit, ObservationOrder::Asc)
+    }
+
+    /// The last `limit` rows of the session, oldest first, as page lines.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn last_lines(&self, limit: usize) -> StoreResult<Vec<SessionLine>> {
+        let mut lines = self.lines(limit, ObservationOrder::Desc)?;
+        lines.reverse();
+        Ok(lines)
+    }
+
+    fn lines(&self, limit: usize, order: ObservationOrder) -> StoreResult<Vec<SessionLine>> {
+        let direction = match order {
+            ObservationOrder::Asc => "ASC",
+            ObservationOrder::Desc => "DESC",
+        };
+        let sql = format!(
+            "SELECT kind, extension, source_event, substr(title, 1, ?3), created_at \
+             FROM observations WHERE session_id = ?1 \
+             ORDER BY created_at {direction}, rowid {direction} LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(params![
+            self.session_id,
+            i64::try_from(limit).unwrap_or(i64::MAX),
+            i64::try_from(SESSION_LINE_TITLE_CHARS).unwrap_or(80),
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind_str: String = row.get(0)?;
+            let created_us: i64 = row.get(4)?;
+            out.push(SessionLine {
+                kind: kind_str
+                    .parse::<ObservationKind>()
+                    .map_err(StoreError::from)?,
+                extension: row.get(1)?,
+                source_event: row.get(2)?,
+                title: row.get(3)?,
+                created_at: Timestamp::from_microsecond(created_us).map_err(|e| {
+                    StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                        "bad timestamp: {e}"
+                    )))
+                })?,
+            });
+            self.rows_read.set(self.rows_read.get() + 1);
+        }
+        Ok(out)
+    }
+
+    /// Walk the session's rows in `order`, one resident at a time, and return
+    /// the first value `visit` produces.
+    ///
+    /// `kinds` restricts the walk to those kinds (empty = every kind) and
+    /// `at_or_before` starts it at an indexed `created_at` bound, which is how
+    /// a caller that already knows the newest row of a kind (from
+    /// [`Self::kind_summary`]) lands on it without walking the rows after it.
+    /// The walk ends at the first `Some`, so a predicate that accepts early
+    /// reads a handful of rows; one that never accepts walks the session, but
+    /// still keeps a single row in memory.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn scan<T>(
+        &self,
+        order: ObservationOrder,
+        kinds: &[ObservationKind],
+        at_or_before: Option<i64>,
+        mut visit: impl FnMut(&Observation) -> Option<T>,
+    ) -> StoreResult<Option<T>> {
+        let direction = match order {
+            ObservationOrder::Asc => "ASC",
+            ObservationOrder::Desc => "DESC",
+        };
+        let mut sql = String::from(
+            "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                    title, body, importance, created_at \
+             FROM observations WHERE session_id = ?",
+        );
+        let mut sql_params: Vec<Value> = vec![Value::Blob(self.session_id.clone())];
+        if let Some(bound) = at_or_before {
+            sql.push_str(" AND created_at <= ?");
+            sql_params.push(Value::Integer(bound));
+        }
+        if !kinds.is_empty() {
+            sql.push_str(" AND kind IN (");
+            for (i, kind) in kinds.iter().enumerate() {
+                sql.push_str(if i == 0 { "?" } else { ", ?" });
+                sql_params.push(Value::Text(kind.as_str().to_string()));
+            }
+            sql.push(')');
+        }
+        let _ = write!(sql, " ORDER BY created_at {direction}, rowid {direction}");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(params_from_iter(sql_params))?;
+        while let Some(row) = rows.next()? {
+            let observation = row_to_observation(row)??;
+            self.rows_read.set(self.rows_read.get() + 1);
+            if let Some(found) = visit(&observation) {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Observation>> {
