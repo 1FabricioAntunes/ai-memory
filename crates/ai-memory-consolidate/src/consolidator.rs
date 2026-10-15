@@ -731,7 +731,24 @@ impl Consolidator {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
-            let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
+            // A path `slugify_page_path` cannot repair (a leading slash, an
+            // empty or dot segment) fails `PagePath::new` inside
+            // `build_update`. Skip that page like the `ensure_portable`
+            // guard below does, rather than let one bad path fail every
+            // other page of the batch (#848).
+            let (mut req, mut outcome) =
+                match build_update(ws, proj, upd, false, &actor, author_id) {
+                    Ok(built) => built,
+                    Err(ConsolidatorError::Memory(e)) => {
+                        warn!(
+                            path = %upd.path,
+                            error = %e,
+                            "skipped consolidation page update: path is invalid",
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // Deterministic backstop for the title-uniqueness prompt
@@ -5020,6 +5037,78 @@ mod tests {
 
         let bad = wiki.read_page(ws, proj, &sanitized_path).unwrap();
         assert_eq!(bad.frontmatter["title"], "Bad path page");
+    }
+
+    /// A batch page whose path `slugify_page_path` cannot repair (leading
+    /// slash, dot segment, empty segment) is skipped on its own: before the
+    /// fix `PagePath::new` rejected it inside `build_update` and the `?`
+    /// failed the whole batch, losing the sibling valid page (#848).
+    #[tokio::test]
+    async fn batch_with_unrepairable_path_skips_only_that_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "rationale": "three bad paths, one good",
+            "updates": [
+                {
+                    "path": "/concepts/absolute.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Absolute path page",
+                    "body_markdown": "Absolute path body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/../escape.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Dot segment page",
+                    "body_markdown": "Dot segment body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts//double.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Empty segment page",
+                    "body_markdown": "Empty segment body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/good.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Good path page",
+                    "body_markdown": "Good path body.",
+                    "tags": []
+                }
+            ]
+        });
+
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("an unrepairable path must not fail the whole batch");
+
+        let paths: Vec<&str> = outcomes.iter().map(|o| o.path.as_str()).collect();
+        assert_eq!(paths, vec!["concepts/good.md"]);
+        let good = wiki
+            .read_page(ws, proj, &PagePath::new("concepts/good.md").unwrap())
+            .unwrap();
+        assert_eq!(good.frontmatter["title"], "Good path page");
     }
 
     /// A batch whose single update targets `path` — the model chooses this
