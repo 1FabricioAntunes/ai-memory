@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -1871,6 +1871,50 @@ project's `.muse/hooks.json` in a trusted workspace; ai-memory does not write
 it, because its commands carry this machine's paths. No managed workstream
 (`ai-memory run muse`) and no transcript backfill from
 `${XDG_DATA_HOME:-~/.local/share}/muse/sessions` are claimed yet.
+
+### CodeBuddy Code
+
+CodeBuddy Code (`codebuddy`), Tencent's coding agent, reads lifecycle hooks
+from the `hooks` key of `~/.codebuddy/settings.json`.
+`install-hooks --agent codebuddy` (alias `code-buddy`) merges ai-memory's
+entries there, keeping your other settings and any hooks you already have
+(#1299):
+
+```bash
+ai-memory install-hooks --agent codebuddy --apply
+```
+
+Without `--apply` the command prints the block to merge by hand, and
+`ai-memory setup-agent --agent codebuddy` prints the same block for a host
+that runs CodeBuddy against a remote server. Running `--apply` again changes
+nothing.
+
+CodeBuddy sends Claude Code-shaped JSON on stdin (`session_id`, `cwd`,
+`tool_name`, `tool_input`, `tool_use_id`, `tool_response`) with Claude Code's
+tool names, so each entry runs the native
+`ai-memory hook --event … --agent codebuddy` command with an empty matcher.
+There is no script bundle; the local spool, bearer auth and
+`[capture] ignore_paths` apply. Seven events are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop` and
+`SessionEnd`.
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`, which CodeBuddy appends to the
+session. With nothing to deliver, the `SessionStart` and `UserPromptSubmit`
+hooks print nothing, since CodeBuddy appends their output too. An interactive
+session can start without a `cwd` in the payload; the hook then uses
+`CODEBUDDY_PROJECT_DIR`, which CodeBuddy sets for its hooks. When neither
+names a directory, the hook still records the event but fetches no handoff,
+because the server cannot tell which project's handoff to claim; the
+handoff stays open for `memory_handoff_list` and `memory_handoff_accept`.
+
+`ai-memory setup` wires CodeBuddy when `~/.codebuddy` exists, and
+`ai-memory uninstall` removes the entries. There is no `install-mcp` client
+for CodeBuddy yet, no transcript backfill, no session close for headless
+`codebuddy -p` runs and no managed workstream. This integration follows
+CodeBuddy's hook documentation and the payloads reported on v2.164 to
+v2.167; the maintainers have not yet run it end to end. Start a new
+CodeBuddy session after installing so it loads the hooks.
 
 ### Hermes Agent (Nous Research)
 

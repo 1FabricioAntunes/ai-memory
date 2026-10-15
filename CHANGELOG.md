@@ -105,7 +105,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `~/.codebuddy/settings.json`, keeps sibling settings and your own hooks,
   and changes nothing on a re-run. There is no script bundle. The
   `SessionStart` hook delivers the pending handoff through
-  `hookSpecificOutput.additionalContext`. `setup` wires CodeBuddy when
+  `hookSpecificOutput.additionalContext`, and a capture-only `SessionStart` or
+  `UserPromptSubmit` prints nothing, since CodeBuddy appends that output to
+  the session. A `SessionStart` without `cwd` falls back to
+  `CODEBUDDY_PROJECT_DIR`. `setup` wires CodeBuddy when
   `~/.codebuddy` exists, `setup-agent --agent codebuddy` prints the hook
   block, and `uninstall` removes the entries. Transcript backfill and
   headless `codebuddy -p` session close are not part of this change.
@@ -138,6 +141,14 @@ version in [`docs/changelog/`](docs/changelog/):
   and no migration. (#1264)
 
 ### Fixed
+- Fixed the native hook claiming a handoff from the wrong project when an
+  event named no directory. A `SessionStart` (or Kimi Code's
+  `UserPromptSubmit`, or Grok's first `PostToolUse`) whose payload carried no
+  `cwd` sent `GET /handoff` with no scope, so the server resolved its default
+  project or the caller's last active one and the hook consumed that
+  project's baton. The hook now fetches no handoff without a directory and
+  says so on stderr; the handoff stays open for `memory_handoff_accept`.
+  (#1312)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and
