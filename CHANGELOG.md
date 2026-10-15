@@ -12,6 +12,13 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the WinSW v2.12.0 service-account example using the v3
+  `<username>` element. WinSW v2.12.0 expects separate `<domain>` and `<user>`
+  elements; it ignored `<username>` and installed the service as
+  `LocalSystem`, which cannot safely own a wiki under another user's profile.
+  The Windows guide now uses the version-correct XML, grants service logon,
+  explains reinstalling an existing service, and verifies its recorded
+  `StartName`. (#1321)
 - Fixed `/web/health` warning that hook events wait in the local spool during
   every active session. Hooks spool each event first and deliver it at the turn,
   compaction or session boundary, so a few fresh events in the spool are normal,
