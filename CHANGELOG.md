@@ -44,6 +44,11 @@ version in [`docs/changelog/`](docs/changelog/):
   sign-in, and shows each proposal's `ai-memory pending-writes approve` /
   `reject` command instead; a decision that fails for another reason now shows
   the server's message even when it is plain text. (#1288)
+- Fixed the managed routing snippet's claim that Claude Code never reads
+  `AGENTS.md`. Claude Code 2.1.277 and later reads it when no `CLAUDE.md`,
+  `.claude/CLAUDE.md`, or `CLAUDE.local.md` is present, and reads that file
+  instead when one exists. The `@AGENTS.md` import is how a canonical
+  `AGENTS.md` reaches sessions that read only `CLAUDE.md`. (#1276)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
