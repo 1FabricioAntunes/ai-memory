@@ -439,6 +439,15 @@ pub(crate) fn muse_settings_path(
     install_mcp::muse_settings_path_in(env.var_os("XDG_CONFIG_HOME"), home_dir())
 }
 
+/// `~/.codebuddy/settings.json` — Tencent CodeBuddy Code's user settings.
+/// The root `hooks` block is Claude Code's nested shape (#1299).
+pub(crate) fn codebuddy_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.codebuddy/settings.json")?
+        .join(".codebuddy")
+        .join("settings.json"))
+}
+
 /// `~/.config/zero/hooks.json` — Zero's user-level lifecycle hook config
 /// (issue #156). Zero resolves it under `$XDG_CONFIG_HOME` falling back to
 /// `~/.config`; like the OpenCode plugin path below we target the default
@@ -982,6 +991,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                     .context("internal: the Muse settings path is resolved before apply")?;
                 apply_to_muse_settings(&path, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::CodeBuddy => {
+                let path = match &args.config_file {
+                    Some(path) => path.clone(),
+                    None => codebuddy_settings_path()?,
+                };
+                apply_to_codebuddy_settings(&path, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -1138,6 +1154,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         }
         AgentChoice::Droid => render_droid(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Muse => render_muse(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::CodeBuddy => render_codebuddy(&server_url, auth, &config.data_dir, strategy),
     }
 }
 
@@ -1332,6 +1349,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Droid => droid_hooks_path().ok()?,
             // `run` resolves it into `args.config_file` before any caller.
             AgentChoice::Muse => return None,
+            AgentChoice::CodeBuddy => codebuddy_settings_path().ok()?,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -1759,6 +1777,8 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::CopilotCli => Some(McpClient::CopilotCli),
         AgentChoice::Droid => Some(McpClient::Droid),
         AgentChoice::Muse => Some(McpClient::Muse),
+        // No first-party CodeBuddy MCP installer in this change.
+        AgentChoice::CodeBuddy => None,
     }
 }
 
@@ -7104,6 +7124,91 @@ fn render_droid(
     Ok(())
 }
 
+/// Merge ai-memory's entries into the `hooks` key of CodeBuddy's
+/// `settings.json`, keeping every other key and every other hook,
+/// idempotently.
+fn apply_to_codebuddy_settings(
+    path: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = super::render_shared::build_codebuddy_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: build_codebuddy_hooks_payload didn't return a hooks object")?;
+    let outcome = apply_atomic(path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in the CodeBuddy settings.json but not an object")?;
+            for (event, value) in our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    print!("{CODEBUDDY_INSTALL_NOTES}");
+    Ok(())
+}
+
+const CODEBUDDY_INSTALL_NOTES: &str = "\
+# NOTE: CodeBuddy appends SessionStart stdout (`hookSpecificOutput.additionalContext`)
+#       to the session, so the prior session's handoff is delivered automatically.
+# NOTE: start a new codebuddy session for it to load the new hooks.
+";
+
+/// Print the `hooks` block for `~/.codebuddy/settings.json` (dry-run
+/// counterpart of [`apply_to_codebuddy_settings`]).
+fn render_codebuddy(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_codebuddy_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing codebuddy hook config")?;
+    println!("# CodeBuddy Code hook config — merge under the `hooks` key of");
+    println!("# ~/.codebuddy/settings.json, or re-run with --apply to merge it in");
+    println!("# place.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
+    }
+    print!("{CODEBUDDY_INSTALL_NOTES}");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 /// Merge ai-memory's entries into the `hooks` key of Muse's `settings.json`,
 /// keeping `schema_version`, every unknown key and every other hook in it,
 /// idempotently, with a backup next to the file on change. Muse fails every
@@ -8077,6 +8182,75 @@ mod tests {
             config_file: Some(config_file.to_path_buf()),
             ..default_hook_args()
         }
+    }
+
+    /// `install-hooks --agent codebuddy --apply` merges native `--agent
+    /// codebuddy` commands under the `hooks` key of `settings.json`, keeps
+    /// sibling keys and third-party hooks, and a re-apply changes nothing.
+    #[test]
+    fn codebuddy_apply_merges_native_hooks_under_the_settings_hooks_key() {
+        let home = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let settings = home.path().join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({
+                "model": "deepseek-v4.1-flash",
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::CodeBuddy,
+            config_file: Some(settings.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_codebuddy_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        let first = fs::read_to_string(&settings).unwrap();
+        apply_to_codebuddy_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        assert_eq!(
+            first,
+            fs::read_to_string(&settings).unwrap(),
+            "re-apply is a no-op"
+        );
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["model"], "deepseek-v4.1-flash");
+        for (event, script) in super::super::render_shared::CODEBUDDY_EVENTS {
+            let entries = root["hooks"][event].as_array().unwrap();
+            let ours: Vec<_> = entries
+                .iter()
+                .filter(|entry| is_ai_memory_hook_entry(entry))
+                .collect();
+            assert_eq!(ours.len(), 1, "{event}: exactly one ai-memory entry");
+            assert_eq!(ours[0]["matcher"], "", "{event}");
+            let command = ours[0]["hooks"][0]["command"].as_str().unwrap();
+            let stem = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!(
+                    " hook --event {stem} --agent codebuddy --server-url "
+                )),
+                "{event}: {command}"
+            );
+            assert!(
+                !command.contains(".sh"),
+                "{event}: no script bundle: {command}"
+            );
+        }
+        assert!(root["hooks"].get("SubagentStart").is_none());
+        assert!(root["hooks"].get("PostToolUseFailure").is_none());
+        let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
     }
 
     /// `install-hooks --agent droid --apply` merges native `--agent droid`

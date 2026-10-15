@@ -163,6 +163,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         if muse_detected(&home, &env) {
             found.push(AgentChoice::Muse);
         }
+        if codebuddy_detected(&home) {
+            found.push(AgentChoice::CodeBuddy);
+        }
         found
     } else {
         dedup(args.agents.iter().copied())
@@ -269,6 +272,13 @@ fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> bool {
     };
     xdg("XDG_CONFIG_HOME", &[".config"]).is_dir()
         || xdg("XDG_DATA_HOME", &[".local", "share"]).is_dir()
+}
+
+/// Whether CodeBuddy Code has been used on this machine: `~/.codebuddy`
+/// exists. CodeBuddy has no native-session adapter, so setup finds it by
+/// that directory rather than by [`detect_agents`].
+fn codebuddy_detected(home: &Path) -> bool {
+    home.join(".codebuddy").is_dir()
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -737,6 +747,19 @@ mod tests {
         assert!(muse_detected(home.path(), &env));
         assert_eq!(skills_for(AgentChoice::Muse), InstallSkillsAgent::Agents);
         assert_eq!(AgentPlan::new(AgentChoice::Muse).mcp, Some(McpClient::Muse));
+    }
+
+    #[test]
+    fn codebuddy_is_detected_only_when_its_home_directory_exists() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!codebuddy_detected(home.path()));
+        std::fs::create_dir_all(home.path().join(".codebuddy")).unwrap();
+        assert!(codebuddy_detected(home.path()));
+        assert_eq!(
+            skills_for(AgentChoice::CodeBuddy),
+            InstallSkillsAgent::Agents
+        );
+        assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy).mcp, None);
     }
 
     /// A versioned Homebrew binary is recorded through the `opt/<formula>`

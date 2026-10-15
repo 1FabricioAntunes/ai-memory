@@ -833,6 +833,10 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Grizzybot
             | AgentKind::Droid
             | AgentKind::Muse
+            // CodeBuddy Code sends Claude Code's snake_case tool fields
+            // (#1299). Unknown values stay `Other` and keep the capture-only
+            // path.
+            | AgentKind::CodeBuddy
     )
 }
 
@@ -2180,6 +2184,8 @@ mod tests {
         assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
         assert_eq!(parse_agent("pool"), AgentKind::Pool);
         assert_eq!(parse_agent("poolside"), AgentKind::Pool);
+        assert_eq!(parse_agent("codebuddy"), AgentKind::CodeBuddy);
+        assert_eq!(parse_agent("code-buddy"), AgentKind::CodeBuddy);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -2239,6 +2245,54 @@ mod tests {
         );
         assert_eq!(unknown.agent, AgentKind::Other);
         assert!(unknown.title_hint.is_none());
+    }
+
+    /// CodeBuddy posts Claude Code's tool payload. The same body under
+    /// `agent=codebuddy` is a closed tool observation; under an unknown
+    /// agent it stays capture-only (`title` empty, no tool family).
+    #[test]
+    fn codebuddy_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_codebuddy",
+            "tool_input": {"file_path": "src/lib.rs"},
+            "tool_response": "file contents"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("codebuddy".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::CodeBuddy);
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("outcome: unknown"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_codebuddy"), "{body}");
+        assert!(body.contains("\n---\nfile contents"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("codebuddy-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
     }
 
     /// Hermes 3.x puts the tool result inside `extra.result` and mirrors the

@@ -125,6 +125,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         emit_muse(&args)?;
         return Ok(());
     }
+    // CodeBuddy too: ~/.codebuddy/settings.json runs the native `hook` command.
+    if matches!(args.agent, AgentChoice::CodeBuddy) {
+        emit_codebuddy(&args)?;
+        return Ok(());
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -222,7 +227,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Zcode
         | AgentChoice::Hermes
         | AgentChoice::Droid
-        | AgentChoice::Muse => {
+        | AgentChoice::Muse
+        | AgentChoice::CodeBuddy => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -364,6 +370,30 @@ fn emit_muse(args: &SetupAgentArgs) -> Result<()> {
     println!("# \"schema_version\": 1. The `command` must be an ai-memory binary reachable");
     println!("# on the host that runs Muse; prefer `ai-memory install-hooks --agent muse");
     println!("# --apply` from that host so the path and data dir are resolved for you.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print the `hooks` block for `~/.codebuddy/settings.json`. No scripts are
+/// staged: each entry runs the ai-memory binary's native `hook` command with
+/// CodeBuddy's event JSON on stdin.
+fn emit_codebuddy(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_codebuddy_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing CodeBuddy hook config")?;
+    println!("# CodeBuddy Code — merge under the `hooks` key of");
+    println!("# ~/.codebuddy/settings.json. The `command` must be an ai-memory");
+    println!("# binary reachable on the host that runs CodeBuddy; prefer");
+    println!("# `ai-memory install-hooks --agent codebuddy --apply` from that host.");
     if args.auth_token.is_some() {
         println!("#       Treat settings.json as sensitive (chmod 600).");
     }

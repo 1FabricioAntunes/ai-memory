@@ -291,6 +291,12 @@ pub enum AgentKind {
     /// Meta Muse Code (`muse`), whose hooks send Claude Code-shaped payloads
     /// with Muse's own tool names.
     Muse,
+    /// Tencent CodeBuddy Code (`codebuddy`). Hooks are Claude Code-shaped
+    /// (PascalCase events; `session_id`, `cwd`, `tool_name` and `tool_input`
+    /// on stdin). `SessionStart` stdout's `hookSpecificOutput.additionalContext`
+    /// is appended to the session (#1299).
+    #[serde(rename = "codebuddy", alias = "code-buddy")]
+    CodeBuddy,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -301,7 +307,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -326,6 +332,7 @@ impl AgentKind {
         Self::Grizzybot,
         Self::Droid,
         Self::Muse,
+        Self::CodeBuddy,
         Self::Other,
     ];
 
@@ -357,6 +364,7 @@ impl AgentKind {
             Self::Grizzybot => "grizzybot",
             Self::Droid => "droid",
             Self::Muse => "muse",
+            Self::CodeBuddy => "codebuddy",
             Self::Other => "other",
         }
     }
@@ -391,6 +399,7 @@ impl AgentKind {
             "grizzybot" | "grizzy-bot" => Self::Grizzybot,
             "droid" | "factory-droid" | "factory_droid" => Self::Droid,
             "muse" | "muse-code" | "musecode" => Self::Muse,
+            "codebuddy" | "code-buddy" => Self::CodeBuddy,
             _ => Self::Other,
         }
     }
@@ -443,6 +452,11 @@ impl AgentKind {
     /// Meta Muse Code injects a `SessionStart` stdout's
     /// `hookSpecificOutput.additionalContext` as developer context (verified
     /// offline against Muse Code 1.4.7), so it takes the same envelope.
+    ///
+    /// CodeBuddy Code appends that same envelope to the session (reported
+    /// against v2.164.0–v2.167.0, #1299), so the native hook fetches the
+    /// handoff for it. The fetch stays the built-in SessionStart path; a
+    /// separate `GET /handoff` client is not part of the installer.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -734,6 +748,34 @@ mod tests {
         assert!(!AgentKind::Muse.user_prompt_injects_handoff());
         assert!(!AgentKind::Muse.post_tool_injects_handoff());
         assert!(!AgentKind::Muse.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_codebuddy_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::CodeBuddy.as_str(), "codebuddy");
+        for alias in ["codebuddy", "code-buddy"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::CodeBuddy, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CodeBuddy).unwrap(),
+            "\"codebuddy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"codebuddy\"").unwrap(),
+            AgentKind::CodeBuddy
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"code-buddy\"").unwrap(),
+            AgentKind::CodeBuddy
+        );
+        assert_eq!(AgentKind::from_wire("codebuddy-2"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("tencent"), AgentKind::Other);
+        // CodeBuddy appends SessionStart's hookSpecificOutput.additionalContext
+        // (#1299), so the built-in fetch is the delivery path.
+        assert!(AgentKind::CodeBuddy.session_start_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.user_prompt_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.post_tool_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.reuses_session_id_after_end());
     }
 
     #[test]

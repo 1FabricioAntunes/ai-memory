@@ -272,6 +272,10 @@ fn build_plan(
                 install_hooks::muse_settings_path(env)?,
                 HookConfigShape::NestedHooksKey,
             ),
+            (
+                install_hooks::codebuddy_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {

@@ -144,6 +144,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | GitHub Copilot CLI | Supported |
 | Factory Droid | Supported |
 | Meta Muse Code | Supported |
+| CodeBuddy Code | Hooks-only |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | DeepSeek Harness (DSH) | MCP-only |
