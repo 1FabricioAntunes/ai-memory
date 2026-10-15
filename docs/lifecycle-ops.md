@@ -21,6 +21,7 @@ on a homelab box where mistakes are harder to undo.
 | `reclaim-ledger-versions` | ✅ yes | superseded pre-#660 ledger page *versions* only | no (the latest page version stays) | Dry-run by default; needs `--confirm` to delete. Online through the writer actor, safe alongside the live writer. Content-gated: only non-latest, non-decay `log.md`/`log-YYYY-MM.md` versions whose body opens with a ledger hook entry are removed; a real page that merely shares the name is untouched. `--compact` additionally rebuilds FTS and `VACUUM`s to reclaim the freed bytes. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
+| MCP `memory_restore_page` | ✅ yes | no (writes a new current version; the replaced one stays reachable) | yes (restore another checkpoint) | Lists a page's checkpoints, or writes one back through the `memory_write_page` path. Admin only, like `restore-page`. See [below](#mcp-memory_restore_page). |
 | `backup-agents --to` / `restore-agents --from <tarball>` | ✅ yes (client-side; never touches the server or its data dir) | no | yes (`restore-agents --apply` keeps timestamped copies of overwritten files) | Agent-config assets, not wiki/db: MCP configs (redacted unless `--include-secrets`), hook configs, instructions, skills, plugins. `restore-agents` is a dry run by default; `--apply` writes to disk and `--force` overwrites existing or differing targets. Non-MCP assets are restored verbatim and may contain secrets, so only `--apply` an archive whose source you trust. |
 | `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
@@ -943,6 +944,45 @@ What it does not recover:
 - Sessions, observations, handoffs, users, audit rows, access counters, and
   embeddings. Those live only in SQLite and require a full `backup` / `restore`
   if you need to roll them back.
+
+### MCP `memory_restore_page`
+
+The agent-facing counterpart of `restore-page`. Without `rev` it lists the git
+checkpoints that changed one page, newest first, including the one that
+deleted it; with `rev` it writes that version back as the page's new current
+version.
+
+It differs from `restore-page` in how the text gets back in. The checkpoint's
+body and frontmatter (`title`, `tier`, `tags`, `pinned`, `expires_at`, `kind`,
+`entities`, `abstract`, `relations`, `applies_to`, `enforced_by`) go through the
+same path as `memory_write_page`: the sanitizer, the admission chain, write
+attribution and supersession all apply, and the version it replaces stays
+reachable. Metadata that `memory_write_page` would refuse is refused here too,
+before anything is written. Other frontmatter keys are not carried over.
+Scope is resolved once, without creating anything, and the listing, the read
+and the write all use that one project.
+
+Who may call it: an admin, the same authority as `/admin/restore-page`. Git
+history keeps every version the live wiki dropped, including pages a root
+deleted, pages a session purge removed and expired pages the forget sweep
+hard-deleted, so listing names them and restoring brings their text back. A DB
+user or proxied operator is refused for both, even on a project they can write
+and even for their own per-user slot. On a server that tells no operators
+apart (anonymous loopback, or a root bearer with no users) the caller is root
+and nothing changes. Over stdio there is no auth layer, and the caller already
+holds the data directory.
+
+Limits:
+
+- Project pages only. Pages written with `scope: "profile"` live in the
+  operator's profile and are not addressable here; restore them with
+  `restore-page` on the profile's project.
+- Listing walks at most 5,000 commits back from `HEAD`, off the async runtime,
+  so a page untouched for longer than that lists no checkpoints. Use
+  `ai-memory checkpoints` and `restore-page --from` for older history.
+- A restored `expires_at` is kept as written. If it is already past, the page
+  is hidden again at once and removed by the next forget sweep; restore an
+  expired page with `memory_write_page` and a new expiry instead.
 
 ### `backup`
 

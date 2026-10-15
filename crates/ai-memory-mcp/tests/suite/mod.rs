@@ -37,6 +37,7 @@ mod query_reasoning;
 mod query_superseded;
 mod read_page_related;
 mod recap_identity;
+mod restore_page_authz;
 mod retrieval_via_tools;
 mod self_service_keys;
 mod session_management;
