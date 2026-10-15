@@ -12,6 +12,15 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `install-instructions` treating a line that is exactly `@AGENTS.md` as
+  proof that Claude Code loads the `AGENTS.md` being written. Claude Code
+  resolves `@path` from the file that contains the import, including in the
+  middle of a sentence, expands `~/` from the home directory, and ignores
+  imports inside code spans and fenced blocks. `@AGENTS.md` in
+  `.claude/CLAUDE.md` loads `.claude/AGENTS.md`, a fenced `@AGENTS.md` loads
+  nothing, and `@AGENTS.md` in a parent directory loads that directory's file.
+  The note now compares the resolved path with the file being written and
+  names the import that reaches it. (#1298)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and

@@ -379,8 +379,11 @@ leaves adherence to whether the agent does. See
 [Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
 `install-instructions` prints a note when it writes only `AGENTS.md` while a
 `CLAUDE.local.md`, `.claude/CLAUDE.md` or `CLAUDE.md` in the directory or above
-it would make Claude Code read that file instead, unless one of them already
-imports `@AGENTS.md`.
+it would make Claude Code read that file instead, unless one of them imports
+the `AGENTS.md` being written. The import is resolved from the file that
+contains it (`@AGENTS.md` in `.claude/CLAUDE.md` points at `.claude/AGENTS.md`;
+that file needs `@../AGENTS.md`), `~/` expands from the home directory, and an
+`@path` inside a code span or fenced block does not count.
 
 To refresh only the managed Agent Skills:
 
