@@ -9,6 +9,7 @@ pub mod active_project;
 pub mod actor;
 pub mod agent_backup;
 pub mod error;
+pub mod excerpt;
 pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
