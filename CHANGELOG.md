@@ -95,6 +95,12 @@ version in [`docs/changelog/`](docs/changelog/):
   credential are still dropped once their attempt budget runs out; they are
   never resent with the current token, which would attribute them to the
   operator. (#1283)
+- Fixed `install-instructions` writing the block into `AGENTS.md` alone, with
+  no warning, when Claude Code would never read it. Claude Code reads
+  `AGENTS.md` only when no `CLAUDE.md`, `.claude/CLAUDE.md` or
+  `CLAUDE.local.md` exists in the directory or above it, so a developer's
+  `CLAUDE.local.md` hid the block. The command now names the file Claude Code
+  reads instead and how to import `@AGENTS.md` from it. (#1297)
 
 ## [3.0.0] - 2026-10-13
 

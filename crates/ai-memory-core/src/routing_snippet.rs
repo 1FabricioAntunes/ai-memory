@@ -109,13 +109,13 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
-Claude Code 2.1.277 and later reads `AGENTS.md` when no `CLAUDE.md`,
-`.claude/CLAUDE.md`, or `CLAUDE.local.md` is present; when one exists, it
-reads that file instead. In a project where `AGENTS.md` is canonical, give
-`CLAUDE.md` a bare `@AGENTS.md` import line so sessions that read only
-`CLAUDE.md` (older Claude Code, the `claude-md` Project instructions
-setting, or a project that also keeps a `CLAUDE.md`) load the same rules at
-session start.
+Claude Code 2.1.277 and later reads `AGENTS.md` only when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` exists in the working directory or
+any directory above it; when one does, it reads that file instead. In a
+project where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md`
+import line so sessions that read only `CLAUDE.md` (older Claude Code, the
+AGENTS.md plugin disabled, the `claude-md` Project instructions setting, or a
+developer's own `CLAUDE.local.md`) load the same rules at session start.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -327,7 +327,7 @@ mod tests {
             "full snippet should name the Claude Code version that reads AGENTS.md"
         );
         assert!(
-            SNIPPET_BODY.contains("reads `AGENTS.md` when"),
+            SNIPPET_BODY.contains("reads `AGENTS.md` only when"),
             "full snippet should state the no-CLAUDE.md fallback"
         );
         assert!(
