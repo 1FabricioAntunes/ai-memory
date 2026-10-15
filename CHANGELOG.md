@@ -94,6 +94,12 @@ version in [`docs/changelog/`](docs/changelog/):
   through `UserPromptSubmit` `additionalContext`, OpenCode V1/V2 through the
   plugin's system/context hook, and Grok Build on the next `PostToolUse`.
   Serving the recap writes nothing, so a reload never consumes a baton (#1230).
+- Added the `memory_restore_page` MCP tool: without `rev` it lists the git
+  checkpoints that changed a page, and with `rev` it writes that version back
+  through the wiki write path (sanitizer, admission, slots and supersession
+  apply), keeping the checkpoint's frontmatter. Restoring can bring back text
+  a root deleted or purged, so both listing and restoring need the same admin
+  authority as `/admin/restore-page`. The MCP surface is now 24 tools. (#1307)
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question

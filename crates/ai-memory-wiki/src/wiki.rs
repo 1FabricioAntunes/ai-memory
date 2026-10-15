@@ -385,6 +385,53 @@ impl Wiki {
         self.git.recent_checkpoints(limit)
     }
 
+    /// Checkpoints, newest first, that changed one page (including the one
+    /// that deleted it), so a caller can pick a `rev` to restore from.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the path escapes the project tree or git
+    /// cannot be read.
+    pub fn page_checkpoints(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        limit: usize,
+    ) -> WikiResult<Vec<Checkpoint>> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
+        let rel = PathBuf::from(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join(path.as_str());
+        self.git.path_checkpoints(&rel, limit)
+    }
+
+    /// Parse one page as stored at checkpoint `rev`, without touching the
+    /// live tree or the index.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the revision/path does not exist or the
+    /// stored bytes are not parseable UTF-8 markdown.
+    pub fn page_at_checkpoint(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        rev: &str,
+    ) -> WikiResult<Markdown> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
+        let rel = PathBuf::from(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join(path.as_str());
+        let bytes = self.git.file_at_rev(rev, &rel)?;
+        let raw = String::from_utf8(bytes).map_err(|e| {
+            WikiError::Io(std::io::Error::other(format!(
+                "{} at {rev} is not valid UTF-8 markdown: {e}",
+                path.as_str()
+            )))
+        })?;
+        parse(&raw)
+    }
+
     /// Create the one-time baseline checkpoint for an existing wiki tree that
     /// was created before git recovery checkpoints existed.
     ///
