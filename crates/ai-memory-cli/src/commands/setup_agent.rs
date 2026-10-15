@@ -151,8 +151,7 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
             .file_name()
             .with_context(|| format!("invalid hook script path {}", from.display()))?;
         let to = dest_dir.join(file_name);
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        install_hooks::copy_replacing(&from, &to)?;
         // Preserve executable bit so the agent CLI can actually run
         // the scripts. On Windows this is a no-op.
         #[cfg(unix)]
@@ -654,8 +653,7 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_dir: &Path) -> Result<()> {
     let shared_lib = source_hooks_root.join("_lib.sh");
     if shared_lib.is_file() {
         let to = dest_hooks_root.join("_lib.sh");
-        fs::copy(&shared_lib, &to)
-            .with_context(|| format!("copying {} → {}", shared_lib.display(), to.display()))?;
+        install_hooks::copy_replacing(&shared_lib, &to)?;
     }
 
     let source_lib = source_hooks_root.join("lib");
@@ -678,8 +676,7 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_dir: &Path) -> Result<()> {
             from.file_name()
                 .with_context(|| format!("invalid hook support path {}", from.display()))?,
         );
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        install_hooks::copy_replacing(&from, &to)?;
     }
     Ok(())
 }
@@ -715,28 +712,33 @@ fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -
     if let Some(p) = explicit {
         return vec![p.join(sub)];
     }
-    let mut v = vec![
-        // Docker image lays them out under /usr/local/share/.
-        PathBuf::from(format!("/usr/local/share/ai-memory/hooks/{sub}")),
-        // Native Linux packages install hook sources under /usr/share.
-        PathBuf::from(format!("/usr/share/ai-memory/hooks/{sub}")),
-    ];
+    let mut v = Vec::with_capacity(5);
+    // Standard Unix prefix layout: `<prefix>/bin/<bin>` ships its bundle at
+    // `<prefix>/share/ai-memory/hooks/<sub>` (Nix, Homebrew, custom prefix).
+    // Probed before the fixed /usr paths, as install-hooks does, so a prefix
+    // install never stages a stale system-wide bundle.
+    if let Some(dir) = exe.as_deref().and_then(Path::parent)
+        && dir.file_name().is_some_and(|name| name == "bin")
+        && let Some(prefix) = dir.parent()
+    {
+        v.push(
+            prefix
+                .join("share")
+                .join("ai-memory")
+                .join(crate::install_layout::HOOKS_DIR_NAME)
+                .join(sub),
+        );
+    }
+    // Docker image lays them out under /usr/local/share/.
+    v.push(PathBuf::from(format!(
+        "/usr/local/share/ai-memory/hooks/{sub}"
+    )));
+    // Native Linux packages install hook sources under /usr/share.
+    v.push(PathBuf::from(format!("/usr/share/ai-memory/hooks/{sub}")));
     if let Some(exe) = exe {
         // Release tarball: `hooks/` sits in the same dir as the binary.
         if let Some(dir) = exe.parent() {
             v.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
-            // Standard Unix prefix layout: `<prefix>/bin/<bin>` -> `<prefix>/share/ai-memory/hooks/<sub>`
-            if dir.file_name().is_some_and(|name| name == "bin") {
-                if let Some(prefix) = dir.parent() {
-                    v.push(
-                        prefix
-                            .join("share")
-                            .join("ai-memory")
-                            .join(crate::install_layout::HOOKS_DIR_NAME)
-                            .join(sub),
-                    );
-                }
-            }
         }
         // Repo-local fallback for `cargo run setup-agent` during dev:
         // target/<profile>/<bin> → repo root.
@@ -800,6 +802,54 @@ mod tests {
             )),
             "prefix share hooks/ dir must be probed; got {candidates:?}"
         );
+        let position = |p: &str| candidates.iter().position(|c| c == Path::new(p));
+        assert!(
+            position("/nix/store/pkg/share/ai-memory/hooks/claude-code")
+                < position("/usr/share/ai-memory/hooks/claude-code"),
+            "prefix share must be probed before /usr/share; got {candidates:?}"
+        );
+    }
+
+    /// Nix ships hook sources 0444 and `fs::copy` keeps that mode, so a
+    /// second `setup-agent` used to fail copying onto its own staged copy.
+    #[cfg(unix)]
+    #[test]
+    fn staging_replaces_read_only_existing_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("src/hooks/claude-code");
+        fs::create_dir_all(source.parent().unwrap().join("lib")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let script = source.join("session-start.sh");
+        let shared = source.parent().unwrap().join("_lib.sh");
+        let support = source.parent().unwrap().join("lib/helper.ps1");
+        for path in [&script, &shared, &support] {
+            fs::write(path, "new\n").unwrap();
+        }
+        let dest = tmp.path().join("dest/hooks/claude-code");
+        fs::create_dir_all(dest.parent().unwrap().join("lib")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let staged = [
+            dest.join("session-start.sh"),
+            dest.parent().unwrap().join("_lib.sh"),
+            dest.parent().unwrap().join("lib/helper.ps1"),
+        ];
+        for path in &staged {
+            fs::write(path, "old\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        install_hooks::copy_replacing(&script, &staged[0]).unwrap();
+        copy_support_hook_scripts(&source, &dest).unwrap();
+
+        for path in &staged {
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                "new\n",
+                "{}",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -807,9 +857,7 @@ mod tests {
         let exe = PathBuf::from("/opt/ai-memory/ai-memory");
         let candidates = source_candidates(None, "claude-code", Some(exe));
         assert!(
-            !candidates.contains(&PathBuf::from(
-                "/opt/share/ai-memory/hooks/claude-code"
-            )),
+            !candidates.contains(&PathBuf::from("/opt/share/ai-memory/hooks/claude-code")),
             "flat tarball directory must not treat parent as prefix; got {candidates:?}"
         );
     }

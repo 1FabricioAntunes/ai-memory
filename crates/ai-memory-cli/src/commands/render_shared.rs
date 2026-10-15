@@ -1999,22 +1999,37 @@ fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
 /// binary. A missing file or a failed resolution falls back to
 /// [`FALLBACK_HOOK_EXE`] instead of baking a dead absolute path into every
 /// hook command.
+///
+/// A binary inside the Nix store also falls back to the bare command: the
+/// store path names one immutable package version, which `nix-collect-garbage`
+/// deletes after the next profile switch, while the profile's `bin/` on PATH
+/// keeps pointing at the current build.
 fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
+    embedded_exe_with(raw, Path::is_file)
+}
+
+/// [`embedded_exe_from`] with the existence probe injected, so the store-path
+/// fallback is testable on hosts without a `/nix/store`.
+fn embedded_exe_with(raw: Option<PathBuf>, is_file: impl Fn(&Path) -> bool) -> PathBuf {
     let Some(exe) = raw else {
         return PathBuf::from(FALLBACK_HOOK_EXE);
     };
-    if exe.starts_with("/nix/store") {
+    if is_nix_store_path(&exe) {
         return PathBuf::from(FALLBACK_HOOK_EXE);
     }
-    if exe.is_file() {
+    if is_file(&exe) {
         return exe;
     }
     let stripped = strip_deleted_suffix(exe);
-    if stripped.is_file() {
+    if is_file(&stripped) {
         stripped
     } else {
         PathBuf::from(FALLBACK_HOOK_EXE)
     }
+}
+
+fn is_nix_store_path(path: &Path) -> bool {
+    path.starts_with("/nix/store")
 }
 
 /// [`embedded_exe_from`] over this process's own executable.
@@ -2786,20 +2801,61 @@ mod tests {
         );
     }
 
+    fn rendered_exec_command(exe: &Path) -> String {
+        let spec = windows_native_exec_spec_with_exe(
+            exe,
+            Path::new("/hooks/post-tool-use.sh"),
+            "http://h:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                None,
+                None,
+            ),
+        );
+        let HookHandlerSpec::Exec { command, .. } = spec else {
+            panic!("expected exec spec")
+        };
+        command
+    }
+
+    /// The existence probe reports the store binary as present, so only the
+    /// store-path guard can produce the bare command: without it the hook
+    /// would name a path garbage collection later deletes.
     #[test]
-    fn embedded_exe_falls_back_for_nix_store_paths() {
+    fn hook_rendered_from_a_nix_store_exe_names_the_bare_command() {
+        let store = PathBuf::from("/nix/store/abc123xyz-ai-memory-2.6.3/bin/ai-memory");
+        let exe = embedded_exe_with(Some(store.clone()), |_| true);
+        assert_eq!(exe, PathBuf::from(FALLBACK_HOOK_EXE));
+        assert_eq!(rendered_exec_command(&exe), FALLBACK_HOOK_EXE);
+        let deleted = PathBuf::from(format!("{} (deleted)", store.display()));
         assert_eq!(
-            embedded_exe_from(Some(PathBuf::from(
-                "/nix/store/abc123xyz-ai-memory-2.6.3/bin/ai-memory"
-            ))),
+            embedded_exe_with(Some(deleted), |_| true),
             PathBuf::from(FALLBACK_HOOK_EXE)
         );
     }
 
     #[test]
+    fn hook_rendered_from_a_normal_exe_keeps_the_absolute_path() {
+        for normal in [
+            "/usr/bin/ai-memory",
+            "/home/dev/.nix-profile/bin/ai-memory",
+            "/opt/nix/store/bin/ai-memory",
+        ] {
+            let exe = embedded_exe_with(Some(PathBuf::from(normal)), |_| true);
+            assert_eq!(exe, PathBuf::from(normal));
+            assert_eq!(rendered_exec_command(&exe), normal);
+        }
+    }
+
+    #[test]
     fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
         let exe = hook_embedded_exe_path();
-        if exe == Path::new(FALLBACK_HOOK_EXE) {
+        // A test binary built inside a Nix sandbox runs from the store, where
+        // the resolver deliberately renders the bare command.
+        if std::env::current_exe().is_ok_and(|current| is_nix_store_path(&current)) {
+            assert_eq!(exe, PathBuf::from(FALLBACK_HOOK_EXE));
             return;
         }
         assert!(exe.is_file(), "{} should exist", exe.display());

@@ -6147,15 +6147,32 @@ fn same_canonical_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Copy `from` onto `to`, replacing a read-only `to` left by an earlier
+/// staging run. Package stores (Nix) ship hook sources as 0444, `fs::copy`
+/// carries that mode over, and a second copy onto the read-only destination
+/// fails with `PermissionDenied`. Only that failure removes the stale copy
+/// and retries, so a writable destination is overwritten exactly as before.
+pub(crate) fn copy_replacing(from: &Path, to: &Path) -> Result<()> {
+    let context = || format!("copying {} → {}", from.display(), to.display());
+    match fs::copy(from, to) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && to.is_file() => {
+            fs::remove_file(to)
+                .with_context(|| format!("removing read-only staged copy {}", to.display()))?;
+            fs::copy(from, to).with_context(context)?;
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(context),
+    }
+}
+
 /// Copy a single hook file (event script or shared `_lib.sh`) into the
 /// staging dir, preserving the executable bit on Unix. Centralised so
 /// the script bulk-copy and the `_lib.sh` companion follow the same
 /// rules without duplicating permission-handling.
 fn copy_hook_file(from: &Path, dest_root: &Path) -> Result<()> {
     let to = dest_root.join(from.file_name().context("bad source file name")?);
-    let _ = fs::remove_file(&to);
-    fs::copy(from, &to)
-        .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+    copy_replacing(from, &to)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -6192,9 +6209,7 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
             continue;
         }
         let to = dest_lib.join(from.file_name().context("bad support file name")?);
-        let _ = fs::remove_file(&to);
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        copy_replacing(&from, &to)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -6274,18 +6289,17 @@ fn hook_source_candidates(
     // Standard Unix prefix layout: binary at `<prefix>/bin/ai-memory`,
     // hooks installed under `<prefix>/share/ai-memory/hooks/<sub>` (Nix,
     // Homebrew, /opt/local, custom prefix installs).
-    if let Some(dir) = exe_dir.as_ref() {
-        if dir.file_name().is_some_and(|name| name == "bin") {
-            if let Some(prefix) = dir.parent() {
-                candidates.push(
-                    prefix
-                        .join("share")
-                        .join("ai-memory")
-                        .join(crate::install_layout::HOOKS_DIR_NAME)
-                        .join(sub),
-                );
-            }
-        }
+    if let Some(dir) = exe_dir.as_ref()
+        && dir.file_name().is_some_and(|name| name == "bin")
+        && let Some(prefix) = dir.parent()
+    {
+        candidates.push(
+            prefix
+                .join("share")
+                .join("ai-memory")
+                .join(crate::install_layout::HOOKS_DIR_NAME)
+                .join(sub),
+        );
     }
     // Docker image lays them out under /usr/local/share/ai-memory/.
     candidates.push(PathBuf::from(format!(
@@ -10821,6 +10835,45 @@ model = "gpt-5"
         );
     }
 
+    /// Nix ships hook sources 0444 and `fs::copy` keeps that mode, so a
+    /// second `install-hooks` used to fail copying onto its own staged copy.
+    #[cfg(unix)]
+    #[test]
+    fn staging_replaces_read_only_existing_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("src/hooks/claude-code");
+        fs::create_dir_all(source.parent().unwrap().join("lib")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let script = source.join("session-start.sh");
+        let support = source.parent().unwrap().join("lib/helper.ps1");
+        fs::write(&script, "new\n").unwrap();
+        fs::write(&support, "new\n").unwrap();
+        let dest = tmp.path().join("dest/hooks/claude-code");
+        fs::create_dir_all(dest.parent().unwrap().join("lib")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let staged = [
+            dest.join("session-start.sh"),
+            dest.parent().unwrap().join("lib/helper.ps1"),
+        ];
+        for path in &staged {
+            fs::write(path, "old\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        copy_hook_file(&script, &dest).unwrap();
+        copy_support_hook_scripts(&source, &dest).unwrap();
+
+        for path in &staged {
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                "new\n",
+                "{}",
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn hook_source_candidates_include_standard_prefix_share_dir() {
         let candidates = hook_source_candidates(
@@ -10848,9 +10901,7 @@ model = "gpt-5"
         );
 
         assert!(
-            !candidates.contains(&PathBuf::from(
-                "/opt/share/ai-memory/hooks/claude-code"
-            )),
+            !candidates.contains(&PathBuf::from("/opt/share/ai-memory/hooks/claude-code")),
             "non-bin exe dir must not probe parent share dir; got {candidates:?}"
         );
     }

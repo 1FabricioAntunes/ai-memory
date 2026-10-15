@@ -520,6 +520,14 @@ All options and defaults are in [`nix/nixos-module.nix`](nix/nixos-module.nix).
 The module is entirely opt-in: `nix build`, `nix run`, `nix develop`, and the CLI are
 unchanged if you don't import it.
 
+`git` is a runtime dependency. Hook capture and `ai-memory doctor` run it to
+read the repository a session works in. The module puts `pkgs.git` on the
+service's `PATH`. The package itself leaves the binary unwrapped, because a
+wrapper renames the running process and the live-process guard in `reset`,
+`restore`, `reindex` and `uninstall --purge-data` looks for a process named
+`ai-memory`. If you install the package without the module (`nix profile
+install`, `home.packages`), install `git` next to it.
+
 ## Everyday use
 
 Day to day, you mostly do not think about ai-memory. Hooks capture

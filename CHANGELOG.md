@@ -11,10 +11,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-### Added
-- Added shell completions (bash, fish, zsh) to the Nix package output via
-  `installShellFiles`.
-
 ### Fixed
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
@@ -53,15 +49,22 @@ version in [`docs/changelog/`](docs/changelog/):
   `.claude/CLAUDE.md`, or `CLAUDE.local.md` is present, and reads that file
   instead when one exists. The `@AGENTS.md` import is how a canonical
   `AGENTS.md` reaches sessions that read only `CLAUDE.md`. (#1276)
-- Fixed bundled hook discovery when `ai-memory` is installed in a standard Unix
-  prefix layout (such as Nix), probing `<prefix>/share/ai-memory/hooks/` from
-  `<prefix>/bin/ai-memory`.
-- Fixed `ai-memory install-hooks` and `setup-agent` failing when staging
-  support scripts over existing read-only copies from a read-only store.
-- Avoided baking absolute `/nix/store/...` paths into generated hook scripts,
-  resolving `ai-memory` dynamically via `$PATH` so hooks survive Nix garbage
-  collection.
-- Wrapped the `ai-memory` binary in the Nix flake package with `git` on `PATH`.
+- Fixed bundled hook discovery for a binary installed in a standard Unix
+  prefix such as Nix: `install-hooks` and `setup-agent` now probe
+  `<prefix>/share/ai-memory/hooks/` from `<prefix>/bin/ai-memory`, and
+  `setup-agent` checks it before the fixed `/usr/local/share` and
+  `/usr/share` locations. (#1275)
+- Fixed `ai-memory install-hooks` and `setup-agent` failing on a second run
+  when the staged hook scripts were read-only copies from a read-only package
+  store (the Nix store ships them `0444`). Staging now replaces a read-only
+  copy instead of erroring. (#1275)
+- Fixed generated hook commands baking an absolute `/nix/store/...` binary
+  path that Nix garbage collection later deletes. A binary running from the
+  Nix store now renders the bare `ai-memory` command, resolved through `PATH`
+  when the hook runs. (#1275)
+- Fixed the NixOS service lacking `git` on `PATH`: the module now adds
+  `pkgs.git` to the unit's `path`. The package binary stays unwrapped so the
+  live-process guard can still see a running server. (#1275)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
@@ -114,8 +117,6 @@ version in [`docs/changelog/`](docs/changelog/):
   `CLAUDE.local.md` exists in the directory or above it, so a developer's
   `CLAUDE.local.md` hid the block. The command now names the file Claude Code
   reads instead and how to import `@AGENTS.md` from it. (#1297)
-
-### Fixed
 - Fixed `move-session` leaving prompt profile candidates and ingest keys in the
   source project. When a session is moved or re-homed into another project, its
   prompt `profile_candidates` (`source_ref = 'session:<id>'`) and `ingest_keys`

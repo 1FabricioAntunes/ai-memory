@@ -1111,6 +1111,10 @@ section](../README.md#nixos) (`nixosModules.default`,
 `services.ai-memory.enable`). This section is the maintainer test ladder
 for the flake and module: what CI runs, and what each tier proves.
 
+The package does not bundle `git`: the module adds `pkgs.git` to the
+service's `PATH`, and a package-only install needs `git` installed beside it.
+Do not wrap the binary to supply it (see the README section for why).
+
 ### Maintainer test ladder
 
 1. **Package smoke**: `nix build .#packages.<system>.default` then
