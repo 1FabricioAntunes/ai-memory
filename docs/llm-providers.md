@@ -335,6 +335,13 @@ wrappers forward either token by name to short-lived helper commands such as
 `llm-test`; configure the long-lived server container separately as shown in the
 installation guide.
 
+Anthropic may also refuse a subscription token outright: with a `claude
+setup-token` token, every request whose system prompt does not identify itself
+as Claude Code can come back as `429 rate_limit_error` with the body `"Error"`,
+even though the same token works from `claude -p` (#1170). That 429 is not a
+real rate limit, and ai-memory does not impersonate Claude Code to get around
+it. Use `anthropic` with an API key, or an OpenAI-compatible gateway, instead.
+
 For both Anthropic providers, ai-memory omits `temperature` for Claude
 4.7 and later models and Claude Mythos Preview because those models reject
 non-default sampling parameters. `llm-test` sends the same representative 0.2
