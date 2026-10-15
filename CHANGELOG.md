@@ -102,6 +102,14 @@ version in [`docs/changelog/`](docs/changelog/):
   `CLAUDE.local.md` hid the block. The command now names the file Claude Code
   reads instead and how to import `@AGENTS.md` from it. (#1297)
 
+### Fixed
+- Fixed `move-session` leaving prompt profile candidates and ingest keys in the
+  source project. When a session is moved or re-homed into another project, its
+  prompt `profile_candidates` (`source_ref = 'session:<id>'`) and `ingest_keys`
+  were not re-stamped into the target project, which distorted cross-project
+  profile convergence and caused a subsequent `purge-project` of the source
+  project to destroy them via cascade. They now re-stamp in the same transaction. (#1265)
+
 ## [3.0.0] - 2026-10-13
 
 ### Added
