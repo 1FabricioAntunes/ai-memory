@@ -208,6 +208,12 @@ version in [`docs/changelog/`](docs/changelog/):
   millisecond read as an outage. The notice now carries the server's own reason
   for a rejection, and keeps the outage wording only for a server the launcher
   could not reach. (#1277)
+- Fixed `ai-memory run --yolo` failing with `401 Unauthorized` after it
+  re-ran itself under ai-jail on an install whose bearer token lives in
+  `[auth].bearer_token_file`. ai-jail's private home hides the data dir, so
+  the jailed run had no token. The outer run now passes the token it resolved,
+  and a `server_url` set in `config.toml` or derived from `bind`, into the
+  jail through the environment, never the command line. (#1284)
 - Updated rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349,
   in the server and in the importer, relay and wikisync companions, and the
   importer's anyhow to 1.0.104 for RUSTSEC-2026-0190. (#1286)
