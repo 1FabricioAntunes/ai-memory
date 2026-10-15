@@ -270,7 +270,23 @@ pub struct Config {
     /// with `AI_MEMORY_TCP_KEEPALIVE_SECS`.
     pub tcp_keepalive_secs: u64,
     /// Base URL used by thin-client CLI commands to contact the running server.
+    ///
+    /// When neither this file nor `AI_MEMORY_SERVER_URL` sets it, the loader
+    /// derives it from [`Self::bind`] so a thin client reaches the server this
+    /// same config starts (#1269); see [`Self::server_url_derived_from_bind`].
     pub server_url: String,
+    /// Whether `server_url` was derived from `bind` rather than set by the
+    /// config file or the environment (#1269).
+    ///
+    /// Kept separate from `server_url` itself so
+    /// [`Self::server_url_configured`] can keep answering "did the operator
+    /// choose the URL" -- the question `install-hooks` / `install-mcp` ask --
+    /// without a derived value being mistaken for a deliberate one.
+    ///
+    /// Not deserialized from the file: it describes what the loader did, not
+    /// something an operator states.
+    #[serde(skip)]
+    pub server_url_derived_from_bind: bool,
     /// Optional override for the GitHub Releases base URL used by
     /// `ai-memory upgrade` (archive + `.sha256` download). Empty/unset
     /// means `https://github.com/akitaonrails/ai-memory/releases`. Set via
@@ -1312,6 +1328,7 @@ impl Default for Config {
             bind: DEFAULT_BIND.into(),
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
+            server_url_derived_from_bind: false,
             release_base_url: None,
             base_path: String::new(),
             home_dir: None,
@@ -2070,6 +2087,77 @@ impl FtsSettings {
     }
 }
 
+/// Point `server_url` at the server `bind` starts, when nothing named one
+/// (#1269).
+///
+/// Only runs when neither the config file nor `AI_MEMORY_SERVER_URL` set
+/// `server_url`; `file_set_server_url` carries the file half, and an env value
+/// would already have replaced `config.server_url` with something other than
+/// the default, which this checks again.
+///
+/// Rules, matching the reporter's proposal:
+/// - an unspecified address becomes loopback, because it is not itself a
+///   reachable target (`0.0.0.0` -> `127.0.0.1`, `[::]` -> `[::1]`);
+/// - any other host is used as given, hostname included, since the server may
+///   bind a name this process cannot resolve the same way;
+/// - a `bind` that does not parse as `host:port` leaves the default URL alone
+///   rather than building one out of a fragment. `serve` still rejects the bad
+///   bind at startup, so the operator sees the real error there.
+///
+/// The default `bind` derives exactly [`DEFAULT_SERVER_URL`], so an install
+/// that never touched either key is byte-identical to before.
+fn derive_server_url_from_bind(config: &mut Config, file_set_server_url: bool) {
+    if file_set_server_url || config.server_url != DEFAULT_SERVER_URL {
+        return;
+    }
+    // A bind that differs from the default is the case this exists for; the
+    // default derives the same URL, so skip the parse entirely for it.
+    if config.bind == DEFAULT_BIND {
+        return;
+    }
+    let Some(url) = server_url_for_bind(&config.bind) else {
+        return;
+    };
+    config.server_url = url;
+    config.server_url_derived_from_bind = true;
+}
+
+/// The client URL for one `bind` value, or `None` when it is not a
+/// `host:port` this can turn into a URL.
+///
+/// Parsed by hand rather than with `SocketAddr` so a HOSTNAME survives: a
+/// server may bind `memory.lan:9000`, and resolving it here would both change
+/// which address the client dials and fail outright on a host this process
+/// cannot resolve but the server can.
+fn server_url_for_bind(bind: &str) -> Option<String> {
+    let bind = bind.trim();
+    // Split on the LAST colon so an IPv6 literal in brackets, which contains
+    // colons of its own, keeps its host in one piece.
+    let (host, port) = bind.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    let host = if host == "0.0.0.0" {
+        "127.0.0.1".to_string()
+    } else if host == "[::]" {
+        "[::1]".to_string()
+    } else if host.starts_with('[') {
+        // An IPv6 literal must carry its brackets into the URL.
+        if !host.ends_with(']') {
+            return None;
+        }
+        host.to_string()
+    } else if host.contains(':') {
+        // A bare IPv6 literal, or a bracketed one split wrong. Rejecting is
+        // safer than emitting a URL whose host cannot be read back.
+        return None;
+    } else {
+        host.to_string()
+    };
+    Some(format!("http://{host}:{port}"))
+}
+
 /// Parse the `AI_MEMORY_SEARCH_FTS_STOPWORDS` env override into
 /// `config.search.fts.stopwords`, following the CSV-string convention
 /// `deserialize_string_or_vec` already uses for `allowed_hosts` /
@@ -2174,6 +2262,11 @@ impl Config {
         if let Some(token) = runtime_env.auth_token.clone() {
             config.auth.bearer_token = Some(token);
         }
+        // Whether the CONFIG FILE named a server URL, sampled before the env
+        // override below so the two sources stay distinguishable. `server_url`
+        // is the one key #1269 derives rather than only defaulting, and the
+        // derivation must not fire when either source set it explicitly.
+        let file_set_server_url = config.server_url != DEFAULT_SERVER_URL;
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
         }
@@ -2222,6 +2315,13 @@ impl Config {
         }
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
+        // #1269: with neither the file nor the environment naming a server
+        // URL, reach the server this same config starts rather than the
+        // compiled-in default. A thin client that ignored `bind` either failed
+        // (nothing on the default port) or, worse, operated on whatever
+        // server WAS on the default port -- which is how the reporter wrote
+        // test pages into their real store.
+        derive_server_url_from_bind(&mut config, file_set_server_url);
         apply_bearer_token_file(
             &mut config.auth,
             &TokenFileContext {
@@ -2449,10 +2549,18 @@ impl Config {
         Ok(config)
     }
 
-    /// Whether the server URL came from config/env instead of the default.
+    /// Whether the server URL came from config/env instead of being derived
+    /// from `bind` or left at the default.
+    ///
+    /// Deliberately unchanged by the #1269 derivation: `install-hooks` and
+    /// `install-mcp` read this to decide whether the operator chose the URL
+    /// themselves, and a user who only edited `bind` did not. `server_url` can
+    /// therefore differ from `DEFAULT_SERVER_URL` without this being true,
+    /// which is exactly why [`Self::server_url_derived_from_bind`] exists.
     #[must_use]
     pub fn server_url_configured(&self) -> bool {
-        self.server_url != DEFAULT_SERVER_URL || self.runtime_env.server_url.is_some()
+        self.server_url != DEFAULT_SERVER_URL && !self.server_url_derived_from_bind
+            || self.runtime_env.server_url.is_some()
     }
 
     /// Parse [`Self::llm_headers`] into typed header material.
@@ -3509,6 +3617,172 @@ mod tests {
                 "{err:#}"
             );
         }
+    }
+
+    /// The shipped `config.default.toml` must actually load.
+    ///
+    /// It is `include_str!`-ed by `init` and written as-is, so a template
+    /// that does not parse would only surface when someone ran `init` and
+    /// started the server. Comments added by #1269 are the kind of edit that
+    /// can break it silently (a stray quote, a line that stops being a
+    /// comment), and nothing tested the file itself.
+    #[test]
+    fn the_shipped_default_config_parses() {
+        const TEMPLATE: &str = include_str!("../templates/config.default.toml");
+        let cfg = load_with_toml(TEMPLATE).expect("config.default.toml must load");
+        assert_eq!(cfg.bind, DEFAULT_BIND);
+        assert_eq!(
+            cfg.server_url, DEFAULT_SERVER_URL,
+            "the template leaves server_url unset, so the default bind derives the default URL"
+        );
+        assert!(
+            !cfg.server_url_derived_from_bind,
+            "the default bind short-circuits the derivation, so nothing is marked derived"
+        );
+    }
+
+    /// #1269: a thin client must reach the server the SAME config starts.
+    ///
+    /// `server_url` defaulted to a constant and was never derived from `bind`,
+    /// so `ai-memory --data-dir X status` called `127.0.0.1:49374` whatever
+    /// `bind` said. With nothing listening there the command failed; with the
+    /// default install's server listening there it silently operated on the
+    /// WRONG store, which is how the reporter wrote twelve test pages into
+    /// their real one.
+    ///
+    /// Each case here is one cell of the truth table: what the file sets, what
+    /// the environment sets, and the URL the client must end up using.
+    #[test]
+    fn server_url_is_derived_from_a_custom_bind() {
+        // No `server_url` anywhere: the bind decides. The port differs from
+        // the default on purpose, so a client that ignored `bind` would be
+        // caught rather than accidentally matching.
+        let cfg = load_with_toml("bind = \"127.0.0.1:49921\"\n").unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1:49921");
+        assert_eq!(cfg.server_url, "http://127.0.0.1:49921");
+
+        // A LAN bind is used as given: the operator named a real interface.
+        let cfg = load_with_toml("bind = \"192.0.2.10:8080\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://192.0.2.10:8080");
+
+        // A hostname is passed through rather than resolved: the server may
+        // bind a name this process cannot resolve the same way.
+        let cfg = load_with_toml("bind = \"memory.lan:9000\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://memory.lan:9000");
+    }
+
+    /// An unspecified bind is not a reachable address, so it maps to loopback
+    /// the way a client would have to reach it anyway.
+    #[test]
+    fn server_url_maps_an_unspecified_bind_to_loopback() {
+        let cfg = load_with_toml("bind = \"0.0.0.0:49921\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://127.0.0.1:49921");
+
+        let cfg = load_with_toml("bind = \"[::]:49921\"\n").unwrap();
+        assert_eq!(
+            cfg.server_url, "http://[::1]:49921",
+            "an IPv6 unspecified address must map to the IPv6 loopback, not to 0.0.0.0"
+        );
+
+        // A specific IPv6 address is used as given, brackets included.
+        let cfg = load_with_toml("bind = \"[::1]:49921\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://[::1]:49921");
+    }
+
+    /// An explicit `server_url` still wins, in the file and in the
+    /// environment. This is the control for the derivation: without it a
+    /// change that ignored the operator's own value would look correct.
+    #[test]
+    fn an_explicit_server_url_still_wins_over_a_custom_bind() {
+        let cfg =
+            load_with_toml("bind = \"127.0.0.1:49921\"\nserver_url = \"https://memory.example\"\n")
+                .unwrap();
+        assert_eq!(cfg.server_url, "https://memory.example");
+
+        // The environment wins over the file, as it does for every other key.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "bind = \"127.0.0.1:49921\"\nserver_url = \"https://from-file.example\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                server_url: Some("https://from-env.example".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.server_url, "https://from-env.example");
+    }
+
+    /// #1269: deriving the URL must not make an operator look like they
+    /// configured it.
+    ///
+    /// `server_url_configured()` is what `install-hooks` and `install-mcp`
+    /// read to decide whether to infer the URL from an existing MCP entry
+    /// rather than fall back to the compiled default. Someone who only edited
+    /// `bind` has not chosen a `server_url`, so the answer has to stay false
+    /// or those installers change behaviour for them.
+    #[test]
+    fn a_derived_server_url_is_not_reported_as_configured() {
+        let cfg = load_with_toml("bind = \"127.0.0.1:49921\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://127.0.0.1:49921");
+        assert!(
+            cfg.server_url_derived_from_bind,
+            "the loader must record that it derived the value"
+        );
+        assert!(
+            !cfg.server_url_configured(),
+            "a bind-derived URL is not an operator-configured one"
+        );
+
+        // Control: a value the operator actually wrote is still reported as
+        // configured, and is not marked derived.
+        let cfg = load_with_toml("server_url = \"https://memory.example\"\n").unwrap();
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+
+        // Control: the environment counts as explicit too, even when it names
+        // the default URL.
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load_with_runtime_env(
+            None,
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                server_url: Some(DEFAULT_SERVER_URL.into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+    }
+
+    /// The default install must be byte-identical to before this change: the
+    /// default bind derives exactly the default URL.
+    #[test]
+    fn the_default_bind_still_resolves_to_the_default_url() {
+        let cfg = load_with_toml("").unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert_eq!(cfg.bind, DEFAULT_BIND);
+
+        // Spelling the default bind out is not a "custom" bind and must not
+        // change the outcome either.
+        let cfg = load_with_toml(&format!("bind = \"{DEFAULT_BIND}\"\n")).unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+    }
+
+    /// A bind that cannot be parsed as `host:port` is not guessed at: the
+    /// client falls back to the default URL instead of building a URL out of
+    /// a fragment. `serve` still reports the bad bind when it starts.
+    #[test]
+    fn an_unparseable_bind_falls_back_to_the_default_url() {
+        let cfg = load_with_toml("bind = \"not-a-bind\"\n").unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
     }
 
     #[test]

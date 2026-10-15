@@ -658,6 +658,18 @@ bind = "0.0.0.0:49374"
 allowed_hosts = ["homelab", "192.168.0.90", "localhost", "127.0.0.1"]
 ```
 
+`server_url` does not need to be set here. When neither `config.toml` nor
+`AI_MEMORY_SERVER_URL` names one, the thin-client commands derive it from
+`bind`, so a local `ai-memory status` reaches this server rather than the
+default port. An unspecified bind is mapped to loopback (`0.0.0.0` becomes
+`127.0.0.1`, `[::]` becomes `[::1]`). Set `server_url` only when clients
+reach the server at an address it does not bind, such as behind a reverse
+proxy or a tunnel:
+
+```toml
+server_url = "https://memory.example"
+```
+
 ```bash
 # optional: replace the token init wrote
 TOKEN=$(ai-memory generate-auth-token)
