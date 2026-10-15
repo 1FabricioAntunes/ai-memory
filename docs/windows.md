@@ -384,6 +384,10 @@ holds, and exits. Only when the host has not exited after ten seconds (a host
 started by an older binary, or a hung one), or when the server outlived its
 host, do they fall back to `taskkill /T /F` on the recorded process ids,
 after checking that each id still belongs to the same ai-memory process.
+The cooperative stop (`Child::kill`) terminates only the server process
+itself, not its process tree, so a subprocess the server started (a CLI-based
+LLM provider in the middle of a consolidation, for one) can linger until it
+finishes on its own.
 
 The logon entry runs only while you are signed in, which matches a systemd
 user unit without lingering and a macOS LaunchAgent. For a server that runs
