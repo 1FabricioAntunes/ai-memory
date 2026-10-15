@@ -25,11 +25,13 @@ version in [`docs/changelog/`](docs/changelog/):
   user turn: `invocationNum` restarts at 0 each turn, so only the first turn of
   a conversation (keyed by `conversationId`) now maps to SessionStart, in the
   native, shell and PowerShell hooks. Payloads without a `conversationId` keep
-  the previous per-turn behavior.
+  the previous per-turn behavior. A conversation resumed in a new process does
+  not start a new session, so a handoff left meanwhile is read with
+  `memory_handoff_list` rather than injected. (#1306)
 - Fixed `llm-test --provider anthropic-oauth` reporting Anthropic's refusal of a
   `claude setup-token` token as a plain rate limit: that 429 now carries a hint
-  that it is not a real rate limit and names the alternatives, and
-  `docs/llm-providers.md` documents the behavior. (#1170)
+  that it is not a real rate limit and names the alternatives, which
+  `docs/llm-providers.md` already describes. (#1170)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and
