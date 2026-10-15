@@ -4,4 +4,3 @@
 
 ALTER TABLE managed_runs ADD COLUMN previous_agent_kind TEXT;
 ALTER TABLE managed_runs ADD COLUMN previous_native_session_id TEXT;
-
