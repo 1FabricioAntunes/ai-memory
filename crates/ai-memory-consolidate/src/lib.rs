@@ -12,6 +12,7 @@ pub mod auto_improve;
 pub mod auto_improve_schedule;
 pub mod auto_improve_telemetry;
 pub mod bootstrap;
+mod code_fence;
 pub mod cold_cluster;
 pub mod compaction;
 pub mod consolidator;

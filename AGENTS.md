@@ -557,6 +557,19 @@ Additional boundary rules:
   precedence, and cross-workspace isolation; PRs touching permissions still need
   root, DB-user, and anonymous cases — now recorded against the inventory.
 - New disk+SQL mutations need recovery/rollback tests.
+- **A changed default reaches every consumer.** When a change alters a default
+  or where a setting or credential lives (auth on for new installs, a token
+  read from a file, a new required header or path), list every component that
+  reads it (thin CLI clients, hook capture and the spool drain, `run` and its
+  jail re-exec, `/web`, backfill, the generated TS adapters) and test each one
+  under the new default. 3.0.0's token-file default broke three of them that
+  no test exercised with it (#1283, #1284, #1288).
+- **Third-party behavior is modeled from its docs.** When code reproduces how
+  another tool behaves (a harness's hook payloads or missing fields, Claude
+  Code's instruction-file and `@import` rules), link the vendor doc next to the
+  code and test each case the doc describes, not only the case at hand. A
+  one-case model of the import rules shipped in #1297 and had to be redone in
+  #1298.
 - The recall-eval framework lives at
   `crates/ai-memory-consolidate/tests/suite/recall_eval.rs`.
 - Tests run with `cargo t` locally,

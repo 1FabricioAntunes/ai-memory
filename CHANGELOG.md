@@ -157,14 +157,62 @@ version in [`docs/changelog/`](docs/changelog/):
   and no migration. (#1264)
 
 ### Fixed
-- Fixed the native hook claiming a handoff from the wrong project when an
-  event named no directory. A `SessionStart` (or Kimi Code's
-  `UserPromptSubmit`, or Grok's first `PostToolUse`) whose payload carried no
-  `cwd` sent `GET /handoff` with no scope, so the server resolved its default
-  project or the caller's last active one and the hook consumed that
-  project's baton. The hook now fetches no handoff without a directory and
-  says so on stderr; the handoff stays open for `memory_handoff_accept`.
-  (#1312)
+- Fixed a hook claiming a handoff from the wrong project when an event named
+  no directory. A `SessionStart` (or Kimi Code's `UserPromptSubmit`, or Grok's
+  first `PostToolUse`) whose payload carried no `cwd` sent `GET /handoff` with
+  no scope, so the server resolved its default project or the caller's last
+  active one, and the hook consumed that project's handoff. The native hook,
+  the shell and PowerShell hook bundles, and the generated OpenCode, OpenCode 2,
+  OMP and Pi integrations now fetch no handoff without a directory, for every
+  agent; the native hook says so on stderr at session start. The handoff stays
+  open for `memory_handoff_accept`. Devin still falls back to
+  `DEVIN_PROJECT_DIR`, then the hook's own directory. (#1312)
+- Fixed `ai-memory setup` reporting "ai-memory is set up" after it installed
+  Codex hooks that Codex had not trusted yet. Codex skips an untrusted hook,
+  so Codex sessions went uncaptured. When Codex was wired, `setup` now asks
+  Codex for the hooks' trust state, the way `doctor` does, and when any are
+  untrusted or modified it names them and says to open Codex, run `/hooks`,
+  and trust them. It still exits 0. (#1313)
+- Fixed `install-instructions` treating a line that is exactly `@AGENTS.md` as
+  proof that Claude Code loads the `AGENTS.md` being written. Claude Code
+  resolves `@path` from the file that contains the import, including in the
+  middle of a sentence, expands `~/` from the home directory, and ignores
+  imports inside code spans and fenced blocks. `@AGENTS.md` in
+  `.claude/CLAUDE.md` loads `.claude/AGENTS.md`, a fenced `@AGENTS.md` loads
+  nothing, and `@AGENTS.md` in a parent directory loads that directory's file.
+  The note now compares the resolved path with the file being written and
+  names the import that reaches it. (#1298)
+- Fixed Antigravity CLI posting a session start and claiming a handoff on every
+  user turn: `invocationNum` restarts at 0 each turn, so only the first turn of
+  a conversation (keyed by `conversationId`) now maps to SessionStart, in the
+  native, shell and PowerShell hooks. Payloads without a `conversationId` keep
+  the previous per-turn behavior. A conversation resumed in a new process does
+  not start a new session, so a handoff left meanwhile is read with
+  `memory_handoff_list` rather than injected. (#1306)
+- Fixed `llm-test --provider anthropic-oauth` reporting Anthropic's refusal of a
+  `claude setup-token` token as a plain rate limit: that 429 now carries a hint
+  that it is not a real rate limit and names the alternatives, which
+  `docs/llm-providers.md` already describes. (#1170)
+- Fixed the curator report treating a per-user focus slot
+  (`_slots/<operator>/current-focus.md`) as an ordinary slot. It only
+  recognised the shared `_slots/current-focus.md`, so with per-user slots the
+  focus slot got the 30-day stale threshold instead of the 7-day one and was
+  reported three weeks late. (#1314)
+- Fixed multi-page consolidation losing every page of a batch when the
+  model gave one page a path that cannot be repaired: a leading slash, a
+  `..` or `.` segment, or an empty segment. Path validation failed the whole
+  session's consolidation, so the valid pages in the same answer were never
+  written. That page is now skipped with a warning and the others are
+  written, as already happened for paths that fail the portability check.
+  (#1315)
+- Fixed auto-improve patches losing track of a page's sections after a code
+  block that contains a different fence. A line of three backticks inside a
+  `~~~` block (or a shorter run inside a longer fence) ended the block early,
+  so the headings after it were missed, and a `replace_section` on the
+  section before them replaced those sections too. Profile harvesting had the
+  same flaw: the code after such a line was read as prose and could be
+  harvested as a preference. A fence now closes only on a run of the same
+  character that is at least as long. (#1316)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and
@@ -282,6 +330,27 @@ version in [`docs/changelog/`](docs/changelog/):
   were not re-stamped into the target project, which distorted cross-project
   profile convergence and caused a subsequent `purge-project` of the source
   project to destroy them via cascade. They now re-stamp in the same transaction. (#1265)
+- Fixed the SQLite `-wal` file staying as large as the database after a
+  `VACUUM`. `compact`, `reclaim-ledger-versions --compact` and the session,
+  project and workspace purges with compaction now run `PRAGMA
+  wal_checkpoint(TRUNCATE)` after the rewrite, and the store's writer
+  connection sets `journal_size_limit` to 64 MiB. A checkpoint that a reader
+  holds back is logged at `warn` and the operation still succeeds. A 29.5 GiB
+  database that shrank to 6.3 GiB kept a 17.8 GB WAL, and the next restart
+  spent 9 minutes replaying it. `serve` now also drops its read connections
+  and checkpoints the WAL on SIGINT, SIGTERM, Ctrl-C or the end of stdio
+  input, waiting at most 5 seconds; a read that arrives after that point is
+  refused. A hard kill before the checkpoint still leaves the WAL to replay.
+  (#1317)
+- Fixed the hook event ledgers (`log.md`, `log-YYYY-MM.md`) being committed to
+  the wiki's git repository. Every checkpoint after a hook append wrote a new
+  whole-file blob of the ledger, and nothing packed them: one install's
+  `wiki/.git` reached 3.49 GB, 229 MB per version of a single ledger.
+  Checkpoints now leave ledgers out, recognized by name and by content, so an
+  ordinary page named like a ledger stays versioned. A ledger an earlier
+  version committed is dropped from the git index, never from disk, by the next
+  checkpoint. Existing history keeps its old blobs; `docs/lifecycle-ops.md`
+  explains how an operator can rewrite it. (#1318)
 
 ## [3.0.0] - 2026-10-13
 
