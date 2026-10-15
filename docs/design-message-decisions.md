@@ -71,7 +71,9 @@ CREATE INDEX idx_agent_messages_work
     WHERE state = 'pending' AND work_id IS NOT NULL;
 ```
 
-V81 is the next free number today. Rust validates `decision` before the
+V81 was the next free number on `main` when this was written; `release/3.1`
+has since taken V81 (CodeBuddy's agent kind), so the migration takes the next
+free number when it is implemented. Rust validates `decision` before the
 insert; a bad stored value becomes `MemoryError::MalformedRecord`, as a bad
 `state` does. `AgentMessage` serializes the new fields only when they are set.
 
@@ -356,7 +358,8 @@ control, and fails with its guard removed.
 ## 9. Alternatives
 
 - The convention-only route has no rule and no link.
-- A `memory_message_reply` tool is a 24th tool and a copy of the send path (Q7).
+- A `memory_message_reply` tool is one more tool (the 25th, since
+  `release/3.1` added `memory_restore_page`) and a copy of the send path (Q7).
 - An answer on the question row needs a read of the decision project, which
   the asker cannot do.
 - With `requires_root: bool`, a new rule needs a new field.
@@ -404,7 +407,7 @@ control, and fails with its guard removed.
   distinguished. **Recommended: (a)**: a single operator has one identity, and
   the root rule covers risky decisions where agents cannot reach root.
 - **Q7. Fields on `memory_message_send`, or a new `memory_message_reply`
-  tool?** (a) Fields. (b) A new tool, which is a 24th tool and a copy of the
+  tool?** (a) Fields. (b) A new tool, which is one more tool and a copy of the
   send path. **Recommended: (a)**: one send path, one scrub, one admission.
 - **Q8. Is polling the only wait for 3.2?** (a) Yes. (b) A bounded `wait_ms`
   now. **Recommended: (a)**. A later bounded wait needs no migration.
