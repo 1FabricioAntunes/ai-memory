@@ -606,6 +606,7 @@ async fn run_once_with_wiring(
         }
         return Err(exec_under_ai_jail(
             ai_jail,
+            config,
             &support,
             &toggles,
             jail_facts.project_config,
@@ -771,6 +772,7 @@ async fn run_once_with_wiring(
     // sits around session-identity resolution, not inside it).
     acquired_try!(
         confirm_yolo_and_maybe_reexec(
+            config,
             &jail_plan,
             ai_jail.as_deref(),
             &jail_facts,
@@ -1453,6 +1455,7 @@ async fn degraded_launch(
     // The `--yolo` warning and ai-jail offer still apply; a degraded launch
     // just has no prepared lease for the re-exec to release.
     confirm_yolo_and_maybe_reexec(
+        config,
         launch.jail_plan,
         launch.ai_jail,
         launch.jail_facts,
@@ -2466,6 +2469,7 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
 /// `lease` is the prepared run to release before that re-exec; a degraded
 /// offline launch passes `None` (it holds no lease).
 async fn confirm_yolo_and_maybe_reexec(
+    config: &Config,
     plan: &JailPlan,
     ai_jail: Option<&Path>,
     facts: &JailHostFacts,
@@ -2526,6 +2530,7 @@ async fn confirm_yolo_and_maybe_reexec(
     }
     Err(exec_under_ai_jail(
         ai_jail,
+        config,
         &support,
         &toggles,
         facts.project_config,
@@ -2536,6 +2541,7 @@ async fn confirm_yolo_and_maybe_reexec(
 /// one-line summary. Returns only on failure.
 fn exec_under_ai_jail(
     ai_jail: &Path,
+    config: &Config,
     support: &JailSupport,
     toggles: &[JailToggleChoice],
     project_config: bool,
@@ -2548,11 +2554,8 @@ fn exec_under_ai_jail(
         }
     };
     let forwarded: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let present: Vec<&str> = FORWARDED_ENV_NAMES
-        .iter()
-        .copied()
-        .filter(|name| std::env::var_os(name).is_some())
-        .collect();
+    let resolved = jail_resolved_env(config);
+    let present = jail_forwarded_names(config, &resolved);
     // `--agent-state` is a bare toggle: enable it so the harness's own login
     // state survives ai-jail's ephemeral private home (ai-jail derives the
     // per-harness state location from the wrapped `run <harness>` it parses).
@@ -2567,7 +2570,46 @@ fn exec_under_ai_jail(
         toggles,
     );
     eprintln!("{}", jail_summary(toggles, project_config));
-    reexec_under_ai_jail(ai_jail, &jail_args)
+    reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+}
+
+/// The [`FORWARDED_ENV_NAMES`] the re-exec passes with `--env NAME`: those set
+/// in the environment [`Config::load`] captured (invariant #1: never the live
+/// one), plus the ones [`jail_resolved_env`] sets on the ai-jail process.
+fn jail_forwarded_names(config: &Config, resolved: &[(&'static str, String)]) -> Vec<&'static str> {
+    FORWARDED_ENV_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            config.runtime_env.var_os(name).is_some() || resolved.iter().any(|(set, _)| set == name)
+        })
+        .collect()
+}
+
+/// Values this run resolved from its config and data dir that the jailed
+/// re-run cannot resolve again: ai-jail's private home hides the data dir that
+/// holds `config.toml` and `auth-tokens/`, so a bearer read from
+/// `[auth].bearer_token_file` (the default since `init` provisions one) or a
+/// `server_url` set in the config file would be gone inside, and every
+/// server call would fail with 401 or reach the wrong server. They go on the
+/// ai-jail child's environment, never its argv, and cross into the jail by
+/// name like every other [`FORWARDED_ENV_NAMES`] entry. When the environment
+/// variable was set already it won in [`Config::load`], so this re-sets the
+/// same value.
+fn jail_resolved_env(config: &Config) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    if config.server_url_configured() {
+        env.push(("AI_MEMORY_SERVER_URL", config.server_url.clone()));
+    }
+    if let Some(token) = config
+        .auth
+        .bearer_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        env.push(("AI_MEMORY_AUTH_TOKEN", token.to_owned()));
+    }
+    env
 }
 
 /// Replace this process with `<ai_jail> <jail_args>` on Unix (never returns
@@ -2575,15 +2617,30 @@ fn exec_under_ai_jail(
 /// never returns). `ai_jail` is the path [`usable_ai_jail_here`] resolved,
 /// never a bare name re-resolved through `PATH`.
 #[cfg(unix)]
-fn reexec_under_ai_jail(ai_jail: &Path, jail_args: &[OsString]) -> anyhow::Error {
+fn reexec_under_ai_jail(
+    ai_jail: &Path,
+    jail_args: &[OsString],
+    env: &[(&'static str, String)],
+) -> anyhow::Error {
     use std::os::unix::process::CommandExt as _;
-    let error = std::process::Command::new(ai_jail).args(jail_args).exec();
+    let error = std::process::Command::new(ai_jail)
+        .args(jail_args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .exec();
     anyhow!(error).context(format!("re-executing under {}", ai_jail.display()))
 }
 
 #[cfg(not(unix))]
-fn reexec_under_ai_jail(ai_jail: &Path, jail_args: &[OsString]) -> anyhow::Error {
-    match std::process::Command::new(ai_jail).args(jail_args).status() {
+fn reexec_under_ai_jail(
+    ai_jail: &Path,
+    jail_args: &[OsString],
+    env: &[(&'static str, String)],
+) -> anyhow::Error {
+    match std::process::Command::new(ai_jail)
+        .args(jail_args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .status()
+    {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(error) => anyhow!(error).context(format!("spawning {}", ai_jail.display())),
     }
@@ -4617,6 +4674,59 @@ mod tests {
             gave_up.is_err(),
             "repeated garbage aborts rather than guessing what to mount"
         );
+    }
+
+    /// Regression: the jailed re-run cannot see the data dir, so a bearer the
+    /// outer run read from `[auth].bearer_token_file` must cross into the jail,
+    /// or every server call inside fails with 401.
+    #[test]
+    fn jail_resolved_env_carries_a_file_sourced_token_and_configured_url() {
+        let mut config = Config {
+            server_url: "http://memory.lan:49374".into(),
+            ..Config::default()
+        };
+        config.auth.adopt_token_file(
+            PathBuf::from("/data/auth-tokens/default"),
+            "file-token".into(),
+        );
+        let env = jail_resolved_env(&config);
+        assert_eq!(
+            env,
+            [
+                ("AI_MEMORY_SERVER_URL", "http://memory.lan:49374".to_owned()),
+                ("AI_MEMORY_AUTH_TOKEN", "file-token".to_owned()),
+            ]
+        );
+        for (name, _) in &env {
+            assert!(
+                FORWARDED_ENV_NAMES.contains(name),
+                "{name} is set on ai-jail but never forwarded into the jail"
+            );
+        }
+    }
+
+    #[test]
+    fn jail_forwarded_names_come_from_the_captured_env_and_resolved_values() {
+        let config = Config {
+            runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[
+                ("CLAUDE_CONFIG_DIR", "/home/op/.claude"),
+                ("UNRELATED", "x"),
+            ]),
+            ..Config::default()
+        };
+        let resolved = [("AI_MEMORY_AUTH_TOKEN", "file-token".to_owned())];
+        assert_eq!(
+            jail_forwarded_names(&config, &resolved),
+            ["AI_MEMORY_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"]
+        );
+        assert!(jail_forwarded_names(&Config::default(), &[]).is_empty());
+    }
+
+    #[test]
+    fn jail_resolved_env_is_empty_for_a_default_unauthenticated_install() {
+        let mut config = Config::default();
+        config.auth.bearer_token = Some("  ".into());
+        assert!(jail_resolved_env(&config).is_empty());
     }
 
     #[test]
