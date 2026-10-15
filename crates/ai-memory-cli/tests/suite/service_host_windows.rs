@@ -1,7 +1,8 @@
 //! `ai-memory service-host` on Windows, through the shipped binary: the
 //! launcher returns at once, the detached supervisor starts the server and
-//! records both pids, and a killed server is started again. Everything lives
-//! in a temp data dir on a free port; the registry is never touched (that is
+//! records both pids, a killed server is started again, and a stop request
+//! ends both. Everything lives in a temp data dir on a free port; the
+//! registry is never touched (that is
 //! `setup`'s step, covered with a recording runner in the unit tests).
 
 #![cfg(windows)]
@@ -133,5 +134,31 @@ mod slow {
                 .is_some_and(|pid| pid != first_server)
                 && healthz(port)
         });
+
+        // The stop request `uninstall` and `setup` write: the supervisor kills
+        // its server through the handle it owns and exits, with no taskkill.
+        let host = read_state(&state_file).expect("the restarted host's state");
+        let server = host.server_pid.expect("the restarted server's pid");
+        std::fs::write(data_dir.join("service-host.stop"), b"").unwrap();
+        wait_for("the host to stop", Duration::from_secs(20), || {
+            !alive(host.supervisor_pid) && !alive(server)
+        });
+        assert!(!healthz(port));
+        assert!(
+            !state_file.exists(),
+            "the supervisor removes its state on the way out"
+        );
     }
+}
+
+fn alive(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new(),
+    );
+    system.process(pid).is_some()
 }
