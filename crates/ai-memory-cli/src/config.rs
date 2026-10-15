@@ -2116,6 +2116,11 @@ fn derive_server_url_from_bind(config: &mut Config, explicit_server_url: bool) {
     let Some(url) = server_url_for_bind(&config.bind) else {
         return;
     };
+    // A bind that resolves to the default URL anyway (a container's
+    // `0.0.0.0:49374`) changes nothing, so it is not marked derived.
+    if url == DEFAULT_SERVER_URL {
+        return;
+    }
     config.server_url = url;
     config.server_url_derived_from_bind = true;
 }
@@ -3751,6 +3756,15 @@ mod tests {
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert!(!cfg.server_url_derived_from_bind);
         assert!(cfg.server_url_configured());
+    }
+
+    /// A bind that maps onto the default URL (an unspecified address on the
+    /// default port, as containers bind) is not a derivation.
+    #[test]
+    fn a_bind_that_maps_to_the_default_url_is_not_marked_derived() {
+        let cfg = load_with_toml("bind = \"0.0.0.0:49374\"\n").unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert!(!cfg.server_url_derived_from_bind);
     }
 
     /// Port 0 picks a free port at startup, so no client URL can be derived
