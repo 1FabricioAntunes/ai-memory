@@ -29,13 +29,14 @@ version in [`docs/changelog/`](docs/changelog/):
   either key is unaffected. `install-hooks` and `install-mcp` still prefer an
   existing MCP entry's URL, and otherwise write the derived URL instead of the
   default port. (#1269)
-||||||| 705aba70
-- Fixed `ai-memory run --yolo` failing with `401 Unauthorized` after it
-  re-ran itself under ai-jail on an install whose bearer token lives in
-  `[auth].bearer_token_file`. ai-jail's private home hides the data dir, so
-  the jailed run had no token. The outer run now passes the token it resolved,
-  and a `server_url` set in `config.toml`, into the jail through the
-  environment, never the command line. (#1284)
+- Fixed a burst of sessions in a directory with no backfill marker launching
+  one `backfill --auto` per session. The SessionStart hook now takes an
+  atomic in-progress marker before it spawns the backfill, so concurrent
+  sessions in that directory start one; the marker is dropped when the worker
+  ends and a leftover one stops blocking after 30 minutes. The backfill's
+  emptiness check against the server also gives up after 30 seconds instead
+  of waiting forever on a saturated server. Keying the trigger on the project
+  rather than the directory is not part of this change. (#1287)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
