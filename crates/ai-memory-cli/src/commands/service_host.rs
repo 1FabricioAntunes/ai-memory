@@ -24,6 +24,15 @@
 //! The supervisor records its own pid and the server's in
 //! `<data_dir>/service-host.json`, which `setup` reads to tell whether the
 //! host runs and `uninstall` reads to stop it.
+//!
+//! Stopping is cooperative: [`stop`] writes `<data_dir>/service-host.stop`,
+//! and the supervisor, which polls for it, kills the server through the
+//! `Child` it owns and exits. Endpoint protection counts an unsigned program
+//! running `taskkill` against a process it found by pid as one more malicious
+//! signal (#1280), and a handle the supervisor holds cannot reach a process
+//! that reused a recorded pid. Only a supervisor that does not answer within
+//! [`STOP_TIMEOUT`] (one started by an older binary, or a hung one), or a
+//! server whose supervisor already died, still gets `taskkill`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -36,6 +45,15 @@ use crate::config::Config;
 
 /// The host's state file name, under the data dir.
 const STATE_FILE: &str = "service-host.json";
+/// The extension that turns the state file's name into the stop request's.
+const STOP_REQUEST_EXTENSION: &str = "stop";
+
+/// How long [`stop`] waits for the supervisor to answer a stop request before
+/// it falls back to `taskkill`.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the supervisor looks for a stop request, and [`stop`] for the
+/// host to be gone.
+const STOP_POLL: Duration = Duration::from_millis(250);
 
 /// Wait before restarting a server that failed.
 const RESTART_DELAY: Duration = Duration::from_secs(5);
@@ -56,6 +74,11 @@ pub(crate) fn state_file(data_dir: &Path) -> PathBuf {
     data_dir.join(STATE_FILE)
 }
 
+/// The file whose presence asks the host behind `state_file` to stop.
+fn stop_request_file(state_file: &Path) -> PathBuf {
+    state_file.with_extension(STOP_REQUEST_EXTENSION)
+}
+
 fn read_state(path: &Path) -> Option<HostState> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
@@ -68,9 +91,10 @@ fn write_state(path: &Path, state: HostState) -> Result<()> {
     Ok(())
 }
 
-/// Whether `pid` is a live ai-memory process. A recorded pid the system has
-/// since handed to another program does not count.
-fn is_live_ai_memory(pid: u32) -> bool {
+/// When `pid` is a live ai-memory process, its start time. A recorded pid the
+/// system has since handed to another program does not count, and the start
+/// time tells a later ai-memory process on the same pid apart.
+fn ai_memory_start_time(pid: u32) -> Option<u64> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
@@ -79,13 +103,21 @@ fn is_live_ai_memory(pid: u32) -> bool {
         true,
         ProcessRefreshKind::new(),
     );
-    system.process(pid).is_some_and(|process| {
-        process
-            .name()
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with("ai-memory")
-    })
+    system
+        .process(pid)
+        .filter(|process| {
+            process
+                .name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("ai-memory")
+        })
+        .map(sysinfo::Process::start_time)
+}
+
+/// Whether `pid` is a live ai-memory process.
+fn is_live_ai_memory(pid: u32) -> bool {
+    ai_memory_start_time(pid).is_some()
 }
 
 /// The recorded host when its supervisor is still alive.
@@ -107,27 +139,73 @@ pub(crate) fn live_pids(state_file: &Path) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// Stop a running host: the supervisor's process tree, then a server left
-/// behind by a supervisor that already died. A host that is not running is
-/// no error. The state file goes with it.
+/// Stop a running host. A host that is not running is no error. The state
+/// file and the stop request go with it.
 ///
 /// # Errors
-/// When `taskkill` could not be run, or refused a process that is still
-/// alive afterwards.
+/// When the stop request cannot be written, or when the supervisor did not
+/// answer it in time and `taskkill` could not be run or refused a process
+/// that is still alive afterwards.
 pub(crate) fn stop(state_file: &Path, runner: &dyn CommandRunner) -> Result<()> {
-    for pid in live_pids(state_file) {
-        let pid_text = pid.to_string();
-        let outcome = runner.run("taskkill", &["/PID", &pid_text, "/T", "/F"])?;
-        if !outcome.success && is_live_ai_memory(pid) {
-            anyhow::bail!(
-                "`taskkill /PID {pid} /T /F` failed: {}",
-                outcome.stderr.trim()
-            );
+    stop_with(
+        state_file,
+        runner,
+        &ai_memory_start_time,
+        STOP_TIMEOUT,
+        STOP_POLL,
+    )
+}
+
+/// [`stop`] with the process probe and the wait injected. `start_time` gives
+/// a pid's start time while it is a live ai-memory process.
+///
+/// A live supervisor gets the stop request and `timeout` to exit with its
+/// server. A recorded process that is still the same one afterwards (the
+/// supervisor ignored the request, or had died and left its server behind)
+/// gets `taskkill`, the supervisor's tree first.
+fn stop_with(
+    state_file: &Path,
+    runner: &dyn CommandRunner,
+    start_time: &dyn Fn(u32) -> Option<u64>,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
+    let request = stop_request_file(state_file);
+    if let Some(state) = read_state(state_file) {
+        let track = |pid: u32| start_time(pid).map(|started| (pid, started));
+        let supervisor = track(state.supervisor_pid);
+        let tracked: Vec<(u32, u64)> = supervisor
+            .into_iter()
+            .chain(state.server_pid.and_then(track))
+            .collect();
+        let still_running = |&(pid, started): &(u32, u64)| start_time(pid) == Some(started);
+        if supervisor.is_some() {
+            ai_memory_wiki::write_atomic(&request, b"")
+                .with_context(|| format!("writing {}", request.display()))?;
+            let deadline = Instant::now() + timeout;
+            while tracked.iter().any(still_running) && Instant::now() < deadline {
+                std::thread::sleep(poll);
+            }
+        }
+        for target in tracked.iter().filter(|target| still_running(target)) {
+            let pid_text = target.0.to_string();
+            let outcome = runner.run("taskkill", &["/PID", &pid_text, "/T", "/F"])?;
+            if !outcome.success && still_running(target) {
+                anyhow::bail!(
+                    "`taskkill /PID {pid_text} /T /F` failed: {}",
+                    outcome.stderr.trim()
+                );
+            }
         }
     }
-    match std::fs::remove_file(state_file) {
+    remove_if_present(&request)?;
+    remove_if_present(state_file)
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(error).with_context(|| format!("removing {}", state_file.display()))
+            Err(error).with_context(|| format!("removing {}", path.display()))
         }
         _ => Ok(()),
     }
@@ -160,22 +238,44 @@ fn after_exit(succeeded: bool, ran: Duration, quick_failures: &mut u32) -> Next 
 }
 
 /// Run the server again and again per [`after_exit`]. `run_server` starts one
-/// server, reports its pid through `started`, waits for it, and returns
-/// whether it exited successfully. Returns the last outcome.
+/// server, reports its pid through `started`, waits for it (killing it when
+/// a stop is requested), and returns whether it exited successfully. A stop
+/// request ends the loop as a clean exit, whatever the server's exit status.
+/// Returns the last outcome.
 fn supervise(
     mut run_server: impl FnMut(&mut dyn FnMut(u32)) -> Result<bool>,
     mut started: impl FnMut(u32),
     mut sleep: impl FnMut(Duration),
     clock: impl Fn() -> Instant,
+    stop_requested: impl Fn() -> bool,
 ) -> Result<bool> {
     let mut quick_failures = 0;
     loop {
+        if stop_requested() {
+            return Ok(true);
+        }
         let began = clock();
         let succeeded = run_server(&mut started)?;
+        if stop_requested() {
+            return Ok(true);
+        }
         match after_exit(succeeded, clock() - began, &mut quick_failures) {
             Next::Stop => return Ok(succeeded),
             Next::RestartAfter(delay) => sleep(delay),
         }
+    }
+}
+
+/// Sleep for `delay`, but return as soon as a stop is requested, so a stop
+/// that lands between two server runs does not wait out the restart delay.
+fn sleep_unless_stopped(delay: Duration, stop_requested: &dyn Fn() -> bool) {
+    let deadline = Instant::now() + delay;
+    while !stop_requested() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(STOP_POLL));
     }
 }
 
@@ -219,6 +319,10 @@ pub async fn run(config: &Config, args: ServiceHostArgs, config_path: Option<&Pa
         // A second logon, or `setup` racing the Run entry: one host serves.
         return Ok(());
     }
+    // A request left behind by a stop that never finished must not end this
+    // host as soon as it starts.
+    let stop_request = stop_request_file(&state_path);
+    remove_if_present(&stop_request)?;
     write_state(
         &state_path,
         HostState {
@@ -229,8 +333,9 @@ pub async fn run(config: &Config, args: ServiceHostArgs, config_path: Option<&Pa
     let mut server_args = install;
     server_args.extend(["serve", "--transport", "http", "--enable-web"].map(Into::into));
     let outcome = tokio::task::spawn_blocking(move || {
+        let stop_requested = || stop_request.exists();
         supervise(
-            |started| windows::run_hidden(&exe, &server_args, started),
+            |started| windows::run_hidden(&exe, &server_args, started, &stop_requested),
             |pid| {
                 let state = HostState {
                     supervisor_pid: own_pid,
@@ -240,8 +345,9 @@ pub async fn run(config: &Config, args: ServiceHostArgs, config_path: Option<&Pa
                     tracing::warn!(error = %format!("{error:#}"), "service-host: recording the server pid");
                 }
             },
-            std::thread::sleep,
+            |delay| sleep_unless_stopped(delay, &stop_requested),
             Instant::now,
+            stop_requested,
         )
         .map(|succeeded| (succeeded, state_path))
     })
@@ -302,17 +408,29 @@ mod windows {
     }
 
     /// Run the server on a hidden console of its own, which the processes it
-    /// starts inherit instead of opening windows, and wait for it.
+    /// starts inherit instead of opening windows, and wait for it. When a stop
+    /// is requested, kill it through the handle this process owns, which no
+    /// other process can have taken over the way a pid can be reused.
     pub(super) fn run_hidden(
         exe: &Path,
         args: &[OsString],
         started: &mut dyn FnMut(u32),
+        stop_requested: &dyn Fn() -> bool,
     ) -> Result<bool> {
         let mut child = command(exe, args, CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .spawn()
             .with_context(|| format!("starting {} serve", exe.display()))?;
         started(child.id());
-        Ok(child.wait().context("waiting for the server")?.success())
+        loop {
+            if let Some(status) = child.try_wait().context("waiting for the server")? {
+                return Ok(status.success());
+            }
+            if stop_requested() {
+                child.kill().context("stopping the server")?;
+                return Ok(child.wait().context("waiting for the server")?.success());
+            }
+            std::thread::sleep(super::STOP_POLL);
+        }
     }
 }
 
@@ -331,6 +449,7 @@ mod windows {
         _exe: &Path,
         _args: &[OsString],
         _started: &mut dyn FnMut(u32),
+        _stop_requested: &dyn Fn() -> bool,
     ) -> Result<bool> {
         bail!("service-host runs only on Windows")
     }
@@ -387,6 +506,7 @@ mod tests {
                 sleeps.set(sleeps.get() + 1);
             },
             Instant::now,
+            || false,
         )
         .unwrap();
         assert!(succeeded);
@@ -406,10 +526,229 @@ mod tests {
             |_| {},
             |_| {},
             Instant::now,
+            || false,
         )
         .unwrap();
         assert!(!succeeded);
         assert_eq!(runs.get(), MAX_QUICK_FAILURES);
+    }
+
+    /// A server killed for a stop request fails, but the loop ends as a clean
+    /// exit instead of restarting it; a request already there runs nothing.
+    #[test]
+    fn supervise_ends_cleanly_on_a_stop_request() {
+        let requested = Cell::new(false);
+        let runs = Cell::new(0);
+        let succeeded = supervise(
+            |_| {
+                runs.set(runs.get() + 1);
+                requested.set(true);
+                Ok(false)
+            },
+            |_| {},
+            |_| panic!("a stopped host must not wait to restart"),
+            Instant::now,
+            || requested.get(),
+        )
+        .unwrap();
+        assert!(succeeded);
+        assert_eq!(runs.get(), 1);
+
+        let succeeded = supervise(
+            |_| panic!("a host asked to stop must not start the server"),
+            |_| {},
+            |_| {},
+            Instant::now,
+            || true,
+        )
+        .unwrap();
+        assert!(succeeded);
+    }
+
+    #[test]
+    fn the_restart_delay_ends_early_on_a_stop_request() {
+        let began = Instant::now();
+        sleep_unless_stopped(Duration::from_secs(60), &|| true);
+        assert!(began.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Records every command; `taskkill` on a pid marks it, and its tree,
+    /// dead in the fake process table.
+    struct Taskkill<'a> {
+        calls: &'a RefCell<Vec<String>>,
+        dead: &'a RefCell<Vec<u32>>,
+        tree: &'a [u32],
+    }
+    impl CommandRunner for Taskkill<'_> {
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> Result<super::super::user_service::CommandOutcome> {
+            self.calls
+                .borrow_mut()
+                .push(format!("{program} {}", args.join(" ")));
+            if program == "taskkill" {
+                let pid: u32 = args[1].parse().unwrap();
+                let mut dead = self.dead.borrow_mut();
+                dead.push(pid);
+                if self.tree.first() == Some(&pid) {
+                    dead.extend_from_slice(self.tree);
+                }
+            }
+            Ok(super::super::user_service::CommandOutcome {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const SUPERVISOR: u32 = 4100;
+    const SERVER: u32 = 4200;
+
+    fn recorded_host(dir: &Path) -> PathBuf {
+        let path = state_file(dir);
+        write_state(
+            &path,
+            HostState {
+                supervisor_pid: SUPERVISOR,
+                server_pid: Some(SERVER),
+            },
+        )
+        .unwrap();
+        path
+    }
+
+    /// A supervisor that answers the stop request takes its server with it,
+    /// and `stop` runs no `taskkill` at all (#1280).
+    #[test]
+    fn stop_asks_a_live_supervisor_and_runs_no_taskkill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = recorded_host(tmp.path());
+        let request = stop_request_file(&path);
+        let calls = RefCell::new(Vec::new());
+        let dead = RefCell::new(Vec::new());
+        let runner = Taskkill {
+            calls: &calls,
+            dead: &dead,
+            tree: &[],
+        };
+        let saw_request = Cell::new(false);
+        let probe = |pid: u32| {
+            if request.exists() {
+                saw_request.set(true);
+                return None;
+            }
+            Some(u64::from(pid))
+        };
+        stop_with(
+            &path,
+            &runner,
+            &probe,
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(saw_request.get(), "the supervisor was never asked to stop");
+        assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
+        assert!(!path.exists());
+        assert!(!request.exists());
+    }
+
+    /// A supervisor that ignores the request (an older binary, a hung one)
+    /// gets `taskkill` on its tree once the timeout runs out.
+    #[test]
+    fn stop_falls_back_to_taskkill_when_the_supervisor_does_not_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = recorded_host(tmp.path());
+        let calls = RefCell::new(Vec::new());
+        let dead = RefCell::new(Vec::new());
+        let runner = Taskkill {
+            calls: &calls,
+            dead: &dead,
+            tree: &[SUPERVISOR, SERVER],
+        };
+        let probe = |pid: u32| (!dead.borrow().contains(&pid)).then_some(u64::from(pid));
+        stop_with(
+            &path,
+            &runner,
+            &probe,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            vec![format!("taskkill /PID {SUPERVISOR} /T /F")]
+        );
+        assert!(!path.exists());
+        assert!(!stop_request_file(&path).exists());
+    }
+
+    /// A server left behind by a supervisor that already died gets
+    /// `taskkill` at once: nobody is there to answer a request.
+    #[test]
+    fn stop_kills_an_orphaned_server_without_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = recorded_host(tmp.path());
+        let request = stop_request_file(&path);
+        let calls = RefCell::new(Vec::new());
+        let dead = RefCell::new(vec![SUPERVISOR]);
+        let runner = Taskkill {
+            calls: &calls,
+            dead: &dead,
+            tree: &[],
+        };
+        let probe = |pid: u32| {
+            assert!(!request.exists(), "no request for a dead supervisor");
+            (!dead.borrow().contains(&pid)).then_some(u64::from(pid))
+        };
+        let began = Instant::now();
+        stop_with(
+            &path,
+            &runner,
+            &probe,
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            *calls.borrow(),
+            vec![format!("taskkill /PID {SERVER} /T /F")]
+        );
+    }
+
+    /// A recorded pid now held by another ai-memory process (same pid, other
+    /// start time) is not the host's: the fallback leaves it alone.
+    #[test]
+    fn stop_never_kills_a_process_that_reused_a_recorded_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = recorded_host(tmp.path());
+        let calls = RefCell::new(Vec::new());
+        let dead = RefCell::new(Vec::new());
+        let runner = Taskkill {
+            calls: &calls,
+            dead: &dead,
+            tree: &[],
+        };
+        let probes = Cell::new(0_u64);
+        let probe = |pid: u32| {
+            probes.set(probes.get() + 1);
+            // The first look records the host; every later one finds the
+            // pids alive again, but started by someone else.
+            Some(u64::from(pid) + u64::from(probes.get() > 2))
+        };
+        stop_with(
+            &path,
+            &runner,
+            &probe,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
     }
 
     /// A state file naming no live ai-memory process means no host runs, and

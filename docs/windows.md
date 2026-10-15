@@ -377,6 +377,14 @@ persistence (Bitdefender's Advanced Threat Control, for one) treats an
 unsigned program running `reg.exe add` on the `Run` key as malicious and
 quarantines it (#1280).
 
+Stopping the host avoids `taskkill` for the same reason. `setup` and
+`uninstall` write `<data dir>\service-host.stop`; the host checks for it
+four times a second, kills the server through the process handle it already
+holds, and exits. Only when the host has not exited after ten seconds (a host
+started by an older binary, or a hung one), or when the server outlived its
+host, do they fall back to `taskkill /T /F` on the recorded process ids,
+after checking that each id still belongs to the same ai-memory process.
+
 The logon entry runs only while you are signed in, which matches a systemd
 user unit without lingering and a macOS LaunchAgent. For a server that runs
 before anyone signs in, or for other users of the machine, use a real Windows
