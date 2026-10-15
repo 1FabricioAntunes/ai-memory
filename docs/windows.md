@@ -367,8 +367,15 @@ The host records its own process id and the server's in
 running host alone; a changed entry is rewritten and the host restarted.
 `ai-memory uninstall --apply` stops the host and deletes the value, but only
 when the value still has the shape `setup` writes (a quoted `ai-memory.exe`
-ending in `service-host`); a value someone else put under the same name is
-left in place.
+ending in `service-host`) and its `--data-dir` is the data dir being
+uninstalled; a value someone else put under the same name, or the entry of
+another install, is left in place.
+
+`setup` and `uninstall` read and write the value through the registry API
+rather than running `reg.exe`. Endpoint protection that watches for
+persistence (Bitdefender's Advanced Threat Control, for one) treats an
+unsigned program running `reg.exe add` on the `Run` key as malicious and
+quarantines it (#1280).
 
 The logon entry runs only while you are signed in, which matches a systemd
 user unit without lingering and a macOS LaunchAgent. For a server that runs

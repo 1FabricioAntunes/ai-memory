@@ -47,10 +47,16 @@ version in [`docs/changelog/`](docs/changelog/):
   with no administrator rights. `ai-memory setup` now has a service step on
   Windows: it writes an `ai-memory` value under the per-user `Run` key that
   starts a hidden `ai-memory service-host` at logon, and starts it right away.
+  The value is written and read through the registry API, not by running
+  `reg.exe`: an unsigned binary running `reg.exe add` on the `Run` key is a
+  common persistence signal, and Bitdefender's behavioral engine quarantined
+  `ai-memory.exe` for it (#1280).
   The host runs the server with no console window and restarts it after a
   failure, giving up after five failures within ten seconds of starting.
   `ai-memory uninstall --apply` stops the host and removes the value when it
-  still has the shape `setup` writes. (#1271)
+  still has the shape `setup` writes and names this install's data dir, so an
+  uninstall against another data dir (a second install, a test's temporary
+  one) leaves the entry alone. (#1271, #1280)
 - Added `ai-memory setup --web`, which shows the setup plan as a page in
   your browser and applies the agents you tick there by running `ai-memory
   setup --yes --agent ...` and streaming its output to the page. The page is

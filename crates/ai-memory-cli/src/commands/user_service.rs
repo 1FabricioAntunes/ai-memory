@@ -401,14 +401,82 @@ pub(crate) fn is_setup_run_entry(data: &str) -> bool {
         && !args.contains('|')
 }
 
-/// The data of the `ai-memory` value under the `Run` key, read with
-/// `reg query`; `None` when it is absent or cannot be read.
+/// The `--data-dir` a `setup` logon entry names, unquoted the way
+/// [`windows_arg`] quoted it; `None` when the entry names none. Only the
+/// first argument after the quoted executable is read, as `render_windows`
+/// writes it, so a `--data-dir` inside the executable's own path never
+/// counts.
+fn run_entry_data_dir(data: &str) -> Option<String> {
+    let (_program, args) = data.strip_prefix('"')?.split_once('"')?;
+    let quoted = args
+        .trim_start()
+        .strip_prefix("--data-dir")?
+        .trim_start()
+        .strip_prefix('"')?;
+    let (dir, after) = quoted.split_once('"')?;
+    // The quote must end the whole argument, as `windows_arg` writes it:
+    // Windows reads `"C:\d"\other` as one argument, `C:\d\other`.
+    if !(after.is_empty() || after.starts_with(' ')) {
+        return None;
+    }
+    // `windows_arg` doubles the backslashes that end the path, so their count
+    // is even; an odd count means the quote was escaped and the argument goes
+    // on past it.
+    let trailing = dir.len() - dir.trim_end_matches('\\').len();
+    if trailing % 2 != 0 {
+        return None;
+    }
+    Some(dir[..dir.len() - trailing / 2].to_owned())
+}
+
+/// Whether two absolute Windows paths name the same directory: the verbatim
+/// prefix (`\\?\C:\…`, `\\?\UNC\server\share\…`), trailing separators and
+/// letter case do not count. A path that is not absolute matches nothing:
+/// `C:` is the current directory on drive C, not its root `C:\`, and would
+/// otherwise compare equal once trailing separators are gone.
+fn same_windows_dir(left: &str, right: &str) -> bool {
+    let plain = |path: &str| {
+        let path = path.replace('/', "\\");
+        let path = super::path_util::strip_windows_verbatim_prefix(&path).into_owned();
+        let bytes = path.as_bytes();
+        let drive_absolute = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
+        let unc = path.starts_with(r"\\") && !path.starts_with(r"\\?\");
+        // `\\?\Volume{GUID}\…` names a volume by its GUID; it keeps the
+        // verbatim prefix and is as absolute as a drive path.
+        const VOLUME: &str = r"\\?\Volume{";
+        let volume = path
+            .get(..VOLUME.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(VOLUME))
+            && path[VOLUME.len()..]
+                .split_once('}')
+                .is_some_and(|(guid, rest)| {
+                    !guid.is_empty() && (rest.is_empty() || rest.starts_with('\\'))
+                });
+        (drive_absolute || unc || volume).then(|| path.trim_end_matches('\\').to_owned())
+    };
+    match (plain(left), plain(right)) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(&right),
+        _ => false,
+    }
+}
+
+/// Whether the logon entry `data` is the one `setup` wrote for `data_dir`.
+/// Another install's entry (a second data dir, a test's temporary one) has
+/// the same shape and the same value name, and is not this uninstall's to
+/// remove.
+fn is_setup_run_entry_for(data: &str, data_dir: &Path) -> bool {
+    is_setup_run_entry(data)
+        && run_entry_data_dir(data)
+            .is_some_and(|dir| same_windows_dir(&dir, &data_dir.to_string_lossy()))
+}
+
+/// The data of the `ai-memory` value under the `Run` key; `None` when it is
+/// absent or cannot be read.
 pub(crate) fn run_value(runner: &dyn CommandRunner) -> Option<String> {
-    let outcome = runner
-        .run("reg", &["query", RUN_KEY, "/v", RUN_VALUE])
-        .ok()
-        .filter(|outcome| outcome.success)?;
-    parse_reg_query(&outcome.stdout, RUN_VALUE)
+    runner.run_key_value()
 }
 
 /// Pick the data out of `reg query <key> /v <name>`, which prints the key,
@@ -447,12 +515,94 @@ pub(crate) trait CommandRunner {
     fn run_launcher(&self, program: &str, args: &[&str]) -> Result<CommandOutcome> {
         self.run(program, args)
     }
+
+    /// The `ai-memory` value under the `Run` key. The default asks
+    /// `reg query`, which test doubles script; [`SystemRunner`] reads the
+    /// registry directly on Windows.
+    fn run_key_value(&self) -> Option<String> {
+        let outcome = self
+            .run("reg", &["query", RUN_KEY, "/v", RUN_VALUE])
+            .ok()
+            .filter(|outcome| outcome.success)?;
+        parse_reg_query(&outcome.stdout, RUN_VALUE)
+    }
+
+    /// Write `data` as the `ai-memory` value under the `Run` key.
+    fn set_run_key_value(&self, data: &str) -> Result<()> {
+        require(
+            self,
+            "reg",
+            &[
+                "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", data, "/f",
+            ],
+        )
+        .map(drop)
+    }
+
+    /// Delete the `ai-memory` value under the `Run` key.
+    fn delete_run_key_value(&self) -> Result<()> {
+        require(self, "reg", &["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]).map(drop)
+    }
 }
 
 /// Runs commands for real, resolved through `PATH`.
 pub(crate) struct SystemRunner;
 
+/// The `Run` key below `HKEY_CURRENT_USER`, as the registry API names it.
+#[cfg(windows)]
+const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// String values under `HKEY_CURRENT_USER`, through the registry API.
+#[cfg(windows)]
+mod user_registry {
+    use anyhow::{Context as _, Result};
+
+    /// A `REG_SZ` value. `get_string` also reads `REG_EXPAND_SZ`, which
+    /// `setup` never writes: such a value under the same name is someone
+    /// else's, as it was when `reg query` output was parsed for `REG_SZ`.
+    pub(super) fn get(subkey: &str, name: &str) -> Option<String> {
+        let key = windows_registry::CURRENT_USER.open(subkey).ok()?;
+        match key.get_type(name).ok()? {
+            windows_registry::Type::String => key.get_string(name).ok(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set(subkey: &str, name: &str, data: &str) -> Result<()> {
+        windows_registry::CURRENT_USER
+            .create(subkey)
+            .and_then(|key| key.set_string(name, data))
+            .with_context(|| format!(r"writing HKCU\{subkey}\{name}"))
+    }
+
+    pub(super) fn delete(subkey: &str, name: &str) -> Result<()> {
+        windows_registry::CURRENT_USER
+            .create(subkey)
+            .and_then(|key| key.remove_value(name))
+            .with_context(|| format!(r"deleting HKCU\{subkey}\{name}"))
+    }
+}
+
 impl CommandRunner for SystemRunner {
+    // Through the registry API, not `reg.exe`: an unsigned binary spawning
+    // `reg.exe add …\CurrentVersion\Run` is a textbook persistence signal,
+    // and Bitdefender's behavioral engine quarantined `ai-memory.exe` for it
+    // (#1280).
+    #[cfg(windows)]
+    fn run_key_value(&self) -> Option<String> {
+        user_registry::get(RUN_SUBKEY, RUN_VALUE)
+    }
+
+    #[cfg(windows)]
+    fn set_run_key_value(&self, data: &str) -> Result<()> {
+        user_registry::set(RUN_SUBKEY, RUN_VALUE, data)
+    }
+
+    #[cfg(windows)]
+    fn delete_run_key_value(&self) -> Result<()> {
+        user_registry::delete(RUN_SUBKEY, RUN_VALUE)
+    }
+
     fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutcome> {
         let output = std::process::Command::new(program)
             .args(args)
@@ -545,21 +695,7 @@ fn install_windows(unit: &ServiceUnit, runner: &dyn CommandRunner) -> Result<Ser
         return Ok(ServiceChange::Unchanged);
     }
     if !current {
-        require(
-            runner,
-            "reg",
-            &[
-                "add",
-                RUN_KEY,
-                "/v",
-                RUN_VALUE,
-                "/t",
-                "REG_SZ",
-                "/d",
-                &unit.contents,
-                "/f",
-            ],
-        )?;
+        runner.set_run_key_value(&unit.contents)?;
     }
     super::service_host::stop(&host.state_file, runner)?;
     let exe = host.exe.to_string_lossy();
@@ -597,7 +733,11 @@ fn write_unit(unit: &ServiceUnit) -> Result<()> {
     Ok(())
 }
 
-fn require(runner: &dyn CommandRunner, program: &str, args: &[&str]) -> Result<CommandOutcome> {
+fn require<R: CommandRunner + ?Sized>(
+    runner: &R,
+    program: &str,
+    args: &[&str],
+) -> Result<CommandOutcome> {
     let outcome = runner.run(program, args)?;
     if !outcome.success {
         bail!(
@@ -698,6 +838,7 @@ pub(crate) enum Removal {
 pub(crate) fn planned_removal_for(
     manager: ServiceManager,
     path: &Path,
+    data_dir: &Path,
     runner: &dyn CommandRunner,
 ) -> Removal {
     if manager != ServiceManager::WindowsRun {
@@ -705,7 +846,9 @@ pub(crate) fn planned_removal_for(
     }
     match run_value(runner) {
         None => Removal::Absent,
-        Some(data) if is_setup_run_entry(&data) => Removal::Removed(path.to_path_buf()),
+        Some(data) if is_setup_run_entry_for(&data, data_dir) => {
+            Removal::Removed(path.to_path_buf())
+        }
         Some(_) => Removal::NotOurs(path.to_path_buf()),
     }
 }
@@ -731,7 +874,7 @@ pub(crate) fn remove(
     data_dir: &Path,
     runner: &dyn CommandRunner,
 ) -> Result<Removal> {
-    let planned = planned_removal_for(manager, path, runner);
+    let planned = planned_removal_for(manager, path, data_dir, runner);
     if !matches!(planned, Removal::Removed(_)) {
         return Ok(planned);
     }
@@ -758,7 +901,7 @@ pub(crate) fn remove(
         }
         ServiceManager::WindowsRun => {
             super::service_host::stop(&super::service_host::state_file(data_dir), runner)?;
-            require(runner, "reg", &["delete", RUN_KEY, "/v", RUN_VALUE, "/f"])?;
+            runner.delete_run_key_value()?;
         }
     }
     Ok(planned)
@@ -1251,22 +1394,115 @@ mod tests {
         assert_eq!(runner.calls.borrow().len(), 2);
     }
 
-    /// Uninstall removes only an entry `setup` wrote; someone else's value
-    /// under the same name is left, and an absent one is nothing to do.
+    /// Uninstall removes only the entry `setup` wrote for this data dir;
+    /// another install's entry, someone else's value under the same name, and
+    /// an absent one are all left alone.
     #[test]
     fn uninstall_removes_only_setups_logon_entry() {
         let root = tempfile::tempdir().unwrap();
         let path = unit_path(ServiceManager::WindowsRun, root.path(), None);
+        let data_dir = Path::new(r"C:\d");
+        let entry = "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \"C:\\d\" \
+                     --config \"C:\\d\\config.toml\" service-host\r\n";
         let ours = FakeRunner {
+            stdout: vec![("reg query", entry)],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(ServiceManager::WindowsRun, &path, data_dir, &ours).unwrap(),
+            Removal::Removed(path.clone())
+        );
+
+        let other_install = FakeRunner {
+            stdout: vec![("reg query", entry)],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(
+                ServiceManager::WindowsRun,
+                &path,
+                root.path(),
+                &other_install
+            )
+            .unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(
+            other_install.calls.borrow().len(),
+            1,
+            "only the query ran: {:?}",
+            other_install.calls.borrow()
+        );
+
+        // Windows reads this data dir as `C:\d\other`: another install's.
+        let past_the_quote = FakeRunner {
             stdout: vec![(
                 "reg query",
-                "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \"C:\\d\" \
+                "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \"C:\\d\"\\other \
                  --config \"C:\\d\\config.toml\" service-host\r\n",
             )],
             ..FakeRunner::default()
         };
         assert_eq!(
-            remove(ServiceManager::WindowsRun, &path, root.path(), &ours).unwrap(),
+            remove(ServiceManager::WindowsRun, &path, data_dir, &past_the_quote).unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(past_the_quote.calls.borrow().len(), 1, "only the query ran");
+
+        // `C:` is the current directory on drive C, not the root being
+        // uninstalled: nothing is stopped or deleted.
+        let drive_relative = FakeRunner {
+            stdout: vec![(
+                "reg query",
+                "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \"C:\" \
+                 --config \"C:\\other\\config.toml\" service-host\r\n",
+            )],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(
+                ServiceManager::WindowsRun,
+                &path,
+                Path::new(r"C:\"),
+                &drive_relative
+            )
+            .unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(drive_relative.calls.borrow().len(), 1, "only the query ran");
+
+        // A volume GUID data dir removes its own entry and leaves another
+        // volume's alone.
+        let volume_entry = "    ai-memory    REG_SZ    \"C:\\x\\ai-memory.exe\" --data-dir \
+             \"\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\ai-memory\" \
+             --config \"C:\\c.toml\" service-host\r\n";
+        let other_volume = FakeRunner {
+            stdout: vec![("reg query", volume_entry)],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(
+                ServiceManager::WindowsRun,
+                &path,
+                Path::new(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}\ai-memory"),
+                &other_volume
+            )
+            .unwrap(),
+            Removal::NotOurs(path.clone())
+        );
+        assert_eq!(other_volume.calls.borrow().len(), 1, "only the query ran");
+        let own_volume = FakeRunner {
+            stdout: vec![("reg query", volume_entry)],
+            ..FakeRunner::default()
+        };
+        assert_eq!(
+            remove(
+                ServiceManager::WindowsRun,
+                &path,
+                Path::new(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\ai-memory"),
+                &own_volume
+            )
+            .unwrap(),
             Removal::Removed(path.clone())
         );
         assert!(
@@ -1321,6 +1557,167 @@ mod windows_entry_tests {
             r#""C:\with space\dir""#
         );
         assert!(windows_arg("data dir", r#"C:\a"b"#).is_err());
+    }
+
+    /// The data dir comes back out of an entry exactly as `windows_arg` put
+    /// it in, trailing backslashes included.
+    #[test]
+    fn the_entry_names_its_data_dir() {
+        for dir in [
+            r"C:\Users\me\AppData\Local\ai-memory",
+            r"D:\",
+            r"C:\with space\d",
+        ] {
+            let entry = format!(
+                "{} --data-dir {} --config {} {SERVICE_HOST}",
+                windows_arg("binary", r"C:\bin\ai-memory.exe").unwrap(),
+                windows_arg("data dir", dir).unwrap(),
+                windows_arg("config", r"C:\c.toml").unwrap(),
+            );
+            assert_eq!(run_entry_data_dir(&entry).as_deref(), Some(dir), "{entry}");
+        }
+        assert_eq!(
+            run_entry_data_dir(r#""C:\bin\ai-memory.exe" service-host"#),
+            None
+        );
+    }
+
+    #[test]
+    fn data_dirs_compare_without_prefix_case_or_trailing_separator() {
+        assert!(same_windows_dir(
+            r"\\?\C:\Users\Me\AppData\Local\ai-memory",
+            r"c:\users\me\appdata\local\ai-memory\"
+        ));
+        assert!(!same_windows_dir(r"C:\a\ai-memory", r"C:\b\ai-memory"));
+        assert!(!same_windows_dir(r"C:\ai-memory", r"C:\ai-memory-test"));
+        // A verbatim UNC path names the same share as its plain spelling.
+        assert!(same_windows_dir(
+            r"\\?\UNC\server\share\ai-memory",
+            r"\\server\share\ai-memory\"
+        ));
+        assert!(!same_windows_dir(
+            r"\\?\UNC\server\share\ai-memory",
+            r"\\server\other\ai-memory"
+        ));
+        // `C:` is the current directory on drive C, not its root.
+        assert!(!same_windows_dir("C:", r"\\?\C:\"));
+        assert!(!same_windows_dir("C:", "C:"));
+        assert!(!same_windows_dir(r"ai-memory", r"ai-memory"));
+        assert!(same_windows_dir(r"C:\", r"\\?\C:\"));
+        // A volume GUID path is absolute and matches itself, not another
+        // volume; a malformed one matches nothing.
+        let volume = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\ai-memory";
+        assert!(same_windows_dir(
+            volume,
+            &format!(r"{}\", volume.to_uppercase())
+        ));
+        assert!(!same_windows_dir(
+            volume,
+            r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}\ai-memory"
+        ));
+        assert!(!same_windows_dir(
+            r"\\?\Volume{}\ai-memory",
+            r"\\?\Volume{}\ai-memory"
+        ));
+        assert!(!same_windows_dir(r"\\?\Volume{x", r"\\?\Volume{x"));
+    }
+
+    /// The entry `setup` renders for a volume GUID data dir is that
+    /// install's, and not another volume's.
+    #[test]
+    fn a_volume_guid_data_dir_owns_its_entry() {
+        let dir = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\ai-memory";
+        let entry = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", dir).unwrap(),
+            windows_arg("config", r"C:\c.toml").unwrap(),
+        );
+        assert!(is_setup_run_entry_for(&entry, Path::new(dir)), "{entry}");
+        assert!(!is_setup_run_entry_for(
+            &entry,
+            Path::new(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}\ai-memory")
+        ));
+    }
+
+    /// A drive-relative `--data-dir "C:"` names the current directory on C,
+    /// so uninstalling the drive root must not claim it.
+    #[test]
+    fn a_drive_relative_data_dir_is_not_the_drive_root() {
+        let root = Path::new(r"C:\");
+        let foreign = r#""C:\bin\ai-memory.exe" --data-dir "C:" --config "C:\other\config.toml" service-host"#;
+        assert!(!is_setup_run_entry_for(foreign, root));
+        assert!(!is_setup_run_entry_for(foreign, Path::new(r"\\?\C:\")));
+        // Control: the entry `setup` renders for the drive root is ours.
+        let ours = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", r"C:\").unwrap(),
+            windows_arg("config", r"C:\config.toml").unwrap(),
+        );
+        assert!(is_setup_run_entry_for(&ours, root), "{ours}");
+    }
+
+    /// A `--data-dir` inside the executable's path is not the option.
+    #[test]
+    fn the_data_dir_is_read_after_the_executable() {
+        let entry = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\tools --data-dir bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", r"C:\Users\me\AppData\Local\ai-memory").unwrap(),
+            windows_arg("config", r"C:\c.toml").unwrap(),
+        );
+        assert_eq!(
+            run_entry_data_dir(&entry).as_deref(),
+            Some(r"C:\Users\me\AppData\Local\ai-memory")
+        );
+        assert!(is_setup_run_entry_for(
+            &entry,
+            Path::new(r"C:\Users\me\AppData\Local\ai-memory")
+        ));
+    }
+
+    /// A data dir argument that does not end at its closing quote names a
+    /// different directory to Windows: `"C:\d"\other` is `C:\d\other`, and
+    /// `"C:\d\" …"` escapes the quote. Neither may claim `C:\d`'s entry.
+    #[test]
+    fn a_data_dir_that_runs_past_its_quote_is_not_ours() {
+        let data_dir = Path::new(r"C:\d");
+        for entry in [
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d"\other --config "C:\c.toml" service-host"#,
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d"x --config "C:\c.toml" service-host"#,
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d\" --config "C:\c.toml" service-host"#,
+        ] {
+            assert!(!is_setup_run_entry_for(entry, data_dir), "{entry}");
+        }
+        // Control: the entry `setup` renders for `C:\d` is ours.
+        let ours = format!(
+            "{} --data-dir {} --config {} {SERVICE_HOST}",
+            windows_arg("binary", r"C:\bin\ai-memory.exe").unwrap(),
+            windows_arg("data dir", r"C:\d").unwrap(),
+            windows_arg("config", r"C:\c.toml").unwrap(),
+        );
+        assert!(is_setup_run_entry_for(&ours, data_dir), "{ours}");
+    }
+
+    /// The test that found this: an `uninstall` run against a temporary data
+    /// dir removed the developer's own logon entry, because every entry with
+    /// `setup`'s shape counted as ours.
+    #[test]
+    fn only_the_entry_for_this_data_dir_is_ours() {
+        let entry = r#""C:\bin\ai-memory.exe" --data-dir "\\?\C:\Users\me\AppData\Local\ai-memory" --config "C:\c.toml" service-host"#;
+        assert!(is_setup_run_entry_for(
+            entry,
+            Path::new(r"C:\Users\me\AppData\Local\ai-memory")
+        ));
+        assert!(!is_setup_run_entry_for(
+            entry,
+            Path::new(r"C:\Users\me\AppData\Local\Temp\.tmpAbC123\data")
+        ));
+        assert!(!is_setup_run_entry_for(
+            r#""C:\bin\ai-memory.exe" service-host"#,
+            Path::new(r"C:\Users\me\AppData\Local\ai-memory")
+        ));
     }
 
     #[test]
@@ -1386,5 +1783,71 @@ mod windows_entry_tests {
             host.state_file,
             super::super::service_host::state_file(&spec.data_dir)
         );
+    }
+}
+
+/// The registry calls the logon entry goes through, against a throwaway key:
+/// the real `Run` key is never touched.
+#[cfg(all(test, windows))]
+mod user_registry_tests {
+    use super::user_registry;
+
+    #[test]
+    fn a_value_round_trips_and_deleting_it_leaves_nothing() {
+        let subkey = format!(r"Software\ai-memory-tests\{}", uuid::Uuid::new_v4());
+        let data = r#""C:\Program Files\ai memory\ai-memory.exe" --data-dir "C:\d\\" service-host"#;
+        assert_eq!(user_registry::get(&subkey, "ai-memory"), None);
+
+        user_registry::set(&subkey, "ai-memory", data).unwrap();
+        assert_eq!(
+            user_registry::get(&subkey, "ai-memory").as_deref(),
+            Some(data)
+        );
+
+        user_registry::delete(&subkey, "ai-memory").unwrap();
+        assert_eq!(user_registry::get(&subkey, "ai-memory"), None);
+        windows_registry::CURRENT_USER.remove_tree(&subkey).unwrap();
+    }
+
+    /// `setup` writes `REG_SZ`; an expandable string under the same name was
+    /// put there by someone else and must not read as `setup`'s entry, or
+    /// `uninstall` would delete it.
+    #[test]
+    fn only_a_plain_string_value_is_read() {
+        let subkey = format!(r"Software\ai-memory-tests\{}", uuid::Uuid::new_v4());
+        let data =
+            r#""C:\bin\ai-memory.exe" --data-dir "C:\d" --config "C:\d\config.toml" service-host"#;
+        let key = windows_registry::CURRENT_USER.create(&subkey).unwrap();
+
+        key.set_expand_string("ai-memory", data).unwrap();
+        assert_eq!(user_registry::get(&subkey, "ai-memory"), None);
+
+        // Control: the same data as REG_SZ is read.
+        key.set_string("ai-memory", data).unwrap();
+        assert_eq!(
+            user_registry::get(&subkey, "ai-memory").as_deref(),
+            Some(data)
+        );
+        windows_registry::CURRENT_USER.remove_tree(&subkey).unwrap();
+    }
+
+    /// The entry `render` writes for an install is recognised as that
+    /// install's, even when the executable's own path holds ` --data-dir `.
+    #[test]
+    fn a_rendered_entry_belongs_to_its_own_data_dir() {
+        let data_dir = std::path::PathBuf::from(r"C:\Users\me\AppData\Local\ai-memory");
+        let spec = super::ServiceSpec {
+            exe: r"C:\tools --data-dir bin\ai-memory.exe".into(),
+            data_dir: data_dir.clone(),
+            config_path: data_dir.join("config.toml"),
+            home: r"C:\Users\me".into(),
+            xdg_config_home: None,
+        };
+        let unit = super::render(super::ServiceManager::WindowsRun, &spec).unwrap();
+        assert!(super::is_setup_run_entry_for(&unit.contents, &data_dir));
+        assert!(!super::is_setup_run_entry_for(
+            &unit.contents,
+            std::path::Path::new(r"C:\tools")
+        ));
     }
 }
