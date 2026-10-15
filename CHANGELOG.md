@@ -37,6 +37,13 @@ version in [`docs/changelog/`](docs/changelog/):
   emptiness check against the server also gives up after 30 seconds instead
   of waiting forever on a saturated server. Keying the trigger on the project
   rather than the directory is not part of this change. (#1287)
+- Fixed `/web/pending` offering Approve and Reject buttons that always failed
+  with `401: unknown error` on a server with a bearer token and no password
+  sign-in. The browser reaches `/web` there with the root token over HTTP
+  Basic, which only admits reads. The page now says so, points to password
+  sign-in, and shows each proposal's `ai-memory pending-writes approve` /
+  `reject` command instead; a decision that fails for another reason now shows
+  the server's message even when it is plain text. (#1288)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the

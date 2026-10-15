@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::AuthLevel;
+use ai_memory_core::{AuthLevel, LegacyBrowserAuth};
 use ai_memory_store::{PendingAutoImproveReview, PendingAutoImproveScope};
 use askama::Template;
 use axum::Extension;
@@ -53,6 +53,7 @@ pub(crate) struct PendingQuery {
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     level: Option<Extension<AuthLevel>>,
+    legacy: Option<Extension<LegacyBrowserAuth>>,
     Query(query): Query<PendingQuery>,
 ) -> Response {
     if let Err(response) = super::require_admin(&state, level).await {
@@ -123,6 +124,7 @@ pub(crate) async fn handler(
             project_count: scopes.len(),
             truncated,
             limit: PENDING_REVIEW_LIMIT,
+            read_only: legacy.is_some(),
         },
         StatusCode::OK,
     )
