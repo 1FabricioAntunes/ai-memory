@@ -1366,6 +1366,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_ledger_retention(config.decay.ledger_retention())
         .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_contradiction_band(config.contradiction_band_min, config.contradiction_band_max)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
@@ -1642,6 +1643,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.ledger_retention(),
                 config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
@@ -2122,6 +2124,7 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.ledger_retention(),
                             decay.compact_cold_episodic,
                             decay.cold_cluster_dedup(dedup_embedding),
                         )
@@ -2140,6 +2143,9 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            ledgers_pruned = outcome.ledgers_pruned,
+                            ledger_bytes_pruned = outcome.ledger_bytes_pruned,
+                            ledgers_undeleted = outcome.ledgers_undeleted,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -2539,6 +2545,9 @@ struct ScheduledSweepTickOutcome {
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
+    ledgers_pruned: usize,
+    ledger_bytes_pruned: u64,
+    ledgers_undeleted: usize,
     errors: usize,
 }
 
@@ -2550,6 +2559,7 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    ledgers: ai_memory_consolidate::LedgerRetention,
     compact_cold_episodic: bool,
     dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
@@ -2560,7 +2570,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match ai_memory_consolidate::run_sweep_with_hygiene(
+        match ai_memory_consolidate::run_sweep_with_ledgers(
             reader,
             writer,
             Some(wiki),
@@ -2571,6 +2581,7 @@ async fn run_scheduled_sweep_tick(
             retention,
             compact_cold_episodic,
             dedup.clone(),
+            ledgers,
             false,
         )
         .await
@@ -2586,6 +2597,9 @@ async fn run_scheduled_sweep_tick(
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
+                outcome.ledgers_pruned += report.ledgers_pruned;
+                outcome.ledger_bytes_pruned += report.ledger_bytes_pruned;
+                outcome.ledgers_undeleted += report.ledgers_undeleted;
             }
             Err(e) => {
                 outcome.errors += 1;
@@ -5570,6 +5584,7 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            ai_memory_consolidate::LedgerRetention::default(),
             false,
             ai_memory_consolidate::ColdClusterDedup::default(),
         )

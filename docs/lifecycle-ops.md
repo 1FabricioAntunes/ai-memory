@@ -18,6 +18,7 @@ on a homelab box where mistakes are harder to undo.
 | `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims, profile prompt candidates, ingest keys and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
 | `repair-backfill-timestamps --project --confirm` | ✅ yes | no | yes, if the operator kept the audit row or the CLI's before/after report (nothing else) | Corrects `sessions.started_at`/`ended_at` for sessions an older `backfill` imported before it carried the transcript's own event time. The CLI reads the operator's local transcripts read-only and posts candidate `(session_id, started_at, ended_at)` tuples to `POST /admin/repair-session-times`, which validates each one against `(workspace, project)` (a candidate outside that scope is `not_found` and untouched), only rewrites a row whose `started_at` postdates the candidate's own end (`not_flattened` otherwise, so a correctly hook-captured session or a re-run is a no-op), refuses negative/inverted/future-dated times, and never assigns an end time to a session still open. Without `--confirm` the server validates and reports inside a rolled-back transaction, so it is a real dry run; a confirmed run writes one `audit_log` row per request with the before/after times. Touches only the two timestamp columns of rows already in scope; `observations` and pages (including the session's own page frontmatter) are untouched. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
+| `forget-sweep` event-ledger pass (`[decay] ledger_retention_months`) | ✅ yes | old hook event ledger *files* (`log-YYYY-MM.md`) from disk, nothing in the database | no ai-memory command restores a ledger (`restore-page` restores pages only); the content stays in the wiki's git history when a checkpoint captured it, recoverable with plain git until the repository is compacted | **Off by default** (`0`). Runs inside the forget sweep, so `--dry-run` previews it: the report lists `ledgers_prunable` and `ledger_bytes_prunable`. Online through the admin API. Only a file whose name is `log-YYYY-MM.md` **and** whose content opens with a ledger hook entry qualifies; `log.md`, the current month and the previous month are never deleted, whatever the setting. Each removal consults the blocking admission chain (`delete_event_ledger` op); a `reject`-policy webhook keeps the file and the report counts it in `ledgers_undeleted`. |
 | `reclaim-ledger-versions` | ✅ yes | superseded pre-#660 ledger page *versions* only | no (the latest page version stays) | Dry-run by default; needs `--confirm` to delete. Online through the writer actor, safe alongside the live writer. Content-gated: only non-latest, non-decay `log.md`/`log-YYYY-MM.md` versions whose body opens with a ledger hook entry are removed; a real page that merely shares the name is untouched. `--compact` additionally rebuilds FTS and `VACUUM`s to reclaim the freed bytes. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
@@ -819,6 +820,59 @@ logical delete alone does not shrink the file: pass `--compact` to rebuild the
 FTS index and `VACUUM`. `--drop-latest` (also content-gated) additionally
 reclaims the latest ledger version when you no longer need the in-wiki ledger at
 all.
+
+### Event-ledger sweep (`forget-sweep`, opt-in)
+
+```bash
+# Preview: which ledgers and how many bytes the sweep would delete.
+ai-memory forget-sweep --dry-run
+# Enable it (config.toml) — the sweep then deletes them on its schedule too:
+#   [decay]
+#   ledger_retention_months = 12
+```
+
+The hook event ledgers (`log-YYYY-MM.md`, one per project per month) are an
+append-only audit trail that no ai-memory surface reads back: the indexer,
+consolidation, the OKF migration and export skip them. On a busy project a
+single month can hold hundreds of megabytes. With `[decay]
+ledger_retention_months = N` (env `AI_MEMORY_DECAY__LEDGER_RETENTION_MONTHS`)
+the forget sweep deletes a project's ledger once `N` whole UTC calendar months
+have passed after its month ended. `0` (the default) keeps every ledger; a
+negative value is rejected at startup.
+
+What it will and will not delete:
+
+- A file qualifies only when its name is `log-YYYY-MM.md` **and** its content
+  opens like a ledger (the same content gate `reclaim-ledger-versions` and the
+  indexer use). A page a person named `log-2025-01.md` is never deleted.
+- The current month and the previous month are never deleted, whatever `N` is:
+  the hook appender may still write to them.
+- `log.md` (the unrotated ledger) is never deleted.
+- Only the swept project's directory is looked at. The sweep that runs for one
+  project never touches another project's ledgers.
+- A deletion is the same blocking admission check a page delete is: webhooks
+  subscribed to the `delete_event_ledger` op are consulted before the unlink,
+  and a `reject`-policy webhook keeps the file. The sweep then counts it in
+  the report's `ledgers_undeleted` and moves on (retried by the next sweep),
+  exactly as a refused page delete is kept and retried. (Per-event *appends*
+  to ledgers still bypass the chain, as before.)
+
+How it deletes: through `Wiki::delete_event_ledger`, which takes the wiki
+mutation guard, re-checks the name and the content gate, runs the blocking
+admission check described above, and only then removes the file; the sweep
+never calls `std::fs` itself. The hook appender does not take
+that guard, so an append landing in the instant between the check and the
+removal would be deleted with the file; that can only affect a month closed for
+at least `N` months, which receives nothing except a very late event (and that
+event recreates a small file). The database is never written: ledgers have no
+`pages` rows since #660, and when a legacy row exists for a deleted ledger the
+report counts it in `ledger_page_rows_left` and leaves it alone — run
+`reclaim-ledger-versions` for those.
+
+The sweep deletes the file from disk. The wiki's git repository keeps the
+blobs a checkpoint already captured; deleting a ledger does not shrink
+`wiki/.git` (that needs the repository to be compacted, which ai-memory does not
+do).
 
 ### `repair-backfill-timestamps`
 

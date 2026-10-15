@@ -126,6 +126,17 @@ log_level = "info"
 # will not shrink after the first prune; the `ai-memory backup` tarball will.
 #   - A quarter of raw capture: observation_retention_days = 90
 #   - Smaller transactions on a slow disk: observation_prune_batch = 2000
+#
+# The hook event ledgers (log-YYYY-MM.md, one per project per month) are an
+# append-only grep trail nothing reads back, and a busy project's month can
+# take hundreds of megabytes. Set ledger_retention_months to a positive number
+# to let the forget sweep DELETE a ledger once that many whole calendar months
+# (UTC) have passed after its month ended. The current and the previous month
+# are never deleted, whatever the value, and only files whose content opens
+# like a ledger qualify (a page that merely shares the name is untouched).
+# Deletion is permanent on disk; git history keeps the old blobs until the
+# repository is compacted. 0 (the default) keeps every ledger.
+#   - Keep a year of ledgers: ledger_retention_months = 12
 # --- Embeddings (hybrid retrieval) ---------------------------------------
 # Unset = the 2.0 default: in-process local embeddings (all-MiniLM-L6-v2,
 # 384-dim), no API key, no data egress. The ~87 MB model is fetched once
@@ -147,6 +158,7 @@ hard_delete_after_days = 180
 breadth_weight = 0.0
 observation_retention_days = 0     # 0 = never prune raw observations
 observation_prune_batch = 5000     # rows per prune transaction
+ledger_retention_months = 0        # 0 = never delete hook event ledgers
 
 # Privacy strip.
 #

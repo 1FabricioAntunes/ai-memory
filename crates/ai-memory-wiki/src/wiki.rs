@@ -37,6 +37,16 @@ pub struct PurgeSessionOutcome {
     pub files_failed: Vec<PagePath>,
 }
 
+/// One hook event ledger (`log-YYYY-MM.md`) found in a project's wiki
+/// directory by [`Wiki::list_event_ledgers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLedgerFile {
+    /// File name inside the project directory, e.g. `log-2026-07.md`.
+    pub file_name: String,
+    /// Size on disk, in bytes.
+    pub bytes: u64,
+}
+
 /// Summary of a [`Wiki::reindex_all`] run.
 #[derive(Debug, Default, Clone)]
 pub struct ReindexSummary {
@@ -1637,6 +1647,154 @@ impl Wiki {
         match self.git.remove_dir_all_checked(&root) {
             Ok(()) => Ok(()),
             Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List the rotated hook event ledgers (`log-YYYY-MM.md`) directly under a
+    /// project's wiki directory, in file-name order.
+    ///
+    /// A file qualifies only when its name has the rotated-ledger shape AND its
+    /// content opens like a ledger (the [`ai_memory_core::log_ledger`]
+    /// predicates, the same gate the indexer, the OKF migration and the OKF
+    /// export apply): an ordinary page named `log-2025-01.md` is not listed.
+    /// The unrotated `log.md` is never listed. Symbolic links and anything
+    /// that is not a regular file are skipped. A project with no directory yet
+    /// lists nothing.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Confinement`] when the project tree crosses a
+    /// symbolic link, or [`WikiError::Io`] when the directory cannot be read.
+    pub fn list_event_ledgers(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<Vec<EventLedgerFile>> {
+        self.inspect_project_tree(workspace_id, project_id)?;
+        let root = self.confined_project_root(workspace_id, project_id, Prepare::Inspect)?;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ledgers = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !crate::ledger::is_rotated_log_filename(&file_name) {
+                continue;
+            }
+            let metadata = match std::fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                // Removed between the listing and the stat: not a ledger now.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if !metadata.is_file()
+                || crate::confinement::is_link_like(&metadata)
+                || !crate::ledger::opens_with_log_ledger(&entry.path())
+            {
+                continue;
+            }
+            ledgers.push(EventLedgerFile {
+                file_name,
+                bytes: metadata.len(),
+            });
+        }
+        ledgers.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+        Ok(ledgers)
+    }
+
+    /// Delete one rotated hook event ledger (`log-YYYY-MM.md`) from a
+    /// project's wiki directory and report the file's size.
+    ///
+    /// The only wiki path that removes a ledger: a ledger is not a page, so
+    /// none of the page-delete helpers (which address `pages` rows) fit. It
+    /// takes the exclusive mutation guard, then re-checks under it what the
+    /// caller may have decided from a stale listing: the name must have the
+    /// rotated-ledger shape (never `log.md`, never a path) and the file must be
+    /// a regular, non-linked file whose content still opens like a ledger, so
+    /// an ordinary page that carries the name is never deleted.
+    ///
+    /// Then it runs the same blocking admission check a page delete gets
+    /// (`remove_page_locked`): webhooks subscribed to `delete_event_ledger`
+    /// are notified with the ledger's file name BEFORE the removal, and a
+    /// `Reject`-policy webhook refuses the delete — the file is left in place
+    /// and the error propagates. Only after the file is gone are the chain's
+    /// non-blocking observers dispatched, the way page deletes tell them.
+    ///
+    /// The window it leaves: the hook ledger appender does not take the
+    /// mutation guard, so an append that lands between the content check and
+    /// the removal (the admission round-trip included in that interval) is
+    /// deleted with the file. Callers are expected to pass only
+    /// closed months, which nothing appends to except a late-delivered event
+    /// (which recreates a small file). Never touches the store: a legacy
+    /// `pages` row for the ledger is left alone.
+    ///
+    /// Returns `Ok(Some(bytes))` when the file was deleted and `Ok(None)` when
+    /// there was nothing deletable: no such file, or one that is not a ledger.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Confinement`] when the project tree crosses a
+    /// symbolic link, [`WikiError::Io`] when `file_name` is not a rotated
+    /// ledger name, when a `reject`-policy webhook refuses the removal, or
+    /// when the filesystem fails.
+    pub async fn delete_event_ledger(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        file_name: &str,
+    ) -> WikiResult<Option<u64>> {
+        if !crate::ledger::is_rotated_log_filename(file_name) {
+            return Err(ai_memory_wiki_error(
+                "only a rotated event ledger (log-YYYY-MM.md) can be deleted",
+            ));
+        }
+        let _guard = self.mutation_lock.write().await;
+        self.inspect_project_tree(workspace_id, project_id)?;
+        let abs = project_path(
+            &self.root,
+            workspace_id,
+            project_id,
+            Path::new(file_name),
+            Prepare::Inspect,
+        )?;
+        let metadata = match std::fs::symlink_metadata(&abs) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if !metadata.is_file()
+            || crate::confinement::is_link_like(&metadata)
+            || !crate::ledger::opens_with_log_ledger(&abs)
+        {
+            return Ok(None);
+        }
+        // The blocking half, exactly as `remove_page_locked` runs it for a
+        // page delete: a `reject`-policy webhook refuses before anything is
+        // removed, and the refusal propagates with the file left in place.
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+            let mut ctx = AdmissionContext {
+                op: AdmissionOp::DeleteEventLedger,
+                ..Default::default()
+            };
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(Some(file_name), &ctx).await?;
+            Some(ctx)
+        } else {
+            None
+        };
+        match self.git.remove_file_checked(&abs) {
+            Ok(()) => {
+                if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                    chain.dispatch_async(Some(file_name), &serde_json::Value::Null, "", ctx);
+                }
+                Ok(Some(metadata.len()))
+            }
+            Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
