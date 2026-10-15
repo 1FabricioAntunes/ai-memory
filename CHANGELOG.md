@@ -27,7 +27,7 @@ version in [`docs/changelog/`](docs/changelog/):
   the session is what the page itself lists: the title of every user prompt.
   The PreCompact and PostCompaction checkpoint page uses the same bounded
   reads. The writer's lifecycle-only re-check and the reader now build their
-  query from one shared predicate. (#PRNUM)
+  query from one shared predicate. (#1323)
 
 ## [3.0.1] - 2026-10-15
 
