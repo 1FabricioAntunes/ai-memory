@@ -573,6 +573,13 @@ and [`docs/deploy.md`](docs/deploy.md) for the server itself. It includes
 measured capacity numbers and the one rule you must follow: one server per
 data directory, never two.
 
+Two opt-in HTTP surfaces build on the same browser sign-in, and both are off
+by default. `serve --enable-session-management` lets signed-in users inspect
+sessions and purge the ones they own
+([`docs/session-management.md`](docs/session-management.md)).
+`serve --enable-self-service-keys` lets them issue and revoke their own `aim_`
+API keys ([`docs/self-service-keys.md`](docs/self-service-keys.md)).
+
 ## Security
 
 The server binds to loopback only by default. A fresh `ai-memory init` also

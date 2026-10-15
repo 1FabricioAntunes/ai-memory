@@ -1151,6 +1151,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
 
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
     refuse_a_missing_token_file(&config.auth)?;
+    if args.enable_session_management && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-session-management requires --transport http");
+    }
+    if args.enable_self_service_keys && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-self-service-keys requires --transport http");
+    }
     config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -1834,6 +1840,35 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
                 )));
+            let router = if args.enable_session_management {
+                router.merge(ai_memory_mcp::session_management::router(
+                    ai_memory_mcp::session_management::SessionManagementState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        wiki: wiki.clone(),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            let router = if args.enable_self_service_keys {
+                router.merge(ai_memory_mcp::self_service_keys::router(
+                    ai_memory_mcp::self_service_keys::SelfServiceKeysState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        pepper: config
+                            .auth
+                            .token_pepper
+                            .clone()
+                            .filter(|p| !p.trim().is_empty())
+                            .map(TokenPepper::new),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
             let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
