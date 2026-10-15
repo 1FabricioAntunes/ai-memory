@@ -99,7 +99,7 @@ pub(crate) fn run_with_opencode_dialect(
         effective_mcp_server_url(config, &args)
     } else {
         inferred.as_ref().map_or_else(
-            || DEFAULT_MCP_URL.to_string(),
+            || effective_mcp_server_url(config, &args),
             |entry| entry.mcp_url.clone(),
         )
     };
@@ -393,7 +393,10 @@ fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
         // so callers who already pass the endpoint are unchanged.
         return mcp_server_url_from_base(url);
     }
-    if config.server_url_configured() {
+    // A URL derived from `bind` counts here too: with nothing configured and no
+    // existing entry to infer from, the client should reach the server this
+    // config starts (#1269).
+    if config.server_url_configured() || config.server_url_derived_from_bind {
         return mcp_server_url_from_base(&config.server_url);
     }
     DEFAULT_MCP_URL.to_string()
@@ -4207,6 +4210,27 @@ mod tests {
             DEFAULT_MCP_URL,
             "an explicit --server-url matching the compiled default must not be \
              silently overridden by a differently-configured server_url"
+        );
+    }
+
+    /// #1269: with only a custom `bind`, the MCP entry points at the server
+    /// that bind starts rather than the compiled default; a plain default
+    /// config is unchanged.
+    #[test]
+    fn mcp_server_url_uses_a_bind_derived_url() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49921".into(),
+            server_url_derived_from_bind: true,
+            ..Config::default()
+        };
+        let args = args_for(McpClient::OpenCode);
+        assert_eq!(
+            effective_mcp_server_url(&config, &args),
+            "http://127.0.0.1:49921/mcp"
+        );
+        assert_eq!(
+            effective_mcp_server_url(&Config::default(), &args),
+            DEFAULT_MCP_URL
         );
     }
 

@@ -1506,6 +1506,10 @@ fn effective_hook_server_url(
         config.server_url.clone()
     } else if let Some(url) = inferred.and_then(|mcp| mcp.hook_server_url.clone()) {
         url
+    } else if config.server_url_derived_from_bind {
+        // Nothing chose a URL and no existing entry names one: reach the
+        // server this config's `bind` starts (#1269).
+        config.server_url.clone()
     } else {
         return DEFAULT_SERVER_URL.to_string();
     };
@@ -8951,6 +8955,35 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert_eq!(
             effective_hook_server_url(&config, &args, Some(&inferred)),
             "http://homelab:49374"
+        );
+    }
+
+    /// #1269: with only a custom `bind`, hooks reach the server that bind
+    /// starts; an existing MCP entry still wins over the derived URL.
+    #[test]
+    fn hook_server_url_uses_a_bind_derived_url_after_an_existing_entry() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49921".into(),
+            server_url_derived_from_bind: true,
+            ..Config::default()
+        };
+        let args = default_hook_args();
+        assert_eq!(
+            effective_hook_server_url(&config, &args, None),
+            "http://127.0.0.1:49921"
+        );
+        let inferred = InferredMcpConfig {
+            hook_server_url: Some("http://homelab:49374".into()),
+            auth_token: None,
+        };
+        assert_eq!(
+            effective_hook_server_url(&config, &args, Some(&inferred)),
+            "http://homelab:49374"
+        );
+        assert_eq!(
+            effective_hook_server_url(&Config::default(), &args, None),
+            DEFAULT_SERVER_URL,
+            "nothing derived and nothing inferred keeps the default"
         );
     }
 

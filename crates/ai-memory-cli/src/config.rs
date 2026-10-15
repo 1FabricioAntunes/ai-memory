@@ -2091,9 +2091,7 @@ impl FtsSettings {
 /// (#1269).
 ///
 /// Only runs when neither the config file nor `AI_MEMORY_SERVER_URL` set
-/// `server_url`; `file_set_server_url` carries the file half, and an env value
-/// would already have replaced `config.server_url` with something other than
-/// the default, which this checks again.
+/// `server_url` (`explicit_server_url`), even to the default URL itself.
 ///
 /// Rules, matching the reporter's proposal:
 /// - an unspecified address becomes loopback, because it is not itself a
@@ -2106,8 +2104,8 @@ impl FtsSettings {
 ///
 /// The default `bind` derives exactly [`DEFAULT_SERVER_URL`], so an install
 /// that never touched either key is byte-identical to before.
-fn derive_server_url_from_bind(config: &mut Config, file_set_server_url: bool) {
-    if file_set_server_url || config.server_url != DEFAULT_SERVER_URL {
+fn derive_server_url_from_bind(config: &mut Config, explicit_server_url: bool) {
+    if explicit_server_url || config.server_url != DEFAULT_SERVER_URL {
         return;
     }
     // A bind that differs from the default is the case this exists for; the
@@ -2135,7 +2133,9 @@ fn server_url_for_bind(bind: &str) -> Option<String> {
     // colons of its own, keeps its host in one piece.
     let (host, port) = bind.rsplit_once(':')?;
     let port: u16 = port.parse().ok()?;
-    if host.is_empty() {
+    // Port 0 asks the OS for any free port, so no client can know it in
+    // advance; keep the default URL.
+    if host.is_empty() || port == 0 {
         return None;
     }
     let host = if host == "0.0.0.0" {
@@ -2262,11 +2262,16 @@ impl Config {
         if let Some(token) = runtime_env.auth_token.clone() {
             config.auth.bearer_token = Some(token);
         }
-        // Whether the CONFIG FILE named a server URL, sampled before the env
-        // override below so the two sources stay distinguishable. `server_url`
+        // Whether the file or the environment named a server URL. `server_url`
         // is the one key #1269 derives rather than only defaulting, and the
-        // derivation must not fire when either source set it explicitly.
-        let file_set_server_url = config.server_url != DEFAULT_SERVER_URL;
+        // derivation must not fire when either source set it, even to the
+        // default URL itself, so the file is asked for the key rather than
+        // the loaded value being compared against the default.
+        let explicit_server_url = runtime_env.server_url.is_some()
+            || (resolved_config_path.exists()
+                && Figment::from(Toml::file(&resolved_config_path))
+                    .find_value("server_url")
+                    .is_ok());
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
         }
@@ -2321,7 +2326,7 @@ impl Config {
         // (nothing on the default port) or, worse, operated on whatever
         // server WAS on the default port -- which is how the reporter wrote
         // test pages into their real store.
-        derive_server_url_from_bind(&mut config, file_set_server_url);
+        derive_server_url_from_bind(&mut config, explicit_server_url);
         apply_bearer_token_file(
             &mut config.auth,
             &TokenFileContext {
@@ -3717,6 +3722,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.server_url, "https://from-env.example");
+    }
+
+    /// An explicit `server_url` that happens to name the default URL is still
+    /// explicit: neither the file nor the environment may be overridden by a
+    /// custom `bind` just because the value matches the default.
+    #[test]
+    fn an_explicit_default_server_url_is_not_rederived_from_bind() {
+        let cfg = load_with_toml(&format!(
+            "bind = \"127.0.0.1:49921\"\nserver_url = \"{DEFAULT_SERVER_URL}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert!(!cfg.server_url_derived_from_bind);
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                server_url: Some(DEFAULT_SERVER_URL.into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+    }
+
+    /// Port 0 picks a free port at startup, so no client URL can be derived
+    /// from it; the default URL stays.
+    #[test]
+    fn a_port_zero_bind_keeps_the_default_server_url() {
+        for bind in ["127.0.0.1:0", "0.0.0.0:0", "[::1]:0"] {
+            let cfg = load_with_toml(&format!("bind = \"{bind}\"\n")).unwrap();
+            assert_eq!(cfg.server_url, DEFAULT_SERVER_URL, "{bind}");
+            assert!(!cfg.server_url_derived_from_bind, "{bind}");
+        }
     }
 
     /// #1269: deriving the URL must not make an operator look like they
