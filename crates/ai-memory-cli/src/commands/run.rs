@@ -2598,7 +2598,9 @@ fn jail_forwarded_names(config: &Config, resolved: &[(&'static str, String)]) ->
 /// same value.
 fn jail_resolved_env(config: &Config) -> Vec<(&'static str, String)> {
     let mut env = Vec::new();
-    if config.server_url_configured() {
+    // A URL derived from a custom `bind` counts: the jail's private home has
+    // no config, so without it the hooks inside would dial the default port.
+    if config.server_url_configured() || config.server_url_derived_from_bind {
         env.push(("AI_MEMORY_SERVER_URL", config.server_url.clone()));
     }
     if let Some(token) = config
@@ -4720,6 +4722,20 @@ mod tests {
             ["AI_MEMORY_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"]
         );
         assert!(jail_forwarded_names(&Config::default(), &[]).is_empty());
+    }
+
+    /// A URL derived from a custom `bind` (#1269) is forwarded too.
+    #[test]
+    fn jail_resolved_env_carries_a_bind_derived_url() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49921".into(),
+            server_url_derived_from_bind: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            jail_resolved_env(&config),
+            [("AI_MEMORY_SERVER_URL", "http://127.0.0.1:49921".to_owned())]
+        );
     }
 
     #[test]
