@@ -161,6 +161,18 @@ version in [`docs/changelog/`](docs/changelog/):
   were not re-stamped into the target project, which distorted cross-project
   profile convergence and caused a subsequent `purge-project` of the source
   project to destroy them via cascade. They now re-stamp in the same transaction. (#1265)
+- Fixed the SQLite `-wal` file staying as large as the database after a
+  `VACUUM`. `compact`, `reclaim-ledger-versions --compact` and the session,
+  project and workspace purges with compaction now run `PRAGMA
+  wal_checkpoint(TRUNCATE)` after the rewrite, and the store's writer
+  connection sets `journal_size_limit` to 64 MiB. A checkpoint that a reader
+  holds back is logged at `warn` and the operation still succeeds. A 29.5 GiB
+  database that shrank to 6.3 GiB kept a 17.8 GB WAL, and the next restart
+  spent 9 minutes replaying it. `serve` now also drops its read connections
+  and checkpoints the WAL on SIGINT, SIGTERM, Ctrl-C or the end of stdio
+  input, waiting at most 5 seconds; a read that arrives after that point is
+  refused. A hard kill before the checkpoint still leaves the WAL to replay.
+  (#1317)
 
 ## [3.0.0] - 2026-10-13
 
