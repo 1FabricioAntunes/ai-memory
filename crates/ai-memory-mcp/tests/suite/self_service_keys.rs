@@ -280,3 +280,167 @@ async fn self_service_keys_refuse_foreign_ids_csrf_machine_and_pending_password_
         1
     );
 }
+
+const KEYS: &str = "/management/v1/credentials";
+
+async fn active_keys(h: &Harness, user: UserId) -> Vec<ai_memory_core::ApiCredential> {
+    h.store
+        .reader
+        .list_api_credentials_for_user(user)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|key| key.revoked_at.is_none())
+        .collect()
+}
+
+async fn issue(h: &Harness, who: &Browser, label: &str) -> (StatusCode, Value) {
+    call(h, Some(who), "POST", KEYS, json!({ "label": label }), true).await
+}
+
+#[tokio::test]
+async fn self_service_keys_refuse_blank_and_overlong_labels() {
+    let h = harness().await;
+    for label in [String::new(), "   \t ".into(), "x".repeat(129)] {
+        let (status, body) = issue(&h, &h.alice, &label).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "label {label:?}");
+        assert!(body.get("token").is_none());
+    }
+    // Multi-byte characters count as characters, not bytes.
+    let (status, body) = issue(&h, &h.alice, &"é".repeat(129)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.get("token").is_none());
+    assert!(active_keys(&h, h.alice.user).await.is_empty());
+
+    // Controls: the limit itself is accepted, and labels are stored trimmed.
+    assert_eq!(
+        issue(&h, &h.alice, &"é".repeat(128)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(issue(&h, &h.alice, "  laptop  ").await.0, StatusCode::OK);
+    let labels: Vec<String> = active_keys(&h, h.alice.user)
+        .await
+        .into_iter()
+        .map(|key| key.label)
+        .collect();
+    assert_eq!(labels.len(), 2);
+    assert!(labels.contains(&"laptop".to_string()));
+}
+
+#[tokio::test]
+async fn self_service_keys_cap_active_keys_per_user() {
+    let h = harness().await;
+    let max = ai_memory_mcp::self_service_keys::MAX_ACTIVE_KEYS_PER_USER;
+    let mut first = None;
+    for n in 0..max {
+        let (status, body) = issue(&h, &h.alice, &format!("key {n}")).await;
+        assert_eq!(status, StatusCode::OK, "key {n}");
+        first.get_or_insert_with(|| body["id"].as_str().unwrap().to_string());
+    }
+    let (status, body) = issue(&h, &h.alice, "one too many").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.get("token").is_none());
+    assert!(
+        body["error"].as_str().unwrap().contains("limit"),
+        "unclear refusal: {body}"
+    );
+    assert_eq!(active_keys(&h, h.alice.user).await.len(), max);
+
+    // The cap is per user: another user still issues keys.
+    assert_eq!(issue(&h, &h.bob, "bob's key").await.0, StatusCode::OK);
+    // Revoked keys do not count: revoking one frees a slot.
+    let revoke = format!("{KEYS}/{}/revoke", first.unwrap());
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &revoke, json!({}), true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(issue(&h, &h.alice, "replacement").await.0, StatusCode::OK);
+    assert_eq!(active_keys(&h, h.alice.user).await.len(), max);
+}
+
+#[tokio::test]
+async fn self_service_keys_refuse_a_disabled_user() {
+    let h = harness().await;
+    assert_eq!(issue(&h, &h.alice, "before").await.0, StatusCode::OK);
+    let id = active_keys(&h, h.alice.user).await[0].id;
+    h.store
+        .writer
+        .set_user_disabled(h.alice.user, true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        call(&h, Some(&h.alice), "GET", KEYS, Value::Null, false)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        issue(&h, &h.alice, "after").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let revoke = format!("{KEYS}/{id}/revoke");
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &revoke, json!({}), true)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(active_keys(&h, h.alice.user).await.len(), 1);
+    // Control: an enabled user is unaffected.
+    assert_eq!(issue(&h, &h.bob, "bob").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn self_service_keys_revoking_an_unknown_or_revoked_id_is_not_found() {
+    let h = harness().await;
+    let alice_key = issue(&h, &h.alice, "alice").await.1["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(issue(&h, &h.bob, "bob").await.0, StatusCode::OK);
+
+    let unknown = format!("{KEYS}/{}/revoke", ai_memory_core::ApiCredentialId::new());
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &unknown, json!({}), true)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    let revoke = format!("{KEYS}/{alice_key}/revoke");
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &revoke, json!({}), true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let revoked_at = h
+        .store
+        .reader
+        .list_api_credentials_for_user(h.alice.user)
+        .await
+        .unwrap()[0]
+        .revoked_at;
+    assert!(revoked_at.is_some());
+    assert_eq!(
+        call(&h, Some(&h.alice), "POST", &revoke, json!({}), true)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    // The repeat neither moved the original revocation time nor touched
+    // another user's key.
+    assert_eq!(
+        h.store
+            .reader
+            .list_api_credentials_for_user(h.alice.user)
+            .await
+            .unwrap()[0]
+            .revoked_at,
+        revoked_at
+    );
+    assert_eq!(active_keys(&h, h.bob.user).await.len(), 1);
+}

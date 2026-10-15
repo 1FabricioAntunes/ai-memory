@@ -573,6 +573,13 @@ and [`docs/deploy.md`](docs/deploy.md) for the server itself. It includes
 measured capacity numbers and the one rule you must follow: one server per
 data directory, never two.
 
+Two opt-in HTTP surfaces build on the same browser sign-in, and both are off
+by default. `serve --enable-session-management` lets signed-in users inspect
+sessions and purge the ones they own
+([`docs/session-management.md`](docs/session-management.md)).
+`serve --enable-self-service-keys` lets them issue and revoke their own `aim_`
+API keys ([`docs/self-service-keys.md`](docs/self-service-keys.md)).
+
 ## Security
 
 The server binds to loopback only by default. A fresh `ai-memory init` also
@@ -691,9 +698,3 @@ MIT. See [LICENSE](LICENSE).
 This codebase is being built collaboratively with Claude Code
 (Anthropic Claude Opus 4.7) following the plan documented in
 `docs/design-decisions.md`.
-
-The optional [human-session session inspection and owned purging](docs/session-management.md)
-uses existing browser authentication and is disabled by default.
-
-Optional [self-service MCP API keys](docs/self-service-keys.md) reuse existing
-browser authentication and are disabled by default.

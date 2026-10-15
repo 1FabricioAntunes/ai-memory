@@ -3374,13 +3374,14 @@ pub enum TransportKind {
 /// Arguments for `serve`.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Enable optional browser-session management API (requires an opt-in build).
-    #[cfg(feature = "session-management")]
+    /// Serve the `/management/v1` session inspection and owned-purge routes to
+    /// signed-in browser users. Off by default; requires `--transport http`.
     #[arg(long, env = "AI_MEMORY_ENABLE_SESSION_MANAGEMENT")]
     pub enable_session_management: bool,
 
-    /// Enable optional browser-session management API (requires an opt-in build).
-    #[cfg(feature = "self-service-keys")]
+    /// Let signed-in browser users issue and revoke their own `aim_` API keys
+    /// under `/management/v1/credentials`. Off by default; requires
+    /// `--transport http`.
     #[arg(long, env = "AI_MEMORY_ENABLE_SELF_SERVICE_KEYS")]
     pub enable_self_service_keys: bool,
 
@@ -3516,7 +3517,6 @@ pub struct WritePageArgs {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "session-management")]
     #[test]
     fn session_management_is_runtime_opt_in() {
         let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
@@ -3537,15 +3537,6 @@ mod tests {
         };
         assert!(args.enable_session_management);
     }
-    #[cfg(not(feature = "session-management"))]
-    #[test]
-    fn session_management_flag_is_absent_by_default() {
-        assert!(
-            Cli::try_parse_from(["ai-memory", "serve", "--enable-session-management"]).is_err()
-        );
-    }
-
-    #[cfg(feature = "self-service-keys")]
     #[test]
     fn self_service_keys_is_runtime_opt_in() {
         let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
@@ -3566,12 +3557,6 @@ mod tests {
         };
         assert!(args.enable_self_service_keys);
     }
-    #[cfg(not(feature = "self-service-keys"))]
-    #[test]
-    fn self_service_keys_flag_is_absent_by_default() {
-        assert!(Cli::try_parse_from(["ai-memory", "serve", "--enable-self-service-keys"]).is_err());
-    }
-
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;

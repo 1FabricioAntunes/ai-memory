@@ -12,12 +12,17 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
-- Added optional human-session session inspection and owned purging, gated by the
-  `session-management` build feature and runtime switch. Reused existing human
-  authentication, authorization, and SQLite storage. (#1231)
-- Added optional human-session self-service native API keys, gated by the
-  `self-service-keys` build feature and runtime switch. Reused existing
-  authentication, credential hashing, and SQLite storage. (#1231)
+- Added opt-in session inspection and owned-session purging for signed-in
+  browser users, enabled at runtime with `serve --enable-session-management`
+  (`AI_MEMORY_ENABLE_SESSION_MANAGEMENT`). A user can purge only a session they
+  own in a project they may write; an Admin can purge any. Requested in #1231.
+  (#1267)
+- Added opt-in self-service `aim_` API keys for signed-in browser users,
+  enabled at runtime with `serve --enable-self-service-keys`
+  (`AI_MEMORY_ENABLE_SELF_SERVICE_KEYS`). Labels must be 1 to 128 characters
+  and a user may hold at most 20 active keys. A self-issued key survives a
+  password reset or account disable and must be revoked separately. Requested
+  in #1231. (#1268)
 - Added `ai-memory search --global`, which searches the wiki pages of every
   project from the terminal instead of only the current one. Each hit shows
   its `workspace/project` in the text output and carries `workspace` and

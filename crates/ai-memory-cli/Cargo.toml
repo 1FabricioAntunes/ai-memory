@@ -23,11 +23,6 @@ path = "src/main.rs"
 # a second ~120 MB harness binary for it that contains no tests.
 test = false
 
-[features]
-default = []
-session-management = ["ai-memory-mcp/session-management"]
-self-service-keys = ["ai-memory-mcp/self-service-keys"]
-
 [dependencies]
 ai-memory-consolidate.workspace = true
 ai-memory-core.workspace = true

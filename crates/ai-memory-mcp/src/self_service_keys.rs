@@ -13,6 +13,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+/// Longest label a user may give a self-issued key, in characters.
+pub const MAX_LABEL_CHARS: usize = 128;
+/// Active (unrevoked, unexpired) self-issued keys one user may hold at once.
+pub const MAX_ACTIVE_KEYS_PER_USER: usize = 20;
+
 /// Dependencies resolved once at startup; credentials never read server config.
 #[derive(Clone)]
 pub struct SelfServiceKeysState {
@@ -97,6 +103,13 @@ async fn create_credential(
     Extension(user): Extension<UserId>,
     Json(body): Json<KeyBody>,
 ) -> Result<Json<Value>, Response> {
+    let label = body.label.trim();
+    if label.is_empty() || label.chars().count() > MAX_LABEL_CHARS {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            &format!("label must be 1 to {MAX_LABEL_CHARS} characters after trimming"),
+        ));
+    }
     let pepper = state
         .pepper
         .as_ref()
@@ -104,12 +117,13 @@ async fn create_credential(
     let token = ai_memory_store::generate_api_key().map_err(store_error)?;
     let id = state
         .writer
-        .create_api_credential(
+        .create_api_credential_within_limit(
             ApiCredentialId::new(),
             user,
-            body.label,
+            label.to_owned(),
             ai_memory_store::hash_token(&token, pepper),
             Some(ai_memory_store::api_key_preview(&token)),
+            MAX_ACTIVE_KEYS_PER_USER,
         )
         .await
         .map_err(store_error)?;
@@ -126,7 +140,9 @@ async fn revoke_credential(
         .find_api_credential(id)
         .await
         .map_err(store_error)?
-        .filter(|key| key.user_id == user)
+        // A foreign id and an already-revoked one both read as absent, so
+        // the response never confirms another user's credential exists.
+        .filter(|key| key.user_id == user && key.revoked_at.is_none())
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "credential not found"))?;
     state
         .writer

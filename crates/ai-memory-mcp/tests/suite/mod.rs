@@ -38,12 +38,8 @@ mod query_superseded;
 mod read_page_related;
 mod recap_identity;
 mod retrieval_via_tools;
+mod self_service_keys;
+mod session_management;
 mod slot_identity;
 mod stress_autoscope;
 mod web_search_parity;
-
-#[cfg(feature = "session-management")]
-mod session_management;
-
-#[cfg(feature = "self-service-keys")]
-mod self_service_keys;
