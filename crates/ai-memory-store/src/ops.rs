@@ -5985,6 +5985,30 @@ pub fn purge_session(
     compaction: Compaction,
     mode: PurgeMode,
 ) -> StoreResult<PurgeSessionSummary> {
+    purge_session_with_owner(
+        conn,
+        workspace_id,
+        project_id,
+        session_id,
+        author_id,
+        compaction,
+        mode,
+        None,
+    )
+}
+
+// Ownership is checked inside the deletion transaction, including previews.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn purge_session_with_owner(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    author_id: Option<ai_memory_core::UserId>,
+    compaction: Compaction,
+    mode: PurgeMode,
+    owner: Option<&ai_memory_core::IdentityKey>,
+) -> StoreResult<PurgeSessionSummary> {
     let wid = workspace_id.as_bytes();
     let pid = project_id.as_bytes();
     let sid = session_id.as_bytes();
@@ -6003,6 +6027,27 @@ pub fn purge_session(
         return Err(StoreError::NotFound(format!(
             "session {session_id} not found in this workspace/project"
         )));
+    }
+
+    if let Some(owner) = owner {
+        let user = author_id.ok_or(StoreError::Forbidden("operator required"))?;
+        let authz = crate::project_authz::resolve_project_authz_strict(
+            &tx,
+            workspace_id,
+            project_id,
+            &crate::ProjectPrincipal::user(user),
+            true,
+        )?;
+        crate::authorize_project(&authz, crate::ProjectAccess::Write)
+            .map_err(|_| StoreError::Forbidden("project write access required"))?;
+        let owned: bool = tx.query_row(
+            "SELECT actor_user = ?4 FROM sessions WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![&sid[..], &wid[..], &pid[..], owner.storage_key()],
+            |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        )?;
+        if !owned {
+            return Err(StoreError::NotFound("session not found".into()));
+        }
     }
 
     // ---- collect, before anything is cut ----
@@ -6117,6 +6162,13 @@ pub fn purge_session(
         rusqlite::params![&pid[..], &sid[..]],
         |row| row.get(0),
     )?;
+
+    if owner.is_some() && (collateral_observations_deleted > 0 || collateral_handoffs_denulled > 0)
+    {
+        return Err(StoreError::InvalidState(
+            "session spans projects; an administrator must purge it".into(),
+        ));
+    }
 
     if mode == PurgeMode::Preview {
         // Same counts a confirmed purge would produce, read the same way it

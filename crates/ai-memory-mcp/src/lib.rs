@@ -38,3 +38,6 @@ extern crate self as ai_memory_mcp;
 #[cfg(test)]
 #[path = "../tests/suite/mod.rs"]
 mod integration;
+
+#[cfg(feature = "session-management")]
+pub mod session_management;

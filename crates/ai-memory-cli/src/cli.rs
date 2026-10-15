@@ -3374,6 +3374,11 @@ pub enum TransportKind {
 /// Arguments for `serve`.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
+    /// Enable optional browser-session management API (requires an opt-in build).
+    #[cfg(feature = "session-management")]
+    #[arg(long, env = "AI_MEMORY_ENABLE_SESSION_MANAGEMENT")]
+    pub enable_session_management: bool,
+
     /// Transport to expose the MCP server on.
     #[arg(long, value_enum, default_value_t = TransportKind::Stdio)]
     pub transport: TransportKind,
@@ -3506,6 +3511,35 @@ pub struct WritePageArgs {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "session-management")]
+    #[test]
+    fn session_management_is_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_session_management);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-session-management",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_session_management);
+    }
+    #[cfg(not(feature = "session-management"))]
+    #[test]
+    fn session_management_flag_is_absent_by_default() {
+        assert!(
+            Cli::try_parse_from(["ai-memory", "serve", "--enable-session-management"]).is_err()
+        );
+    }
+
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;

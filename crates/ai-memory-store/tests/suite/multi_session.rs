@@ -3666,3 +3666,274 @@ async fn observation_excerpts_follow_the_session_owner_while_the_vote_stays_shar
         .unwrap();
     assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
 }
+
+/// The self-service purge checks exact ownership in the writer transaction,
+/// including previews; shared legacy rows are readable but never user-deletable.
+#[tokio::test]
+async fn owned_session_purge_refuses_foreign_shared_and_wrong_scope_sessions() {
+    use ai_memory_core::IdentityKey;
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "purge-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let mut sessions = Vec::new();
+    for owner in [Some("user:purge-alice"), Some("user:purge-bob"), None] {
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: owner.map(str::to_string),
+            })
+            .await
+            .unwrap();
+        sessions.push(sid);
+    }
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        for (project, sid) in [
+            (proj, sessions[1]),
+            (proj, sessions[2]),
+            (other, sessions[0]),
+        ] {
+            let result = store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    project,
+                    sid,
+                    IdentityKey::User("purge-alice".into()),
+                    Some(user),
+                    mode,
+                )
+                .await;
+            assert!(matches!(result, Err(StoreError::NotFound(_))));
+            assert!(
+                store
+                    .reader
+                    .session_summary_scoped(ws, proj, sid, OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Simulate a grant revoked after the HTTP preflight: the writer must refuse.
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .writer
+            .purge_owned_session(
+                ws,
+                proj,
+                sessions[0],
+                IdentityKey::User("purge-alice".into()),
+                Some(user),
+                PurgeMode::Commit
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Open)
+        .await
+        .unwrap();
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Admin control remains able to purge an ownerless legacy session.
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sessions[2],
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control() {
+    use ai_memory_core::{IdentityKey, NewObservation, ObservationKind, Sanitized, Sanitizer};
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "cascade-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(ws, "foreign", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: Some("user:cascade-alice".into()),
+        })
+        .await
+        .unwrap();
+    let observation = NewObservation {
+        session_id: sid,
+        workspace_id: ws,
+        project_id: foreign,
+        kind: ObservationKind::UserPrompt,
+        extension: None,
+        source_event: None,
+        title: "foreign record".into(),
+        body: "must survive a self-service purge".into(),
+        importance: 5,
+        occurred_at: None,
+    };
+    store
+        .writer
+        .insert_observation(Sanitized::new(observation, &Sanitizer::default()))
+        .await
+        .unwrap();
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        assert!(matches!(
+            store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    proj,
+                    sid,
+                    IdentityKey::User("cascade-alice".into()),
+                    Some(user),
+                    mode
+                )
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            store
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let preview = store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.collateral_observations_deleted, 1);
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

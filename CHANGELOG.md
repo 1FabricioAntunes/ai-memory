@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added optional human-session session inspection and owned purging, gated by the
+  `session-management` build feature and runtime switch. Reused existing human
+  authentication, authorization, and SQLite storage. (#1231)
 - Added `ai-memory search --global`, which searches the wiki pages of every
   project from the terminal instead of only the current one. Each hit shows
   its `workspace/project` in the text output and carries `workspace` and

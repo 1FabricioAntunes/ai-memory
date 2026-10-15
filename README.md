@@ -691,3 +691,6 @@ MIT. See [LICENSE](LICENSE).
 This codebase is being built collaboratively with Claude Code
 (Anthropic Claude Opus 4.7) following the plan documented in
 `docs/design-decisions.md`.
+
+The optional [human-session session inspection and owned purging](docs/session-management.md)
+uses existing browser authentication and is disabled by default.
