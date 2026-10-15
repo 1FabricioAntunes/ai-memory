@@ -138,6 +138,16 @@ pub struct HealthCheck {
     pub fix: Option<String>,
 }
 
+const SPOOL_STUCK_AFTER_MS: u64 = 15 * 60 * 1000;
+
+fn spool_is_stuck(spool: &SpoolState) -> bool {
+    spool.pending > 0
+        && (spool.retries_total > 0
+            || spool
+                .oldest_age_ms
+                .is_none_or(|age| age >= SPOOL_STUCK_AFTER_MS))
+}
+
 /// The checks that fail for `s`, most severe first. An empty list is a
 /// healthy server.
 #[must_use]
@@ -199,7 +209,7 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
                 ),
                 Some(fix_lines::RECOVER),
             );
-        } else if spool.pending > 0 {
+        } else if spool_is_stuck(&spool) {
             push(
                 "spool_pending",
                 CheckStatus::Warn,
@@ -406,10 +416,39 @@ mod tests {
     }
 
     #[test]
+    fn a_young_spool_awaiting_its_boundary_drain_is_healthy() {
+        let mut snapshot = healthy();
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: Some(SPOOL_STUCK_AFTER_MS - 1),
+            retries_total: 0,
+            capacity: 500,
+        });
+        assert!(checks(&snapshot).is_empty());
+
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: Some(1_000),
+            retries_total: 1,
+            capacity: 500,
+        });
+        assert_eq!(only(&snapshot).id, "spool_pending");
+
+        snapshot.process.spool = Some(SpoolState {
+            pending: 6,
+            oldest_age_ms: None,
+            retries_total: 0,
+            capacity: 500,
+        });
+        assert_eq!(only(&snapshot).id, "spool_pending");
+    }
+
+    #[test]
     fn spool_and_journal_point_at_recover() {
         let mut snapshot = healthy();
         snapshot.process.spool = Some(SpoolState {
             pending: 3,
+            oldest_age_ms: Some(SPOOL_STUCK_AFTER_MS),
             capacity: 500,
             ..SpoolState::default()
         });
