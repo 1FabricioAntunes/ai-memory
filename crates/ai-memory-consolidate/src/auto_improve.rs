@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::code_fence::CodeFence;
 use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
 
@@ -1510,45 +1511,17 @@ fn parse_markdown_sections(body: &str) -> Vec<MarkdownSection> {
 fn heading_positions(body: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut offset = 0;
-    // The open fence's glyph and run length: only a run of the same glyph,
-    // at least as long and with no info string, closes it (CommonMark §4.5,
-    // as `ai_memory_wiki`'s `CodeFence` tracks it). Toggling on any fence
-    // line let a lone ``` inside a ~~~ block end it early and hide every
-    // heading after the block.
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = None;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        match (fence, fence_run(trimmed)) {
-            // A backtick fence's info string cannot contain a backtick.
-            (None, Some((glyph, len, info))) if glyph == '~' || !info.contains('`') => {
-                fence = Some((glyph, len));
-            }
-            (Some((open, open_len)), Some((glyph, len, info)))
-                if glyph == open && len >= open_len && info.trim().is_empty() =>
-            {
-                fence = None;
-            }
-            (None, _) => {
-                if let Some(level) = heading_level(trimmed) {
-                    out.push((offset, level, trimmed.to_string()));
-                }
-            }
-            (Some(_), _) => {}
+        let (next_fence, is_code) = CodeFence::step(fence, trimmed);
+        fence = next_fence;
+        if !is_code && let Some(level) = heading_level(trimmed) {
+            out.push((offset, level, trimmed.to_string()));
         }
         offset += line.len();
     }
     out
-}
-
-/// The glyph, run length and info string of a fence line, if it is one.
-fn fence_run(line: &str) -> Option<(char, usize, &str)> {
-    let trimmed = line.trim_start();
-    let glyph = trimmed.chars().next().filter(|&c| matches!(c, '`' | '~'))?;
-    let len = trimmed.chars().take_while(|&c| c == glyph).count();
-    if len < 3 {
-        return None;
-    }
-    Some((glyph, len, &trimmed[len..]))
 }
 
 fn heading_level(line: &str) -> Option<usize> {
