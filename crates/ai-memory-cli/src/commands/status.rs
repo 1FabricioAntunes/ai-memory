@@ -4,6 +4,8 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+mod presentation;
+
 use ai_memory_core::fix_lines;
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
@@ -292,184 +294,21 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             ))?
         );
     } else {
-        println!("ai-memory {} (server)", report.version);
-        println!("  server:       {}", ep.url);
-        println!("  data-dir:     {}", report.data_dir);
-        println!("  db:           {}", report.db_path);
-        println!("  bind:         {}", report.bind);
-        println!("  auth:         {}", auth_posture.line());
-        if let Some(problem) = &windows_logon {
-            print!("{}", problem.render_human());
-        }
-        println!(
-            "  pages:        {} (all versions: {})",
-            report.counts.pages_latest, report.counts.pages_all
+        presentation::render(
+            &crate::terminal::Terminal::stdout(&config.runtime_env),
+            presentation::View {
+                report: &report,
+                ep: &ep,
+                spool: &spool,
+                journal_pending,
+                journal_degraded,
+                journal_finish_failed,
+                journal_error: journal_error.as_deref(),
+                capture_mode,
+                auth_posture,
+                windows_logon: windows_logon.as_ref(),
+            },
         );
-        println!("  sessions:     {}", report.counts.sessions);
-        println!("  observations: {}", report.counts.observations);
-        println!(
-            "  fts:          pages {}/{}; observations {}/{}",
-            report.derived.pages_fts_rows,
-            report.derived.pages_rows,
-            report.derived.observations_fts_rows,
-            report.derived.observations_rows
-        );
-        println!(
-            "  embeddings:   {} rows; {} latest pages missing",
-            report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
-        );
-        if report.derived.latest_pages_unembeddable > 0 {
-            println!(
-                "    unembeddable: {} (empty body; no embedder can cover these)",
-                report.derived.latest_pages_unembeddable
-            );
-        }
-        for triple in &report.derived.embedding_triples {
-            println!(
-                "    {}/{} dim {}: {} rows",
-                triple.provider, triple.model, triple.dim, triple.count
-            );
-        }
-        // Only shown when there is something to act on. A recovered count with
-        // no outstanding failures is history, not a problem.
-        if report.derived.embed_failures_unresolved > 0 {
-            println!(
-                "    embed failures: {} unresolved ({} recovered since)",
-                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
-            );
-        }
-        // The figure that makes a `compact` decision possible. Reported
-        // always, so "should I VACUUM?" has an answer other than a guess; the
-        // advisory line only appears once it is worth the exclusive lock.
-        if report.storage.database_bytes > 0 {
-            let pct = (report.storage.reclaimable_bytes as f64
-                / report.storage.database_bytes as f64)
-                * 100.0;
-            println!(
-                "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
-                super::compact::human_bytes(report.storage.database_bytes),
-                super::compact::human_bytes(report.storage.reclaimable_bytes),
-            );
-            if let Some(free) = report.storage.data_dir_free_bytes {
-                println!("    filesystem free: {}", super::compact::human_bytes(free));
-            }
-            if fix_lines::reclaim_advised(
-                report.storage.reclaimable_bytes,
-                report.storage.database_bytes,
-            ) {
-                println!(
-                    "    `{}` would return it (blocks writes while it runs)",
-                    fix_lines::COMPACT
-                );
-            }
-        }
-        println!(
-            "  links:        {} latest-page links (unresolved: {}, stale: {})",
-            report.derived.links_from_latest_pages,
-            report.derived.unresolved_links_from_latest_pages,
-            report.derived.stale_links_from_latest_pages
-        );
-        if !report.derived.typed_links_from_latest_pages.is_empty() {
-            let typed: Vec<String> = report
-                .derived
-                .typed_links_from_latest_pages
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect();
-            println!("    typed edges: {}", typed.join(", "));
-        }
-        if let Some(wiki) = &report.wiki_format {
-            let migrated = if wiki.okf_migrated {
-                "OKF v0.2 (migrated)"
-            } else {
-                "OKF v0.2 (native, no migration needed)"
-            };
-            match (&wiki.backup_archive, wiki.backup_archive_bytes) {
-                (Some(path), Some(bytes)) => println!(
-                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
-                     {path} ({})",
-                    super::compact::human_bytes(bytes)
-                ),
-                _ => println!("  wiki format:  {migrated}"),
-            }
-        }
-        if let Some((queued, capacity)) = report.write_queue {
-            // A queue pinned near capacity is the wedged-writer signal.
-            if queued > 0 {
-                println!("  write queue:  {queued}/{capacity}");
-            }
-        }
-        println!("  spool:");
-        println!("    pending:    {}", spool.pending);
-        println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
-        println!("    retries:    {}", spool.retries_total);
-        if journal_pending > 0 || journal_error.is_some() {
-            println!("  recovery:");
-            println!(
-                "    journal:    {journal_pending} pending ({journal_degraded} degraded, {journal_finish_failed} finish-failed)"
-            );
-            if let Some(error) = &journal_error {
-                println!("    error:      {error}");
-            }
-            println!("    action:     run `{}`", fix_lines::RECOVER);
-        }
-        if let Some(ingest) = &report.ingest {
-            println!("  ingest (server, this process):");
-            println!("    accepted:   {}", ingest.accepted);
-            println!(
-                "    dropped:    {} (capture policy)",
-                ingest.dropped_by_policy
-            );
-            println!(
-                "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
-                ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
-            );
-            println!(
-                "    drops:      {} unauthorized, {} collision, {} invalid",
-                ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
-            );
-            println!(
-                "    shed:       {} saturated, {} rate-limited",
-                ingest.shed_saturated, ingest.shed_rate_limited
-            );
-            println!(
-                "    last write: {}",
-                last_write_line(ingest.last_persisted_ms)
-            );
-        }
-        // #446 + #428 interact here: under allowlist mode an unmarked
-        // repository never sends, so zero counters read exactly like a broken
-        // install. Deliberately outside the ingest block above: the mode is a
-        // client-side fact, and an older server returns no ingest section at
-        // all — which is precisely a case where the operator needs telling.
-        if capture_mode == "allowlist" {
-            println!(
-                "  capture mode: allowlist — repositories without a \
-                 .ai-memory.toml marker send nothing"
-            );
-        }
-        println!("  providers:");
-        println!(
-            "    llm:       {}",
-            provider_health_line(&report.providers.llm)
-        );
-        println!(
-            "    embedding: {}",
-            provider_health_line(&report.providers.embedding)
-        );
-        if report.providers.llm.status == ProviderHealthStatus::Error
-            && let Some(hint) = &report.providers.llm.retry_hint
-        {
-            println!("    retry:     {hint}");
-        }
-        // Only present when `llm_fallbacks` is configured — an older server
-        // or a plain single-provider setup reports an empty list.
-        if !report.providers.llm_candidates.is_empty() {
-            println!("    fallback chain:");
-            for candidate in &report.providers.llm_candidates {
-                println!("      {}", fallback_candidate_line(candidate));
-            }
-        }
     }
     Ok(())
 }
