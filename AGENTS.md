@@ -81,10 +81,11 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
-Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
-where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
-line. Without it a rule written to `AGENTS.md` is absent from context at
-session start and reaches Claude Code only if the agent opens the file.
+Claude Code 2.1.277 and later reads `AGENTS.md` when no `CLAUDE.md` or
+`CLAUDE.local.md` is present; when `CLAUDE.md` exists it still wins. In a
+project where `AGENTS.md` is canonical, give `CLAUDE.md` a bare
+`@AGENTS.md` import line so older Claude Code and the CLAUDE.md-first
+mode load the same rules at session start.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it

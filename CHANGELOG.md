@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the managed routing snippet's Claude Code instruction. Since 2.1.277
+  it reads `AGENTS.md` when no `CLAUDE.md` or `CLAUDE.local.md` is present,
+  and prefers `CLAUDE.md` when that file exists. The `@AGENTS.md` import is
+  how a canonical `AGENTS.md` reaches those sessions. (#1276)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
