@@ -16,8 +16,8 @@ use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
-    NewSession, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer, SessionId,
-    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
+    NewSession, PageId, PagePath, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
+    WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle,
@@ -45,7 +45,7 @@ use crate::payload::{
     HookEnvelope, HookEvent, HookQuery, ProjectSource, ProjectStrategy, body_is_subagent,
     durable_body_cap, parse_agent,
 };
-use crate::synth::synthesize_session_page;
+use crate::synth::{HandoffFacts, SessionDigest, synthesize_session_page};
 
 /// Default maximum number of hook events allowed to be processing at once.
 ///
@@ -3964,8 +3964,15 @@ async fn process_authorized(
                 Ok(None) => debug!("wiki clean during SessionEnd recovery"),
                 Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
             }
-            let observations = state.reader.observations_for_session(session_id).await?;
-            if !is_ephemeral_session(&observations) {
+            if state
+                .reader
+                .session_has_substantive_observation(
+                    session.workspace_id(),
+                    session.project_id(),
+                    session_id,
+                )
+                .await?
+            {
                 recovered |= enqueue_session_end_consolidation(
                     state,
                     session_id,
@@ -4138,11 +4145,10 @@ async fn process_authorized(
         && !managed
         && !body_is_subagent(&env.raw);
     if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
-        let mut observations = state.reader.observations_for_session(session_id).await?;
         // A checkpoint writes where the session's end will: the session row's
         // scope, not wherever this Stop resolved (a marker may have appeared
         // mid-session). One that lost the race with the end writes nothing.
-        let checkpoint_scope = if turn_checkpoint && !is_ephemeral_session(&observations) {
+        let checkpoint_scope = if turn_checkpoint {
             state.reader.open_session_scope(session_id).await?
         } else {
             None
@@ -4154,7 +4160,17 @@ async fn process_authorized(
             return Ok(outcome);
         }
         let (page_ws, page_proj) = checkpoint_scope.unwrap_or((ws, proj));
-        if is_ephemeral_session(&observations) {
+        // A session can hold hundreds of thousands of rows, so nothing on this
+        // path loads them all: the lifecycle-only decision is one existence
+        // query (the writer re-checks it in the ending transaction with the
+        // same predicate), and the page and handoff are rendered from a
+        // digest read with bounded queries. Bind it to the session/page scope,
+        // not the provisional scope of a mid-session marker.
+        let substantive = state
+            .reader
+            .session_has_substantive_observation(page_ws, page_proj, session_id)
+            .await?;
+        if !substantive {
             let lifecycle_outcome = state
                 .writer
                 .end_admitted_lifecycle_only_session(admitted.clone(), env.occurred_at_micros())
@@ -4182,23 +4198,25 @@ async fn process_authorized(
                     return Ok(outcome);
                 }
                 ai_memory_store::LifecycleOnlyEndOutcome::Substantive => {
-                    observations = state.reader.observations_for_session(session_id).await?;
                     debug!(
                         session = %session_id,
                         "substantive work raced lifecycle-only SessionEnd; using normal end path",
                     );
-                    // The writer observed substantive work, so the refreshed
-                    // set cannot still satisfy the lifecycle-only predicate.
-                    debug_assert!(!is_ephemeral_session(&observations));
                 }
             }
         }
+        // Read after the decision above, so a substantive write that raced the
+        // lifecycle-only end is in it.
+        let digest = SessionDigest::load(&state.reader, page_ws, page_proj, session_id).await?;
+        // The writer observed substantive work when it answered `Substantive`,
+        // so the digest cannot still satisfy the lifecycle-only predicate.
+        debug_assert!(substantive || digest.is_substantive());
         let new_page = synthesize_session_page(
             page_ws,
             page_proj,
             session_id,
             admitted.agent_kind(),
-            &observations,
+            &digest,
         );
         let track_page_write = turn_checkpoint && outcome == HookProcessingOutcome::Resumed;
         let previous_page_id = if track_page_write {
@@ -4268,7 +4286,7 @@ async fn process_authorized(
                 env.agent,
                 session_id,
                 env.cwd.clone(),
-                &observations,
+                &digest,
                 handoff_owner,
                 turn_checkpoint,
             )
@@ -4451,16 +4469,22 @@ fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
 /// `Stop` and `Notification`, which some harnesses (e.g. OpenCode) fire for
 /// purely internal work such as branch-naming — is ephemeral/no-op and must
 /// not synthesize a session page. This positive definition MUST stay in sync
-/// with the store-side SQL in `end_lifecycle_only_session_in_tx`
-/// (ai-memory-store/src/ops.rs): both sides classify every observation set
-/// identically, or the atomic store re-check silently reverts this verdict.
+/// with the store-side SQL, `SUBSTANTIVE_OBSERVATION_KIND_SQL`
+/// (ai-memory-store/src/reader.rs), which both the writer's
+/// `end_lifecycle_only_session_in_tx` and the reader's existence query build
+/// from: all sides classify every observation set identically, or the atomic
+/// store re-check silently reverts this verdict.
+///
+/// Production asks the database (`session_has_substantive_observation`);
+/// this row-list form is the twin the tests pin the SQL to.
+#[cfg(test)]
 fn is_ephemeral_session(observations: &[ai_memory_core::Observation]) -> bool {
     !observations.iter().any(|observation| {
         matches!(
             observation.kind,
-            ObservationKind::UserPrompt
-                | ObservationKind::PreToolUse
-                | ObservationKind::PostToolUse
+            ai_memory_core::ObservationKind::UserPrompt
+                | ai_memory_core::ObservationKind::PreToolUse
+                | ai_memory_core::ObservationKind::PostToolUse
         )
     })
 }
@@ -4472,20 +4496,11 @@ fn build_auto_handoff(
     from_agent: AgentKind,
     session_id: SessionId,
     cwd: Option<String>,
-    observations: &[ai_memory_core::Observation],
+    digest: &SessionDigest,
     owner_user: Option<String>,
     turn_checkpoint: bool,
 ) -> NewHandoff {
-    // Prefer obs.body (the full prompt) over obs.title (first-line +
-    // truncated to 80 chars for log/list display). When body is
-    // empty fall back to title so we never produce an empty entry.
-    fn pick_text(obs: &ai_memory_core::Observation) -> &str {
-        if !obs.body.is_empty() {
-            obs.body.as_str()
-        } else {
-            obs.title.as_str()
-        }
-    }
+    let facts = digest.handoff_facts();
     /// Cap so a single 10-page prompt doesn't blow up the handoff.
     /// The body is already scrubbed at insert time; this is just a
     /// length budget. 1500 chars ≈ 250 words ≈ a paragraph.
@@ -4498,33 +4513,13 @@ fn build_auto_handoff(
             format!("{truncated}…")
         }
     }
-    let mut prompts: Vec<String> = Vec::new();
-    let mut tools: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for obs in observations {
-        match obs.kind {
-            ObservationKind::UserPrompt => {
-                let text = pick_text(obs);
-                // A harness block delivered as a user turn (`<task-notification>`)
-                // is not a request to continue from.
-                if !text.is_empty() && !ai_memory_core::looks_like_markup_block(text) {
-                    prompts.push(text.to_string());
-                }
-            }
-            // Skip `tool <family>` / bare-`<family>` labels: a family is a
-            // partition of the calls, not a name for a tool, so "Tools used:
-            // tool file, tool non-file" tells the receiver nothing. Only a
-            // harness's own tool name is worth listing.
-            ObservationKind::PostToolUse | ObservationKind::PreToolUse
-                if !obs.title.is_empty()
-                    && crate::payload::tool_family_from_title(&obs.title).is_none() =>
-            {
-                tools.insert(obs.title.as_str());
-            }
-            _ => {}
-        }
-    }
-    let first_prompt = prompts.first().cloned();
-    let last_prompt = prompts.last().cloned();
+    // The first and last prompt with usable text (obs.body, the full prompt,
+    // over obs.title, which is first-line truncated for display; a harness
+    // block delivered as a user turn, `<task-notification>`, is not a request
+    // to continue from), and the tool names worth listing, were found with
+    // bounded queries when the digest loaded.
+    let first_prompt = facts.first_prompt.clone();
+    let last_prompt = facts.last_prompt.clone();
     let mut summary = match (&first_prompt, &last_prompt) {
         (Some(first), Some(last)) if first == last => format!("Session focused on: {}", cap(first)),
         (Some(first), Some(last)) => format!("Started: {}\n\nLast: {}", cap(first), cap(last),),
@@ -4536,17 +4531,15 @@ fn build_auto_handoff(
             } else {
                 "Session ended"
             },
-            observations.len()
+            digest.observation_count()
         ),
     };
     // Stop bodies exist only after the assistant-capture double opt-in. The
     // excerpt continues the work in the next session's baton and stays out of
     // the git-tracked session page.
-    if let Some(assistant) = observations.iter().rev().find(|observation| {
-        observation.kind == ObservationKind::Stop && !observation.body.trim().is_empty()
-    }) {
+    if let Some(assistant) = &facts.latest_assistant {
         summary.push_str("\n\nLatest assistant response: ");
-        summary.push_str(&assistant.body);
+        summary.push_str(assistant);
     }
     let open_questions = if turn_checkpoint {
         // A completed turn is neither a native-session exit nor evidence that
@@ -4559,14 +4552,19 @@ fn build_auto_handoff(
             .into_iter()
             .collect()
     } else {
-        derive_open_questions(observations, &last_prompt)
+        derive_open_questions(facts, &last_prompt)
     };
-    let next_steps = if tools.is_empty() {
+    let next_steps = if facts.tools.is_empty() {
         Vec::new()
     } else {
         vec![format!(
             "Tools used: {}",
-            tools.into_iter().collect::<Vec<_>>().join(", ")
+            facts
+                .tools
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
         )]
     };
     NewHandoff {
@@ -4602,24 +4600,13 @@ fn build_auto_handoff(
 ///    *substantive* prompt (filtering acknowledgments).
 /// 4. Normal end → last substantive prompt as "Continue from: …".
 /// 5. Fallback → empty Vec (same as the old behaviour when no prompts).
-fn derive_open_questions(
-    observations: &[ai_memory_core::Observation],
-    last_prompt: &Option<String>,
-) -> Vec<String> {
-    let last_of_kind = |kind: ObservationKind| -> Option<&ai_memory_core::Observation> {
-        observations.iter().rev().find(|o| o.kind == kind)
-    };
-
-    // Harness blocks delivered as a user turn are not the user's question.
-    let last_prompt_obs = observations.iter().rev().find(|o| {
-        let text = if o.body.is_empty() { &o.title } else { &o.body };
-        o.kind == ObservationKind::UserPrompt && !ai_memory_core::looks_like_markup_block(text)
-    });
-    let last_tool = last_of_kind(ObservationKind::PostToolUse);
-    let last_stop = last_of_kind(ObservationKind::Stop);
-    let has_session_end = observations
-        .iter()
-        .any(|o| o.kind == ObservationKind::SessionEnd);
+fn derive_open_questions(facts: &HandoffFacts, last_prompt: &Option<String>) -> Vec<String> {
+    // Harness blocks delivered as a user turn are not the user's question, so
+    // `question_prompt` is the last prompt that is not one.
+    let last_prompt_obs = facts.question_prompt.as_ref();
+    let last_tool = facts.last_tool_title.as_deref();
+    let has_stop = facts.has_stop;
+    let has_session_end = facts.has_session_end;
 
     // Heuristic 1: last prompt is a question → it is the open question.
     if let Some(p) = last_prompt_obs {
@@ -4646,9 +4633,8 @@ fn derive_open_questions(
     // made — only that the session touched files and then ended without a
     // normal Stop, which is worth telling the receiver either way.
     if let Some(tool) = last_tool {
-        let touched_files =
-            crate::payload::tool_family_from_title(&tool.title) == Some(ToolFamily::File);
-        if touched_files && last_stop.is_none() {
+        let touched_files = crate::payload::tool_family_from_title(tool) == Some(ToolFamily::File);
+        if touched_files && !has_stop {
             return vec![
                 "Session ended without a normal stop while working with files".into(),
                 "Check the working tree for uncommitted or unverified changes".into(),
@@ -4661,7 +4647,7 @@ fn derive_open_questions(
         let body = p.trim();
         if !body.is_empty() && !is_acknowledgment(body) {
             // Heuristic 3 signal: no SessionEnd → flag as mid-task.
-            if !has_session_end && last_stop.is_some() {
+            if !has_session_end && has_stop {
                 return vec![format!(
                     "Continue from (mid-task exit): {}",
                     cap_handoff_text(body)
@@ -4796,17 +4782,12 @@ async fn write_checkpoint_page(
     {
         return Ok(false);
     }
-    let observations = state.reader.observations_for_session(session_id).await?;
-    if is_ephemeral_session(&observations) {
+    let digest = SessionDigest::load(&state.reader, workspace_id, project_id, session_id).await?;
+    if !digest.is_substantive() {
         return Ok(false);
     }
-    let new_page = synthesize_session_page(
-        workspace_id,
-        project_id,
-        session_id,
-        agent_kind,
-        &observations,
-    );
+    let new_page =
+        synthesize_session_page(workspace_id, project_id, session_id, agent_kind, &digest);
     // With a provider this page is the first half of a consolidation, so it
     // carries the `consolidate` admission operation the inline LLM write
     // used to: a policy refusing consolidation for this actor or scope fails
@@ -4923,8 +4904,62 @@ pub(crate) mod tests {
     use ai_memory_wiki::Wiki;
     use tempfile::TempDir;
 
+    use ai_memory_core::ObservationKind;
+
     use super::*;
     use crate::payload::HookQuery;
+
+    // The page and the handoff are rendered from a digest of the session.
+    // These tests describe a session as the row list it is made of, so each
+    // shim digests that list the way the database queries do
+    // (`SessionDigest::from_observations`) and the assertions read as before.
+    // `session_end_equivalence` holds the queries to the original row-list
+    // code.
+    fn synthesize_session_page(
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        observations: &[ai_memory_core::Observation],
+    ) -> ai_memory_core::NewPage {
+        super::synthesize_session_page(
+            workspace_id,
+            project_id,
+            session_id,
+            agent_kind,
+            &SessionDigest::from_observations(session_id, observations),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_auto_handoff(
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        from_agent: AgentKind,
+        session_id: SessionId,
+        cwd: Option<String>,
+        observations: &[ai_memory_core::Observation],
+        owner_user: Option<String>,
+        turn_checkpoint: bool,
+    ) -> NewHandoff {
+        super::build_auto_handoff(
+            workspace_id,
+            project_id,
+            from_agent,
+            session_id,
+            cwd,
+            &SessionDigest::from_observations(session_id, observations),
+            owner_user,
+            turn_checkpoint,
+        )
+    }
+
+    fn derive_open_questions(
+        observations: &[ai_memory_core::Observation],
+        last_prompt: &Option<String>,
+    ) -> Vec<String> {
+        super::derive_open_questions(&HandoffFacts::from_observations(observations), last_prompt)
+    }
 
     #[test]
     fn inbox_notice_is_count_only_and_empty_at_zero() {
@@ -15024,6 +15059,110 @@ pub(crate) mod tests {
         );
     }
 
+    /// A SessionEnd on a session far larger than the raw-observation window
+    /// must not load its rows: the page and the baton are rendered from
+    /// bounded reads. The reader pool's counter is the seam; it counts every
+    /// row a whole-session read deserializes, so a full load put back anywhere
+    /// on the path (the lifecycle-only check, the page, the handoff) moves it
+    /// by the size of the session.
+    #[tokio::test]
+    async fn session_end_of_a_huge_session_loads_a_bounded_number_of_rows() {
+        const FILLER: i64 = 12_000;
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "30303030-3030-3030-3030-303030303030";
+        let session_id: SessionId = sid.parse().unwrap();
+        let fire = |event: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "ship the bounded read" }),
+            )
+        };
+        process(&state, fire("user-prompt-submit"), None, Vec::new())
+            .await
+            .unwrap();
+        let first = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap()
+            .remove(0);
+
+        // Bulk-seed the rest of the session with plain SQL: this many rows
+        // through the writer actor would be the whole test.
+        let mut conn = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite"))
+            .expect("the store's database file");
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
+        // The FTS trigger indexes every inserted row and nothing here
+        // searches them.
+        conn.execute_batch("DROP TRIGGER IF EXISTS observations_fts_ai")
+            .unwrap();
+        let first_us = first.created_at.as_microsecond();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO observations \
+                     (id, session_id, workspace_id, project_id, kind, title, body, importance, \
+                      created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 5, ?7)",
+                )
+                .unwrap();
+            for i in 0..FILLER {
+                let kind = if i % 2 == 0 {
+                    ObservationKind::PreToolUse
+                } else {
+                    ObservationKind::PostToolUse
+                };
+                insert
+                    .execute(rusqlite::params![
+                        ai_memory_core::ObservationId::new().as_bytes(),
+                        session_id.as_bytes(),
+                        first.workspace_id.as_bytes(),
+                        first.project_id.as_bytes(),
+                        kind.as_str(),
+                        "Bash",
+                        first_us + 1 + i,
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        process(&state, fire("session-end"), None, Vec::new())
+            .await
+            .unwrap();
+        let page = state
+            .wiki
+            .read_page(
+                first.workspace_id,
+                first.project_id,
+                &PagePath::new(format!("sessions/{sid}.md")).unwrap(),
+            )
+            .expect("the session page is written");
+        assert!(
+            page.body
+                .contains("raw observations omitted from the middle"),
+            "a long session still gets the elided raw list: {}",
+            page.body.lines().take(12).collect::<Vec<_>>().join("\n")
+        );
+        let briefing = state
+            .reader
+            .briefing_for_project(
+                first.workspace_id,
+                first.project_id,
+                1,
+                ai_memory_core::OwnerFilter::Any,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(briefing.pending_handoff_count, 1, "the baton is still made");
+    }
+
     #[tokio::test]
     async fn session_end_queues_llm_work_without_calling_provider() {
         let tmp = TempDir::new().unwrap();
@@ -20554,3 +20693,7 @@ pub(crate) mod tests {
         assert_ne!(ordinary, (state.workspace_id, state.project_id));
     }
 }
+
+#[cfg(test)]
+#[path = "session_end_equivalence.rs"]
+mod session_end_equivalence;

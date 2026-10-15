@@ -69,6 +69,102 @@ async fn open_session(
     id
 }
 
+/// A SessionEnd digest takes a raw session id internally, but the reader must
+/// still require the admitted scope. Otherwise a future caller could render a
+/// foreign project's prompts merely by learning its id.
+#[tokio::test]
+async fn session_end_readers_refuse_foreign_session_ids() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: session,
+                workspace_id: ws,
+                project_id: home,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "private prompt".into(),
+                body: "foreign scopes must not read this".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .session_has_substantive_observation(ws, home, session)
+            .await
+            .unwrap(),
+        "the owning scope is the legitimate control"
+    );
+    let total = store
+        .reader
+        .read_session_observations(ws, home, session, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+
+    for (attempt_ws, attempt_project) in [(ws, sibling), (other_ws, home)] {
+        assert!(
+            !store
+                .reader
+                .session_has_substantive_observation(attempt_ws, attempt_project, session)
+                .await
+                .unwrap(),
+            "a foreign scope must not learn the session's substantive state"
+        );
+        let error = store
+            .reader
+            .read_session_observations(attempt_ws, attempt_project, session, |snapshot| {
+                Ok(snapshot.kind_summary()?.total)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::SessionCollision));
+    }
+
+    let missing = SessionId::new();
+    let error = store
+        .reader
+        .read_session_observations(ws, home, missing, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::SessionCollision),
+        "missing and foreign ids deliberately expose the same refusal"
+    );
+}
+
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
     NewPage {
         workspace_id: ws,

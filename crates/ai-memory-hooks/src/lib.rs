@@ -65,7 +65,7 @@ pub use router::{
     DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates, IngestRateLimiter, ProjectCache,
     ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
 };
-pub use synth::synthesize_session_page;
+pub use synth::{SessionDigest, synthesize_session_page};
 pub use workstream::{WorkstreamState, workstream_router};
 
 /// Request header every first-party client (native hook and CLI, the shell and

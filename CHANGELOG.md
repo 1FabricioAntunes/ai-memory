@@ -194,6 +194,22 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Fixed SessionEnd loading every observation of the session into memory, up to
+  three times, on the hook path. One production claude-code session held
+  948,136 observations, so ending it deserialized close to a million rows
+  (bodies included) per read. The lifecycle-only decision is now one `EXISTS`
+  query, and the summary page and the auto-handoff are rendered from bounded
+  reads taken in one read transaction: SQL aggregates for the counts and the
+  "last of a kind" markers, the 250 first and 250 last rows the raw list
+  prints, and early-exit scans for the first or last prompt that passes the
+  usual filters; subagent-preamble prompt bodies are read one at a time and
+  only until one names the page. The page, the handoff and the lifecycle-only
+  decision are unchanged byte for byte (an equivalence test holds them to the
+  original row-list code on sessions of every shape). What still grows with
+  the session is what the page itself lists: the title of every user prompt.
+  The PreCompact and PostCompaction checkpoint page uses the same bounded
+  reads. The writer's lifecycle-only re-check and the reader now build their
+  query from one shared predicate. (#1323)
 - Fixed `ai-memory run --yolo` failing with `401 Unauthorized` after it
   re-ran itself under ai-jail on an install whose bearer token lives in
   `[auth].bearer_token_file`. ai-jail's private home hides the data dir, so
