@@ -1506,6 +1506,10 @@ fn effective_hook_server_url(
         config.server_url.clone()
     } else if let Some(url) = inferred.and_then(|mcp| mcp.hook_server_url.clone()) {
         url
+    } else if config.server_url_derived_from_bind {
+        // Nothing chose a URL and no existing entry names one: reach the
+        // server this config's `bind` starts (#1269).
+        config.server_url.clone()
     } else {
         return DEFAULT_SERVER_URL.to_string();
     };
@@ -6182,14 +6186,32 @@ fn same_canonical_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Copy `from` onto `to`, replacing a read-only `to` left by an earlier
+/// staging run. Package stores (Nix) ship hook sources as 0444, `fs::copy`
+/// carries that mode over, and a second copy onto the read-only destination
+/// fails with `PermissionDenied`. Only that failure removes the stale copy
+/// and retries, so a writable destination is overwritten exactly as before.
+pub(crate) fn copy_replacing(from: &Path, to: &Path) -> Result<()> {
+    let context = || format!("copying {} → {}", from.display(), to.display());
+    match fs::copy(from, to) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && to.is_file() => {
+            fs::remove_file(to)
+                .with_context(|| format!("removing read-only staged copy {}", to.display()))?;
+            fs::copy(from, to).with_context(context)?;
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(context),
+    }
+}
+
 /// Copy a single hook file (event script or shared `_lib.sh`) into the
 /// staging dir, preserving the executable bit on Unix. Centralised so
 /// the script bulk-copy and the `_lib.sh` companion follow the same
 /// rules without duplicating permission-handling.
 fn copy_hook_file(from: &Path, dest_root: &Path) -> Result<()> {
     let to = dest_root.join(from.file_name().context("bad source file name")?);
-    fs::copy(from, &to)
-        .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+    copy_replacing(from, &to)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -6226,8 +6248,14 @@ fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> 
             continue;
         }
         let to = dest_lib.join(from.file_name().context("bad support file name")?);
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+        copy_replacing(&from, &to)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&to)?.permissions();
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(&to, perms);
+        }
     }
     Ok(())
 }
@@ -6286,7 +6314,7 @@ fn hook_source_candidates(
     exe_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(5);
+    let mut candidates = Vec::with_capacity(6);
     // Cargo-run from the repo.
     if let Some(root) = repo_root {
         candidates.push(root.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
@@ -6294,8 +6322,23 @@ fn hook_source_candidates(
     // Release tarball (macOS/Windows/Linux archive): the `hooks/` bundle
     // ships in the same directory as the binary, so it's reachable without
     // `--source` (issue #107).
-    if let Some(dir) = exe_dir {
+    if let Some(dir) = exe_dir.as_ref() {
         candidates.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
+    }
+    // Standard Unix prefix layout: binary at `<prefix>/bin/ai-memory`,
+    // hooks installed under `<prefix>/share/ai-memory/hooks/<sub>` (Nix,
+    // Homebrew, /opt/local, custom prefix installs).
+    if let Some(dir) = exe_dir.as_ref()
+        && dir.file_name().is_some_and(|name| name == "bin")
+        && let Some(prefix) = dir.parent()
+    {
+        candidates.push(
+            prefix
+                .join("share")
+                .join("ai-memory")
+                .join(crate::install_layout::HOOKS_DIR_NAME)
+                .join(sub),
+        );
     }
     // Docker image lays them out under /usr/local/share/ai-memory/.
     candidates.push(PathBuf::from(format!(
@@ -8993,6 +9036,35 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         );
     }
 
+    /// #1269: with only a custom `bind`, hooks reach the server that bind
+    /// starts; an existing MCP entry still wins over the derived URL.
+    #[test]
+    fn hook_server_url_uses_a_bind_derived_url_after_an_existing_entry() {
+        let config = Config {
+            server_url: "http://127.0.0.1:49921".into(),
+            server_url_derived_from_bind: true,
+            ..Config::default()
+        };
+        let args = default_hook_args();
+        assert_eq!(
+            effective_hook_server_url(&config, &args, None),
+            "http://127.0.0.1:49921"
+        );
+        let inferred = InferredMcpConfig {
+            hook_server_url: Some("http://homelab:49374".into()),
+            auth_token: None,
+        };
+        assert_eq!(
+            effective_hook_server_url(&config, &args, Some(&inferred)),
+            "http://homelab:49374"
+        );
+        assert_eq!(
+            effective_hook_server_url(&Config::default(), &args, None),
+            DEFAULT_SERVER_URL,
+            "nothing derived and nothing inferred keeps the default"
+        );
+    }
+
     #[test]
     fn resolve_hooks_dir_uses_grok_bundle_for_grok() {
         let tmp = TempDir::new().unwrap();
@@ -10799,6 +10871,77 @@ model = "gpt-5"
         assert_eq!(
             candidates[4],
             PathBuf::from("/home/alice/.local/share/ai-memory/hooks/claude-code")
+        );
+    }
+
+    /// Nix ships hook sources 0444 and `fs::copy` keeps that mode, so a
+    /// second `install-hooks` used to fail copying onto its own staged copy.
+    #[cfg(unix)]
+    #[test]
+    fn staging_replaces_read_only_existing_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("src/hooks/claude-code");
+        fs::create_dir_all(source.parent().unwrap().join("lib")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let script = source.join("session-start.sh");
+        let support = source.parent().unwrap().join("lib/helper.ps1");
+        fs::write(&script, "new\n").unwrap();
+        fs::write(&support, "new\n").unwrap();
+        let dest = tmp.path().join("dest/hooks/claude-code");
+        fs::create_dir_all(dest.parent().unwrap().join("lib")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let staged = [
+            dest.join("session-start.sh"),
+            dest.parent().unwrap().join("lib/helper.ps1"),
+        ];
+        for path in &staged {
+            fs::write(path, "old\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        copy_hook_file(&script, &dest).unwrap();
+        copy_support_hook_scripts(&source, &dest).unwrap();
+
+        for path in &staged {
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                "new\n",
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn hook_source_candidates_include_standard_prefix_share_dir() {
+        let candidates = hook_source_candidates(
+            "claude-code",
+            None,
+            Some(PathBuf::from("/nix/store/pkg/bin")),
+            None,
+        );
+
+        assert!(
+            candidates.contains(&PathBuf::from(
+                "/nix/store/pkg/share/ai-memory/hooks/claude-code"
+            )),
+            "standard prefix share hooks/ dir must be probed; got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn hook_source_candidates_ignores_non_bin_parent_for_prefix_share() {
+        let candidates = hook_source_candidates(
+            "claude-code",
+            None,
+            Some(PathBuf::from("/opt/ai-memory")),
+            None,
+        );
+
+        assert!(
+            !candidates.contains(&PathBuf::from("/opt/share/ai-memory/hooks/claude-code")),
+            "non-bin exe dir must not probe parent share dir; got {candidates:?}"
         );
     }
 

@@ -7226,9 +7226,10 @@ pub struct MoveSessionSummary {
 }
 
 /// Re-stamp one session and every row that hangs off it (`observations`,
-/// `handoffs` it produced, its consolidation jobs, auto-improve runs and
-/// scheduler claim) into `(target_workspace, target_project)` in ONE
-/// transaction, plus its `sessions/<session_id>.md` page per `pages`.
+/// `handoffs` it produced, its consolidation jobs, auto-improve runs,
+/// scheduler claim, profile prompt candidates, and ingest keys) into
+/// `(target_workspace, target_project)` in ONE transaction, plus its
+/// `sessions/<session_id>.md` page per `pages`.
 ///
 /// Dependent rows are matched by session id alone, so a hybrid session whose
 /// events were scattered over other scopes (mid-session routing before the
@@ -7389,6 +7390,36 @@ pub fn move_session(
     summary.consolidation_jobs = restamp("session_consolidation_jobs", "session_id")?;
     summary.auto_improve_runs = restamp("auto_improve_runs", "session_id")?;
     summary.auto_improve_claims = restamp("auto_improve_scheduler_claims", "session_id")?;
+
+    // Profile evidence harvested from this session's prompts, keyed by
+    // `session:<id>`. Re-stamped so later convergence attributes the
+    // statements to the target project, and a subsequent purge of the
+    // source project does not delete them via CASCADE.
+    let session_ref = format!("session:{session_id}");
+    tx.execute(
+        "UPDATE OR IGNORE profile_candidates SET workspace_id = ?1, project_id = ?2 \
+         WHERE source_kind = 'prompt' AND source_ref = ?3 \
+           AND NOT (workspace_id = ?1 AND project_id = ?2)",
+        params![&to_ws[..], &to_proj[..], session_ref.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM profile_candidates \
+         WHERE source_kind = 'prompt' AND source_ref = ?1 \
+           AND NOT (workspace_id = ?2 AND project_id = ?3)",
+        params![session_ref.as_str(), &to_ws[..], &to_proj[..]],
+    )?;
+
+    // Ingest idempotency and recovery keys tied to the session.
+    tx.execute(
+        "UPDATE OR IGNORE ingest_keys SET project_id = ?1 \
+         WHERE session_id = ?2 AND project_id != ?1",
+        params![&to_proj[..], &sid[..]],
+    )?;
+    tx.execute(
+        "DELETE FROM ingest_keys \
+         WHERE session_id = ?1 AND project_id != ?2",
+        params![&sid[..], &to_proj[..]],
+    )?;
 
     // Page rows to handle: the source scope's in a real move; in a re-home,
     // any scope other than the target (the source IS the target).
@@ -13843,6 +13874,20 @@ pub(crate) mod tests {
             params![ws.as_bytes(), proj.as_bytes(), sid.as_bytes()],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'topic', 'workflow', 'statement', 'quote', 1, 'general')",
+            params![ws.as_bytes(), proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, ?2, 1, 1, ?3)",
+            params![proj.as_bytes(), format!("key-{sid}"), sid.as_bytes()],
+        )
+        .unwrap();
         let path = format!("sessions/{sid}.md");
         upsert_page(conn, &page(ws, proj, &path, "first version")).unwrap();
         upsert_page(conn, &page(ws, proj, &path, "second version")).unwrap();
@@ -13942,6 +13987,65 @@ pub(crate) mod tests {
                 session_rows_in_scope(conn, table, col, sid, gone.0, gone.1),
                 0,
                 "{table} rows must not sit in the other scope"
+            );
+        }
+        let candidate_here: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    here.0.as_bytes(),
+                    here.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_here, 1,
+            "profile_candidates must sit in the expected scope"
+        );
+        let candidate_gone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    gone.0.as_bytes(),
+                    gone.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_gone, 0,
+            "profile_candidates must not sit in the other scope"
+        );
+
+        let ingest_here: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND session_id = ?2",
+                params![here.1.as_bytes(), sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ingest_here, 1,
+            "ingest_keys must sit in the expected project"
+        );
+        if here.1 != gone.1 {
+            let ingest_gone: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND session_id = ?2",
+                    params![gone.1.as_bytes(), sid.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                ingest_gone, 0,
+                "ingest_keys must not sit in the other project"
             );
         }
     }
@@ -14442,6 +14546,308 @@ pub(crate) mod tests {
         assert_eq!(summary.page_versions_moved, 0);
         assert_eq!(session_page_versions(&conn, sid, ws, stray), (1, 0));
         assert_eq!(session_page_versions(&conn, sid, ws, target), (2, 1));
+    }
+
+    #[test]
+    fn move_session_restamps_profile_candidates_and_ingest_keys() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+
+        let (moved_sid, _) = seed_session(&mut conn, src_ws, src_proj, "moved");
+        let (sibling_sid, _) = seed_session(&mut conn, src_ws, src_proj, "sibling");
+
+        let insert_candidate =
+            |ws: WorkspaceId, proj: ProjectId, kind: &str, source_ref: &str, topic: &str| {
+                conn.execute(
+                    "INSERT INTO profile_candidates \
+                     (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+                      statement, quote, observed_at, generality) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'workflow', 'statement', 'quote', 1, 'general')",
+                    params![ws.as_bytes(), proj.as_bytes(), kind, source_ref, topic],
+                )
+                .unwrap();
+            };
+
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{moved_sid}"),
+            "topic1",
+        );
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{sibling_sid}"),
+            "topic1",
+        );
+        insert_candidate(src_ws, src_proj, "page", "page:_rules/keep.md", "topic1");
+
+        let insert_ingest_key = |proj: ProjectId, key: &str, sid: Option<SessionId>| {
+            conn.execute(
+                "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+                 VALUES (?1, ?2, 1, 1, ?3)",
+                params![
+                    proj.as_bytes(),
+                    key,
+                    sid.as_ref().map(|s| &s.as_bytes()[..])
+                ],
+            )
+            .unwrap();
+        };
+
+        insert_ingest_key(src_proj, "key-moved", Some(moved_sid));
+        insert_ingest_key(src_proj, "key-sibling", Some(sibling_sid));
+        insert_ingest_key(src_proj, "key-unattached", None);
+
+        // Move `moved_sid` from src to dst.
+        let summary = move_session(
+            &mut conn,
+            moved_sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.session_moved);
+
+        // Verify `moved_sid` candidate moved to (dst_ws, dst_proj).
+        let moved_candidate_in_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_candidate_in_dst, 1);
+
+        let moved_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_candidate_in_src, 0);
+
+        // Verify sibling and page candidates stayed in (src_ws, src_proj).
+        let sibling_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sibling_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling_candidate_in_src, 1);
+
+        let page_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'page' AND source_ref = 'page:_rules/keep.md'",
+                params![src_ws.as_bytes(), src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_candidate_in_src, 1);
+
+        // Verify ingest keys: moved key sits in dst_proj, sibling and unattached in src_proj.
+        let moved_key_in_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-moved'",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_key_in_dst, 1);
+
+        let moved_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-moved'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_key_in_src, 0);
+
+        let sibling_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-sibling'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling_key_in_src, 1);
+
+        let unattached_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-unattached'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unattached_key_in_src, 1);
+
+        // Now purge src_proj: because moved_sid's candidate and ingest key
+        // were re-stamped to dst_proj, they MUST survive the purge cascade.
+        purge_project(
+            &mut conn,
+            &src_ws,
+            &src_proj,
+            "default/source",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let dst_candidates_after_purge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2",
+                params![dst_ws.as_bytes(), dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dst_candidates_after_purge, 1,
+            "moved session's profile candidate must survive source project purge"
+        );
+
+        let dst_ingest_keys_after_purge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dst_ingest_keys_after_purge, 1,
+            "moved session's ingest key must survive source project purge"
+        );
+    }
+
+    #[test]
+    fn move_session_handles_duplicate_candidate_and_ingest_key_conflicts() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+
+        let (sid, _) = seed_session(&mut conn, src_ws, src_proj, "conflict-test");
+
+        // Seed duplicate candidate in both src and dst with same topic_key
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'duptopic', 'workflow', 'stmt1', 'quote1', 1, 'general')",
+            params![src_ws.as_bytes(), src_proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'duptopic', 'workflow', 'stmt2', 'quote2', 2, 'general')",
+            params![dst_ws.as_bytes(), dst_proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+
+        // Seed duplicate ingest key in both src and dst
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, 'dupkey', 1, 1, ?2)",
+            params![src_proj.as_bytes(), sid.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, 'dupkey', 2, 2, NULL)",
+            params![dst_proj.as_bytes()],
+        )
+        .unwrap();
+
+        // Move must not fail with UNIQUE constraint error
+        let summary = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.session_moved);
+
+        // Exactly 1 candidate in dst for this session, 0 in src
+        let count_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_dst, 1);
+        let count_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_src, 0);
+
+        // Exactly 1 ingest key in dst with key 'dupkey', 0 in src
+        let key_count_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'dupkey'",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_count_dst, 1);
+        let key_count_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'dupkey'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_count_src, 0);
     }
 
     #[test]

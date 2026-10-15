@@ -26,6 +26,7 @@ mod retrieval_observation_stream;
 mod retrieval_superseded;
 mod retrieval_tuning_streams;
 mod session_ids_touching_scope;
+mod session_move;
 mod session_observations;
 mod session_scope_from_observations;
 mod sessions_by_agent;

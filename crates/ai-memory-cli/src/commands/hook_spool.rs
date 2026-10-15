@@ -1391,6 +1391,16 @@ pub async fn drain_with_live_token(
     // the 7-day TTL) instead of deleting the oldest events.
     let mut unreachable_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Credentials refused during THIS pass, keyed by what decides a retry:
+    // endpoint, profile and bearer. A `401` belongs to the chunk's credential,
+    // not to the entries behind it that carry another one, so the pass
+    // carries on past it; a later entry with the same credential would only
+    // be refused again, so it waits for the next pass uncharged.
+    let mut rejected_credentials: std::collections::HashSet<(
+        String,
+        Option<String>,
+        Option<String>,
+    )> = std::collections::HashSet::new();
     // Resolved on first need only — a healthy drain never reads the config.
     let mut configured_server: Option<Option<String>> = None;
     'drain: while idx < files.len() {
@@ -1416,6 +1426,15 @@ pub async fn drain_with_live_token(
         }
 
         let bearer = entry_bearer(&entry, &client, data_dir, &mut oidc_cache).await;
+        let credential = (
+            batch_endpoint(&entry.url),
+            entry.profile.clone(),
+            bearer.clone(),
+        );
+        if rejected_credentials.contains(&credential) {
+            result.remaining += 1;
+            continue;
+        }
 
         if batch_supported {
             // Extend the chunk over consecutive entries sharing the same batch
@@ -1755,6 +1774,7 @@ pub async fn drain_with_live_token(
                         live_token,
                         &mut profile_tokens,
                     );
+                    let mut credential_refused = true;
                     if let Some(token) = retry {
                         match post_batch(&client, &base, &payload, Some(&token), batch_timeout)
                             .await
@@ -1781,16 +1801,25 @@ pub async fn drain_with_live_token(
                             // The current token is no better — the server is
                             // rejecting more than a stale credential. Fall
                             // through and charge conservatively.
-                            _ => {}
+                            BatchOutcome::Unauthorized => {}
+                            // The retry hit the server's state (saturation, a
+                            // failure, the endpoint going away), not the
+                            // credential, so the pass stops as for `Failed`.
+                            _ => credential_refused = false,
                         }
                     }
 
                     // Same conservative accounting as `Failed`: the server
                     // refused the whole batch, so nothing in it was processed.
                     bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
-                    result.remaining +=
-                        chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
-                    break;
+                    if !credential_refused {
+                        result.remaining +=
+                            chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
+                        break;
+                    }
+                    result.remaining += chunk.len().saturating_sub(1);
+                    rejected_credentials.insert(credential);
+                    continue;
                 }
                 BatchOutcome::Failed => {
                     // The batch didn't land (server answered with an unexpected
@@ -4474,6 +4503,192 @@ mod tests {
 
         assert_eq!(r.sent, 0, "nothing to retry with");
         assert_eq!(list_entries(&spool).unwrap().0.len(), 1, "entry survives");
+    }
+
+    /// #1283: entries captured before `auth enable` carry no credential and
+    /// sort ahead of everything captured after it. Their `401` rejects that
+    /// credential only, so the entry behind them, carrying the token the
+    /// server now accepts, is still delivered in the same pass. A later entry
+    /// with the refused credential would be refused identically, so it waits
+    /// for the next pass without a request and without a charged attempt.
+    #[tokio::test]
+    async fn a_refused_credential_does_not_hold_back_entries_with_a_valid_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_token_gated_hook("root-token", count.clone()).await;
+
+        for (event, token) in [("a0", None), ("t0", Some("root-token")), ("a1", None)] {
+            let entry = entry_for(
+                format!("http://{addr}/hook?event={event}"),
+                "{}".into(),
+                token,
+                false,
+            );
+            enqueue(&spool, &entry).unwrap();
+        }
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("root-token"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1, "the tokened entry is delivered");
+        assert_eq!(r.remaining, 2);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            sorted_attempts(&spool),
+            vec![1, 0],
+            "only the refused request is charged"
+        );
+    }
+
+    /// A profile entry retries with its own stored token, so a refusal of a
+    /// default entry at the same address with the same captured bearer must
+    /// not hold it back.
+    #[tokio::test]
+    async fn a_refused_default_credential_does_not_hold_back_a_profile_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = serve_token_gated_hook("b-new", count.clone()).await;
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(
+            tmp.path(),
+            &name,
+            &format!("http://{server}"),
+            &[],
+            Some("b-new"),
+        )
+        .unwrap();
+
+        let default_entry = entry_for(
+            format!("http://{server}/hook?event=d0"),
+            "{}".into(),
+            Some("b-old"),
+            false,
+        );
+        enqueue(&spool, &default_entry).unwrap();
+        let profile_entry = entry_for(
+            format!("http://{server}/hook?event=p0"),
+            "{}".into(),
+            Some("b-old"),
+            false,
+        )
+        .routed_to(Some("team-b"));
+        enqueue(&spool, &profile_entry).unwrap();
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(
+            r.sent, 1,
+            "the profile entry is delivered with its own token"
+        );
+        assert_eq!(r.remaining, 1);
+    }
+
+    /// The refused credential belongs to one endpoint: an anonymous entry
+    /// refused by a server that requires a token does not hold back an
+    /// anonymous entry for a server that accepts it.
+    #[tokio::test]
+    async fn a_refusal_at_one_endpoint_does_not_hold_back_another_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let gated_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gated = serve_token_gated_hook("root-token", gated_count.clone()).await;
+        let open_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open = serve_counting_hook(open_count.clone(), "200 OK").await;
+
+        for url in [
+            format!("http://{gated}/hook?event=a0"),
+            format!("http://{open}/hook?event=a1"),
+        ] {
+            enqueue(&spool, &entry_for(url, "{}".into(), None, false)).unwrap();
+        }
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("root-token"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1, "the entry for the open server is delivered");
+        assert_eq!(open_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A retry that hits the server's state rather than the credential (here a
+    /// `429`) stops the pass, as a saturated batch does.
+    #[tokio::test]
+    async fn a_saturated_retry_stops_the_pass() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rc = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let rc = rc.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let live = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .any(|l| l.trim().eq_ignore_ascii_case("authorization: Bearer live"));
+                    let status = if live {
+                        "429 Too Many Requests"
+                    } else {
+                        "401 Unauthorized"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for (event, token) in [("t0", Some("old")), ("a0", None)] {
+            let url = format!("http://{addr}/hook?event={event}");
+            enqueue(&spool, &entry_for(url, "{}".into(), token, false)).unwrap();
+        }
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("live"),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(r.remaining, 2);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the refused request and its retry, nothing after them"
+        );
     }
 
     /// #992, adversarial: server B accepts exactly the install default's live

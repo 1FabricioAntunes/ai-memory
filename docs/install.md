@@ -476,8 +476,12 @@ managed Agent Skills are installed or updated alongside it.
 
 If you install into `AGENTS.md` and the project is also used from Claude Code,
 make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
-loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
-installed block is absent from context at session start. See
+2.1.277 and later reads `AGENTS.md` only when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` exists in the working directory or
+any directory above it. Without that import, sessions that read only
+`CLAUDE.md` (older Claude Code, the AGENTS.md plugin disabled, the `claude-md`
+Project instructions setting, or a developer's own `CLAUDE.local.md`) miss the
+installed block at session start. See
 [Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
 
 ---
@@ -718,6 +722,18 @@ route; set `AI_MEMORY_AUTH_TOKEN` in `/etc/ai-memory/env` only to replace it:
 ```toml
 bind = "0.0.0.0:49374"
 allowed_hosts = ["homelab", "192.168.0.90", "localhost", "127.0.0.1"]
+```
+
+`server_url` does not need to be set here. When neither `config.toml` nor
+`AI_MEMORY_SERVER_URL` names one, the thin-client commands derive it from
+`bind`, so a local `ai-memory status` reaches this server rather than the
+default port. An unspecified bind is mapped to loopback (`0.0.0.0` becomes
+`127.0.0.1`, `[::]` becomes `[::1]`). Set `server_url` only when clients
+reach the server at an address it does not bind, such as behind a reverse
+proxy or a tunnel:
+
+```toml
+server_url = "https://memory.example"
 ```
 
 ```bash
@@ -1156,6 +1172,10 @@ User-facing NixOS module setup lives in the [README NixOS
 section](../README.md#nixos) (`nixosModules.default`,
 `services.ai-memory.enable`). This section is the maintainer test ladder
 for the flake and module: what CI runs, and what each tier proves.
+
+The package does not bundle `git`: the module adds `pkgs.git` to the
+service's `PATH`, and a package-only install needs `git` installed beside it.
+Do not wrap the binary to supply it (see the README section for why).
 
 ### Maintainer test ladder
 

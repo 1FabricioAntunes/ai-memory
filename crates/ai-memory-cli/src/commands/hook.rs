@@ -1112,12 +1112,15 @@ where
         if args.event == "session-start"
             && let Ok(trigger_cwd) = std::env::current_dir()
             && !super::backfill::sentinel_path(&dd, &trigger_cwd).exists()
+            && super::backfill::claim_inflight(&dd, &trigger_cwd)
         {
             let target = match profile_name {
                 Some(name) => hook_drain_process::BackfillTarget::Profile(name),
                 None => hook_drain_process::BackfillTarget::ServerUrl(base),
             };
-            let _ = hook_drain_process::spawn_backfill(&dd, target);
+            if hook_drain_process::spawn_backfill(&dd, target).is_err() {
+                super::backfill::release_inflight(&dd, &trigger_cwd);
+            }
         }
     }
 

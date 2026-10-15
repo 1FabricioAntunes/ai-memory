@@ -109,10 +109,13 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
-Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
-where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
-line. Without it a rule written to `AGENTS.md` is absent from context at
-session start and reaches Claude Code only if the agent opens the file.
+Claude Code 2.1.277 and later reads `AGENTS.md` only when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` exists in the working directory or
+any directory above it; when one does, it reads that file instead. In a
+project where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md`
+import line so sessions that read only `CLAUDE.md` (older Claude Code, the
+AGENTS.md plugin disabled, the `claude-md` Project instructions setting, or a
+developer's own `CLAUDE.local.md`) load the same rules at session start.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -303,6 +306,42 @@ mod tests {
         assert!(COMPACT_SNIPPET_BODY.contains("Session-aware clients"));
         assert!(COMPACT_SNIPPET_BODY.contains("Static clients"));
         assert!(COMPACT_SNIPPET_BODY.contains("omit `workspace`, `project`, and `cwd`"));
+    }
+
+    #[test]
+    fn snippet_does_not_claim_claude_code_ignores_agents_md() {
+        assert!(
+            !SNIPPET_BODY.contains("does not read `AGENTS.md`"),
+            "Claude Code 2.1.277+ reads AGENTS.md when no CLAUDE.md exists"
+        );
+        assert!(
+            !COMPACT_SNIPPET_BODY.contains("does not read `AGENTS.md`"),
+            "compact snippet must not repeat the stale CLAUDE.md-only claim"
+        );
+    }
+
+    #[test]
+    fn snippet_describes_claude_code_agents_md_fallback() {
+        assert!(
+            SNIPPET_BODY.contains("2.1.277"),
+            "full snippet should name the Claude Code version that reads AGENTS.md"
+        );
+        assert!(
+            SNIPPET_BODY.contains("reads `AGENTS.md` only when"),
+            "full snippet should state the no-CLAUDE.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("`CLAUDE.local.md`"),
+            "a CLAUDE.local.md also blocks the AGENTS.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("`.claude/CLAUDE.md`"),
+            "a .claude/CLAUDE.md also blocks the AGENTS.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("the `claude-md` Project instructions"),
+            "name Claude Code's real setting, not an invented mode"
+        );
     }
 
     #[test]

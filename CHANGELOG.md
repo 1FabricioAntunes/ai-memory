@@ -122,6 +122,59 @@ version in [`docs/changelog/`](docs/changelog/):
   and no migration. (#1264)
 
 ### Fixed
+- Fixed the thin-client commands ignoring a custom `bind`, which could write
+  into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
+  and was never derived from `bind`, so `ai-memory --data-dir X status` (and
+  `write-page`, `search`, `purge-project`, ...) called the default port
+  whatever `bind` said. With nothing listening there the command failed; with
+  another server listening there it operated on that server's data, and one
+  reporter wrote test pages into their real store this way. When neither
+  `config.toml` nor `AI_MEMORY_SERVER_URL` sets `server_url`, it is now
+  derived from `bind`: an unspecified address maps to loopback (`0.0.0.0` to
+  `127.0.0.1`, `[::]` to `[::1]`) and any other host is used as given,
+  hostname included. An explicit value in the file or the environment still
+  wins, even when it names the default URL; a `bind` that is not a
+  `host:port`, or one on port 0, leaves the default URL alone; and the default
+  `bind` resolves to the same URL as before, so an install that never changed
+  either key is unaffected. `install-hooks` and `install-mcp` still prefer an
+  existing MCP entry's URL, and otherwise write the derived URL instead of the
+  default port. (#1269)
+- Fixed a burst of sessions in a directory with no backfill marker launching
+  one `backfill --auto` per session. The SessionStart hook now takes an
+  atomic in-progress marker before it spawns the backfill, so concurrent
+  sessions in that directory start one; the marker is dropped when the worker
+  ends and a leftover one stops blocking after 30 minutes. The backfill's
+  emptiness check against the server also gives up after 30 seconds instead
+  of waiting forever on a saturated server. Keying the trigger on the project
+  rather than the directory is not part of this change. (#1287)
+- Fixed `/web/pending` offering Approve and Reject buttons that always failed
+  with `401: unknown error` on a server with a bearer token and no password
+  sign-in. The browser reaches `/web` there with the root token over HTTP
+  Basic, which only admits reads. The page now says so, points to password
+  sign-in, and shows each proposal's `ai-memory pending-writes approve` /
+  `reject` command instead; a decision that fails for another reason now shows
+  the server's message even when it is plain text. (#1288)
+- Fixed the managed routing snippet's claim that Claude Code never reads
+  `AGENTS.md`. Claude Code 2.1.277 and later reads it when no `CLAUDE.md`,
+  `.claude/CLAUDE.md`, or `CLAUDE.local.md` is present, and reads that file
+  instead when one exists. The `@AGENTS.md` import is how a canonical
+  `AGENTS.md` reaches sessions that read only `CLAUDE.md`. (#1276)
+- Fixed bundled hook discovery for a binary installed in a standard Unix
+  prefix such as Nix: `install-hooks` and `setup-agent` now probe
+  `<prefix>/share/ai-memory/hooks/` from `<prefix>/bin/ai-memory`, and
+  `setup-agent` checks it before the fixed `/usr/local/share` and
+  `/usr/share` locations. (#1275)
+- Fixed `ai-memory install-hooks` and `setup-agent` failing on a second run
+  when the staged hook scripts were read-only copies from a read-only package
+  store (the Nix store ships them `0444`). Staging now replaces a read-only
+  copy instead of erroring. (#1275)
+- Fixed generated hook commands baking an absolute `/nix/store/...` binary
+  path that Nix garbage collection later deletes. A binary running from the
+  Nix store now renders the bare `ai-memory` command, resolved through `PATH`
+  when the hook runs. (#1275)
+- Fixed the NixOS service lacking `git` on `PATH`: the module now adds
+  `pkgs.git` to the unit's `path`. The package binary stays unwrapped so the
+  live-process guard can still see a running server. (#1275)
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
@@ -145,6 +198,41 @@ version in [`docs/changelog/`](docs/changelog/):
   embedding backfill ran, which by default is only at the next server
   start. These paths now embed each written page the same way
   `memory_write_page` does. (#1258)
+- Fixed `ai-memory run` reporting `server unavailable` for a heartbeat the
+  server answered and rejected. A heartbeat is rejected once its managed run
+  stops being active, which on a workstation usually means a later `run`
+  prepared a workstream and expired every active run whose lease had already
+  passed. The launcher printed the outage notice for a failure of any kind and
+  sent the real reason to a `debug` line nobody sees at the default level, so a
+  server that answered `409 managed run lease is not active` in about a
+  millisecond read as an outage. The notice now carries the server's own reason
+  for a rejection, and keeps the outage wording only for a server the launcher
+  could not reach. (#1277)
+- Updated rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349,
+  in the server and in the importer, relay and wikisync companions, and the
+  importer's anyhow to 1.0.104 for RUSTSEC-2026-0190. (#1286)
+- Fixed the hook spool delivering nothing after `ai-memory auth enable`
+  while it still held entries captured before the switch. Those entries
+  carry no credential and sort first, so their batch was refused with `401`
+  and the drain stopped there, never posting the entries behind them that
+  carry the accepted token. A refused credential now only holds back the
+  entries that carry it: they stay queued, the first of them charged once
+  per pass, and the drain carries on with the rest. Entries captured with no
+  credential are still dropped once their attempt budget runs out; they are
+  never resent with the current token, which would attribute them to the
+  operator. (#1283)
+- Fixed `install-instructions` writing the block into `AGENTS.md` alone, with
+  no warning, when Claude Code would never read it. Claude Code reads
+  `AGENTS.md` only when no `CLAUDE.md`, `.claude/CLAUDE.md` or
+  `CLAUDE.local.md` exists in the directory or above it, so a developer's
+  `CLAUDE.local.md` hid the block. The command now names the file Claude Code
+  reads instead and how to import `@AGENTS.md` from it. (#1297)
+- Fixed `move-session` leaving prompt profile candidates and ingest keys in the
+  source project. When a session is moved or re-homed into another project, its
+  prompt `profile_candidates` (`source_ref = 'session:<id>'`) and `ingest_keys`
+  were not re-stamped into the target project, which distorted cross-project
+  profile convergence and caused a subsequent `purge-project` of the source
+  project to destroy them via cascade. They now re-stamp in the same transaction. (#1265)
 
 ## [3.0.0] - 2026-10-13
 

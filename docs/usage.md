@@ -441,13 +441,20 @@ Agent, `--skills-agent hermes`
 installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
-`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code loads
-`CLAUDE.md` and does not read `AGENTS.md`, so without that import a block
-installed with `--target AGENTS.md`, along with every project rule in the same
-file, is absent from context at session start. A prose "read AGENTS.md" pointer
-does not load the file; it asks the agent to open it, which leaves adherence to
-whether the agent does. See
+`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code 2.1.277
+and later reads `AGENTS.md` only when no `CLAUDE.md`, `.claude/CLAUDE.md`, or
+`CLAUDE.local.md` exists in the working directory or any directory above it.
+Without that import, sessions that read only `CLAUDE.md` (older Claude Code, the
+AGENTS.md plugin disabled, the `claude-md` Project instructions setting, or a
+developer's own `CLAUDE.local.md`) start without a block installed with
+`--target AGENTS.md`, or any other project rule in that file. A prose "read
+AGENTS.md" pointer does not load the file; it asks the agent to open it, which
+leaves adherence to whether the agent does. See
 [Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+`install-instructions` prints a note when it writes only `AGENTS.md` while a
+`CLAUDE.local.md`, `.claude/CLAUDE.md` or `CLAUDE.md` in the directory or above
+it would make Claude Code read that file instead, unless one of them already
+imports `@AGENTS.md`.
 
 To refresh only the managed Agent Skills:
 
