@@ -361,9 +361,16 @@ fn windows_arg(what: &str, text: &str) -> Result<String> {
 /// The logon entry: the binary `setup` ran from, the data dir and config it
 /// used, and `service-host`, as one command line.
 fn render_windows(spec: &ServiceSpec) -> Result<ServiceUnit> {
-    let exe = checked_path("binary", &spec.exe)?;
-    let data_dir = checked_path("data dir", &spec.data_dir)?;
-    let config = checked_path("config file", &spec.config_path)?;
+    // Write plain paths: the canonical form of an install path carries a
+    // `\\?\` verbatim prefix, which is unusual in a Run value and one of the
+    // signals behaviour-based antivirus weighs (#1280). Uninstall compares
+    // both forms as equal, so an entry written by an older build still
+    // matches.
+    use super::path_util::strip_windows_verbatim_prefix as plain;
+    let exe = plain(checked_path("binary", &spec.exe)?);
+    let data_dir = plain(checked_path("data dir", &spec.data_dir)?);
+    let config = plain(checked_path("config file", &spec.config_path)?);
+    let (exe, data_dir, config) = (exe.as_ref(), data_dir.as_ref(), config.as_ref());
     let contents = format!(
         "{} --data-dir {} --config {} {SERVICE_HOST}",
         windows_arg("binary", exe)?,
@@ -1757,6 +1764,30 @@ mod windows_entry_tests {
         ] {
             assert!(!is_setup_run_entry(theirs), "{theirs}");
         }
+    }
+
+    /// A canonical `\\?\` install path is written as a plain path (#1280).
+    #[test]
+    fn the_rendered_entry_writes_plain_paths() {
+        if !cfg!(windows) {
+            return;
+        }
+        let spec = ServiceSpec {
+            exe: PathBuf::from(r"\\?\C:\Users\me\ai\ai-memory.exe"),
+            data_dir: PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"),
+            config_path: PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory\config.toml"),
+            home: PathBuf::from(r"C:\Users\me"),
+            xdg_config_home: None,
+        };
+        let unit = render(ServiceManager::WindowsRun, &spec).unwrap();
+        assert!(!unit.contents.contains(r"\\?\"), "{}", unit.contents);
+        assert!(
+            unit.contents.starts_with(
+                r#""C:\Users\me\ai\ai-memory.exe" --data-dir "C:\Users\me\AppData\Local\ai-memory""#
+            ),
+            "{}",
+            unit.contents
+        );
     }
 
     /// The rendered entry is one setup recognises as its own, names the

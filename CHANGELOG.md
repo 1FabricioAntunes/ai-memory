@@ -50,7 +50,8 @@ version in [`docs/changelog/`](docs/changelog/):
   The value is written and read through the registry API, not by running
   `reg.exe`: an unsigned binary running `reg.exe add` on the `Run` key is a
   common persistence signal, and Bitdefender's behavioral engine quarantined
-  `ai-memory.exe` for it (#1280).
+  `ai-memory.exe` for it (#1280). Its paths are written plainly, without the
+  `\\?\` prefix a canonical path carries.
   The host runs the server with no console window and restarts it after a
   failure, giving up after five failures within ten seconds of starting.
   `ai-memory uninstall --apply` stops the host and removes the value when it
