@@ -1147,6 +1147,21 @@ assert_eq "powershell: every request passes the header table" "$PS_REQUESTS" "$P
 assert_eq "no fixture event was spooled into the caller's data dir" "" \
     "$(grep -rlF -e "$TMP" -e '{"url":"http://memory.test' "$CALLER_SPOOL" 2>/dev/null | head -n 1)"
 
+# Antigravity: invocationNum restarts per turn, so the first turn of a
+# conversation records a start marker and the next turn exits before any
+# request. A closed port proves no request is attempted on the second turn.
+AGY_DATA="$TMP/agy-gate"
+AGY_TURN='{"invocationNum":0,"conversationId":"agy/conv-1","workspacePaths":["/tmp"]}'
+printf '%s' "$AGY_TURN" | AI_MEMORY_DATA_DIR="$AGY_DATA" AI_MEMORY_HOOK_URL="http://127.0.0.1:9" \
+    sh hooks/antigravity-cli/session-start.sh >/dev/null 2>&1
+assert_eq "antigravity first turn records the conversation start marker" "yes" \
+    "$([ -e "$AGY_DATA/briefed/agy-start-agy_conv-1" ] && printf yes || printf no)"
+assert_eq "antigravity later turn of the same conversation prints an empty reply" "{}" \
+    "$(printf '%s' "$AGY_TURN" | AI_MEMORY_DATA_DIR="$AGY_DATA" AI_MEMORY_HOOK_URL="http://127.0.0.1:9" \
+        sh -x hooks/antigravity-cli/session-start.sh 2>"$TMP/agy-trace")"
+assert_eq "antigravity later turn sends no request" "" \
+    "$(grep -E 'ai_memory_(post_hook|get_handoff)' "$TMP/agy-trace" | head -n 1)"
+
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -991,6 +991,20 @@ function Invoke-AiMemoryHook {
         [Console]::Out.Write("{}")
         return
     }
+    # invocationNum restarts at 0 on every user turn: only a conversation's
+    # first turn may post session-start and claim a handoff.
+    if ($AntigravityPreInvocationOutput) {
+        $Conversation = $null
+        try { $Conversation = [string](($Payload | ConvertFrom-Json).conversationId) } catch { }
+        if ($Conversation -and $Conversation.Trim()) {
+            $StartMarker = Get-AiMemoryBriefedFile -Key ("agy-start-" + $Conversation.Trim())
+            if (Test-Path -LiteralPath $StartMarker) {
+                [Console]::Out.Write("{}")
+                return
+            }
+            Set-AiMemoryBriefed -Path $StartMarker
+        }
+    }
     # Assistant/Stop capture (#196) is native-only. Scoped to claude-code + stop
     # so a PostToolUse whose tool output legitimately contains the literal string
     # is unaffected. If a Stop payload still carries the raw field, drop the whole

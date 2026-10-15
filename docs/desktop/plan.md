@@ -115,8 +115,10 @@ The research's best new target, ahead of the RFC's `.mcpb`:
 5. Tray stack choice + Flatpak feasibility (Phase 4).
 6. Does the Claude Desktop Chat tab ever gain a local store/export? (No
    current path; re-check quarterly.)
-7. Antigravity's SessionStart mapping fires on every user turn
-   (`invocationNum` restarts per turn): keep, or gate per conversation?
+7. Antigravity's SessionStart mapping fired on every user turn
+   (`invocationNum` restarts per turn): resolved — gated per conversation by
+   a `briefed/agy-start-<conversationId>` marker in the native, shell and
+   PowerShell hooks.
 8. Cowork capture on Linux, where tasks run in a VM.
 9. Cursor runs the operator's Claude Code hooks by default, so a Cursor
    session reaches ai-memory twice when Cursor's own hooks are installed

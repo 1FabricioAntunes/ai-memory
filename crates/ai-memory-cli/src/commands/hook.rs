@@ -499,6 +499,29 @@ fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_jso
     true
 }
 
+/// `<data_dir>/briefed/agy-start-<conversationId>` for an Antigravity
+/// SessionStart that names its conversation; `None` for every other event.
+fn antigravity_conversation_start_marker(
+    data_dir: &Path,
+    agent: AgentKind,
+    event: HookEvent,
+    raw: &serde_json::Value,
+) -> Option<PathBuf> {
+    if agent != AgentKind::AntigravityCli || event != HookEvent::SessionStart {
+        return None;
+    }
+    let conversation = raw
+        .get("conversationId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    Some(
+        data_dir
+            .join("briefed")
+            .join(format!("agy-start-{}", sanitize_briefed_key(conversation))),
+    )
+}
+
 /// A `--agent claude-code` hook invoked by Cursor (it runs Claude Code's
 /// settings too) is a duplicate when Cursor's own ai-memory hooks are also
 /// installed: the native `--agent cursor` hook already delivers the same
@@ -731,6 +754,23 @@ where
     if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
+    }
+    // `invocationNum` restarts at 0 on every user turn, so invocation zero
+    // marks a turn, not a conversation. Only the first turn of a conversation
+    // may post session-start and claim a handoff.
+    if !args.check_capture
+        && let Some(marker) = antigravity_conversation_start_marker(
+            &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+            agent_kind,
+            hook_event,
+            &json,
+        )
+    {
+        if marker.exists() {
+            write_success_response(stdout, agent_kind, hook_event)?;
+            return Ok(());
+        }
+        mark_briefed(&marker);
     }
     // Assistant/Stop capture (#196). On an opted-in install
     // (`install-hooks --capture-assistant`), extract the assistant message,
@@ -5603,6 +5643,86 @@ mod tests {
                     && request.contains("session_id=agy-conversation")
             }),
             "{recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_second_turn_of_a_conversation_does_not_restart_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let payload = serde_json::json!({
+            "invocationNum": 0,
+            "conversationId": "agy-conversation",
+            "workspacePaths": [tmp.path()]
+        })
+        .to_string();
+        let (base, _first) = serve_requests("200 OK", "AGY-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("session-start", &base),
+            payload.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let (base, mut requests) = serve_requests("200 OK", "MUST-NOT-BE-CONSUMED").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("session-start", &base),
+            payload,
+            &mut stdout,
+            |_, _| Err(std::io::Error::other("must not spawn")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(first_request(&mut requests).await.is_none());
+    }
+
+    #[test]
+    fn antigravity_conversation_marker_only_for_named_antigravity_starts() {
+        let dir = Path::new("/d");
+        let raw = serde_json::json!({"conversationId": "a/b"});
+        assert_eq!(
+            antigravity_conversation_start_marker(
+                dir,
+                AgentKind::AntigravityCli,
+                HookEvent::SessionStart,
+                &raw
+            ),
+            Some(dir.join("briefed").join("agy-start-a_b"))
+        );
+        assert!(
+            antigravity_conversation_start_marker(
+                dir,
+                AgentKind::AntigravityCli,
+                HookEvent::SessionStart,
+                &serde_json::json!({})
+            )
+            .is_none()
+        );
+        assert!(
+            antigravity_conversation_start_marker(
+                dir,
+                AgentKind::AntigravityCli,
+                HookEvent::PostToolUse,
+                &raw
+            )
+            .is_none()
+        );
+        assert!(
+            antigravity_conversation_start_marker(
+                dir,
+                AgentKind::ClaudeCode,
+                HookEvent::SessionStart,
+                &raw
+            )
+            .is_none()
         );
     }
 
