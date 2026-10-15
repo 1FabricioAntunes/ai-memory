@@ -29,6 +29,7 @@ mod logging;
 mod marker;
 mod process_guard;
 mod server_profiles;
+mod terminal;
 
 use cli::{Cli, Command};
 use config::Config;

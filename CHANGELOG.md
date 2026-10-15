@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Grouped interactive `status` and `doctor` reports into sections with semantic
+  colors, consistent margins and terminal-width wrapping, retaining every
+  diagnostic field and remedy. Redirected, `NO_COLOR`,
+  `TERM=dumb` and JSON reports kept their existing stdout format. (#1313)
 - Added opt-in session inspection and owned-session purging for signed-in
   browser users, enabled at runtime with `serve --enable-session-management`
   (`AI_MEMORY_ENABLE_SESSION_MANAGEMENT`). A user can purge only a session they

@@ -550,6 +550,11 @@ ai-memory export-okf …               # export the wiki as an OKF bundle
 ai-memory serve                      # run the server
 ```
 
+On an interactive terminal, `status` and `doctor` group and wrap their output
+for readability. Redirected output, JSON, `NO_COLOR`, and `TERM=dumb` remain
+plain; see [Diagnostic report presentation](diagnostics.md) for the exact
+contract.
+
 ## When it isn't doing what you expect
 
 - **Server/homelab down**: `ai-memory run` does not need the server to start a
