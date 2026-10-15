@@ -193,7 +193,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
   },
   memory_restore_page: {
     status: "not_exposed",
-    reason: "restores one page from a git checkpoint; use callTool",
+    reason: "admin-only restore of one page from a git checkpoint; use callTool",
   },
 };
 

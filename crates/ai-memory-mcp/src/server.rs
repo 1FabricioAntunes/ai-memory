@@ -391,9 +391,11 @@ should be proposed from a completed session, or at explicit wrap-up \
   instead of falling back. Pass `expected_page_id` to delete only the \
   version you read.\n\
 - `memory_restore_page` — when the user asks to undo a page change or \
-  bring back a deleted page. Without `rev` it lists the page's checkpoints; \
-  with `rev` it writes that version back through `memory_write_page`. \
-  Follow the client-aware project-scope rule above.\n\
+  bring back a deleted page. Admin only (implicit on a single-operator \
+  server); project pages only, not `scope: \"profile\"` pages. Without \
+  `rev` it lists the page's checkpoints; with `rev` it writes that version, \
+  frontmatter included, back through the `memory_write_page` path. Follow \
+  the client-aware project-scope rule above.\n\
 - `memory_feedback` — right after a `memory_query` / `memory_read_page` \
   hit proves useful or misleading, and whenever the user says a recalled \
   page is out of date or wrong. Pass the exact `path` from the hit plus \
@@ -1691,6 +1693,38 @@ struct RestorePageArgs {
     /// Workspace of the page, together with `project`.
     #[serde(default)]
     workspace: Option<String>,
+}
+
+/// The page metadata a checkpoint's frontmatter carries, in the shape
+/// `memory_write_page` takes, so a restore keeps `kind`, `entities`,
+/// `abstract`, `relations` and the profile fields instead of clearing them.
+/// The write path validates them again with the same bounds as any write.
+fn checkpoint_write_metadata(
+    frontmatter: &serde_json::Value,
+) -> Result<ai_memory_core::page::PageWriteMetadata, McpError> {
+    const KEYS: [&str; 6] = [
+        "kind",
+        "entities",
+        "abstract",
+        "relations",
+        "applies_to",
+        "enforced_by",
+    ];
+    let picked: serde_json::Map<String, serde_json::Value> = KEYS
+        .iter()
+        .filter_map(|key| {
+            frontmatter
+                .get(*key)
+                .filter(|value| !value.is_null())
+                .map(|value| ((*key).to_owned(), value.clone()))
+        })
+        .collect();
+    serde_json::from_value(serde_json::Value::Object(picked)).map_err(|e| {
+        McpError::invalid_params(
+            format!("the checkpoint's page metadata cannot be restored as written: {e}"),
+            None,
+        )
+    })
 }
 
 /// Write one durable wiki page. Optional metadata (`kind`, `entities`,
@@ -4311,6 +4345,18 @@ impl AiMemoryServer {
         Parameters(args): Parameters<WritePageArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        self.write_page_in_scope(args, parts, None).await
+    }
+
+    /// The body of [`Self::memory_write_page`]. `resolved` is a scope the
+    /// caller already resolved and authorized (`memory_restore_page` resolves
+    /// once and must write where it read); `None` resolves from `args`.
+    async fn write_page_in_scope(
+        &self,
+        args: WritePageArgs,
+        parts: axum::http::request::Parts,
+        resolved: Option<ai_memory_store::ResolvedWriteScope>,
+    ) -> Result<CallToolResult, McpError> {
         let metadata = args
             .metadata
             .into_frontmatter()
@@ -4386,74 +4432,77 @@ impl AiMemoryServer {
                 None,
             ));
         }
-        let resolved_scope = match args.scope.as_deref().map(str::trim) {
-            None | Some("") => {
-                self.resolve_write_target_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?
-            }
-            Some("global") => {
-                if args
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || args
-                        .project
+        let resolved_scope = match resolved {
+            Some(resolved) => resolved,
+            None => match args.scope.as_deref().map(str::trim) {
+                None | Some("") => {
+                    self.resolve_write_target_with_actor(
+                        args.workspace.as_deref(),
+                        args.project.as_deref(),
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
+                    .await?
+                }
+                Some("global") => {
+                    if args
+                        .workspace
                         .as_deref()
                         .is_some_and(|s| !s.trim().is_empty())
-                {
+                        || args
+                            .project
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(McpError::internal_error(
+                            "scope: \"global\" cannot be combined with workspace/project",
+                            None,
+                        ));
+                    }
+                    // The same resolver and choke point as an explicit
+                    // `default/_global` write, so both spellings are gated alike.
+                    self.resolve_write_target_with_actor(
+                        Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
+                        Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
+                    .await?
+                }
+                Some("profile") => {
+                    if args
+                        .workspace
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        || args
+                            .project
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(McpError::internal_error(
+                            "scope: \"profile\" cannot be combined with workspace/project",
+                            None,
+                        ));
+                    }
+                    let (workspace_id, project_id) =
+                        self.profile_target_ids(&parts, &aps_actor, true).await?;
+                    ai_memory_store::ResolvedWriteScope {
+                        scope: ai_memory_store::ResolvedScope {
+                            workspace_id,
+                            project_id,
+                        },
+                        promoted_from: None,
+                    }
+                }
+                Some(other) => {
                     return Err(McpError::internal_error(
-                        "scope: \"global\" cannot be combined with workspace/project",
+                        format!(
+                            "unknown scope '{other}': the supported values are \"global\" and \"profile\""
+                        ),
                         None,
                     ));
                 }
-                // The same resolver and choke point as an explicit
-                // `default/_global` write, so both spellings are gated alike.
-                self.resolve_write_target_with_actor(
-                    Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
-                    Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?
-            }
-            Some("profile") => {
-                if args
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || args
-                        .project
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                {
-                    return Err(McpError::internal_error(
-                        "scope: \"profile\" cannot be combined with workspace/project",
-                        None,
-                    ));
-                }
-                let (workspace_id, project_id) =
-                    self.profile_target_ids(&parts, &aps_actor, true).await?;
-                ai_memory_store::ResolvedWriteScope {
-                    scope: ai_memory_store::ResolvedScope {
-                        workspace_id,
-                        project_id,
-                    },
-                    promoted_from: None,
-                }
-            }
-            Some(other) => {
-                return Err(McpError::internal_error(
-                    format!(
-                        "unknown scope '{other}': the supported values are \"global\" and \"profile\""
-                    ),
-                    None,
-                ));
-            }
+            },
         };
         let (ws, proj) = resolved_scope.scope.as_tuple();
         let manifest_warning = self.refresh_promoted_scope(&resolved_scope).await;
@@ -5019,26 +5068,35 @@ impl AiMemoryServer {
         annotations(
             title = "Restore memory page",
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = true,
-            open_world_hint = true
+            open_world_hint = false
         ),
         description = "Bring back an earlier version of a wiki page, \
-        including a deleted one. Without `rev`, lists the checkpoints that \
-        changed `path` (newest first): `{ path, checkpoints: [{ rev, summary, \
-        time }] }` — read-only. With `rev` (a listed checkpoint, or the \
-        checkpoint before a `memory_delete_page`), writes that \
-        version back as a new current version through `memory_write_page`, \
-        so sanitization, admission, attribution and supersession apply; the \
-        version it replaces stays reachable. Pass `workspace` + `project` \
-        together on static clients. Use only when the user asks to restore \
-        or undo a page change."
+        including a deleted one. Admin only: the same authority as \
+        `/admin/restore-page`, because a checkpoint can hold text a root \
+        deleted, purged or let expire (implicit on a single-operator \
+        server). Without `rev`, lists the checkpoints that changed `path` \
+        (newest first): `{ path, checkpoints: [{ rev, summary, time }] }`. \
+        With `rev` (a listed checkpoint, or the checkpoint before a \
+        `memory_delete_page`), writes that version back, frontmatter \
+        included, as a new current version through the `memory_write_page` \
+        path, so sanitization, admission, attribution and supersession \
+        apply; the version it replaces stays reachable. Project pages only: \
+        `scope: \"profile\"` pages cannot be restored here. Pass \
+        `workspace` + `project` together on static clients. Use only when \
+        the user asks to restore or undo a page change."
     )]
     async fn memory_restore_page(
         &self,
         Parameters(args): Parameters<RestorePageArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        // Git history keeps every version the live wiki dropped: pages a root
+        // deleted, purge-session removed or the forget sweep expired. Listing
+        // names those versions and restoring resurrects them, so both need
+        // `/admin/restore-page`'s authority, not a reader's or writer's grant.
+        self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
             return Err(McpError::internal_error(
@@ -5047,9 +5105,14 @@ impl AiMemoryServer {
             ));
         };
         let path = PagePath::new(args.path.clone())
+            .and_then(|p| p.ensure_portable().map(|()| p))
             .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
+        // Resolved once, no-create, for writing: the listing, the checkpoint
+        // read and the write all address this one project, so a moving
+        // active-project pointer cannot read from one project and write into
+        // another.
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -5061,6 +5124,7 @@ impl AiMemoryServer {
             let limit = args.limit.unwrap_or(20).clamp(1, 100);
             let checkpoints = wiki
                 .page_checkpoints(ws, proj, &path, limit)
+                .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             let checkpoints: Vec<_> = checkpoints
                 .into_iter()
@@ -5072,10 +5136,14 @@ impl AiMemoryServer {
             }));
         };
 
-        let md = wiki.page_at_checkpoint(ws, proj, &path, rev).map_err(|e| {
-            McpError::invalid_params(format!("cannot read {path} at {rev}: {e}"), None)
-        })?;
+        let md = wiki
+            .page_at_checkpoint(ws, proj, &path, rev)
+            .await
+            .map_err(|e| {
+                McpError::invalid_params(format!("cannot read {path} at {rev}: {e}"), None)
+            })?;
         let fm = &md.frontmatter;
+        let metadata = checkpoint_write_metadata(fm)?;
         let text = |key: &str| {
             fm.get(key)
                 .and_then(serde_json::Value::as_str)
@@ -5092,7 +5160,7 @@ impl AiMemoryServer {
             })
             .unwrap_or_default();
         let write = WritePageArgs {
-            metadata: Default::default(),
+            metadata,
             path: path.to_string(),
             body: md.body,
             title: text("title"),
@@ -5110,8 +5178,15 @@ impl AiMemoryServer {
             expected_page_id: None,
             create_only: false,
         };
+        let resolved = ai_memory_store::ResolvedWriteScope {
+            scope: ai_memory_store::ResolvedScope {
+                workspace_id: ws,
+                project_id: proj,
+            },
+            promoted_from: None,
+        };
         let result = self
-            .memory_write_page(Parameters(write), OptionalParts(parts))
+            .write_page_in_scope(write, parts, Some(resolved))
             .await?;
         if result.is_error.unwrap_or(false) {
             return Ok(result);
@@ -17388,6 +17463,117 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Keep the same event id.")
+        );
+    }
+
+    /// A restore must bring back the page's metadata, not only its body:
+    /// the write path clears omitted metadata, so a restore that dropped it
+    /// would silently strip `kind`, `entities`, `abstract` and `relations`.
+    #[tokio::test]
+    async fn memory_restore_page_round_trips_frontmatter_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki.clone());
+        let payload = serde_json::json!({
+            "path": "notes/metadata.md", "body": "# Metadata\n\nDurable content.",
+            "kind": "rule", "entities": ["sqlite", "writer actor"],
+            "abstract": "One-line summary.",
+            "relations": {"fixes": ["gotchas/build"], "contradicts": ["decisions/old.md"]},
+            "tags": ["storage"], "pinned": true, "tier": "procedural"
+        });
+        server
+            .memory_write_page(
+                Parameters(serde_json::from_value(payload.clone()).unwrap()),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let path = PagePath::new("notes/metadata.md").unwrap();
+        let before = wiki.read_page(ws, proj, &path).unwrap();
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: path.to_string(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let listed = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args(path.as_str(), None, None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let pre_delete = listed["checkpoints"][1]["rev"].as_str().unwrap().to_owned();
+        server
+            .memory_restore_page(
+                Parameters(restore_args(path.as_str(), Some(&pre_delete), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let after = wiki.read_page(ws, proj, &path).unwrap();
+        for key in [
+            "kind",
+            "entities",
+            "abstract",
+            "relations",
+            "tags",
+            "pinned",
+            "tier",
+        ] {
+            assert_eq!(
+                after.frontmatter.get(key),
+                before.frontmatter.get(key),
+                "restore must keep `{key}`: {}",
+                after.frontmatter
+            );
+        }
+        assert_eq!(after.frontmatter["kind"], "rule");
+        assert_eq!(after.frontmatter["relations"], payload["relations"]);
+        assert_eq!(after.body, before.body);
+    }
+
+    /// Metadata that the write path would refuse is refused from a
+    /// checkpoint too, before anything is written.
+    #[test]
+    fn checkpoint_write_metadata_keeps_only_page_metadata_and_rejects_bad_shapes() {
+        let meta = checkpoint_write_metadata(&serde_json::json!({
+            "title": "ignored here", "kind": "rule", "entities": ["a"],
+            "abstract": null, "session_id": "x"
+        }))
+        .unwrap();
+        assert_eq!(meta.kind.as_deref(), Some("rule"));
+        assert_eq!(meta.entities, ["a"]);
+        assert!(meta.abstract_text.is_none());
+        assert!(
+            checkpoint_write_metadata(&serde_json::json!({ "entities": "not-a-list" })).is_err()
+        );
+        assert!(
+            checkpoint_write_metadata(&serde_json::json!({ "relations": { "blocks": ["x"] } }))
+                .is_err()
         );
     }
 
