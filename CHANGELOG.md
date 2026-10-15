@@ -86,7 +86,10 @@ version in [`docs/changelog/`](docs/changelog/):
   and the drain stopped there, never posting the entries behind them that
   carry the accepted token. A refused credential now only holds back the
   entries that carry it: they stay queued, the first of them charged once
-  per pass, and the drain carries on with the rest. (#1283)
+  per pass, and the drain carries on with the rest. Entries captured with no
+  credential are still dropped once their attempt budget runs out; they are
+  never resent with the current token, which would attribute them to the
+  operator. (#1283)
 
 ## [3.0.0] - 2026-10-13
 
