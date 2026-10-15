@@ -4132,6 +4132,7 @@ const OPENCODE2_BINDING: &str = r#"
               startedSessions.delete(id);
               sessionCwds.delete(id);
             } else if (event.type === "session.compaction.started") {
+              recapFetches.delete(event.data.sessionID);
               const session = await ensureSession(event.data.sessionID);
               if (!session) continue;
               postPreCompact(event.data.sessionID, session.location.directory);
@@ -4153,6 +4154,9 @@ const OPENCODE2_BINDING: &str = r#"
         messageID: event.messageID,
         prompt: event.prompt.text,
       });
+      if (!session.parentID && RELOAD_TRIGGER.test(event.prompt.text)) {
+        recapFetches.set(event.sessionID, fetchRecap(session.location.directory, event.sessionID));
+      }
     });
     const contextRegistration = await ctx.session.hook("context", async (event) => {
       const id = event.sessionID;
@@ -4169,6 +4173,10 @@ const OPENCODE2_BINDING: &str = r#"
       if (handoff === undefined) handoffFetches.delete(id);
       if (handoff) {
         event.system.push({ type: "text", text: handoff });
+      }
+      const recap = await recapFetches.get(id);
+      if (recap) {
+        event.system.push({ type: "text", text: recap });
       }
     });
     const beforeRegistration = await ctx.tool.hook("execute.before", async (event) => {
@@ -5002,6 +5010,10 @@ function textFromParts(parts: unknown): string {{
 const sessionCwds = new Map<string, string>();
 const startedSessions = new Set<string>();
 const handoffFetches = new Map<string, Promise<string | undefined>>();
+// "reload context": the session's compaction recap, kept until its next
+// compaction like the handoff it sits beside.
+const RELOAD_TRIGGER = {reload_trigger};
+const recapFetches = new Map<string, Promise<string | undefined>>();
 const preCompactLast = new Map<string, number>();
 
 function cwdFor(id: string | undefined, directory: string): string {{
@@ -5030,6 +5042,7 @@ function endSession(id: string | undefined, directory: string, cwd?: string, ext
   postHook("session-end", {{ sessionID: id, cwd: resolvedCwd, ...extra }});
   sessionCwds.delete(id);
   handoffFetches.delete(id);
+  recapFetches.delete(id);
   preCompactLast.delete(id);
 }}
 
@@ -5077,6 +5090,25 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   }}
 }}
 
+async function fetchRecap(cwd: string, id: string): Promise<string | undefined> {{
+  if (captureServerRouted(cwd)) return undefined;
+  const url = new URL(`${{SERVER}}/recap`);
+  url.searchParams.set("agent", AGENT);
+  url.searchParams.set("session_id", id);
+  if (!applyMarkerParams(url, cwd)) return undefined;
+  try {{
+    const response = await fetch(url, {{
+      headers: authHeaders(),
+      signal: timeoutSignal(1000),
+    }});
+    if (!response.ok) return undefined;
+    const recap = (await response.text()).trim();
+    return recap || undefined;
+  }} catch (_e) {{
+    return undefined;
+  }}
+}}
+
 export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
   return {{
     dispose: async () => {{
@@ -5117,6 +5149,7 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
       if (event?.type === "session.compacted") {{
         const id = properties.sessionID;
         postPreCompact(id, directory);
+        if (id) recapFetches.delete(id);
       }}
     }},
     "chat.message": async (input, output) => {{
@@ -5131,6 +5164,8 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         messageID: (input as any).messageID,
         prompt: textFromParts((output as any).parts),
       }});
+      const prompt = textFromParts((output as any).parts);
+      if (id && RELOAD_TRIGGER.test(prompt)) recapFetches.set(id, fetchRecap(cwd, id));
     }},
     "tool.execute.before": async (input, output) => {{
       const id = sessionID(input);
@@ -5160,6 +5195,7 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
     "experimental.session.compacting": async (input) => {{
       const id = sessionID(input);
       postPreCompact(id, directory);
+      if (id) recapFetches.delete(id);
     }},
     "experimental.chat.system.transform": async (input, output) => {{
       const id = sessionID(input);
@@ -5172,6 +5208,8 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
       }}
       const handoff = await pending;
       if (handoff) (output as any).system.push(handoff);
+      const recap = await recapFetches.get(id);
+      if (recap) (output as any).system.push(recap);
     }},
   }};
 }};
@@ -5180,6 +5218,7 @@ export default AiMemoryHooks;
 "#,
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
+        reload_trigger = ai_memory_core::compaction_recap::RELOAD_TRIGGER_JS_REGEX,
     );
     // Anchors are compile-time constants over this same file's template;
     // a mismatch is a template edit that forgot the spool patch.
@@ -11146,6 +11185,56 @@ model = "gpt-5"
 
         remove_incompatible_opencode_plugin(&custom, AgentChoice::OpenCode2).unwrap();
         assert!(sibling.exists());
+    }
+
+    const RELOAD_TRIGGER_LINE: &str =
+        r"const RELOAD_TRIGGER = /^\s*reload context(?![\p{L}\p{N}_])/iu;";
+
+    #[test]
+    fn opencode_plugin_fetches_a_recap_for_a_reload_prompt() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(
+            plugin.contains(RELOAD_TRIGGER_LINE),
+            "trigger regex missing"
+        );
+        assert!(
+            plugin.contains("const recapFetches = new Map<string, Promise<string | undefined>>();")
+        );
+        assert!(plugin.contains("async function fetchRecap(cwd: string, id: string)"));
+        assert!(plugin.contains("`${SERVER}/recap`"));
+        assert!(plugin.contains(
+            "if (id && RELOAD_TRIGGER.test(prompt)) recapFetches.set(id, fetchRecap(cwd, id));"
+        ));
+        assert!(plugin.contains("if (recap) (output as any).system.push(recap);"));
+        // A new compaction starts a new window: both compaction paths and the
+        // session end forget the delivered recap.
+        assert_eq!(plugin.matches("recapFetches.delete(id);").count(), 3);
+    }
+
+    #[test]
+    fn opencode2_plugin_fetches_a_recap_for_a_reload_prompt() {
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", None, None, "denylist", false)
+                .unwrap();
+        assert!(
+            plugin.contains(RELOAD_TRIGGER_LINE),
+            "trigger regex missing"
+        );
+        assert!(plugin.contains("async function fetchRecap(cwd: string, id: string)"));
+        assert!(plugin.contains("RELOAD_TRIGGER.test(event.prompt.text)"));
+        assert!(plugin.contains("event.system.push({ type: \"text\", text: recap });"));
+        assert!(plugin.contains("recapFetches.delete(event.data.sessionID);"));
+    }
+
+    #[test]
+    fn omp_and_pi_extensions_do_not_fetch_a_recap() {
+        for extension in [
+            build_omp_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            build_pi_extension("http://127.0.0.1:49374", None, None, "denylist"),
+        ] {
+            assert!(!extension.contains("/recap"));
+            assert!(!extension.contains("RELOAD_TRIGGER"));
+        }
     }
 
     #[test]

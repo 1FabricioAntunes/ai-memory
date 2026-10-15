@@ -562,6 +562,18 @@ fn write_success_response<W: std::io::Write>(
 
 const GROK_ADDITIONAL_CONTEXT_CHARS: usize = 10_000;
 
+/// Grok carries the handoff and the recap in one `additionalContext`, clipped
+/// at [`GROK_ADDITIONAL_CONTEXT_CHARS`]. The recap is asked to fit the room
+/// the handoff leaves, so the clip never cuts its closing fence. `None` when
+/// that room is under the smallest recap the server renders: the recap then
+/// waits for the next tool result, which has the whole field to itself.
+fn grok_recap_room(handoff_chars: usize) -> Option<usize> {
+    const JOIN: usize = "\n\n".len();
+    GROK_ADDITIONAL_CONTEXT_CHARS
+        .checked_sub(handoff_chars + JOIN)
+        .filter(|room| *room >= ai_memory_hooks::RECAP_BUDGET_MIN)
+}
+
 fn grok_post_tool_handoff_envelope(handoff: &str) -> serde_json::Value {
     serde_json::json!({
         "hookSpecificOutput": {
@@ -607,6 +619,75 @@ fn handoff_shown_path(
     data_dir
         .join("handoff-shown")
         .join(key.file_name().unwrap_or_default())
+}
+
+/// A Grok "reload context" request waits for the session's next tool result.
+/// Grok reuses a session id after `SessionEnd`, so an unanswered request
+/// must not outlive the moment it was made.
+const RECAP_MARKER_TTL: Duration = Duration::from_secs(30 * 60);
+/// Codex previews model-visible hook output past about 2,500 tokens, so it
+/// asks for a recap that stays under that even at three chars per token.
+const CODEX_RECAP_BUDGET: usize = 6_000;
+
+fn recap_pending_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    let key = briefed_marker_path(data_dir, agent, session_id, cwd);
+    data_dir
+        .join("recap-pending")
+        .join(key.file_name().unwrap_or_default())
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Record a reload request for delivery on a later event. Best effort: a
+/// failed write only means the request is not delivered.
+fn mark_recap_pending(path: &Path) {
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_ok()
+    {
+        let _ = fs::write(path, unix_now_secs().to_string());
+    }
+}
+
+/// Whether a recorded reload request is still due. A stale or unreadable
+/// marker is removed.
+fn recap_pending_is_fresh(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let fresh = text
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|at| unix_now_secs().saturating_sub(at) <= RECAP_MARKER_TTL.as_secs());
+    if !fresh {
+        let _ = fs::remove_file(path);
+    }
+    fresh
+}
+
+fn recap_url(base: &str, agent: &str, session_id: &str, budget: Option<usize>) -> String {
+    let budget_qs = budget.map_or_else(String::new, |n| format!("&budget={n}"));
+    format!(
+        "{base}/recap?agent={agent}&session_id={}{budget_qs}",
+        url_encode(session_id)
+    )
+}
+
+fn user_prompt_recap_envelope(recap: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": recap,
+        }
+    })
 }
 
 fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
@@ -717,6 +798,10 @@ where
             return Ok(());
         }
     };
+    // Read before any capture rewrite can drop the prompt text.
+    let reload_requested = hook_event == HookEvent::UserPrompt
+        && ai_memory_hooks::user_prompt_text(&json)
+            .is_some_and(|prompt| ai_memory_core::compaction_recap::is_reload_request(&prompt));
     // Antigravity exposes PreInvocation rather than a true SessionStart. It
     // fires before every model call; invocation zero is the only startup
     // boundary. Fail closed when the documented counter is absent so a later
@@ -1081,6 +1166,55 @@ where
         }
     }
 
+    // "reload context": a recap of the window the last compaction dropped.
+    // Claude Code and Codex add the UserPromptSubmit envelope to this turn.
+    // Cursor runs Claude Code's settings too; its handling of this envelope
+    // is unverified, so a Cursor payload gets nothing. Drain first so the
+    // latest pre-compact boundary is stored before the recap reads it.
+    if reload_requested
+        && agent_kind.user_prompt_injects_context()
+        && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && let Some(session_id) = canonical_session_id.as_deref()
+    {
+        if !external_capture {
+            let _ = hook_spool::drain_exclusive_within_budget(
+                &spool,
+                &dd,
+                start_drain_budget(),
+                drain_event_timeout(),
+                max_attempts,
+            )
+            .await;
+        }
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+        let budget = (agent_kind == AgentKind::Codex).then_some(CODEX_RECAP_BUDGET);
+        let url = recap_url(base, &args.agent, session_id, budget);
+        if let Some(recap) = get_handoff(&client, &url, bearer.as_deref(), handoff_timeout()).await
+        {
+            writeln!(stdout, "{}", user_prompt_recap_envelope(&recap))?;
+            return Ok(());
+        }
+    }
+    // Grok discards an allowing UserPromptSubmit's output, so the request
+    // waits for the session's next tool result (below).
+    if reload_requested && agent_kind.post_tool_injects_handoff() && !subagent_payload {
+        mark_recap_pending(&recap_pending_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        ));
+    }
+    if hook_event == HookEvent::SessionEnd && agent_kind.post_tool_injects_handoff() {
+        let _ = fs::remove_file(recap_pending_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        ));
+    }
+
     // user-prompt: agents whose SessionStart stdout is discarded AND whose
     // UserPromptSubmit stdout is injected (Kimi Code) receive the handoff
     // here. Grok discards both, so it must not take this path: the GET
@@ -1175,8 +1309,11 @@ where
     // are discarded, so this is the event that can carry a handoff without
     // burning it. One fetch per session. A session that never calls a tool
     // leaves the handoff open for memory_handoff_accept.
+    // The same event carries a "reload context" recap the session's prompt
+    // asked for, once, after any handoff.
     if HookEvent::parse(&args.event) == HookEvent::PostToolUse
         && AgentKind::from_wire(&args.agent).post_tool_injects_handoff()
+        && !subagent_payload
     {
         let shown = handoff_shown_path(
             &dd,
@@ -1184,26 +1321,57 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        if !shown.is_file() && !subagent_payload {
+        let recap_pending = recap_pending_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        );
+        let wants_handoff = !shown.is_file();
+        let wants_recap = canonical_session_id.is_some() && recap_pending_is_fresh(&recap_pending);
+        if wants_handoff || wants_recap {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
-            let native_session_qs = canonical_session_id
-                .as_deref()
-                .map_or_else(String::new, |session_id| {
-                    format!("&session_id={}", url_encode(session_id))
-                });
-            let handoff_url = format!(
-                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
-                args.agent
-            );
-            let handoff =
-                get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await;
-            // Only a real body consumes this session's one chance. An empty
-            // or failed claim must retry on the next parent tool; a child
-            // session that errors must not burn the baton for the parent.
-            if let Some(handoff) = handoff {
-                mark_briefed(&shown);
-                let envelope = grok_post_tool_handoff_envelope(&handoff);
+            let mut parts = Vec::new();
+            if wants_handoff {
+                let native_session_qs = canonical_session_id
+                    .as_deref()
+                    .map_or_else(String::new, |session_id| {
+                        format!("&session_id={}", url_encode(session_id))
+                    });
+                let handoff_url = format!(
+                    "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                    args.agent
+                );
+                // Only a real body consumes this session's one chance. An empty
+                // or failed claim must retry on the next parent tool; a child
+                // session that errors must not burn the baton for the parent.
+                if let Some(handoff) =
+                    get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
+                {
+                    mark_briefed(&shown);
+                    parts.push(handoff);
+                }
+            }
+            // With no handoff the server's default budget already fits.
+            let recap_budget = match parts.first() {
+                Some(handoff) => grok_recap_room(handoff.chars().count()).map(Some),
+                None => Some(None),
+            };
+            if wants_recap
+                && let Some(session_id) = canonical_session_id.as_deref()
+                && let Some(budget) = recap_budget
+            {
+                let url = recap_url(base, &args.agent, session_id, budget);
+                if let Some(recap) =
+                    get_handoff(&client, &url, bearer.as_deref(), handoff_timeout()).await
+                {
+                    let _ = fs::remove_file(&recap_pending);
+                    parts.push(recap);
+                }
+            }
+            if !parts.is_empty() {
+                let envelope = grok_post_tool_handoff_envelope(&parts.join("\n\n"));
                 writeln!(stdout, "{envelope}")?;
                 return Ok(());
             }
@@ -7120,5 +7288,356 @@ mod tests {
                 .join(format!("session-{:04}", count - 1))
                 .is_file()
         );
+    }
+    fn codex_args(event: &str, server_url: &str) -> HookArgs {
+        let mut args = claude_args(event, server_url);
+        args.agent = "codex".into();
+        args
+    }
+
+    async fn run_hook(data_dir: &Path, args: HookArgs, payload: serde_json::Value) -> Vec<u8> {
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.to_path_buf()),
+            args,
+            payload.to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        stdout
+    }
+
+    /// Every request the stub saw, waiting briefly for each.
+    async fn all_requests(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Some(request) = first_request(requests).await {
+            seen.push(request);
+        }
+        seen
+    }
+
+    fn recap_requests(seen: &[String]) -> Vec<&String> {
+        seen.iter()
+            .filter(|r| r.starts_with("GET /recap"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn claude_reload_prompt_prints_the_recap_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "claude-session",
+                "cwd": tmp.path(),
+                "prompt": "reload context after last compaction, then go"
+            }),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "RECAP-BODY"
+        );
+        let seen = all_requests(&mut requests).await;
+        let recap = recap_requests(&seen);
+        assert_eq!(recap.len(), 1, "{seen:?}");
+        assert!(
+            recap[0].contains("session_id=claude-session"),
+            "{}",
+            recap[0]
+        );
+        assert!(recap[0].contains("agent=claude-code"), "{}", recap[0]);
+        assert!(!recap[0].contains("budget="), "{}", recap[0]);
+    }
+
+    #[tokio::test]
+    async fn codex_reload_prompt_asks_for_a_smaller_recap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            codex_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "codex-session",
+                "cwd": tmp.path(),
+                "prompt": "Reload context"
+            }),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "RECAP-BODY"
+        );
+        let seen = all_requests(&mut requests).await;
+        let recap = recap_requests(&seen);
+        assert_eq!(recap.len(), 1, "{seen:?}");
+        assert!(recap[0].contains("budget=6000"), "{}", recap[0]);
+    }
+
+    #[tokio::test]
+    async fn ordinary_prompt_does_not_fetch_a_recap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "claude-session",
+                "cwd": tmp.path(),
+                "prompt": "can you reload context later?"
+            }),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn cursor_running_claude_settings_does_not_fetch_a_recap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "cursor-session",
+                "cwd": tmp.path(),
+                "cursor_version": "2.0.0",
+                "prompt": "reload context"
+            }),
+        )
+        .await;
+        assert!(!String::from_utf8_lossy(&stdout).contains("RECAP-BODY"));
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn recap_server_down_leaves_the_prompt_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("user-prompt-submit", &dead_server_url()),
+            serde_json::json!({
+                "session_id": "claude-session",
+                "cwd": tmp.path(),
+                "prompt": "reload context"
+            }),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+    }
+
+    #[tokio::test]
+    async fn grok_reload_prompt_marks_and_never_fetches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("user-prompt", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": tmp.path(),
+                "prompt": "reload context, then continue"
+            }),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            data_dir
+                .join("recap-pending")
+                .join("grok-session")
+                .is_file(),
+            "recap marker missing"
+        );
+    }
+
+    fn grok_tool_payload(cwd: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "grok-session",
+            "cwd": cwd,
+            "tool_name": "read_file"
+        })
+    }
+
+    /// The handoff was already shown, so only the recap can be fetched.
+    fn mark_handoff_shown(data_dir: &Path) {
+        let shown = data_dir.join("handoff-shown");
+        std::fs::create_dir_all(&shown).unwrap();
+        std::fs::write(shown.join("grok-session"), b"").unwrap();
+    }
+
+    fn write_recap_marker(data_dir: &Path, age: Duration) {
+        let dir = data_dir.join("recap-pending");
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .saturating_sub(age)
+            .as_secs();
+        std::fs::write(dir.join("grok-session"), at.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_delivers_the_recap_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        mark_handoff_shown(&data_dir);
+        write_recap_marker(&data_dir, Duration::from_secs(5));
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["hookEventName"],
+            "PostToolUse"
+        );
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "RECAP-BODY"
+        );
+        assert!(!data_dir.join("recap-pending").join("grok-session").exists());
+        let seen = all_requests(&mut requests).await;
+        let recap = recap_requests(&seen);
+        assert_eq!(recap.len(), 1, "{seen:?}");
+        assert!(recap[0].contains("agent=grok"), "{}", recap[0]);
+
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        assert!(!String::from_utf8_lossy(&stdout).contains("RECAP-BODY"));
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn grok_recap_sharing_a_handoff_asks_for_the_room_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        write_recap_marker(&data_dir, Duration::from_secs(5));
+        // The fake server answers both GETs with this 3,000-char body.
+        let body: &'static str = Box::leak("H".repeat(3_000).into_boxed_str());
+        let (base, mut requests) = serve_requests("200 OK", body).await;
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        let context = envelope["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert_eq!(context.chars().count(), 3_000 + 2 + 3_000);
+        let seen = all_requests(&mut requests).await;
+        let recap = recap_requests(&seen);
+        assert_eq!(recap.len(), 1, "{seen:?}");
+        // 10,000 minus the handoff and the blank line joining them.
+        assert!(recap[0].contains("budget=6998"), "{}", recap[0]);
+    }
+
+    #[tokio::test]
+    async fn grok_recap_waits_for_the_next_tool_when_a_handoff_leaves_no_room() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        write_recap_marker(&data_dir, Duration::from_secs(5));
+        let body: &'static str = Box::leak("H".repeat(9_000).into_boxed_str());
+        let (base, mut requests) = serve_requests("200 OK", body).await;
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            9_000,
+            "only the handoff"
+        );
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            data_dir
+                .join("recap-pending")
+                .join("grok-session")
+                .is_file(),
+            "the recap must stay pending"
+        );
+
+        // The next tool result has the whole context to itself.
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        assert!(!stdout.is_empty());
+        let seen = all_requests(&mut requests).await;
+        let recap = recap_requests(&seen);
+        assert_eq!(recap.len(), 1, "{seen:?}");
+        assert!(!recap[0].contains("budget="), "{}", recap[0]);
+        assert!(!data_dir.join("recap-pending").join("grok-session").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_stale_recap_marker_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        mark_handoff_shown(&data_dir);
+        write_recap_marker(&data_dir, Duration::from_secs(31 * 60));
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let stdout = run_hook(
+            &data_dir,
+            grok_hook_args("post-tool-use", &base),
+            grok_tool_payload(tmp.path()),
+        )
+        .await;
+        assert!(!String::from_utf8_lossy(&stdout).contains("RECAP-BODY"));
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(!data_dir.join("recap-pending").join("grok-session").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_session_end_removes_the_recap_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        write_recap_marker(&data_dir, Duration::from_secs(5));
+        run_hook(
+            &data_dir,
+            grok_hook_args("session-end", &dead_server_url()),
+            serde_json::json!({ "session_id": "grok-session", "cwd": tmp.path() }),
+        )
+        .await;
+        assert!(!data_dir.join("recap-pending").join("grok-session").exists());
     }
 }

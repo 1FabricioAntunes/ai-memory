@@ -290,6 +290,13 @@ same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
 handoffs from the exact cwd, bounding repeated SessionEnds before any receiver
 starts.
+`GET /recap?session_id=` answers a prompt that starts with `reload context`
+(Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
+`PostToolUse`, OpenCode through its system/context hooks). It is read-only and
+anchored on the session row rather than a cwd: project read authorization and
+the handoff owner filter gate it, and it renders the captured prompts and last
+reply between the session's latest two `pre-compact` observations plus the
+project's open handoffs, listed without a claim.
 ai-memory opens native stores read-only. Raw sanitized JSONL segments are
 immutable, while SQLite supplies monotonic sequences, FTS, native
 source/delivery cursors, and idempotent retry state. A full-ledger

@@ -478,6 +478,19 @@ impl AgentKind {
         matches!(self, Self::KimiCode)
     }
 
+    /// Whether this agent adds a `UserPromptSubmit` hook's
+    /// `hookSpecificOutput.additionalContext` to the turn it belongs to.
+    ///
+    /// Claude Code places it alongside the submitted prompt and Codex adds it
+    /// as developer context (both hook references). The compaction recap uses
+    /// this channel. Grok discards an allowing `UserPromptSubmit`'s output,
+    /// and Kimi Code injects raw stdout rather than this envelope, so neither
+    /// is listed.
+    #[must_use]
+    pub fn user_prompt_injects_context(self) -> bool {
+        matches!(self, Self::ClaudeCode | Self::Codex)
+    }
+
     /// Whether `PostToolUse` stdout is model-visible context.
     ///
     /// Grok Build reads that stdout and delivers `hookSpecificOutput.additionalContext`
@@ -832,6 +845,18 @@ mod tests {
             assert_eq!(
                 agent.user_prompt_injects_handoff(),
                 agent == AgentKind::KimiCode,
+                "{}",
+                agent.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn user_prompt_context_injection_is_claude_code_and_codex() {
+        for agent in AgentKind::ALL {
+            assert_eq!(
+                agent.user_prompt_injects_context(),
+                matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex),
                 "{}",
                 agent.as_str()
             );

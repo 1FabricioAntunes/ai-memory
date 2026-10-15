@@ -72,6 +72,16 @@ version in [`docs/changelog/`](docs/changelog/):
   macOS and Windows installers on manual dispatch; they are not attached to
   releases until the project signs them. `setup --web` gained a hidden
   `--stop-on-stdin-eof` flag so the page stops when the app does. (#1273)
+- A prompt that starts with `reload context` (for example `reload context
+  after last compaction, then …`) now puts the stretch of the session that
+  its last compaction dropped back in front of the agent: the prompts typed
+  between the latest two compactions, verbatim; the last captured reply (with
+  the assistant-capture opt-in); and the project's open handoffs, listed
+  without claiming them. The new read-only `GET /recap` route builds it from
+  captured observations. Claude Code and Codex receive it with that prompt
+  through `UserPromptSubmit` `additionalContext`, OpenCode V1/V2 through the
+  plugin's system/context hook, and Grok Build on the next `PostToolUse`.
+  Serving the recap writes nothing, so a reload never consumes a baton (#1230).
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question

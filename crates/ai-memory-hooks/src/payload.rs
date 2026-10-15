@@ -507,6 +507,14 @@ pub fn parse_agent(s: &str) -> AgentKind {
     AgentKind::from_wire(s)
 }
 
+/// The prompt text of a `UserPromptSubmit`-style payload, from the same keys
+/// the router reads (`prompt`, `message`, `text`), flattened when a harness
+/// sends content blocks.
+#[must_use]
+pub fn user_prompt_text(raw: &serde_json::Value) -> Option<String> {
+    extract_content(raw, &["prompt", "message", "text"])
+}
+
 /// Identify the harness from the payload itself when it carries an
 /// unambiguous vendor marker, overriding the `?agent=` the hook command
 /// declared.

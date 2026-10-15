@@ -599,7 +599,7 @@ async fn owner_stamp_for_event(
 /// the same way the auth middleware already treats it. Reading `user` alone
 /// would file every operator behind such a proxy as anonymous and hand them all
 /// one shared bucket.
-fn actor_identity(
+pub(crate) fn actor_identity(
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
 ) -> Option<IdentityKey> {
     actor.and_then(|axum::Extension(ctx)| ctx.identity_key())
@@ -626,13 +626,15 @@ fn admission_skips(
     )
 }
 
-/// Build a router with `POST /hook` (event ingress) and `GET /handoff`
-/// (synchronous handoff-fetch for session-start hooks).
+/// Build a router with `POST /hook` (event ingress), `GET /handoff`
+/// (synchronous handoff-fetch for session-start hooks) and `GET /recap`
+/// (the read-only compaction recap for a "reload context" prompt).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
         .route("/hook", post(handle_hook))
         .route("/hook/batch", post(handle_hook_batch))
         .route("/handoff", get(handle_handoff))
+        .route("/recap", get(crate::recap::handle_recap))
         .with_state(Arc::new(state))
 }
 
@@ -2248,8 +2250,8 @@ const BRIEF_CORE_PAGES_LIMIT: usize = 24;
 /// How many recently-updated page titles the brief lists as follow-up
 /// pointers.
 const BRIEF_RECENT_PAGES_LIMIT: usize = 10;
-const UNTRUSTED_HISTORY_START: &str = "<!-- ai-memory:untrusted-history:start -->";
-const UNTRUSTED_HISTORY_END: &str = "<!-- ai-memory:untrusted-history:end -->";
+pub(crate) const UNTRUSTED_HISTORY_START: &str = "<!-- ai-memory:untrusted-history:start -->";
+pub(crate) const UNTRUSTED_HISTORY_END: &str = "<!-- ai-memory:untrusted-history:end -->";
 /// Closing instruction to the receiving agent. Rendered after the
 /// untrusted-history fence, so it is never budget-negotiable.
 const BRIEF_AGENT_FOOTER: &str = "\n_**To the receiving agent:** this brief is compiled from this \
@@ -2504,8 +2506,9 @@ fn render_brief_recent_section(recent: &[ai_memory_store::BriefingPage], budget:
 
 /// Neutralize the untrusted-history markers inside stored text, so it
 /// can neither close the fence early nor open a second one. Escaping is
-/// idempotent: the escaped form contains no marker.
-fn escape_untrusted_history(text: &str) -> String {
+/// idempotent: the escaped form contains no marker. Shared by the
+/// session-start brief and the compaction recap.
+pub(crate) fn escape_untrusted_history(text: &str) -> String {
     text.replace(
         UNTRUSTED_HISTORY_START,
         "&lt;!-- ai-memory:untrusted-history:start --&gt;",
@@ -4908,7 +4911,7 @@ const fn importance_for(event: HookEvent) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -6190,7 +6193,7 @@ mod tests {
         id
     }
 
-    async fn make_state(tmp: &TempDir) -> HookState {
+    pub(crate) async fn make_state(tmp: &TempDir) -> HookState {
         let store = Store::open(tmp.path()).unwrap();
         let ws = store
             .writer
