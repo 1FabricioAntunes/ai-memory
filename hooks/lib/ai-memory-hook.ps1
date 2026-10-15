@@ -1079,7 +1079,13 @@ function Invoke-AiMemoryHook {
         Clear-AiMemorySessionId -Agent $Agent
     }
 
-    if ($FetchHandoff) {
+    # `GET /handoff` claims the newest open baton in whatever project the
+    # server resolves. A payload that names no directory would send no `cwd`,
+    # the server would fall back to its default or the caller's last active
+    # project, and the claim could consume another repository's handoff.
+    # Without a directory the handoff stays open for memory_handoff_accept
+    # (parity with the native hook and `ai_memory_get_handoff`).
+    if ($FetchHandoff -and $Cwd) {
         $NativeSessionQS = ""
         $NativeSessionId = $null
         try {
@@ -1211,7 +1217,7 @@ function Invoke-AiMemoryHook {
         if ($ProfileFile) {
             Set-AiMemoryBriefed -Path $ProfileFile
         }
-    } elseif ($AntigravityPreInvocationOutput) {
+    } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
         [Console]::Out.Write("{}")
     }
 }

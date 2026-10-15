@@ -5062,6 +5062,10 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
 }}
 
 async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
+  // The GET claims the newest open handoff in whatever project the server
+  // resolves; with no directory that is its default or last active project,
+  // so another repository's baton could be consumed. Leave it open instead.
+  if (!cwd) return undefined;
   if (captureServerRouted(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
@@ -5816,6 +5820,10 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
 }}
 
 async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
+  // The GET claims the newest open handoff in whatever project the server
+  // resolves; with no directory that is its default or last active project,
+  // so another repository's baton could be consumed. Leave it open instead.
+  if (!cwd) return undefined;
   if (captureServerRouted(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
@@ -12469,6 +12477,158 @@ model = "gpt-5"
                 .unwrap_or_else(|| panic!("{agent}: handoff fetch must be gated"));
             let request = handoff.find("/handoff`").unwrap();
             assert!(guard < request, "{agent}: gate must precede the request");
+        }
+    }
+
+    /// `GET /handoff` claims a baton in whatever project the server resolves,
+    /// so a generated integration must never send one without a directory:
+    /// the server would use its default or last active project. OpenCode
+    /// always has its plugin `directory`; Pi and OMP read `ctx.cwd`, which a
+    /// host may omit.
+    #[test]
+    fn generated_integrations_never_fetch_a_handoff_without_a_directory() {
+        let plugins = [
+            (
+                "opencode",
+                build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist"),
+            ),
+            (
+                "opencode2",
+                build_opencode2_plugin("http://127.0.0.1:49374", None, None, "denylist", false)
+                    .unwrap(),
+            ),
+            (
+                "omp",
+                build_omp_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            ),
+            (
+                "pi",
+                build_pi_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            ),
+        ];
+        for (agent, plugin) in plugins {
+            let handoff = plugin
+                .split_once("async function fetchHandoff(")
+                .unwrap_or_else(|| panic!("{agent}: no fetchHandoff"))
+                .1;
+            let guard = handoff
+                .find("if (!cwd) return undefined;")
+                .unwrap_or_else(|| panic!("{agent}: handoff fetch must require a directory"));
+            let request = handoff.find("/handoff`").unwrap();
+            assert!(guard < request, "{agent}: guard must precede the request");
+        }
+    }
+
+    /// Slow tier: spawns Node to run the generated OMP extension.
+    mod slow_generated_handoff_runtime {
+        use super::*;
+
+        const PLACEHOLDER_SERVER: &str = "http://127.0.0.1:65535";
+
+        /// Binds a loopback stand-in for the server, points the rendered
+        /// extension at it, then drives `before_agent_start` for a context
+        /// whose `cwd` is empty and for one that names a directory. Every
+        /// `/handoff` request is recorded with the `cwd` it named.
+        const HARNESS: &str = r#"import { createServer } from "node:http";
+import { readFileSync, writeFileSync } from "node:fs";
+
+const project = process.argv[2]!;
+const claims: string[] = [];
+const server = createServer((req, res) => {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  req.resume();
+  if (url.pathname === "/handoff") {
+    claims.push(url.searchParams.get("cwd") ?? "<none>");
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("OTHER-PROJECT-HANDOFF");
+    return;
+  }
+  res.writeHead(204);
+  res.end();
+});
+await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+const port = (server.address() as any).port;
+writeFileSync(
+  "./ext.ts",
+  readFileSync("./ext.template.ts", "utf8").replace("http://127.0.0.1:65535", `http://127.0.0.1:${port}`),
+);
+const { default: AiMemoryExtension } = await import("./ext.ts");
+const handlers: Record<string, any> = {};
+AiMemoryExtension({ on: (name: string, fn: any) => { handlers[name] = fn; } });
+const ctx = (id: string, cwd?: string) => ({
+  sessionManager: { getSessionId: () => id },
+  ...(cwd === undefined ? {} : { cwd }),
+});
+const unscoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-unscoped", ""));
+const scoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-scoped", project));
+console.log(JSON.stringify({
+  claims,
+  unscoped: unscoped?.message?.content ?? null,
+  scoped: scoped?.message?.content ?? null,
+}));
+process.exit(0);
+"#;
+
+        #[test]
+        fn omp_extension_never_claims_a_handoff_without_a_directory() {
+            if !Command::new("node")
+                .args(["--experimental-strip-types", "--version"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+            {
+                eprintln!("skipping: node lacks --experimental-strip-types");
+                return;
+            }
+            let tmp = TempDir::new().unwrap();
+            let project = tmp.path().join("project");
+            fs::create_dir(&project).unwrap();
+            fs::write(
+                tmp.path().join("ext.template.ts"),
+                build_omp_extension(PLACEHOLDER_SERVER, None, None, "denylist"),
+            )
+            .unwrap();
+            fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
+            let mut command = Command::new("node");
+            for (key, _) in std::env::vars_os() {
+                let key_text = key.to_string_lossy();
+                if key_text.starts_with("AI_MEMORY_") || key_text.starts_with("GIT_") {
+                    command.env_remove(&key);
+                }
+            }
+            let output = command
+                .args(["--experimental-strip-types", "--no-warnings", "harness.ts"])
+                .arg(&project)
+                .current_dir(tmp.path())
+                .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
+                .env("AI_MEMORY_HOME", tmp.path())
+                .env("AI_MEMORY_DATA_DIR", tmp.path().join("data"))
+                .env("GIT_CONFIG_GLOBAL", tmp.path().join("absent-gitconfig"))
+                .env("GIT_CONFIG_SYSTEM", tmp.path().join("absent-gitconfig"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "harness failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let run: serde_json::Value = serde_json::from_slice(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .last()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+            // Only the scoped context claims, and it names its directory.
+            assert_eq!(
+                run["claims"],
+                serde_json::json!([project.to_string_lossy()]),
+                "{run}"
+            );
+            assert_eq!(run["unscoped"], serde_json::Value::Null, "{run}");
+            assert_eq!(run["scoped"], "OTHER-PROJECT-HANDOFF", "{run}");
         }
     }
 

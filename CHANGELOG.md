@@ -12,6 +12,16 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed a hook claiming a handoff from the wrong project when an event named
+  no directory. A `SessionStart` (or Kimi Code's `UserPromptSubmit`, or Grok's
+  first `PostToolUse`) whose payload carried no `cwd` sent `GET /handoff` with
+  no scope, so the server resolved its default project or the caller's last
+  active one, and the hook consumed that project's handoff. The native hook,
+  the shell and PowerShell hook bundles, and the generated OpenCode, OpenCode 2,
+  OMP and Pi integrations now fetch no handoff without a directory, for every
+  agent; the native hook says so on stderr at session start. The handoff stays
+  open for `memory_handoff_accept`. Devin still falls back to
+  `DEVIN_PROJECT_DIR`, then the hook's own directory. (#1312)
 - Fixed `ai-memory setup` reporting "ai-memory is set up" after it installed
   Codex hooks that Codex had not trusted yet. Codex skips an untrusted hook,
   so Codex sessions went uncaptured. When Codex was wired, `setup` now asks

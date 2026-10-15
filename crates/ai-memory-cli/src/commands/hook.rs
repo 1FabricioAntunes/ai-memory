@@ -970,6 +970,12 @@ where
         },
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
+    // `GET /handoff` claims the newest open baton in whatever project the
+    // server resolves. With no cwd the request names none, and the server
+    // falls back to its default or the caller's last active project, so an
+    // unscoped claim could consume another repository's handoff. Without a
+    // resolved directory the handoff stays open for `memory_handoff_accept`.
+    let handoff_scoped = policy_cwd.is_some();
     let spool = hook_spool::spool_dir(&dd);
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
@@ -1097,7 +1103,13 @@ where
         // consume the handoff server-side (the GET is destructive) and then
         // discard the result — silently losing it. Those agents recover the
         // handoff on demand via the MCP `memory_handoff_accept` tool.
-        if agent_kind.session_start_injects_handoff() {
+        if agent_kind.session_start_injects_handoff() && !handoff_scoped {
+            eprintln!(
+                "ai-memory hook warning: the event named no project directory, so no handoff \
+                 was fetched; recover a pending one with memory_handoff_accept"
+            );
+        }
+        if agent_kind.session_start_injects_handoff() && handoff_scoped {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -1135,6 +1147,7 @@ where
     // canonicalizes both (and the snake/native spellings) to UserPrompt.
     if HookEvent::parse(&args.event) == HookEvent::UserPrompt
         && AgentKind::from_wire(&args.agent).user_prompt_injects_handoff()
+        && handoff_scoped
     {
         let client = build_client();
         let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
@@ -1227,7 +1240,7 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        if !shown.is_file() && !subagent_payload {
+        if handoff_scoped && !shown.is_file() && !subagent_payload {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id
@@ -2516,6 +2529,84 @@ mod tests {
             "{}",
             entries[0].url
         );
+    }
+
+    /// `GET /handoff` claims a baton in whatever project the server resolves,
+    /// so an event that names no directory must not send one: the server
+    /// would fall back to its default or the caller's last active project and
+    /// consume another repository's handoff. Control: the same event with a
+    /// `cwd` claims, scoped to that directory.
+    #[tokio::test]
+    async fn a_handoff_is_never_claimed_without_a_project_directory() {
+        let cases = [
+            ("claude-code", "session-start", serde_json::json!({})),
+            ("codex", "session-start", serde_json::json!({})),
+            (
+                "kimi-code",
+                "user-prompt-submit",
+                serde_json::json!({"prompt": "continue"}),
+            ),
+            (
+                "grok",
+                "post-tool-use",
+                serde_json::json!({"tool_name": "read_file", "tool_input": {}}),
+            ),
+        ];
+        for (agent, event, extra) in cases {
+            for with_cwd in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let project = tmp.path().join("project");
+                std::fs::create_dir(&project).unwrap();
+                let (base, mut requests) = serve_requests("200 OK", "OTHER-PROJECT-HANDOFF").await;
+                let mut payload = extra.clone();
+                payload["session_id"] = "11111111-2222-3333-4444-555555555555".into();
+                if with_cwd {
+                    payload["cwd"] = project.to_string_lossy().into_owned().into();
+                }
+                let mut stdout = Vec::new();
+                run_with_payload(
+                    Some(tmp.path().join("data")),
+                    HookArgs {
+                        agent: agent.into(),
+                        server_url: base,
+                        ..devin_hook_args(event)
+                    },
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| Ok(()),
+                )
+                .await
+                .unwrap();
+                let mut recorded = Vec::new();
+                while let Some(request) = first_request(&mut requests).await {
+                    recorded.push(request);
+                }
+                let claims: Vec<_> = recorded
+                    .iter()
+                    .filter(|request| request.starts_with("GET /handoff?"))
+                    .collect();
+                let stdout = String::from_utf8(stdout).unwrap();
+                if with_cwd {
+                    assert_eq!(claims.len(), 1, "{agent}: {recorded:?}");
+                    let target = claims[0].split_whitespace().nth(1).unwrap();
+                    assert_eq!(
+                        query_param(target, "cwd"),
+                        Some(url_encode(&project.to_string_lossy()).as_str()),
+                        "{agent}: the claim names its directory: {target}"
+                    );
+                    assert!(
+                        stdout.contains("OTHER-PROJECT-HANDOFF"),
+                        "{agent}: {stdout}"
+                    );
+                } else {
+                    assert!(claims.is_empty(), "{agent}: unscoped claim: {recorded:?}");
+                    assert!(
+                        !stdout.contains("OTHER-PROJECT-HANDOFF"),
+                        "{agent}: {stdout}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
