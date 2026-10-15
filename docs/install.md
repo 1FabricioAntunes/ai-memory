@@ -131,7 +131,11 @@ the commands a native install otherwise needs one by one:
    engine share a store with OpenCode and Kiro CLI, so they are wired only
    when named, for example `--agent opencode2`.
 4. A self-check that writes nothing: `GET /healthz`, a `memory_status` call
-   over MCP with the install's credential, and `doctor`.
+   over MCP with the install's credential, and `doctor`. When Codex was wired,
+   `setup` also asks Codex whether it will run the ai-memory hooks. If Codex
+   has not trusted them yet, the closing line says so and tells you to open
+   Codex, run `/hooks`, and trust them, instead of reporting the install as
+   ready. That still exits 0, because only you can grant the trust in Codex.
 
 Without `--yes`, `setup` prints this plan and asks on a terminal; with no
 terminal (a script, an agent's tool call) it changes nothing and exits

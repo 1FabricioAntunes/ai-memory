@@ -439,6 +439,54 @@ esac
         );
     }
 
+    /// Codex skips hooks the user has not trusted in `/hooks`. A `setup` that
+    /// wired Codex while Codex reports its hooks untrusted names the `/hooks`
+    /// approval instead of claiming everything is set up, and still exits 0:
+    /// only the user can grant that trust. Codex's `hooks/list` answer comes
+    /// from a fake `codex` first on `PATH`; the operator's Codex never runs.
+    #[tokio::test]
+    async fn setup_names_pending_codex_hook_trust_instead_of_claiming_ready() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sandbox = Sandbox::new();
+        let service = Service::new(&sandbox.root);
+        let hooks = sandbox.home.join(".codex/hooks.json");
+        let reply = json!({"jsonrpc": "2.0", "id": 2, "result": {"data": [{"hooks": [{
+            "eventName": "sessionStart", "trustStatus": "untrusted", "sourcePath": hooks,
+            "command": "ai-memory hook --event session-start --agent codex"
+        }]}]}})
+        .to_string();
+        let fake = service.bin.join("codex");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"id\":2'*) \
+                 printf '%s\\n' '{reply}' ;;\nesac\ndone\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let port = crate::e2e_support::free_port();
+
+        let out = setup(&sandbox, &service, port, &["--yes", "--agent", "codex"]);
+        assert!(out.status.success(), "{}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            std::fs::read_to_string(&hooks)
+                .unwrap()
+                .contains("ai-memory"),
+            "{}",
+            text(&out)
+        );
+        assert!(!stdout.contains("ai-memory is set up."), "{}", text(&out));
+        assert!(
+            stdout.contains("Codex has not approved its 1 ai-memory hook(s)")
+                && stdout.contains("sessionStart (untrusted)")
+                && stdout.contains("run /hooks"),
+            "{}",
+            text(&out)
+        );
+    }
+
     fn uninstall(sandbox: &Sandbox, service: &Service, port: u16) -> Output {
         let mut cmd = sandbox.cmd(Some(port));
         service.apply(&mut cmd);

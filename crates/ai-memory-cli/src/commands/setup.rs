@@ -530,9 +530,8 @@ async fn execute(
         println!("{hint}");
     }
     if problems.is_empty() {
-        println!(
-            "ai-memory is set up. Restart your agents so they load the new hooks and MCP entry."
-        );
+        let codex = codex_hook_trust(&config, &plan).await;
+        println!("{}", ready_message(codex.as_ref()));
         return Ok(());
     }
     for problem in &problems {
@@ -542,6 +541,57 @@ async fn execute(
         "setup finished with {} problem(s); fix them and re-run `ai-memory setup`",
         problems.len()
     )
+}
+
+/// Codex's trust state for the ai-memory hooks setup left in place: the
+/// hooks file `install-hooks` wrote, or the enabled plugin's hooks. `None`
+/// when Codex was not wired or its state is unknown (Codex not installed or
+/// not answering).
+async fn codex_hook_trust(
+    config: &Config,
+    plan: &SetupPlan,
+) -> Option<super::codex_hook_trust::CodexHookTrust> {
+    let codex = plan
+        .agents
+        .iter()
+        .find(|agent| agent.agent == AgentChoice::Codex)?;
+    let cwd = std::env::current_dir().ok()?;
+    if codex.plugin {
+        super::codex_hook_trust::probe(
+            Path::new("codex"),
+            super::codex_hook_trust::HookSource::Plugin(agent_plugins::PLUGIN_ID),
+            &cwd,
+        )
+        .await
+    } else {
+        doctor::codex_hook_trust(&config.runtime_env, &cwd).await
+    }
+}
+
+/// The closing line of a run with no problems. Codex skips a hook the user
+/// has not trusted in its `/hooks` review, so with any skipped the install
+/// is not ready for Codex yet. Setup still succeeds: only the user can grant
+/// that trust, inside Codex, and re-running setup would not change it.
+fn ready_message(codex: Option<&super::codex_hook_trust::CodexHookTrust>) -> String {
+    let restart = "Restart your agents so they load the new hooks and MCP entry.";
+    match codex.filter(|trust| !trust.skipped.is_empty()) {
+        None => format!("ai-memory is set up. {restart}"),
+        Some(trust) => {
+            let skipped: Vec<String> = trust
+                .skipped
+                .iter()
+                .map(|(event, status)| format!("{event} ({status})"))
+                .collect();
+            format!(
+                "ai-memory is installed, but Codex has not approved its {} ai-memory hook(s) \
+                 yet: {}. Codex skips a hook until you trust it, so Codex sessions are not \
+                 captured until then. Action required: open Codex, run /hooks, and trust \
+                 them. {restart}",
+                trust.skipped.len(),
+                skipped.join(", "),
+            )
+        }
+    }
 }
 
 /// How a browser signs in to the web UI on a token-file install. With no
@@ -853,6 +903,39 @@ mod tests {
 
         install_codex_plugin(home.path());
         assert!(AgentPlan::detect(AgentChoice::Codex, home.path(), &env).plugin);
+    }
+
+    /// Codex skips an untrusted hook, so a run that left any unapproved says
+    /// so and names `/hooks` instead of claiming the install is ready; all
+    /// trusted, or an unknown state, keeps the plain ready line.
+    #[test]
+    fn untrusted_codex_hooks_are_not_reported_as_ready() {
+        use super::super::codex_hook_trust::CodexHookTrust;
+        let ready = "ai-memory is set up.";
+
+        let untrusted = CodexHookTrust {
+            trusted: vec!["stop".to_owned()],
+            skipped: vec![
+                ("sessionStart".to_owned(), "untrusted".to_owned()),
+                ("userPromptSubmit".to_owned(), "modified".to_owned()),
+            ],
+        };
+        let message = ready_message(Some(&untrusted));
+        assert!(!message.contains(ready), "{message}");
+        assert!(message.contains("run /hooks"), "{message}");
+        assert!(
+            message.contains("2 ai-memory hook(s)")
+                && message.contains("sessionStart (untrusted)")
+                && message.contains("userPromptSubmit (modified)"),
+            "{message}"
+        );
+
+        let trusted = CodexHookTrust {
+            trusted: vec!["sessionStart".to_owned()],
+            skipped: Vec::new(),
+        };
+        assert!(ready_message(Some(&trusted)).starts_with(ready));
+        assert!(ready_message(None).starts_with(ready));
     }
 
     /// A token-file install learns how to open the web UI: the URL and the

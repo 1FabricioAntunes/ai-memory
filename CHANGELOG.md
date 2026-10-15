@@ -12,6 +12,12 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `ai-memory setup` reporting "ai-memory is set up" after it installed
+  Codex hooks that Codex had not trusted yet. Codex skips an untrusted hook,
+  so Codex sessions went uncaptured. When Codex was wired, `setup` now asks
+  Codex for the hooks' trust state, the way `doctor` does, and when any are
+  untrusted or modified it names them and says to open Codex, run `/hooks`,
+  and trust them. It still exits 0. (#1313)
 - Fixed `install-instructions` treating a line that is exactly `@AGENTS.md` as
   proof that Claude Code loads the `AGENTS.md` being written. Claude Code
   resolves `@path` from the file that contains the import, including in the
