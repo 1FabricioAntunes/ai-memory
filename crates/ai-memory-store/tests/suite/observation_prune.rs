@@ -10,7 +10,7 @@
 //! the delete leaves every observation of a session with a claimable job in
 //! place while still pruning a sibling session in the same batch, and the
 //! dry-run count — which shares the one SQL fragment
-//! (`ops::CONSOLIDATION_QUEUE_GUARD_SQL`) with the delete — equals what the
+//! (`ops::OBSERVATION_PRUNE_SESSION_GUARD_SQL`) with the delete — equals what the
 //! prune deletes in every job state.
 
 use ai_memory_core::{ProjectId, SessionId, WorkspaceId};
@@ -277,6 +277,31 @@ async fn a_pending_job_protects_a_consolidated_sessions_observations() {
 async fn a_running_job_protects_a_consolidated_sessions_observations() {
     let (_tmp, store) = open_seeded(Some("running"));
     assert_case(&measure(&store).await, Some("running"));
+}
+
+/// Capture can resume after a session ended but before its next checkpoint or
+/// SessionEnd enqueues a consolidation job. The persisted end generation then
+/// trails the live observation count, which must protect the new raw rows.
+#[tokio::test]
+async fn resumed_capture_is_protected_before_its_next_job_exists() {
+    let (_tmp, store) = open_seeded(None);
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE sessions SET ended_observation_count = 2 WHERE id = ?1",
+        params![s1().as_bytes()],
+    )
+    .unwrap();
+
+    let m = measure(&store).await;
+    assert_eq!(m.count_before, 3);
+    assert_eq!(m.deleted, 3);
+    assert_eq!(m.s1_rows, 3, "resumed capture must remain intact");
+    assert_eq!(m.s1_watermark, 2, "the prior end generation is unchanged");
+    assert_eq!(m.s2_rows, 0, "the fully ended control is still pruned");
+    assert_eq!(m.s2_watermark, 0);
+    assert_eq!(m.touched, vec![s2()]);
+    assert_eq!(m.resynced, 1);
+    assert_eq!(m.count_after, 0);
 }
 
 /// `completed`, `failed` and `superseded` are terminal for the automatic

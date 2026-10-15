@@ -4051,17 +4051,18 @@ pub struct ObservationPruneOutcome {
     pub sessions_resynced: usize,
 }
 
-/// Queued-consolidation exclusion shared, byte for byte, by the observation
-/// prune and its dry-run count (`ReaderPool::prunable_observation_count`):
-/// a session with a `session_consolidation_jobs` row in `pending` or
-/// `running` still needs its raw capture, so those rows never match, however
-/// old. Defined once here and interpolated at both call sites so the two
-/// queries cannot drift apart. The primary key `(session_id, generation)`
-/// already serves the lookup by `session_id`; no extra index is needed.
-pub(crate) const CONSOLIDATION_QUEUE_GUARD_SQL: &str = "NOT EXISTS ( \
+/// Active-work exclusion shared, byte for byte, by the observation prune and
+/// its dry-run count (`ReaderPool::prunable_observation_count`). The caller
+/// applies this once per distinct candidate session as alias `s`: a queued job
+/// still needs its raw capture, and an ended session whose observation count
+/// advanced has resumed but not yet reached the next consolidation enqueue.
+pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "NOT EXISTS ( \
     SELECT 1 FROM session_consolidation_jobs j \
-    WHERE j.session_id = o.session_id \
+    WHERE j.session_id = s.id \
       AND j.state IN ('pending', 'running') \
+) AND s.ended_observation_count >= ( \
+    SELECT COUNT(*) FROM observations current \
+    WHERE current.session_id = s.id \
 )";
 
 /// Permanently delete one bounded batch of raw observations belonging to
@@ -4079,13 +4080,18 @@ pub(crate) const CONSOLIDATION_QUEUE_GUARD_SQL: &str = "NOT EXISTS ( \
 /// row, or one that never ended, matches nothing and can never be pruned.
 ///
 /// A session with a consolidation job the worker can still claim is excluded
-/// by [`CONSOLIDATION_QUEUE_GUARD_SQL`] even when every other predicate
+/// by [`OBSERVATION_PRUNE_SESSION_GUARD_SQL`] even when every other predicate
 /// holds: that job — a `pending` row (a transient failure is recorded as a
 /// `pending` retry, not `failed`) or a `running` row whose stale lease the
 /// next claim reclaims — still reads the raw capture to consolidate the
 /// session, and pruning underneath it would consolidate a truncated session.
 /// `completed`, `failed` and `superseded` rows are terminal for the automatic
 /// worker and block nothing.
+///
+/// The same guard excludes a resumed session before its next job exists.
+/// `ended_observation_count` is the generation covered by its latest end; a
+/// larger live count means new capture has arrived and is not yet represented
+/// by the session-end page/queue state.
 ///
 /// `ORDER BY created_at` makes the batching deterministic: a run interrupted
 /// halfway leaves a clean age boundary rather than holes, so the next run
@@ -4114,20 +4120,24 @@ pub fn prune_consolidated_observations(
     let mut deleted = 0usize;
     let mut sessions: BTreeSet<Vec<u8>> = BTreeSet::new();
     {
+        let guard = OBSERVATION_PRUNE_SESSION_GUARD_SQL;
         let mut stmt = tx.prepare(&format!(
-            "DELETE FROM observations \
+            "WITH candidate_sessions AS ( \
+                 SELECT DISTINCT session_id FROM observations \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND created_at < ?3 \
+             ), eligible_sessions AS MATERIALIZED ( \
+                 SELECT s.id FROM candidate_sessions candidate \
+                 JOIN sessions s ON s.id = candidate.session_id \
+                 JOIN pages p ON p.id = s.summary_page_id \
+                 WHERE p.superseded_at IS NULL AND {guard} \
+             ) \
+             DELETE FROM observations \
              WHERE id IN ( \
                  SELECT o.id FROM observations o \
+                 JOIN eligible_sessions eligible ON eligible.id = o.session_id \
                  WHERE o.workspace_id = ?1 \
                    AND o.project_id = ?2 \
                    AND o.created_at < ?3 \
-                   AND EXISTS ( \
-                       SELECT 1 FROM sessions s \
-                       JOIN pages p ON p.id = s.summary_page_id \
-                       WHERE s.id = o.session_id \
-                         AND p.superseded_at IS NULL \
-                   ) \
-                   AND {CONSOLIDATION_QUEUE_GUARD_SQL} \
                  ORDER BY o.created_at \
                  LIMIT ?4 \
              ) \
