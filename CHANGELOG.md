@@ -72,6 +72,13 @@ version in [`docs/changelog/`](docs/changelog/):
 - Updated rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349,
   in the server and in the importer, relay and wikisync companions, and the
   importer's anyhow to 1.0.104 for RUSTSEC-2026-0190. (#1286)
+- Fixed the hook spool delivering nothing after `ai-memory auth enable`
+  while it still held entries captured before the switch. Those entries
+  carry no credential and sort first, so their batch was refused with `401`
+  and the drain stopped there, never posting the entries behind them that
+  carry the accepted token. A refused credential now only holds back the
+  entries that carry it: they stay queued, the first of them charged once
+  per pass, and the drain carries on with the rest. (#1283)
 
 ## [3.0.0] - 2026-10-13
 
