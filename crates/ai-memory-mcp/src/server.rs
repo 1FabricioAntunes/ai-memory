@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_compaction,
+    AutoImproveReviewConfig, ColdClusterDedup, Consolidator, LedgerRetention, ObservationRetention,
+    projection::cap_text_with_marker, run_auto_improve_review, run_lint, run_sweep_with_ledgers,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -409,9 +409,15 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
-  pages. Three passes: expired pages are hard-deleted even when \
+  pages. Five passes: expired pages are hard-deleted even when \
   pinned, cold episodic pages decay to tombstones (pinned exempt), \
-  old tombstones are purged (idempotent, supports dry-run).\n\
+  old tombstones are purged, old raw observations are pruned, and \
+  old hook event ledgers (log-YYYY-MM.md) are deleted — the last two \
+  only when their opt-in retention is configured (decay \
+  `observation_retention_days` / `ledger_retention_months`), and the \
+  ledger pass never touches the current or previous month. \
+  Idempotent; `dry_run=true` reports what every pass would delete \
+  without deleting anything.\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -503,6 +509,9 @@ pub struct AiMemoryServer {
     /// Opt-in bound on how long raw observations outlive their consolidation.
     /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
     observation_retention: ObservationRetention,
+    /// Opt-in age bound for the hook event ledgers. Default is disabled, so
+    /// `memory_forget_sweep` deletes no ledger file.
+    ledger_retention: LedgerRetention,
     /// A2 opt-in: compact cold episodic pages (tier-down) instead of evicting
     /// them. Default `false`, so the sweep evicts exactly as before.
     compact_cold_episodic: bool,
@@ -1889,6 +1898,7 @@ impl AiMemoryServer {
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
             observation_retention: ObservationRetention::default(),
+            ledger_retention: LedgerRetention::default(),
             compact_cold_episodic: false,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
@@ -2620,6 +2630,14 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_observation_retention(mut self, retention: ObservationRetention) -> Self {
         self.observation_retention = retention;
+        self
+    }
+
+    /// Set the opt-in event ledger age bound used by `memory_forget_sweep`.
+    /// Unset, the sweep never deletes a ledger file.
+    #[must_use]
+    pub fn with_ledger_retention(mut self, retention: LedgerRetention) -> Self {
+        self.ledger_retention = retention;
         self
     }
 
@@ -3601,7 +3619,7 @@ impl AiMemoryServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "Run the retention sweep. FOUR passes, and they \
+        description = "Run the retention sweep. FIVE passes, and they \
         differ on what they will delete. (1) TTL: pages whose frontmatter \
         expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
         OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
@@ -3618,9 +3636,15 @@ impl AiMemoryServer {
         page that is still live — an unconsolidated session, or one whose \
         page pass 2 or 3 just removed, keeps every row. This pass is DISABLED \
         by default (observation_retention_days = 0) and deletes nothing until \
-        an operator opts in; when off, observations_pruned is 0. The report's \
-        expired / hard_deleted / observations_pruned counts come from passes \
-        1, 3 and 4. Pass dry_run=true to preview."
+        an operator opts in; when off, observations_pruned is 0. (5) Event \
+        ledgers: hook event ledger files (log-YYYY-MM.md) whose month ended \
+        at least decay.ledger_retention_months whole months ago are deleted \
+        from disk permanently (never the current or previous month, never a \
+        file that does not open like a ledger). DISABLED by default \
+        (ledger_retention_months = 0); when off, ledgers_pruned is 0. The \
+        report's expired / hard_deleted / observations_pruned counts come \
+        from passes 1, 3 and 4; ledgers_prunable / ledgers_pruned and their \
+        byte counts from pass 5. Pass dry_run=true to preview."
     )]
     async fn memory_forget_sweep(
         &self,
@@ -3640,7 +3664,7 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        let report = run_sweep_with_compaction(
+        let report = run_sweep_with_ledgers(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -3650,6 +3674,8 @@ impl AiMemoryServer {
             self.decay_breadth_weight,
             self.observation_retention,
             self.compact_cold_episodic,
+            ColdClusterDedup::default(),
+            self.ledger_retention,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -10045,10 +10071,25 @@ mod tests {
         );
 
         // MEMORY_INSTRUCTIONS is read before an agent ever inspects
-        // `tools/list`, so it carries the same obligation.
+        // `tools/list`, so it carries the same obligation. The ledger pass
+        // removes a new class of file (monthly hook event ledgers), so the
+        // item must name it and its opt-in gate; the stale three-pass count
+        // must not come back either.
         assert!(
             MEMORY_INSTRUCTIONS.contains("hard-deleted even when"),
             "MEMORY_INSTRUCTIONS must warn that expired pages delete despite a pin"
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("ledger_retention_months"),
+            "MEMORY_INSTRUCTIONS must name the opt-in event-ledger retention pass"
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("dry_run=true"),
+            "MEMORY_INSTRUCTIONS must say a dry run reports without deleting"
+        );
+        assert!(
+            !MEMORY_INSTRUCTIONS.contains("Three passes"),
+            "the stale three-pass count must not come back in MEMORY_INSTRUCTIONS"
         );
     }
 

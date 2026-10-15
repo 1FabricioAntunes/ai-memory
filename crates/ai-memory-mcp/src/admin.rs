@@ -59,11 +59,12 @@ use std::pin::Pin;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
-    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
-    EmbedBackfillCounts, EmbedBackfillOptions, ObservationRetention, SourceCounts,
-    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
-    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report_with_breadth, run_embedding_backfill, run_lint, run_sweep_with_compaction,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, ColdClusterDedup, CuratorParams,
+    CuratorReport, EmbedBackfillCounts, EmbedBackfillOptions, LedgerRetention,
+    ObservationRetention, SourceCounts, prune_sources_to_budget,
+    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report_with_breadth,
+    run_embedding_backfill, run_lint, run_sweep_with_ledgers,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
@@ -101,6 +102,8 @@ const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 struct SweepTuning {
     breadth_weight: f64,
     retention: ObservationRetention,
+    /// Opt-in age bound for the hook event ledgers (disabled by default).
+    ledger_retention: LedgerRetention,
     /// A2 opt-in: compact cold episodic pages instead of evicting them.
     compact_cold_episodic: bool,
 }
@@ -623,17 +626,20 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
         state,
         breadth_weight,
         ObservationRetention::default(),
+        LedgerRetention::default(),
         false,
     )
 }
 
 /// Build the admin router with every sweep knob that lives outside
-/// `DecayParams`, including the opt-in observation prune (disabled by default)
-/// and A2 extractive tier-down (`compact_cold_episodic`, off by default).
+/// `DecayParams`, including the opt-in observation prune (disabled by default),
+/// the opt-in event ledger age sweep (disabled by default) and A2 extractive
+/// tier-down (`compact_cold_episodic`, off by default).
 pub fn admin_router_with_sweep_tuning(
     state: AdminState,
     breadth_weight: f64,
     retention: ObservationRetention,
+    ledger_retention: LedgerRetention,
     compact_cold_episodic: bool,
 ) -> Router {
     let state = Arc::new(state);
@@ -750,6 +756,7 @@ pub fn admin_router_with_sweep_tuning(
         .layer(axum::Extension(SweepTuning {
             breadth_weight,
             retention,
+            ledger_retention,
             compact_cold_episodic,
         }))
 }
@@ -3971,7 +3978,7 @@ async fn handle_forget_sweep(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep_with_compaction(
+    run_sweep_with_ledgers(
         &state.reader,
         &state.writer,
         Some(&state.wiki),
@@ -3981,6 +3988,8 @@ async fn handle_forget_sweep(
         tuning.breadth_weight,
         tuning.retention,
         tuning.compact_cold_episodic,
+        ColdClusterDedup::default(),
+        tuning.ledger_retention,
         req.dry_run,
     )
     .await

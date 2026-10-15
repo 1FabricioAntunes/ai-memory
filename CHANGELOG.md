@@ -133,6 +133,26 @@ version in [`docs/changelog/`](docs/changelog/):
   apply), keeping the checkpoint's frontmatter. Restoring can bring back text
   a root deleted or purged, so both listing and restoring need the same admin
   authority as `/admin/restore-page`. The MCP surface is now 24 tools. (#1307)
+- Added an opt-in sweep of old hook event ledgers by age. With `[decay]
+  ledger_retention_months = N` (env `AI_MEMORY_DECAY__LEDGER_RETENTION_MONTHS`;
+  `0`, the default, disables it; a negative value is rejected at startup), the
+  forget sweep deletes a project's `log-YYYY-MM.md` once `N` whole UTC calendar
+  months have passed after its month ended. A file qualifies only when its name
+  is a rotated ledger **and** its content opens like a ledger, so a page that
+  merely shares the name is never deleted; that content gate is repeated after
+  the blocking admission round-trip. `log.md`, the current month and the
+  previous month are never deleted whatever `N` is. The deletion goes through
+  the wiki (`Wiki::delete_event_ledger`, under the mutation guard) and never
+  writes the database; a dry run reports `ledgers_prunable` and
+  `ledger_bytes_prunable` and deletes nothing, and a real run reports
+  `ledgers_pruned`, `ledger_bytes_pruned` and `ledger_page_rows_left` (legacy
+  page rows it left alone) in the `forget-sweep` / `memory_forget_sweep`
+  report. Each removal consults the blocking admission chain on the new
+  `delete_event_ledger` op, the same check a page delete runs: a `reject`-policy
+  webhook keeps the file, which the sweep counts in `ledgers_undeleted`, keeps
+  going and retries on the next run, and non-blocking observers are told only
+  after the unlink. The deletion is permanent on disk; the wiki's git history
+  keeps the blobs a checkpoint already captured. (#1322)
 
 
 ### Changed

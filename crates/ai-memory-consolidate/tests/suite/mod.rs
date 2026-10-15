@@ -14,6 +14,7 @@ mod embeddings;
 mod entropy_experience;
 #[cfg(unix)]
 mod eval_results;
+mod ledger_sweep;
 mod lifecycle;
 mod local_embeddings;
 mod multi_machine;

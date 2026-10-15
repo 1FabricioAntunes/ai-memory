@@ -207,7 +207,23 @@ from hook paths.
    a better model, a better prompt, or a fixed consolidator bug), and its
    summary page becomes the only surviving account of that session. Freed
    SQLite pages are reused rather than returned to the OS: the `.db` file does
-   not shrink, but the backup tarball does.
+   not shrink, but the backup tarball does. A fifth pass, disabled unless
+   `[decay] ledger_retention_months` is positive (env
+   `AI_MEMORY_DECAY__LEDGER_RETENTION_MONTHS`), deletes old hook event ledgers
+   (`log-YYYY-MM.md`) once that many whole UTC calendar months have passed
+   after their month ended. It qualifies a file by name AND content (the
+   `log_ledger` predicates), never touches `log.md`, never touches the current
+   or the previous month whatever the setting, and removes files through
+   `Wiki::delete_event_ledger` (confined, under the wiki mutation guard,
+   content gate re-checked) rather than from the sweep. Each removal consults
+   the blocking admission chain on the `delete_event_ledger` op, the same
+   check a page delete runs: a `reject`-policy webhook keeps the file, which
+   the sweep counts in `ledgers_undeleted`, keeps going and retries next run —
+   and non-blocking observers are dispatched only after the unlink. Ledgers are
+   not pages:
+   the store is only read, and a legacy `pages` row for a deleted ledger is left
+   for `reclaim-ledger-versions`. A dry run reports the files and bytes it would
+   delete (`ledgers_prunable`, `ledger_bytes_prunable`) and deletes nothing.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
    enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A
@@ -1036,6 +1052,10 @@ hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 observation_retention_days = 0     # 0 = never prune raw observations
 observation_prune_batch = 5000     # rows per prune transaction
+ledger_retention_months = 0        # 0 = never delete hook event ledgers; N > 0 =
+                                   # delete a log-YYYY-MM.md N whole months after
+                                   # its month ended (current + previous month
+                                   # are never deleted)
 compact_cold_episodic = false      # A2 opt-in: tier-down (compact) a cold
                                    # episodic page instead of evicting it —
                                    # keep abstract+summary+keep-tokens, drop
