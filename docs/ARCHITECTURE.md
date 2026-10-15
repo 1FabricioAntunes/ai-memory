@@ -198,7 +198,10 @@ from hook paths.
    is positive, then deletes raw `observations` older than that age, but only
    for sessions already consolidated into a summary page that is still live, so
    raw capture is never removed while it is the last copy of that session's
-   work. It runs last so this run's own evictions and hard-deletes already
+   work, and never for a session that still has a `session_consolidation_jobs`
+   row in `pending` or `running` — a queued (or lease-stale) consolidation
+   still reads the raw capture, and the dry-run count applies the same guard,
+   so the two can never disagree. It runs last so this run's own evictions and hard-deletes already
    exclude their sessions, deletes in `observation_prune_batch` transactions so
    a multi-million row prune cannot hold the write lock, and repairs
    `sessions.ended_observation_count` downward in the same transaction. The

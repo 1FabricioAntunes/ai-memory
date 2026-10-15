@@ -5203,7 +5203,11 @@ impl ReaderPool {
     /// [`prune_consolidated_observations`](crate::ops::prune_consolidated_observations),
     /// read-only, so a dry run can report a number without any chance of a
     /// write. Kept beside the delete rather than derived from it because the
-    /// dry run must never open a write transaction at all.
+    /// dry run must never open a write transaction at all. The
+    /// queued-consolidation exclusion is the shared fragment
+    /// `CONSOLIDATION_QUEUE_GUARD_SQL` (interpolated verbatim here and in the
+    /// delete), so a dry run can never report rows the real pass would keep,
+    /// or miss rows it would delete.
     ///
     /// # Errors
     /// Propagates SQL errors.
@@ -5214,7 +5218,8 @@ impl ReaderPool {
         cutoff_us: i64,
     ) -> StoreResult<usize> {
         self.with_conn(move |conn| {
-            let n: i64 = conn.query_row(
+            let guard = crate::ops::CONSOLIDATION_QUEUE_GUARD_SQL;
+            let sql = format!(
                 "SELECT COUNT(*) FROM observations o \
                  WHERE o.workspace_id = ?1 \
                    AND o.project_id = ?2 \
@@ -5224,7 +5229,11 @@ impl ReaderPool {
                        JOIN pages p ON p.id = s.summary_page_id \
                        WHERE s.id = o.session_id \
                          AND p.superseded_at IS NULL \
-                   )",
+                   ) \
+                   AND {guard}"
+            );
+            let n: i64 = conn.query_row(
+                &sql,
                 params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us],
                 |row| row.get(0),
             )?;

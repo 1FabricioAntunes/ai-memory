@@ -4047,6 +4047,19 @@ pub struct ObservationPruneOutcome {
     pub sessions_resynced: usize,
 }
 
+/// Queued-consolidation exclusion shared, byte for byte, by the observation
+/// prune and its dry-run count (`ReaderPool::prunable_observation_count`):
+/// a session with a `session_consolidation_jobs` row in `pending` or
+/// `running` still needs its raw capture, so those rows never match, however
+/// old. Defined once here and interpolated at both call sites so the two
+/// queries cannot drift apart. The primary key `(session_id, generation)`
+/// already serves the lookup by `session_id`; no extra index is needed.
+pub(crate) const CONSOLIDATION_QUEUE_GUARD_SQL: &str = "NOT EXISTS ( \
+    SELECT 1 FROM session_consolidation_jobs j \
+    WHERE j.session_id = o.session_id \
+      AND j.state IN ('pending', 'running') \
+)";
+
 /// Permanently delete one bounded batch of raw observations belonging to
 /// sessions that were already distilled into a live summary page.
 ///
@@ -4060,6 +4073,15 @@ pub struct ObservationPruneOutcome {
 /// by the same sweep is excluded for free, because the `ON DELETE SET NULL`
 /// foreign key has already cleared the pointer. A session with no `sessions`
 /// row, or one that never ended, matches nothing and can never be pruned.
+///
+/// A session with a consolidation job the worker can still claim is excluded
+/// by [`CONSOLIDATION_QUEUE_GUARD_SQL`] even when every other predicate
+/// holds: that job — a `pending` row (a transient failure is recorded as a
+/// `pending` retry, not `failed`) or a `running` row whose stale lease the
+/// next claim reclaims — still reads the raw capture to consolidate the
+/// session, and pruning underneath it would consolidate a truncated session.
+/// `completed`, `failed` and `superseded` rows are terminal for the automatic
+/// worker and block nothing.
 ///
 /// `ORDER BY created_at` makes the batching deterministic: a run interrupted
 /// halfway leaves a clean age boundary rather than holes, so the next run
@@ -4088,7 +4110,7 @@ pub fn prune_consolidated_observations(
     let mut deleted = 0usize;
     let mut sessions: BTreeSet<Vec<u8>> = BTreeSet::new();
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(&format!(
             "DELETE FROM observations \
              WHERE id IN ( \
                  SELECT o.id FROM observations o \
@@ -4101,11 +4123,12 @@ pub fn prune_consolidated_observations(
                        WHERE s.id = o.session_id \
                          AND p.superseded_at IS NULL \
                    ) \
+                   AND {CONSOLIDATION_QUEUE_GUARD_SQL} \
                  ORDER BY o.created_at \
                  LIMIT ?4 \
              ) \
              RETURNING session_id",
-        )?;
+        ))?;
         let rows = stmt.query_map(
             params![
                 workspace_id.as_bytes(),
