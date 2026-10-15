@@ -9,15 +9,20 @@ use crate::config::RuntimeEnv;
 
 pub(crate) struct Terminal {
     color: bool,
+    columns: usize,
 }
 
 impl Terminal {
     pub(crate) fn stdout(env: &RuntimeEnv) -> Self {
-        Self::new(std::io::stdout().is_terminal(), env)
+        Self {
+            columns: crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns)),
+            ..Self::new(std::io::stdout().is_terminal(), env)
+        }
     }
 
     fn new(tty: bool, env: &RuntimeEnv) -> Self {
         Self {
+            columns: 80,
             color: tty
                 && env.var_os("NO_COLOR").is_none()
                 && env.var_os("TERM").is_none_or(|term| term != "dumb"),
@@ -49,7 +54,7 @@ impl Terminal {
         print!("{}", self.paint(text));
     }
 
-    /// Decoration never drops, reorders, wraps or truncates report content.
+    /// Plain reports remain exact; interactive reports add margins and wrap prose.
     fn paint(&self, text: &str) -> String {
         if !self.color {
             return text.to_owned();
@@ -58,6 +63,7 @@ impl Terminal {
             .map(|line| {
                 let value = line.trim_end_matches('\n');
                 let trimmed = value.trim_start();
+                let value = self.layout(value);
                 let color = if trimmed.starts_with(['⚠', '!', '?']) {
                     Some(Color::Yellow)
                 } else if trimmed.starts_with('✓') {
@@ -78,7 +84,7 @@ impl Terminal {
                 {
                     format!("{}:{rest}", label.dark_grey())
                 } else {
-                    value.to_owned()
+                    value
                 };
                 format!(
                     "{decorated}{}",
@@ -86,6 +92,37 @@ impl Terminal {
                 )
             })
             .collect()
+    }
+
+    fn layout(&self, line: &str) -> String {
+        if line.is_empty() {
+            return String::new();
+        }
+        let text = line.trim_start();
+        let indent = " ".repeat((line.len() - text.len()).max(2));
+        let mut result = String::new();
+        let mut rest = text;
+        // Byte lengths are conservative for Unicode terminal columns. Keep long
+        // tokens intact, and only wrap at spaces: paths and words are never cut.
+        let available = self.columns.saturating_sub(indent.len() + 1).max(1);
+        while rest.len() > available {
+            let split = rest
+                .char_indices()
+                .take_while(|(index, _)| *index <= available)
+                .filter(|(_, ch)| *ch == ' ')
+                .map(|(index, _)| index)
+                .last();
+            let Some(split) = split.filter(|index| *index > 0) else {
+                break;
+            };
+            result.push_str(&indent);
+            result.push_str(&rest[..split]);
+            result.push('\n');
+            rest = &rest[split + 1..];
+        }
+        result.push_str(&indent);
+        result.push_str(rest);
+        result
     }
 }
 
@@ -109,7 +146,38 @@ mod tests {
     }
 
     #[test]
-    fn styled_reports_preserve_every_character_including_unknown_fields() {
+    fn interactive_margins_and_wrapping_keep_words_and_nested_indentation() {
+        let terminal = Terminal {
+            color: true,
+            columns: 48,
+        };
+        for text in [
+            "ai-memory 3.0.0 (server)",
+            "Capture coverage for preview/onboarding (server http://127.0.0.1:49374)",
+            "⚠ Codex skips its untrusted hooks. Open Codex, run /hooks, and trust them.",
+            "      └ nested remedy",
+            "        ai-memory install-hooks --agent claude-code --apply",
+        ] {
+            let rendered = terminal.layout(text);
+            assert_eq!(
+                rendered.split_whitespace().collect::<Vec<_>>(),
+                text.split_whitespace().collect::<Vec<_>>()
+            );
+            assert!(
+                rendered
+                    .lines()
+                    .all(|line| line.starts_with("  ") && line.len() <= 48)
+            );
+            if text.starts_with("      ") {
+                assert!(rendered.lines().all(|line| line.starts_with("      ")));
+            }
+        }
+        assert_eq!(terminal.layout(""), "");
+        assert_eq!(terminal.layout("  "), "  ");
+    }
+
+    #[test]
+    fn styled_reports_preserve_words_including_unknown_fields() {
         let terminal = Terminal::new(
             true,
             &RuntimeEnv::with_process_env_for_tests(&[("TERM", "xterm-256color")]),
@@ -130,6 +198,10 @@ mod tests {
                 plain.push(ch);
             }
         }
-        assert_eq!(plain, text);
+        assert_eq!(
+            plain.split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>()
+        );
+        assert!(plain.lines().all(|line| line.starts_with("  ")));
     }
 }
