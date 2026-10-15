@@ -37,6 +37,13 @@ version in [`docs/changelog/`](docs/changelog/):
   recognised the shared `_slots/current-focus.md`, so with per-user slots the
   focus slot got the 30-day stale threshold instead of the 7-day one and was
   reported three weeks late. (#1314)
+- Fixed multi-page consolidation losing every page of a batch when the
+  model gave one page a path that cannot be repaired: a leading slash, a
+  `..` or `.` segment, or an empty segment. Path validation failed the whole
+  session's consolidation, so the valid pages in the same answer were never
+  written. That page is now skipped with a warning and the others are
+  written, as already happened for paths that fail the portability check.
+  (#1315)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and
