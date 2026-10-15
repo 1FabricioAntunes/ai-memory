@@ -97,6 +97,11 @@ enum PageStoreRemoval {
     },
 }
 
+/// Most commits [`Wiki::page_checkpoints`] inspects for one page. A
+/// checkpoint is one commit per write or consolidation pass, so this covers a
+/// long history while keeping a lookup on a page nobody touched lately bounded.
+pub const PAGE_CHECKPOINT_WALK_LIMIT: usize = 5_000;
+
 /// Body + optional L0 abstract text a caller of `reindex_page_locked` should
 /// embed once it is safe to do so (i.e. after releasing whatever lock it
 /// took to call in). Captured before `upsert_page` moves `md.body` /
@@ -383,6 +388,65 @@ impl Wiki {
     /// Propagates [`WikiError`] from the git adapter.
     pub fn recent_checkpoints(&self, limit: usize) -> WikiResult<Vec<Checkpoint>> {
         self.git.recent_checkpoints(limit)
+    }
+
+    /// Checkpoints, newest first, that changed one page (including the one
+    /// that deleted it), so a caller can pick a `rev` to restore from.
+    ///
+    /// The history walk runs on the blocking pool and inspects at most
+    /// [`PAGE_CHECKPOINT_WALK_LIMIT`] commits.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the path escapes the project tree or git
+    /// cannot be read.
+    pub async fn page_checkpoints(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        limit: usize,
+    ) -> WikiResult<Vec<Checkpoint>> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
+        let rel = PathBuf::from(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join(path.as_str());
+        let git = self.git.clone();
+        tokio::task::spawn_blocking(move || {
+            git.path_checkpoints(&rel, limit, PAGE_CHECKPOINT_WALK_LIMIT)
+        })
+        .await
+        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Parse one page as stored at checkpoint `rev`, without touching the
+    /// live tree or the index.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the revision/path does not exist or the
+    /// stored bytes are not parseable UTF-8 markdown.
+    pub async fn page_at_checkpoint(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        rev: &str,
+    ) -> WikiResult<Markdown> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
+        let rel = PathBuf::from(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join(path.as_str());
+        let git = self.git.clone();
+        let rev_owned = rev.to_owned();
+        let bytes = tokio::task::spawn_blocking(move || git.file_at_rev(&rev_owned, &rel))
+            .await
+            .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+        let raw = String::from_utf8(bytes).map_err(|e| {
+            WikiError::Io(std::io::Error::other(format!(
+                "{} at {rev} is not valid UTF-8 markdown: {e}",
+                path.as_str()
+            )))
+        })?;
+        parse(&raw)
     }
 
     /// Create the one-time baseline checkpoint for an existing wiki tree that

@@ -146,6 +146,25 @@ pub(crate) const MUSE_EVENTS: [(&str, &str); 8] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// Tencent CodeBuddy Code lifecycle events ai-memory hooks (#1299). Each pair
+/// is `(event-name-in-~/.codebuddy/settings.json, native hook-event script
+/// stem)`; CodeBuddy has no script bundle, so the `.sh` name only carries the
+/// event token the native command is rendered with.
+///
+/// The reporter's mapping on v2.164–v2.167: Claude Code's vocabulary minus
+/// the subagent events. `PostToolUseFailure` is not in that mapping.
+/// `SessionEnd` is wired for the interactive exit; headless `codebuddy -p`
+/// is a separate follow-up.
+pub(crate) const CODEBUDDY_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+];
+
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
 /// seconds, like the Claude Code plugins it loads. The capture POST is
 /// fire-and-forget; `SessionStart` also fetches a handoff.
@@ -1139,6 +1158,34 @@ pub(crate) fn build_muse_hooks_payload(
     payload
 }
 
+/// `{"hooks": <event map>}` for Tencent CodeBuddy Code (#1299). The `hooks`
+/// key of `~/.codebuddy/settings.json` holds Claude Code's nested shape
+/// (`"Event": [{"matcher": "", "hooks": [{"type": "command", "command": …}]}]`).
+/// CodeBuddy runs each `command` with the Claude Code-shaped event JSON on
+/// stdin, so every entry invokes the native `ai-memory hook` command; there
+/// is no script bundle, whatever `AI_MEMORY_HOOK_PLATFORM` asks for. An empty
+/// matcher fires on every tool and every SessionStart source.
+pub(crate) fn build_codebuddy_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &CODEBUDDY_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "codebuddy",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
 /// Pool (Poolside Agent CLI) `.poolside/settings.yaml` `hooks:` block for
 /// install-hooks' print path. Pool's hook config is a project-scoped YAML
 /// file at the repo root — there is no user-global hook file for ai-memory
@@ -1999,19 +2046,37 @@ fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
 /// binary. A missing file or a failed resolution falls back to
 /// [`FALLBACK_HOOK_EXE`] instead of baking a dead absolute path into every
 /// hook command.
+///
+/// A binary inside the Nix store also falls back to the bare command: the
+/// store path names one immutable package version, which `nix-collect-garbage`
+/// deletes after the next profile switch, while the profile's `bin/` on PATH
+/// keeps pointing at the current build.
 fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
+    embedded_exe_with(raw, Path::is_file)
+}
+
+/// [`embedded_exe_from`] with the existence probe injected, so the store-path
+/// fallback is testable on hosts without a `/nix/store`.
+fn embedded_exe_with(raw: Option<PathBuf>, is_file: impl Fn(&Path) -> bool) -> PathBuf {
     let Some(exe) = raw else {
         return PathBuf::from(FALLBACK_HOOK_EXE);
     };
-    if exe.is_file() {
+    if is_nix_store_path(&exe) {
+        return PathBuf::from(FALLBACK_HOOK_EXE);
+    }
+    if is_file(&exe) {
         return exe;
     }
     let stripped = strip_deleted_suffix(exe);
-    if stripped.is_file() {
+    if is_file(&stripped) {
         stripped
     } else {
         PathBuf::from(FALLBACK_HOOK_EXE)
     }
+}
+
+fn is_nix_store_path(path: &Path) -> bool {
+    path.starts_with("/nix/store")
 }
 
 /// [`embedded_exe_from`] over this process's own executable.
@@ -2783,9 +2848,63 @@ mod tests {
         );
     }
 
+    fn rendered_exec_command(exe: &Path) -> String {
+        let spec = windows_native_exec_spec_with_exe(
+            exe,
+            Path::new("/hooks/post-tool-use.sh"),
+            "http://h:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                None,
+                None,
+            ),
+        );
+        let HookHandlerSpec::Exec { command, .. } = spec else {
+            panic!("expected exec spec")
+        };
+        command
+    }
+
+    /// The existence probe reports the store binary as present, so only the
+    /// store-path guard can produce the bare command: without it the hook
+    /// would name a path garbage collection later deletes.
+    #[test]
+    fn hook_rendered_from_a_nix_store_exe_names_the_bare_command() {
+        let store = PathBuf::from("/nix/store/abc123xyz-ai-memory-2.6.3/bin/ai-memory");
+        let exe = embedded_exe_with(Some(store.clone()), |_| true);
+        assert_eq!(exe, PathBuf::from(FALLBACK_HOOK_EXE));
+        assert_eq!(rendered_exec_command(&exe), FALLBACK_HOOK_EXE);
+        let deleted = PathBuf::from(format!("{} (deleted)", store.display()));
+        assert_eq!(
+            embedded_exe_with(Some(deleted), |_| true),
+            PathBuf::from(FALLBACK_HOOK_EXE)
+        );
+    }
+
+    #[test]
+    fn hook_rendered_from_a_normal_exe_keeps_the_absolute_path() {
+        for normal in [
+            "/usr/bin/ai-memory",
+            "/home/dev/.nix-profile/bin/ai-memory",
+            "/opt/nix/store/bin/ai-memory",
+        ] {
+            let exe = embedded_exe_with(Some(PathBuf::from(normal)), |_| true);
+            assert_eq!(exe, PathBuf::from(normal));
+            assert_eq!(rendered_exec_command(&exe), normal);
+        }
+    }
+
     #[test]
     fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
         let exe = hook_embedded_exe_path();
+        // A test binary built inside a Nix sandbox runs from the store, where
+        // the resolver deliberately renders the bare command.
+        if std::env::current_exe().is_ok_and(|current| is_nix_store_path(&current)) {
+            assert_eq!(exe, PathBuf::from(FALLBACK_HOOK_EXE));
+            return;
+        }
         assert!(exe.is_file(), "{} should exist", exe.display());
         assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
     }

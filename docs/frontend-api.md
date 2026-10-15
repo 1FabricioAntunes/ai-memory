@@ -50,7 +50,9 @@ position). Both follow the same per-project read rule as the page view.
 The builtin wiki also serves the root-only `GET {web_slug}/pending` page. It
 lists pending auto-improvement proposals and posts approve and reject to the
 existing `/admin/pending-writes/*` routes. A signed-in non-root user gets a
-403 page, not the change-password redirect. The root-only
+403 page, not the change-password redirect. A browser on the GET-only legacy
+Basic credential sees each proposal's `ai-memory pending-writes` commands in
+place of the buttons, since its posts would be refused. The root-only
 `GET {web_slug}/health` page follows the same gate: hook counters (accepted,
 shed, 429), writer queue, the spool and recovery journal under the server's
 data directory, the consolidation queue, embedder and provider state, and the

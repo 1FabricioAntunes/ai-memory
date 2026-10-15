@@ -49,7 +49,9 @@ automatically, and (with an LLM) consolidation compiles them into pages.
 Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
-prepended to the agent's context automatically. To make it apply to **all** your
+prepended to the agent's context automatically: an excerpt of every rule first,
+whole bodies while the budget lasts, and `memory_read_page` for the rest. Pin
+the rule to have it shown in full before the others. To make it apply to **all** your
 projects, ask for it as a standing preference. It goes to your cross-project
 profile (see the next recipe), or to the shared `_global` scope with
 `scope: "global"`. On a multi-user
@@ -298,6 +300,38 @@ compacted or merged stays in git and the supersession chain, recoverable with
   project's context here: use cross-project messaging. Say "send project-b a request to
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
+
+## Recipe: ask an operator to decide
+
+When an orchestrator has to stop for a person, send a normal cross-project
+message and poll for a normal reply. The subject lines are the shared
+convention; `memory_message_send` and `memory_message_list` are the tools.
+
+1. Send to the project the operator reads. `subject` is
+   `decision: <short question>`. The body names the question, each option's
+   `id` and label, and `reply_project: <your workspace>/<your project>`.
+   Save the returned `message_id`. You need write on that mailbox project,
+   and it must already exist.
+2. The operator, or a companion, answers with `memory_message_send` back to
+   `reply_project`. `subject` is `decision-reply: <message_id>`. The body
+   carries `option: <id>`. Sending the reply needs write on your project.
+3. Poll `memory_message_list` on your inbox until a pending row's subject is
+   that exact `decision-reply:` line. The oldest match is the answer. Pop it
+   when you take it, then `memory_message_cancel` the question.
+
+Before you act on a `requires_root: true` decision, compare `from_owner_user`
+on the reply with the root identity you were configured with. It is
+attribution, not a role, and it is empty on anonymous and single-operator
+servers, so treat an empty value as not root. The server itself does not check
+who answers. `/web` shows the mailbox and leaves every message pending.
+
+The list is oldest-first, 50 rows by default and 200 at most, so keep the
+inbox you poll from drained. A companion can wake on the `message_send`
+observer webhook, then list; the webhook carries scope and actor, and the
+orchestrator still polls.
+
+Full layout and limits:
+[`agent-messaging.md`](agent-messaging.md#operator-decisions-by-subject-and-body).
 
 ## Recipe: several accounts or an external launcher
 

@@ -195,6 +195,11 @@ struct DoctorReport {
     /// Meta Muse Code's settings file, when there is one: whether ai-memory's
     /// hooks and MCP entry are in it, and the two shapes that break Muse.
     muse: Option<MuseReport>,
+    /// Set when the Windows logon entry `setup` wrote for this data dir names
+    /// an `ai-memory.exe` that is no longer on disk (#1280). Omitted
+    /// otherwise, so the JSON shape is unchanged when there is nothing to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    windows_logon: Option<super::user_service::MissingLogonBinary>,
 }
 
 /// One installed ai-memory marketplace plugin and what else wires the same
@@ -652,6 +657,9 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         .ok()
         .and_then(|path| muse_report(&path));
 
+    // Local, like the spool: a quarantined binary leaves no server to ask.
+    let windows_logon = super::user_service::check_logon_binary(&config.data_dir);
+
     let auth_posture = identity.as_ref().map(|identity| {
         crate::local_auth::AuthPosture::classify(identity.level == "anonymous", &ep.url)
     });
@@ -675,6 +683,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         agentmemory_residue,
         plugins,
         muse,
+        windows_logon,
     };
 
     if args.json {
@@ -688,7 +697,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
 /// The trust state of the installed ai-memory Codex hooks, when there are
 /// any: asking Codex starts it, so a machine without ai-memory's Codex hooks
 /// is left alone.
-async fn codex_hook_trust(
+pub(super) async fn codex_hook_trust(
     env: &crate::config::RuntimeEnv,
     cwd: &Path,
 ) -> Option<super::codex_hook_trust::CodexHookTrust> {
@@ -1119,6 +1128,10 @@ fn render_human(report: &DoctorReport) {
         println!("  recent window: last {} days\n", report.since_days);
     }
 
+    if let Some(problem) = &report.windows_logon {
+        println!("{}", problem.render_human());
+    }
+
     if let Some(problem) = &report.marker_capture_problem {
         println!(
             "⚠ {}: the settings marker has an invalid `[capture]` section.\n  \
@@ -1241,7 +1254,35 @@ mod tests {
             agentmemory_residue: Vec::new(),
             plugins: Vec::new(),
             muse: None,
+            windows_logon: None,
         }
+    }
+
+    /// The logon-binary warning is a key of its own in doctor's JSON, and
+    /// absent when there is nothing to report.
+    #[test]
+    fn doctor_json_carries_a_missing_logon_binary_only_when_there_is_one() {
+        let quiet = health_report(
+            super::super::hook_spool::SpoolHealth::default(),
+            false,
+            None,
+        );
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert!(json.get("windows_logon").is_none(), "{json}");
+
+        let mut report = quiet;
+        report.windows_logon = Some(super::super::user_service::MissingLogonBinary {
+            classification: super::super::user_service::LOGON_BINARY_MISSING,
+            executable: r"C:\bin\ai-memory.exe".into(),
+            detail: "gone".into(),
+            fix: "restore it",
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["windows_logon"]["classification"],
+            "logon_binary_missing"
+        );
+        assert_eq!(json["windows_logon"]["executable"], r"C:\bin\ai-memory.exe");
     }
 
     /// Doctor reads Muse's settings file: the wiring it finds, and the two

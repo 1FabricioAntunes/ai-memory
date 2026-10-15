@@ -333,7 +333,9 @@ ships something ai-memory does not, it is named.
 - **From OpenViking:** you trade a self-hostable AGPL server that needs a VLM
   for a zero-LLM binary under a permissive licence. OpenViking's L0/L1/L2
   progressive tiers map onto ai-memory's extractive tier-down (abstract +
-  summary + keep-tokens). You gain claim-once handoffs (its `ov-kanban`
+  summary + keep-tokens) and onto the opt-in session-start brief, which
+  gives every standing page an excerpt and adds whole bodies while the
+  budget lasts. You gain claim-once handoffs (its `ov-kanban`
   skill passes tasks as markdown files without a claim guard) and per-project
   multi-user auth; you give up its VLM-driven extraction depth, its
   ACLs and user groups, and the v0.5 gateway proxy that injects recall into

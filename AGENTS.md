@@ -81,10 +81,13 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
-Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
-where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
-line. Without it a rule written to `AGENTS.md` is absent from context at
-session start and reaches Claude Code only if the agent opens the file.
+Claude Code 2.1.277 and later reads `AGENTS.md` only when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` exists in the working directory or
+any directory above it; when one does, it reads that file instead. In a
+project where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md`
+import line so sessions that read only `CLAUDE.md` (older Claude Code, the
+AGENTS.md plugin disabled, the `claude-md` Project instructions setting, or a
+developer's own `CLAUDE.local.md`) load the same rules at session start.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -216,6 +219,8 @@ companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace mem
                            and `./companions/ai-memory-macos/build.sh`.
 companions/ai-memory-ts/        optional TypeScript client SDK (npm, Node 22+); NOT a workspace
                            member and never shipped with the server.
+companions/ai-memory-desktop/   Tauri v2 desktop installer (plain HTML, no npm) that installs the
+                           binary and runs `setup --web` in a window; own workspace.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 plugins/                   generated Claude Code + Codex marketplace plugins (catalogs in
                            `.claude-plugin/`, `.agents/plugins/`); edit the templates in
@@ -311,6 +316,12 @@ covers the same tests, slower, no tiers.
   `swift test --package-path companions/ai-memory-macos`
   (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
   Root `--workspace` commands do not cover it.
+- Run the desktop installer separately (Linux needs the `webkit2gtk-4.1`,
+  `gtk3`, `librsvg` and `libsoup3` development packages): `cargo fmt --check`,
+  `cargo clippy --locked --all-targets -- -D warnings` and `cargo test
+  --locked`, each with `--manifest-path companions/ai-memory-desktop/Cargo.toml`.
+  `.github/workflows/desktop.yml` runs them on a pull request that touches it
+  and builds unsigned installers on dispatch.
 - Run the TypeScript SDK separately, from `companions/ai-memory-ts`:
   `npm ci --ignore-scripts`, `npm run check` (typecheck, unit tests, schema
   and generated-docs checks, TypeDoc) and
@@ -550,6 +561,19 @@ Additional boundary rules:
   precedence, and cross-workspace isolation; PRs touching permissions still need
   root, DB-user, and anonymous cases — now recorded against the inventory.
 - New disk+SQL mutations need recovery/rollback tests.
+- **A changed default reaches every consumer.** When a change alters a default
+  or where a setting or credential lives (auth on for new installs, a token
+  read from a file, a new required header or path), list every component that
+  reads it (thin CLI clients, hook capture and the spool drain, `run` and its
+  jail re-exec, `/web`, backfill, the generated TS adapters) and test each one
+  under the new default. 3.0.0's token-file default broke three of them that
+  no test exercised with it (#1283, #1284, #1288).
+- **Third-party behavior is modeled from its docs.** When code reproduces how
+  another tool behaves (a harness's hook payloads or missing fields, Claude
+  Code's instruction-file and `@import` rules), link the vendor doc next to the
+  code and test each case the doc describes, not only the case at hand. A
+  one-case model of the import rules shipped in #1297 and had to be redone in
+  #1298.
 - The recall-eval framework lives at
   `crates/ai-memory-consolidate/tests/suite/recall_eval.rs`.
 - Tests run with `cargo t` locally,
@@ -705,7 +729,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 23 (see `docs/ARCHITECTURE.md`). They also
+  The tool count is currently 24 (see `docs/ARCHITECTURE.md`). They also
   update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
   the schema snapshot (`npm run schema:update`), the wrapper or its
   classification in `src/coverage.ts`, types, tests and docs. The SDK's

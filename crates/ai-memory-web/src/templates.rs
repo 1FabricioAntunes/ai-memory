@@ -742,6 +742,11 @@ pub(crate) struct PendingRow {
     pub is_rule: bool,
     /// The proposal rewrites an existing page.
     pub rewrites_existing: bool,
+    /// `ai-memory pending-writes approve` for this row, shell-quoted, shown to
+    /// a browser that can only read the page.
+    pub cli_approve: String,
+    /// The matching `reject` command.
+    pub cli_reject: String,
 }
 
 /// One `<option>` in a triage-page filter.
@@ -772,6 +777,9 @@ pub(crate) struct PendingView {
     pub truncated: bool,
     /// The read cap, shown when `truncated`.
     pub limit: usize,
+    /// The browser signed in with the legacy Basic credential, which admits
+    /// GET only: the decision buttons give way to the CLI commands.
+    pub read_only: bool,
 }
 
 // ---------------------------------------------------------------------------

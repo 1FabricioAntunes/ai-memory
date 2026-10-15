@@ -238,6 +238,11 @@ pub enum Command {
     /// Hidden hook spool drainer used by native session-end hooks.
     #[command(hide = true, name = "hook-drain")]
     HookDrain(HookDrainArgs),
+    /// Hidden Windows background host the logon entry `setup` installs
+    /// starts: it runs `serve` with no console window and restarts it after
+    /// a failure.
+    #[command(hide = true, name = "service-host")]
+    ServiceHost(ServiceHostArgs),
     /// Generate the marketplace plugins under `plugins/` and their catalogs
     /// (maintainer tool: `bin/release` and the drift test call it).
     #[command(hide = true, name = "render-plugins")]
@@ -1975,6 +1980,27 @@ pub struct SetupArgs {
     /// already runs some other way (Docker, a packaged system unit).
     #[arg(long)]
     pub no_service: bool,
+    /// Print the plan and change nothing: what would be created, which
+    /// agents would be wired and why each was detected, and which supported
+    /// agents are not in the plan.
+    #[arg(long, conflicts_with = "yes")]
+    pub plan: bool,
+    /// With `--plan`, print the plan as a JSON document (its `format` field
+    /// names the layout version) for a script or front end to render.
+    #[arg(long, requires = "plan")]
+    pub json: bool,
+    /// Show the plan as a page in your browser, served on 127.0.0.1 behind a
+    /// one-time address printed here, and apply the agents you pick there.
+    /// Nothing changes until you press Apply.
+    #[arg(long, conflicts_with_all = ["yes", "plan"])]
+    pub web: bool,
+    /// With `--web`, print the page's address without opening a browser.
+    #[arg(long, requires = "web")]
+    pub no_open: bool,
+    /// With `--web`, stop when standard input closes. The desktop installer
+    /// holds the write end, so the page goes away with the app.
+    #[arg(long, requires = "web", hide = true)]
+    pub stop_on_stdin_eof: bool,
 }
 
 /// Arguments for `status`.
@@ -2436,6 +2462,13 @@ pub enum AgentChoice {
     /// Muse's own `SessionEnd` closes the session.
     #[value(alias = "muse-code", alias = "musecode")]
     Muse,
+    /// Tencent CodeBuddy Code (`codebuddy`) — lifecycle hooks merged into the
+    /// `hooks` key of `~/.codebuddy/settings.json`. CodeBuddy sends Claude
+    /// Code-shaped hook payloads on stdin, so each entry runs ai-memory's
+    /// native `hook` command directly; there is no script bundle. SessionStart
+    /// stdout (`hookSpecificOutput.additionalContext`) carries the handoff.
+    #[value(name = "codebuddy", alias = "code-buddy")]
+    CodeBuddy,
 }
 
 impl AgentChoice {
@@ -2469,6 +2502,7 @@ impl AgentChoice {
             Self::CopilotCli => AgentKind::CopilotCli,
             Self::Droid => AgentKind::Droid,
             Self::Muse => AgentKind::Muse,
+            Self::CodeBuddy => AgentKind::CodeBuddy,
         }
     }
 
@@ -2489,7 +2523,8 @@ impl AgentChoice {
             | Self::Zcode
             | Self::Hermes
             | Self::Droid
-            | Self::Muse => None,
+            | Self::Muse
+            | Self::CodeBuddy => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -3098,6 +3133,14 @@ pub struct HookArgs {
 #[derive(Debug, Args)]
 pub struct HookDrainArgs {}
 
+/// Arguments for hidden `service-host`.
+#[derive(Debug, Args)]
+pub struct ServiceHostArgs {
+    /// Run the supervisor in this process instead of starting it detached.
+    #[arg(long)]
+    pub supervise: bool,
+}
+
 /// Arguments for hidden `render-plugins`.
 #[derive(Debug, Args)]
 pub struct RenderPluginsArgs {
@@ -3340,15 +3383,16 @@ pub enum TransportKind {
 /// Arguments for `serve`.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Enable optional browser-session management API (requires an opt-in build).
-    #[cfg(feature = "self-service-keys")]
-    #[arg(long, env = "AI_MEMORY_ENABLE_SELF_SERVICE_KEYS")]
-    pub enable_self_service_keys: bool,
-
-    /// Enable optional browser-session management API (requires an opt-in build).
-    #[cfg(feature = "session-management")]
+    /// Serve the `/management/v1` session inspection and owned-purge routes to
+    /// signed-in browser users. Off by default; requires `--transport http`.
     #[arg(long, env = "AI_MEMORY_ENABLE_SESSION_MANAGEMENT")]
     pub enable_session_management: bool,
+
+    /// Let signed-in browser users issue and revoke their own `aim_` API keys
+    /// under `/management/v1/credentials`. Off by default; requires
+    /// `--transport http`.
+    #[arg(long, env = "AI_MEMORY_ENABLE_SELF_SERVICE_KEYS")]
+    pub enable_self_service_keys: bool,
 
     /// Transport to expose the MCP server on.
     #[arg(long, value_enum, default_value_t = TransportKind::Stdio)]
@@ -3486,6 +3530,46 @@ pub struct WritePageArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_management_is_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_session_management);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-session-management",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_session_management);
+    }
+    #[test]
+    fn self_service_keys_is_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_self_service_keys);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-self-service-keys",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_self_service_keys);
+    }
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
@@ -4648,6 +4732,20 @@ mod tests {
                 panic!("expected install-mcp");
             };
             assert_eq!(args.client, McpClient::Droid);
+        }
+    }
+
+    #[test]
+    fn codebuddy_install_hooks_parses_with_the_kebab_alias() {
+        for alias in ["codebuddy", "code-buddy"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::CodeBuddy);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
+            assert_eq!(args.agent.script_hook_subdir(), None);
         }
     }
 

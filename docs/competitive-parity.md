@@ -111,6 +111,7 @@ remaining risk is that borrowed ideas sit **dormant** until the eval harness (R2
 | Retention-as-formula (decay) | agentmemory | **BETTER** | Real SQL decay math vs in-memory O(N²) Jaccard capped at 1000 rows; 2.4 adds opt-in per-tier half-life curves (identity default) |
 | Per-tier retention curves (365/180/90/30) | mcp-memory-service | **SHIPPED (parity), better default** | `[decay.half_life_days]` per tier (2.4, #807); their shape, but the omitted-key default is byte-identical to the old single-λ, so no upgrade mass-evicts |
 | Extractive, zero-LLM compression | agentmemory / mcp-memory-service | **BETTER** | 2.4 tier-down (#808) keeps abstract+summary+regex keep-tokens and drops prose, but is **reversible** (git + supersession chain, `restore-page`) and off by default, not a lossy in-place rewrite |
+| Progressive-disclosure on-start brief (L0/L1/L2) | OpenViking / Letta-code (MemFS directory deferral) | **BETTER on the default path** | The opt-in SessionStart brief gives every pinned / `_rules/` / `_slots/` page an extractive excerpt before any page gets a body, then deepens pinned and slot pages first; four or more unpinned excerpts of one family share a heading. Zero-LLM (OpenViking generates its tiers with a VLM), file-first (frontmatter `abstract:` / `summary:`, no sidecar files), no new MCP tool, and the A2 tier-down substrate stays reversible. Retrieval reads still have no `detail` / `path_prefix` tier (the TrieHI half of R7) |
 | Cold-cluster dedup (DBSCAN, adaptive-eps) | mcp-memory-service | **SHIPPED (parity), better safety** | 2.4 (#812) over the bounded cold set (no O(N²)); collapses by **supersede-not-delete** (invariant #16), conservative eps ceiling, zero-LLM, off by default |
 | Access-weighted retention (access boost) | mcp-memory-service | **SHIPPED (parity+), closed a real gap** | 2.4 (#798) wired reinforcement into `read_page`, the related-walk, and `explore`: every read path, not just search; throttled/async/FTS-exempt |
 | Contradiction detection (0.4–0.75 band) | mcp-memory-service | **SHIPPED (parity), advisory-only** | 2.4 (#814) surfaces likely conflicts in `memory_lint` from existing embeddings; zero-LLM, never edits/deletes/persists an edge |
@@ -190,7 +191,10 @@ implemented without a separate decision.** Ordered by leverage.
    1.2 s from the first command to a returned memory, in a clean temporary
    home with a debug build served as a local release and no model download.
    That run drives the service step through a stand-in `systemctl`/`launchctl`,
-   not a real systemd or launchd, and Windows has no service step. Still open:
+   not a real systemd or launchd. 3.1 brings native Windows to the same two
+   commands: `install.ps1` (checksum-verified, no administrator rights) and a
+   `setup` service step that registers a per-user logon entry running the
+   server with no console window and restarting it after a failure. Still open:
    no npm package, and a "coming from Claude built-in?" importer (the
    `~/.claude/.../memory/` format is nearly identical markdown + `type`
    frontmatter, which makes it a cheap, strong on-ramp).
@@ -279,7 +283,7 @@ invariants), **ALREADY** (we have it and should say so).
 | Auth on by default | SHIPPED (3.0) for new installs; requiring auth on existing loopback installs DECLINED for 2.x | Flipping existing installs would break every env-less hook and MCP config, a major change under our semver. Existing installs opt in with `ai-memory auth enable` |
 | One-command installer / onboarding | SHIPPED (3.0) for Linux and macOS (`install.sh` + `ai-memory setup`); the agent-driven install doc is folded in | No npm package; no Windows service step |
 | Many-language README | DECLINE | Translations go stale on every release, and stale docs are defects under our quality bar |
-| Large speculative tool surfaces (leases, task graphs, routines, sentinels, sketches, crystals, facets; 50+ tools visible by default) | DECLINE | No evidence of real use; each tool adds prompt-surface cost; we keep 23 tools and have run leases where needed |
+| Large speculative tool surfaces (leases, task graphs, routines, sentinels, sketches, crystals, facets; 50+ tools visible by default) | DECLINE | No evidence of real use; each tool adds prompt-surface cost; we keep 24 tools and have run leases where needed |
 | Signals between agents | ALREADY | Typed cross-project messaging with exactly-once pop |
 | Mesh / P2P sync | ALREADY (3.0) via `ai-memory-wikisync` | Two-way, conflict-aware git sync over the file truth using `expected_page_id` compare-and-swap |
 | Durable capture inbox / offline spool | ALREADY | Hook spool, `ai-memory-relay`, `ai-memory recover`, 202/429 backpressure |

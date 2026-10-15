@@ -15,7 +15,9 @@ pub mod auth;
 pub mod human_auth;
 pub mod identity;
 pub mod metrics;
+pub mod self_service_keys;
 mod server;
+pub mod session_management;
 
 pub use actor::actor_from_headers;
 pub use admin::{
@@ -38,9 +40,3 @@ extern crate self as ai_memory_mcp;
 #[cfg(test)]
 #[path = "../tests/suite/mod.rs"]
 mod integration;
-
-#[cfg(feature = "session-management")]
-pub mod session_management;
-
-#[cfg(feature = "self-service-keys")]
-pub mod self_service_keys;

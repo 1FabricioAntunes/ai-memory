@@ -36,6 +36,7 @@ mod routing_skills;
 mod run_offline;
 mod serve_shutdown;
 mod server_profiles;
+mod service_host_windows;
 mod setup_e2e;
 mod shutdown_signals;
 mod upgrade_e2e;

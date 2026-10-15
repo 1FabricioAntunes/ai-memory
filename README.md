@@ -149,6 +149,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | GitHub Copilot CLI | Supported |
 | Factory Droid | Supported |
 | Meta Muse Code | Supported |
+| CodeBuddy Code | Hooks-only |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | DeepSeek Harness (DSH) | MCP-only |
@@ -216,8 +217,12 @@ and links `~/.local/bin/ai-memory`. `ai-memory setup` then creates the data
 directory with a bearer token in an owner-only file, starts a per-user service
 (systemd `--user` or a launchd LaunchAgent), and wires MCP, hooks and Agent
 Skills for every agent it finds, or the ones you name with `--agent`. It shows
-the plan and asks first; `--yes` skips the question, and running it again
-changes nothing. Restart your agents afterwards. Details, the environment
+the plan, with where it found each agent, and asks first: answer `y`, or type
+the numbers of the agents to wire. `--plan` prints the plan and changes
+nothing, `--web` shows the plan as a page in your browser and applies the agents
+you tick there, `--yes` skips the question, and running it again changes nothing.
+Afterwards, restart your agents and ask one of them "What do you remember
+about this project?" to see it answer through ai-memory. Details, the environment
 variables and how to verify the script before running it are in
 [`docs/install.md`](docs/install.md#one-step-native-install-installsh--ai-memory-setup).
 An AI agent installing ai-memory for you can follow
@@ -234,6 +239,23 @@ codex plugin marketplace add akitaonrails/ai-memory && codex plugin add ai-memor
 Codex then asks you to trust the hooks in `/hooks`. See
 [Marketplace plugins](docs/install.md#marketplace-plugins).
 
+### Windows (two commands, no admin)
+
+In PowerShell:
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+ai-memory setup
+```
+
+`install.ps1` checks the release zip against its published SHA-256 checksum,
+unpacks it under `%LOCALAPPDATA%\Programs\ai-memory` and adds that directory
+to your user `PATH`. `ai-memory setup` then does what it does on Linux and
+macOS, with a logon entry in place of the service: the server starts when you
+sign in, with no console window, and restarts if it fails. Details and the
+other Windows setups (WSL2, Docker Desktop, a real Windows service) are in
+[`docs/windows.md`](docs/windows.md).
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install
@@ -243,6 +265,7 @@ user-level systemd units.
 ```bash
 yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary
 yay -S ai-memory        # builds from source
+ai-memory setup         # data dir, user service, agents, self-check
 ```
 
 ### Fedora (RPM)
@@ -255,17 +278,12 @@ then install it:
 sudo dnf install ./ai-memory-*.rpm
 ```
 
-Then follow the native Linux service instructions in [`docs/install.md`](docs/install.md).
-
-Single-user workstation:
+On a single-user workstation, `ai-memory setup` then does the rest, as on the
+two-command path above: data dir and token, a user service, the agents it
+finds, and a self-check.
 
 ```bash
-mkdir -p ~/.config/ai-memory ~/.local/share/ai-memory
-ai-memory --data-dir ~/.local/share/ai-memory \
-  --config ~/.config/ai-memory/config.toml init
-systemctl --user enable --now ai-memory.service
-ai-memory install-mcp --client claude-code --apply
-ai-memory install-hooks --agent claude-code --apply
+ai-memory setup
 ```
 
 System service installs use `/var/lib/ai-memory` and `/etc/ai-memory/` via the
@@ -292,12 +310,12 @@ open "companions/ai-memory-macos/dist/AI Memory.app"
 Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
 from the menu extra (no Dock icon). The app reads the bearer token `init`
 wrote into its data dir, so the status item turns green on its own. Then wire
-an agent with the bundled binary:
+your agents with the bundled binary; `--no-service` leaves the app's
+LaunchAgent in charge:
 
 ```bash
 BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
-"$BIN" install-mcp --client claude-code --apply
-"$BIN" install-hooks --agent claude-code --apply
+"$BIN" setup --no-service
 ```
 
 Prebuilt tarball and launchd-without-the-app paths:
@@ -525,6 +543,14 @@ All options and defaults are in [`nix/nixos-module.nix`](nix/nixos-module.nix).
 The module is entirely opt-in: `nix build`, `nix run`, `nix develop`, and the CLI are
 unchanged if you don't import it.
 
+`git` is a runtime dependency. Hook capture and `ai-memory doctor` run it to
+read the repository a session works in. The module puts `pkgs.git` on the
+service's `PATH`. The package itself leaves the binary unwrapped, because a
+wrapper renames the running process and the live-process guard in `reset`,
+`restore`, `reindex` and `uninstall --purge-data` looks for a process named
+`ai-memory`. If you install the package without the module (`nix profile
+install`, `home.packages`), install `git` next to it.
+
 ## Everyday use
 
 Day to day, you mostly do not think about ai-memory. Hooks capture
@@ -560,6 +586,13 @@ Start with [`docs/users.md`](docs/users.md) for accounts and ownership,
 and [`docs/deploy.md`](docs/deploy.md) for the server itself. It includes
 measured capacity numbers and the one rule you must follow: one server per
 data directory, never two.
+
+Two opt-in HTTP surfaces build on the same browser sign-in, and both are off
+by default. `serve --enable-session-management` lets signed-in users inspect
+sessions and purge the ones they own
+([`docs/session-management.md`](docs/session-management.md)).
+`serve --enable-self-service-keys` lets them issue and revoke their own `aim_`
+API keys ([`docs/self-service-keys.md`](docs/self-service-keys.md)).
 
 ## Security
 
@@ -660,7 +693,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
-| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), [team-wiki sync](companions/ai-memory-wikisync) and the [TypeScript client SDK](companions/ai-memory-ts). |
+| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), [team-wiki sync](companions/ai-memory-wikisync), the [TypeScript client SDK](companions/ai-memory-ts) and the [desktop installer](companions/ai-memory-desktop) (unsigned preview). |
 | [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 

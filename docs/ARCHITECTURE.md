@@ -227,6 +227,22 @@ from hook paths.
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
 
+**Session-start project brief:** when the project's marker sets
+`[briefing] inject_on_session_start`, `GET /handoff` appends a brief of the
+project's pinned, `_rules/` and `_slots/` pages, packed into `[briefing]
+max_chars` (clamped to 1500-20000) with no LLM call. Every page first gets an
+extractive L0 excerpt (`ai_memory_core::excerpt`: frontmatter `abstract`, else
+`summary`, else the leading prose read across paragraphs and lists, 256
+bytes); the bytes left deepen
+pages to an L1 excerpt (`summary` first, 500 bytes, the same clip as A2
+compaction) and then to the whole body, pinned and `_slots/` pages before the
+rest, other bodies cheapest first (`ai_memory_hooks::brief_tiers`). A body is included whole or not at all.
+Four or more unpinned excerpts of one family share a heading. Pages that do not
+fit are listed by path for `memory_read_page`, and the count of them is
+reserved before any page is deepened. The security notice, the
+untrusted-history fence (with fence markers inside page text escaped) and the
+closing footer are never traded for content.
+
 **Cross-project profile:** after the project brief, SessionStart appends a
 fenced, byte-budgeted, byte-stable digest of the user's usual choices from other
 projects (`docs/cross-project-profile.md`), filtered by the stack the project's
@@ -282,6 +298,13 @@ same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
 handoffs from the exact cwd, bounding repeated SessionEnds before any receiver
 starts.
+`GET /recap?session_id=` answers a prompt that starts with `reload context`
+(Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
+`PostToolUse`, OpenCode through its system/context hooks). It is read-only and
+anchored on the session row rather than a cwd: project read authorization and
+the handoff owner filter gate it, and it renders the captured prompts and last
+reply between the session's latest two `pre-compact` observations plus the
+project's open handoffs, listed without a claim.
 ai-memory opens native stores read-only. Raw sanitized JSONL segments are
 immutable, while SQLite supplies monotonic sequences, FTS, native
 source/delivery cursors, and idempotent retry state. A full-ledger
@@ -588,7 +611,7 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (23 tools)
+## MCP tool surface (24 tools)
 
 Every registered tool carries explicit MCP annotations for its human-readable
 title and read-only, destructive, idempotent, and open-world behavior. These
@@ -634,6 +657,7 @@ long-lived entry there is expected policy behavior, not a fault.
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope and `scope: "profile"` into the caller's cross-project profile (path placed under `profile/`); optional `expires_at` sets an RFC3339 or date-only TTL; optional `session_id` cites a session of the same project as evidence, and on `sessions/<id>.md` stamps the session-page frontmatter and settles the queued consolidation job. Optional `expected_page_id` (the `page_id` a read returned) writes only if that is still the latest version, and `create_only: true` refuses to overwrite an existing page; a failed precondition writes nothing and returns `reason: "precondition_failed"` with the current version (see `docs/programmatic-memory.md`). |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`; `scope: "profile"` deletes from the caller's cross-project profile. Fires the admission chain (op=delete); idempotent. Optional `expected_page_id` deletes only if that is still the latest version; otherwise nothing is deleted and the call returns `reason: "precondition_failed"`. |
+| `memory_restore_page` | destructive | Admin only, like `/admin/restore-page`. Without `rev`, list the git checkpoints that changed `path`. With `rev`, write that version (body and frontmatter metadata) back through the `memory_write_page` path (sanitizer, admission, slots, supersession), including a deleted page. Project pages only, not `scope: "profile"`. |
 | `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the `contradiction_band_min`–`contradiction_band_max` cosine-similarity band (default 0.4–0.75; "same topic, not a near-duplicate"; at/above the max is A3 dedup, below the min unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only (never deletes/edits/supersedes a page and persists no edge, invariants #13, #16, #2), so no migration. On a single-language or single-domain store, background similarity between unrelated pages already sits well above the default floor, so the band measures domain proximity more than conflict and produces noisy findings, so raise `contradiction_band_min` (`config.toml` or `AI_MEMORY_CONTRADICTION_BAND_MIN`) for such a store. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
@@ -814,12 +838,23 @@ path filled in, then `install-mcp`, `install-hooks` and global
 session store or MCP config (the stores `doctor` scans). It finishes with a
 read-only self-check: `/healthz`, a `memory_status` call over MCP, and
 `doctor`. The service manager is reached through an injectable runner, so the
-unit rendering and the `systemctl`/`launchctl` calls are tested without a real
-session. Windows has no service step. A second run changes no file. Each
+unit rendering and the `systemctl`/`launchctl`/`reg` calls are tested without a
+real session. On Windows the "unit" is an `ai-memory` value under the per-user
+`HKCU\...\CurrentVersion\Run` key that runs the hidden `service-host`
+command at logon; `service-host` detaches from the console and supervises
+`serve` with a hidden console, restarting it after a failure, and records both
+pids in `<data_dir>/service-host.json`. A second run changes no file. Each
 rendered unit carries an identity line with the SHA-256 of the rest of the
-file; `uninstall` stops and removes only a unit whose digest still matches.
-`install.sh`, a release asset with its own `.sha256`, installs the release
-tarball under `~/.local` after checking it against the published checksum.
+file; `uninstall` stops and removes only a unit whose digest still matches (on
+Windows, only a `Run` value with the shape `setup` writes).
+`install.sh` and, for Windows, `install.ps1` are release assets with their own
+`.sha256` files; each installs the release archive after checking it against
+the published checksum, under `~/.local` or `%LOCALAPPDATA%\Programs`.
+`setup --web` serves the plan from a one-shot axum router in the CLI
+(`commands/setup_web.rs`), separate from the read-only `/web` UI: loopback
+only, a one-time path secret, an exact `Host` check, `Origin` plus CSRF on
+every POST, and an Apply that runs `setup --yes --agent ...` as a child
+process (security-boundaries row 17).
 
 The hidden `render-plugins --out <dir>` generates the Claude Code and Codex
 marketplace plugins under `plugins/` and their catalogs

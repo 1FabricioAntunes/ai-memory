@@ -112,7 +112,12 @@ ai-jail --network --agent-state --no-save-config \
   minimal allowlist, so `AI_MEMORY_*`, `CLAUDE_CONFIG_DIR`, and provider tokens
   are **not** inherited. ai-memory forwards the ones it set (server/hook URL,
   the token vars it already threads) with `--env NAME`. Only names that are
-  actually set in the current environment are forwarded.
+  actually set in the current environment are forwarded, plus two values the
+  outer run resolved from its config: the bearer token (often read from
+  `[auth].bearer_token_file`) and a `server_url` set in `config.toml`.
+  ai-jail's private home hides the data dir holding both, so without them the
+  jailed run got 401 on every server call. ai-memory sets them on the ai-jail
+  process's environment, never its argv, and forwards them by name.
 - **`--no-save-config`** so ai-jail never writes these flags into the
   project `.ai-jail` (§5).
 - **`--agent-state`** so the harness's own login/credentials persist across the

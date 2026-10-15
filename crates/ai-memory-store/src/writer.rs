@@ -492,6 +492,17 @@ pub(crate) enum WriteCmd {
         owner: Option<IdentityKey>,
         reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
     },
+    /// Final `wal_checkpoint(TRUNCATE)`, then close the connection and stop
+    /// the actor. See [`WriterHandle::checkpoint_and_close`].
+    Close {
+        reply: oneshot::Sender<()>,
+    },
+    /// Test seam: read `PRAGMA journal_size_limit` off the writer's own
+    /// connection, the only place the pragma is set.
+    #[cfg(test)]
+    JournalSizeLimit {
+        reply: oneshot::Sender<StoreResult<i64>>,
+    },
     /// Reclaim free pages on demand: rebuild the FTS indexes and `VACUUM`,
     /// deleting nothing. See [`ops::compact`].
     Compact {
@@ -684,6 +695,10 @@ pub(crate) enum WriteCmd {
         label: String,
         token_hash: [u8; TOKEN_HASH_LEN],
         preview: Option<String>,
+        /// Refuse with [`StoreError::InvalidState`] when the user already
+        /// holds this many active credentials. Checked on the writer thread,
+        /// so concurrent creates cannot both slip under the limit.
+        max_active: Option<usize>,
         reply: oneshot::Sender<StoreResult<ApiCredentialId>>,
     },
     RotateApiCredential {
@@ -2410,6 +2425,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Truncate the WAL, close the writer's connection and stop the actor,
+    /// waiting until that has happened. Later calls fail with
+    /// [`StoreError::WriterClosed`]. Returns at once if the actor already
+    /// stopped.
+    ///
+    /// Queued behind every command already accepted, so it also waits for a
+    /// long-running one (a `VACUUM`); callers bound it with a timeout. A
+    /// checkpoint a reader holds back is logged, never an error.
+    pub async fn checkpoint_and_close(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.send(WriteCmd::Close { reply: tx }).await.is_ok() {
+            // The reply follows the checkpoint and the connection close; a
+            // dropped sender means the actor stopped without answering.
+            let _ = rx.await;
+        }
+    }
+
+    /// `PRAGMA journal_size_limit` as the writer's connection reports it.
+    #[cfg(test)]
+    pub(crate) async fn journal_size_limit(&self) -> StoreResult<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::JournalSizeLimit { reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Reclaim free pages on demand, deleting nothing.
     ///
     /// Runs through the writer actor like every other exclusive operation, so
@@ -3090,6 +3130,38 @@ impl WriterHandle {
         token_hash: [u8; TOKEN_HASH_LEN],
         preview: Option<String>,
     ) -> StoreResult<ApiCredentialId> {
+        self.send_create_api_credential(id, user_id, label, token_hash, preview, None)
+            .await
+    }
+
+    /// Insert a native API credential unless `user_id` already holds
+    /// `max_active` active ones.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidState`] at the limit; duplicate hash, writer
+    /// closed, SQL.
+    pub async fn create_api_credential_within_limit(
+        &self,
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+        max_active: usize,
+    ) -> StoreResult<ApiCredentialId> {
+        self.send_create_api_credential(id, user_id, label, token_hash, preview, Some(max_active))
+            .await
+    }
+
+    async fn send_create_api_credential(
+        &self,
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+        max_active: Option<usize>,
+    ) -> StoreResult<ApiCredentialId> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::CreateApiCredential {
             id,
@@ -3097,6 +3169,7 @@ impl WriterHandle {
             label,
             token_hash,
             preview,
+            max_active,
             reply: tx,
         })
         .await?;
@@ -4293,6 +4366,25 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "purge_session");
             }
+            WriteCmd::Close { reply } => {
+                ops::truncate_wal_best_effort(&conn, "shutdown");
+                // Close before replying, so the caller's return means the
+                // connection is released.
+                drop(conn);
+                send_or_warn(reply, (), "close");
+                // Same drain as `Shutdown`: callers that already hold a
+                // permit see `WriterClosed` instead of waiting forever.
+                rx.close();
+                while rx.blocking_recv().is_some() {}
+                break;
+            }
+            #[cfg(test)]
+            WriteCmd::JournalSizeLimit { reply } => {
+                let result = conn
+                    .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+                    .map_err(StoreError::from);
+                send_or_warn(reply, result, "journal_size_limit");
+            }
             WriteCmd::Compact { reply } => {
                 let result = ops::compact(&mut conn);
                 send_or_warn(reply, result, "compact");
@@ -4601,16 +4693,32 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 label,
                 token_hash,
                 preview,
+                max_active,
                 reply,
             } => {
-                let result = api_credentials::insert_api_credential(
-                    &conn,
-                    id,
-                    user_id,
-                    &label,
-                    &token_hash,
-                    preview.as_deref(),
-                );
+                let at_limit = match max_active {
+                    Some(max) => api_credentials::count_active_api_credentials_for_user(
+                        &conn,
+                        user_id,
+                        jiff::Timestamp::now().as_microsecond(),
+                    )
+                    .map(|active| (active >= max).then_some(max)),
+                    None => Ok(None),
+                };
+                let result = match at_limit {
+                    Ok(Some(max)) => Err(StoreError::InvalidState(format!(
+                        "active API key limit reached ({max}); revoke a key before creating another"
+                    ))),
+                    Ok(None) => api_credentials::insert_api_credential(
+                        &conn,
+                        id,
+                        user_id,
+                        &label,
+                        &token_hash,
+                        preview.as_deref(),
+                    ),
+                    Err(e) => Err(e),
+                };
                 send_or_warn(reply, result, "create_api_credential");
             }
             WriteCmd::RotateApiCredential {

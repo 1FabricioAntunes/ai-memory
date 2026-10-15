@@ -1853,6 +1853,10 @@ pub struct BriefPageBody {
     pub pinned: bool,
     /// ISO-8601 timestamp of the last update.
     pub updated_at: String,
+    /// Parsed frontmatter, where the renderer finds the page's `abstract:`
+    /// and `summary:`. `{}` if the stored JSON ever fails to parse, which
+    /// leaves that page with body-only excerpts.
+    pub frontmatter_json: serde_json::Value,
 }
 
 /// One row per (workspace, project) with aggregate stats.
@@ -2303,8 +2307,16 @@ pub struct ReaderPool {
 
 struct Inner {
     db_path: PathBuf,
-    pool: Mutex<Vec<Connection>>,
+    pool: Mutex<Pool>,
     soft_cap: usize,
+}
+
+/// The idle connections and whether the pool still hands out new ones. One
+/// lock covers both, so a checkout or a return cannot interleave with
+/// [`ReaderPool::close`] between reading the flag and touching the idle list.
+struct Pool {
+    idle: Vec<Connection>,
+    closed: bool,
 }
 
 impl ReaderPool {
@@ -2317,12 +2329,31 @@ impl ReaderPool {
         Ok(Self {
             inner: Arc::new(Inner {
                 db_path: db_path.to_path_buf(),
-                pool: Mutex::new(Vec::with_capacity(soft_cap.max(1))),
+                pool: Mutex::new(Pool {
+                    idle: Vec::with_capacity(soft_cap.max(1)),
+                    closed: false,
+                }),
                 soft_cap: soft_cap.max(1),
             }),
             tuning: RetrievalTuning::default(),
             fts_stopwords: FtsStopwords::default(),
         })
+    }
+
+    /// Close the pool for shutdown: drop every idle connection, and make every
+    /// later read fail with [`StoreError::ReaderClosed`] instead of opening a
+    /// new one. Idempotent.
+    ///
+    /// A read already running is not interrupted or waited for: it finishes
+    /// on its own connection, and that connection is dropped when it is
+    /// returned rather than pooled again. Such a read can hold a snapshot that
+    /// keeps the writer's final checkpoint from truncating the WAL; the
+    /// checkpoint then logs the blocked attempt and the WAL is replayed on the
+    /// next start, as after any other unclean stop.
+    pub fn close(&self) {
+        let mut pool = self.inner.pool.lock();
+        pool.closed = true;
+        pool.idle.clear();
     }
 
     /// Configure the opt-in ranking signals used by [`Self::hybrid_search`].
@@ -7861,7 +7892,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let core_sql = format!(
-                "SELECT path, title, body, pinned, updated_at \
+                "SELECT path, title, body, pinned, updated_at, frontmatter_json \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                    AND (path GLOB '_rules/*' \
@@ -7880,6 +7911,7 @@ impl ReaderPool {
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)? != 0,
                     updated_us,
+                    row.get::<_, String>(5)?,
                 ))
             };
             let core_rows = match slot_glob.as_deref() {
@@ -7906,7 +7938,7 @@ impl ReaderPool {
             let core: Vec<BriefPageBody> = core_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .map(|(path, title, body, pinned, updated_us)| {
+                .map(|(path, title, body, pinned, updated_us, frontmatter)| {
                     jiff::Timestamp::from_microsecond(updated_us)
                         .map(|ts| BriefPageBody {
                             path,
@@ -7914,6 +7946,8 @@ impl ReaderPool {
                             body,
                             pinned,
                             updated_at: ts.to_string(),
+                            frontmatter_json: serde_json::from_str(&frontmatter)
+                                .unwrap_or_else(|_| serde_json::json!({})),
                         })
                         .map_err(|e| {
                             StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(
@@ -12927,16 +12961,24 @@ fn has_trailing_path_separator(path: &str) -> bool {
 }
 
 fn checkout(inner: &Inner) -> StoreResult<Connection> {
-    if let Some(conn) = inner.pool.lock().pop() {
-        return Ok(conn);
+    {
+        let mut pool = inner.pool.lock();
+        if pool.closed {
+            return Err(StoreError::ReaderClosed);
+        }
+        if let Some(conn) = pool.idle.pop() {
+            return Ok(conn);
+        }
     }
     open_read_only(&inner.db_path)
 }
 
 fn checkin(inner: &Inner, conn: Connection) {
     let mut pool = inner.pool.lock();
-    if pool.len() < inner.soft_cap {
-        pool.push(conn);
+    // A connection returned after `close` is dropped, not pooled: pooling it
+    // would revive a reader the shutdown just released.
+    if !pool.closed && pool.idle.len() < inner.soft_cap {
+        pool.idle.push(conn);
     }
 }
 
@@ -12951,6 +12993,39 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `close` is a state, not a one-off sweep: a connection checked out
+    /// before it is dropped on return, and nothing opens after it. The control
+    /// half shows the same return pools the connection while the pool is open.
+    #[test]
+    fn a_closed_pool_drops_a_returned_connection_and_refuses_checkout() {
+        use super::{ReaderPool, checkin, checkout};
+        use crate::error::StoreError;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("pool.sqlite");
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = ReaderPool::new(&path, 4).unwrap();
+
+        let open = checkout(&pool.inner).unwrap();
+        checkin(&pool.inner, open);
+        assert_eq!(pool.inner.pool.lock().idle.len(), 1, "control: pooled");
+
+        let held = checkout(&pool.inner).unwrap();
+        pool.close();
+        assert_eq!(pool.inner.pool.lock().idle.len(), 0, "idle set released");
+        checkin(&pool.inner, held);
+        assert_eq!(
+            pool.inner.pool.lock().idle.len(),
+            0,
+            "a connection returned after close was pooled again"
+        );
+        assert!(matches!(
+            checkout(&pool.inner),
+            Err(StoreError::ReaderClosed)
+        ));
+        pool.close();
+    }
 
     /// The percentage is what an operator actually reads, and it divides by a
     /// figure that is zero on a fresh database.
