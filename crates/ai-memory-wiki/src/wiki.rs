@@ -11,8 +11,9 @@ use ai_memory_core::{
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, PurgeSessionSummary,
-    ReaderPool, ScopeRow, WriterHandle, artifact_path_for, f32_vec_to_bytes,
+    ConditionalUpsert, FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagePrecondition,
+    PagesMode, PurgeSessionSummary, ReaderPool, ScopeRow, WriterHandle, artifact_path_for,
+    f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -295,10 +296,12 @@ impl Wiki {
         &self.sanitizer
     }
 
-    /// Attach an embedder. When set, `write_page` computes + stores an
-    /// embedding for the new version synchronously. `apply_batch` keeps
-    /// the SQL/file fan-out atomic and leaves vector completeness to
-    /// admin or scheduled embedding backfill. Without an embedder,
+    /// Attach an embedder. When set, every page-writing path (`write_page`,
+    /// `apply_batch`, auto-improvement approval, checkpoint restore and the
+    /// watcher's reindex) computes + stores an embedding for the new version
+    /// on the caller's task, after its mutation guard is released; a
+    /// provider failure is recorded and leaves the page to admin or
+    /// scheduled embedding backfill. Without an embedder,
     /// vector search is skipped and `ReaderPool::hybrid_search` uses
     /// FTS5 + entity + graph expansion.
     #[must_use]
@@ -899,29 +902,38 @@ impl Wiki {
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         let meta = derive_index_metadata(&path, &md.frontmatter)?;
+        let body = md.body.clone();
+        let abstract_text = frontmatter_abstract(&md.frontmatter).map(str::to_owned);
 
-        let _guard = self.mutation_lock.read().await;
-        self.ensure_project_workspace(workspace_id, project_id)
-            .await?;
-        let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
-        self.git.write_atomic(&abs, raw.as_bytes())?;
-        let id = self
-            .writer
-            .upsert_page(NewPage {
-                workspace_id,
-                project_id,
-                path,
-                title,
-                body: md.body,
-                tier: meta.tier,
-                frontmatter_json: md.frontmatter,
-                pinned: meta.pinned,
-                links,
-                author_id: None,
-                expires_at: meta.expires_at,
-                entities: meta.entities,
-                evidence: Vec::new(),
-            })
+        let id = {
+            let _guard = self.mutation_lock.read().await;
+            self.ensure_project_workspace(workspace_id, project_id)
+                .await?;
+            let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
+            self.git.write_atomic(&abs, raw.as_bytes())?;
+            self.writer
+                .upsert_page(NewPage {
+                    workspace_id,
+                    project_id,
+                    path,
+                    title,
+                    body: md.body,
+                    tier: meta.tier,
+                    frontmatter_json: md.frontmatter,
+                    pinned: meta.pinned,
+                    links,
+                    author_id: None,
+                    expires_at: meta.expires_at,
+                    entities: meta.entities,
+                    evidence: Vec::new(),
+                })
+                .await?
+        };
+        // Embed the restored version like `write_page` does; without this it
+        // ranked FTS-only until a backfill. The watcher's reindex of the file
+        // just written hits the unchanged-content short-circuit and does not
+        // embed it either.
+        self.embed_page_version(id, &body, abstract_text.as_deref())
             .await?;
         Ok(id)
     }
@@ -1020,6 +1032,7 @@ impl Wiki {
         path: &PagePath,
         expected_latest_id: PageId,
         admission_ctx: Option<AdmissionContext>,
+        author_id: Option<UserId>,
     ) -> WikiResult<bool> {
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.write().await;
@@ -1040,7 +1053,7 @@ impl Wiki {
             path,
             admission_ctx,
             PageStoreRemoval::Delete {
-                author_id: None,
+                author_id,
                 expected_latest_id: Some(expected_latest_id),
             },
         )
@@ -1215,11 +1228,17 @@ impl Wiki {
 
         let delete_result = match removal {
             PageStoreRemoval::Delete {
+                author_id,
                 expected_latest_id: Some(expected),
-                ..
             } => {
                 self.writer
-                    .delete_page_if_latest(workspace_id, project_id, path.clone(), expected)
+                    .delete_page_if_latest(
+                        workspace_id,
+                        project_id,
+                        path.clone(),
+                        expected,
+                        author_id,
+                    )
                     .await
             }
             PageStoreRemoval::Delete {
@@ -1835,6 +1854,17 @@ impl Wiki {
                 }
             }
         };
+
+        // Embed the applied version like `write_page` does, after the
+        // mutation guard is released (the provider call may block). Without
+        // this, approved pages stayed vectorless until a backfill ran: the
+        // watcher's reindex of the file we just wrote hits the store's
+        // unchanged-content short-circuit, so it never embeds them either.
+        if let ApproveAutoImproveProposalResult::Approved { page_id } = &result {
+            let abstract_text = frontmatter_abstract(&markdown.frontmatter);
+            self.embed_page_version(*page_id, &markdown.body, abstract_text)
+                .await?;
+        }
 
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
             chain.dispatch_async(
@@ -2572,6 +2602,22 @@ impl Wiki {
             (ids, dispatches)
         };
 
+        // Embed each applied version like `write_page` does, after the
+        // guards are released. Unlike `write_page`, a store error while
+        // persisting a vector is logged rather than returned: the batch has
+        // committed, and callers (consolidation, sweep, dream, bootstrap)
+        // record per-page outcomes from these ids, so an `Err` here would
+        // report written pages as failed. The vector-less page is picked up
+        // by the next embedding backfill.
+        for (id, (path, frontmatter, body, _)) in ids.iter().zip(&dispatches) {
+            if let Err(error) = self
+                .embed_page_version(*id, body, frontmatter_abstract(frontmatter))
+                .await
+            {
+                tracing::warn!(%error, path = %path.as_str(), "batch page indexed without its embedding");
+            }
+        }
+
         if let Some(chain) = &self.admission_chain {
             for (path, frontmatter, body, ctx) in &dispatches {
                 if let Some(ctx) = ctx {
@@ -2640,6 +2686,39 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for any filesystem, parsing, or store error.
     pub async fn write_page(&self, req: WritePageRequest) -> WikiResult<PageId> {
+        match self.write_page_inner(req, None).await? {
+            ConditionalWrite::Written(id) => Ok(id),
+            ConditionalWrite::Mismatch { .. } => Err(ai_memory_wiki_error(
+                "an unconditional page write reported a precondition mismatch",
+            )),
+        }
+    }
+
+    /// [`Self::write_page`] only when `precondition` holds for the page's
+    /// latest version. A mismatch writes nothing: no file change, no new
+    /// version, no webhook dispatch.
+    ///
+    /// Checked twice under the page lock: before the file is replaced, so a
+    /// normal mismatch never touches disk, and again in the store transaction
+    /// that writes the version, which is the authority (a plain delete takes
+    /// only the shared mutation lock and can land between the two); a
+    /// mismatch there restores the file.
+    ///
+    /// # Errors
+    /// As [`Self::write_page`].
+    pub async fn write_page_if(
+        &self,
+        req: WritePageRequest,
+        precondition: PagePrecondition,
+    ) -> WikiResult<ConditionalWrite> {
+        self.write_page_inner(req, Some(precondition)).await
+    }
+
+    async fn write_page_inner(
+        &self,
+        req: WritePageRequest,
+        precondition: Option<PagePrecondition>,
+    ) -> WikiResult<ConditionalWrite> {
         self.confined_page_path(
             req.workspace_id,
             req.project_id,
@@ -2762,30 +2841,51 @@ impl Wiki {
             self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
+            if let (Some(precondition), Some(reader)) = (precondition, &self.store_reader) {
+                let current = reader
+                    .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+                    .await?;
+                if !precondition_holds(precondition, current) {
+                    return Ok(ConditionalWrite::Mismatch { current });
+                }
+            }
             let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
             let installed =
                 replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?; // lgtm [rust/path-injection]
 
-            match self
-                .writer
-                .upsert_page(NewPage {
-                    workspace_id,
-                    project_id,
-                    path,
-                    title,
-                    body: final_body.clone(),
-                    tier,
-                    frontmatter_json: final_frontmatter,
-                    pinned,
-                    links,
-                    author_id,
-                    expires_at,
-                    entities,
-                    evidence,
-                })
-                .await
-            {
-                Ok(id) => id,
+            let page = NewPage {
+                workspace_id,
+                project_id,
+                path,
+                title,
+                body: final_body.clone(),
+                tier,
+                frontmatter_json: final_frontmatter,
+                pinned,
+                links,
+                author_id,
+                expires_at,
+                entities,
+                evidence,
+            };
+            let written = match precondition {
+                None => self
+                    .writer
+                    .upsert_page(page)
+                    .await
+                    .map(ConditionalUpsert::Upserted),
+                Some(precondition) => self.writer.upsert_page_if(page, precondition).await,
+            };
+            match written {
+                Ok(ConditionalUpsert::Upserted(id)) => id,
+                Ok(ConditionalUpsert::Mismatch { current }) => {
+                    rollback_or_inconsistent(
+                        &self.git,
+                        std::slice::from_ref(&installed),
+                        &"a page write precondition no longer held",
+                    )?;
+                    return Ok(ConditionalWrite::Mismatch { current });
+                }
                 Err(e) => {
                     rollback_or_inconsistent(&self.git, std::slice::from_ref(&installed), &e)?;
                     return Err(e.into());
@@ -2810,17 +2910,21 @@ impl Wiki {
                 ctx,
             );
         }
-        Ok(page_id)
+        Ok(ConditionalWrite::Written(page_id))
     }
 
     /// Embed `body` (and its L0 `abstract:` line, if present) into
     /// `page_id`'s vectors, when an embedder is configured.
     ///
-    /// Shared by [`Wiki::write_page`] (every version written through the
-    /// API) and [`Wiki::reindex_page_locked`] (external file writes and
-    /// rewrites picked up by the watcher), so a page version becomes
-    /// hybrid-searchable through the same mechanism regardless of which path
-    /// produced it. Before this was pulled out, only `write_page` embedded —
+    /// Called after the upsert, outside the mutation guard, by every path
+    /// that writes a page version: [`Wiki::write_page`] (every version
+    /// written through the API), [`Wiki::reindex_page`] (external file
+    /// writes and rewrites picked up by the watcher), auto-improvement
+    /// approval, [`Wiki::apply_batch`] and checkpoint restore. A page version
+    /// becomes hybrid-searchable through the same mechanism regardless of
+    /// which path produced it; the watcher cannot cover the others, because
+    /// its reindex of a file the wiki just wrote hits the unchanged-content
+    /// short-circuit. Before this was pulled out, only `write_page` embedded —
     /// a watcher-driven rewrite got a new page id (the supersession chain
     /// worked) but no embedding until a manual `ai-memory embed` (issue
     /// #929): hybrid search silently fell back to FTS-only ranking for
@@ -2911,6 +3015,18 @@ impl Wiki {
         }
         Ok(())
     }
+}
+
+/// The outcome of [`Wiki::write_page_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalWrite {
+    /// The precondition held and the page was written; the id is current.
+    Written(PageId),
+    /// The precondition did not hold and nothing was written.
+    Mismatch {
+        /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
 }
 
 /// Input bundle for [`Wiki::write_page`]. Carries the full 3-tuple
@@ -3252,6 +3368,13 @@ fn rollback_installed_files(git: &GitAdapter, installed: &[InstalledFile]) -> Wi
         }
     }
     Ok(())
+}
+
+fn precondition_holds(precondition: PagePrecondition, current: Option<PageId>) -> bool {
+    match precondition {
+        PagePrecondition::Absent => current.is_none(),
+        PagePrecondition::Latest(expected) => current == Some(expected),
+    }
 }
 
 fn rollback_or_inconsistent<E: std::fmt::Display>(
@@ -4829,6 +4952,127 @@ mod tests {
                 .body,
             "new proposal body"
         );
+    }
+
+    /// An approved auto-improvement page is embedded on approval, like every
+    /// `write_page` version. Before, nothing on the write path embedded it:
+    /// the page stayed out of the vector stream until an embedding backfill
+    /// (startup, scheduled or `ai-memory embed`) found it.
+    #[tokio::test]
+    async fn auto_improve_approval_embeds_the_applied_page() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(32));
+        let wiki = wiki.with_embedder(embedder);
+        let id = stage_one(&store, ws, proj, "notes/embedded.md", "approved body").await;
+        let result = wiki
+            .approve_auto_improve_proposal(ws, proj, id, ActorContext::default(), None, None)
+            .await
+            .unwrap();
+        let ApproveAutoImproveProposalResult::Approved { page_id } = result else {
+            panic!("expected approval, got {result:?}");
+        };
+        let embedded = store
+            .reader
+            .embedded_page_ids(ws, proj, "synthetic".into(), "bag-of-words-v1".into(), 32)
+            .await
+            .unwrap();
+        assert!(
+            embedded.contains(&page_id),
+            "the approved page version must be embedded by the approval itself"
+        );
+    }
+
+    /// Body and abstract vector sets for the synthetic test embedder.
+    async fn synthetic_embedded(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> (Vec<PageId>, Vec<PageId>) {
+        let (provider, model) = ("synthetic".to_string(), "bag-of-words-v1".to_string());
+        let body = store
+            .reader
+            .embedded_page_ids(ws, proj, provider.clone(), model.clone(), 32)
+            .await
+            .unwrap();
+        let abstracts = store
+            .reader
+            .abstract_embedded_page_ids(ws, proj, provider, model, 32)
+            .await
+            .unwrap();
+        (body, abstracts)
+    }
+
+    /// Batch writes (consolidation, sweep, dream, bootstrap) embed every
+    /// applied version, abstract included, like `write_page`. Before, they
+    /// stayed out of the vector stream until an embedding backfill.
+    #[tokio::test]
+    async fn apply_batch_embeds_every_applied_page() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(32));
+        let wiki = wiki.with_embedder(embedder);
+        let ids = wiki
+            .apply_batch(vec![
+                req(
+                    ws,
+                    proj,
+                    "notes/plain.md",
+                    "plain batch body",
+                    serde_json::json!({}),
+                ),
+                req(
+                    ws,
+                    proj,
+                    "notes/summarized.md",
+                    "summarized batch body",
+                    serde_json::json!({"abstract": "one-line batch summary"}),
+                ),
+            ])
+            .await
+            .unwrap();
+        let (body, abstracts) = synthetic_embedded(&store, ws, proj).await;
+        assert!(
+            ids.iter().all(|id| body.contains(id)),
+            "every batch page must be embedded by the batch itself: {ids:?} vs {body:?}"
+        );
+        assert_eq!(abstracts, vec![ids[1]], "only the page with an abstract");
+    }
+
+    /// A checkpoint restore writes a new latest version and must embed it;
+    /// before, the restored version had no vectors until a backfill.
+    #[tokio::test]
+    async fn restore_from_checkpoint_embeds_the_restored_version() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = "notes/restored.md";
+        // Both earlier versions are written with no embedder, so only the
+        // restore itself can produce the vectors checked below.
+        wiki.write_page(req(
+            ws,
+            proj,
+            path,
+            "checkpointed body",
+            serde_json::json!({"abstract": "checkpointed summary"}),
+        ))
+        .await
+        .unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+        wiki.write_page(req(ws, proj, path, "later body", serde_json::json!({})))
+            .await
+            .unwrap();
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(32));
+        let wiki = wiki.with_embedder(embedder);
+        let id = wiki
+            .restore_page_from_checkpoint(ws, proj, PagePath::new(path).unwrap(), &rev)
+            .await
+            .unwrap();
+        let (body, abstracts) = synthetic_embedded(&store, ws, proj).await;
+        assert_eq!(body, vec![id], "the restored version is embedded");
+        assert_eq!(abstracts, vec![id], "with its restored abstract");
     }
 
     #[tokio::test]

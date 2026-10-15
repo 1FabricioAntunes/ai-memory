@@ -477,3 +477,43 @@ fn devin_install_instructions_writes_project_devin_skills() {
     assert!(!project.path().join(".claude/skills").exists());
     assert!(!project.path().join(".agents/skills").exists());
 }
+
+/// #1297: with only `AGENTS.md` written, a `CLAUDE.local.md` or
+/// `.claude/CLAUDE.md` makes Claude Code read that instead, so the install
+/// says so. Controls: `AGENTS.md` alone, a `CLAUDE.md` target alongside, and a
+/// shadowing file that already imports `@AGENTS.md` print no note.
+#[test]
+fn install_instructions_warns_when_claude_code_will_skip_agents_md() {
+    let note = "so Claude Code reads it instead of AGENTS.md";
+    let run = |files: &[(&str, &str)]| {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("AGENTS.md"), "# Project\n").unwrap();
+        for (name, text) in files {
+            let path = project.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let output = run_ai_memory(
+            project.path(),
+            home.path(),
+            &["install-instructions", "--no-skills"],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_success(output);
+        let agents = fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains(MARKER_START), "AGENTS.md gets the block");
+        stderr
+    };
+    for shadow in ["CLAUDE.local.md", ".claude/CLAUDE.md"] {
+        let stderr = run(&[(shadow, "# mine\n")]);
+        assert!(
+            stderr.contains(note) && stderr.contains(shadow),
+            "{shadow}: {stderr}"
+        );
+    }
+    assert!(!run(&[]).contains(note));
+    assert!(!run(&[("CLAUDE.local.md", "@AGENTS.md\n")]).contains(note));
+    // A CLAUDE.md alongside becomes a target too, so Claude Code sees the block.
+    assert!(!run(&[("CLAUDE.md", "# claude\n")]).contains(note));
+}

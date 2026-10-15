@@ -1792,6 +1792,13 @@ fn validate_proposal(
     if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
     }
+    // Confidence is documented as `0.0..=1.0`. A model that answers in percent
+    // (`85`) would clear the floor below and be stored, and shown to the
+    // reviewer, as 8500%. NaN fails every comparison, so it needs this test
+    // too.
+    if !(0.0..=1.0).contains(&proposal.confidence) {
+        return Err("confidence_out_of_range".into());
+    }
     if proposal.confidence < cfg.min_confidence {
         return Err("confidence_below_threshold".into());
     }
@@ -2378,10 +2385,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_eval_script(body: &str) -> String {
+    fn write_eval_script(body: &str) -> (tempfile::TempDir, String) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().unwrap().keep();
-        let path = dir.join("eval.sh");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("eval.sh");
         std::fs::write(&path, body).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
@@ -2390,13 +2397,14 @@ mod tests {
         // temp file directly. Some Linux filesystems can briefly report
         // ETXTBSY for direct exec under parallel tests even after write(2)
         // returns and the file handle has been dropped.
-        format!("sh {}", path.display())
+        let command = format!("sh {}", path.display());
+        (dir, command)
     }
 
     #[cfg(windows)]
-    fn write_eval_script(body: &str) -> String {
-        let dir = tempfile::TempDir::new().unwrap().keep();
-        let path = dir.join("eval.ps1");
+    fn write_eval_script(body: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("eval.ps1");
         let body = match body {
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n" => {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}')\n"
@@ -2429,11 +2437,12 @@ mod tests {
             other => panic!("unmapped eval script fixture for Windows: {other:?}"),
         };
         std::fs::write(&path, body).unwrap();
-        format!(
+        let command = format!(
             "{} -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
             ai_memory_test_support::powershell_exe(),
             path.display()
-        )
+        );
+        (dir, command)
     }
 
     #[tokio::test]
@@ -2457,7 +2466,7 @@ mod tests {
 
     #[tokio::test]
     async fn passing_eval_allows_proposal_and_records_evidence() {
-        let script = write_eval_script(
+        let (_eval_dir, script) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n",
         );
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
@@ -2484,7 +2493,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn structured_eval_records_server_observation() {
-        let command = write_eval_script(
+        let (_eval_dir, command) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":true,\"score_before\":0.72,\"score_after\":0.76,\"run_id\":\"caller-run\",\"eval_id\":\"caller-eval\",\"checker_invocation_digest\":\"caller-digest\",\"after_body_sha256\":\"caller-body\"}'\n",
         );
         let candidate = proposal("_rules/test.md", "rule", 0.9);
@@ -2545,7 +2554,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_eval_filters_and_records_rejection() {
-        let script = write_eval_script(
+        let (_eval_dir, script) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}'\n",
         );
         let mut proposals = vec![proposal("procedures/test.md", "procedure", 0.9)];
@@ -2576,7 +2585,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_reports_rejected_when_scorer_returns_false() {
-        let script = write_eval_script(
+        let (_eval_dir, script) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":false,\"reason\":\"structure check failed\"}'\n",
         );
         let mut proposals = vec![proposal("procedures/test.md", "procedure", 0.9)];
@@ -2668,7 +2677,7 @@ mod tests {
                 "eval_gate_timeout",
             ),
         ];
-        for (command, expected_reason) in cases {
+        for ((_eval_dir, command), expected_reason) in cases {
             let mut cfg = eval_cfg(command);
             cfg.timeout_secs = if cfg!(windows) { 8 } else { 1 };
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
@@ -2705,7 +2714,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_timeout_covers_blocked_stdin_write() {
-        let script = write_eval_script("#!/bin/sh\nsleep 5\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nsleep 5\n");
         let mut cfg = eval_cfg(script);
         cfg.timeout_secs = 1;
         let mut proposal = proposal("_rules/test.md", "rule", 0.9);
@@ -2743,7 +2752,7 @@ mod tests {
         // One zero-padded printf writes the 70,000 bytes at once. A shell loop
         // printing one byte per iteration took longer than the gate's 2s
         // timeout on a loaded machine, which failed the test as a timeout.
-        let script = write_eval_script("#!/bin/sh\nprintf '%070000d' 0\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nprintf '%070000d' 0\n");
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
@@ -2801,7 +2810,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_targeted_proposal_bypasses_eval() {
-        let script = write_eval_script("#!/bin/sh\nexit 7\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nexit 7\n");
         let mut proposals = vec![proposal("gotchas/test.md", "gotcha", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
@@ -3675,6 +3684,28 @@ mod tests {
         assert_eq!(rejected.len(), 2);
         assert_eq!(rejected[0].reason, "confidence_below_threshold");
         assert_eq!(rejected[1].reason, "unsupported_path_prefix");
+    }
+
+    #[test]
+    fn validation_rejects_confidence_outside_the_unit_interval() {
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![
+                proposal("gotchas/percent.md", "gotcha", 85.0),
+                proposal("gotchas/nan.md", "gotcha", f32::NAN),
+                proposal("gotchas/negative.md", "gotcha", -0.5),
+                proposal("gotchas/one.md", "gotcha", 1.0),
+            ],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "gotchas/one.md");
+        assert_eq!(rejected.len(), 3);
+        for rejection in &rejected {
+            assert_eq!(rejection.reason, "confidence_out_of_range");
+        }
     }
 
     #[test]

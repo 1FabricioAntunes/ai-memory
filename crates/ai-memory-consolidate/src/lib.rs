@@ -21,10 +21,12 @@ pub mod embed;
 pub mod entropy_filter;
 pub mod experience;
 pub mod keep_tokens;
+mod link_guard;
 pub mod lint;
 mod path_sanitize;
 pub mod profile;
 pub mod projection;
+mod prompt_template;
 pub mod sweep;
 pub mod types;
 
@@ -66,7 +68,7 @@ pub use consolidator::{
     DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
     DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS, MIN_CONSOLIDATION_MAX_INPUT_TOKENS,
     MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS, build_batch_request, disambiguate_colliding_session_title,
-    existing_session_page_titles, redacted_error_summary,
+    effective_input_chars, existing_session_page_titles, redacted_error_summary,
 };
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,

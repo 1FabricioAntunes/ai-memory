@@ -132,10 +132,10 @@ impl ScopeSource {
     /// [`ScopeSource::SharedSlot`] (whichever project published last). Two
     /// same-operator agents with no session id share that one slot, so a
     /// no-scope read can resolve to a *different* project than the caller
-    /// meant — the empty-pop dead-end where the on-start inbox notice counted
-    /// one project's mail but a later no-scope `memory_message_pop` resolved
-    /// another project's (empty) inbox and returned nothing. A surface that
-    /// answers from an inferred scope should say so when the answer is empty.
+    /// meant — the on-start inbox notice counted one project's mail but a
+    /// later no-scope `memory_message_pop` resolved another project's inbox.
+    /// The message tools therefore refuse an inferred scope for pop, cancel,
+    /// and send, and name it on every listing.
     #[must_use]
     pub fn is_inferred(self) -> bool {
         !matches!(self, ScopeSource::Explicit | ScopeSource::Session)
@@ -1596,16 +1596,18 @@ mod tests {
         assert_eq!(written.scope.project_id, secret);
     }
 
-    async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {
+    async fn user_named(store: &Store, username: &str) -> UserId {
         store
             .writer
-            .create_user(
+            .create_human_user(
                 NewUser {
                     username: username.to_owned(),
                     name: None,
                     email: None,
                 },
-                [byte; crate::TOKEN_HASH_LEN],
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
             .await
             .unwrap()
@@ -1630,8 +1632,8 @@ mod tests {
             .get_or_create_project(ws, "client-work", None)
             .await
             .unwrap();
-        let alice = user_named(store, "alice", 1).await;
-        let bob = user_named(store, "bob", 2).await;
+        let alice = user_named(store, "alice").await;
+        let bob = user_named(store, "bob").await;
         (ws, project, alice, bob)
     }
 
