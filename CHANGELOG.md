@@ -45,6 +45,9 @@ version in [`docs/changelog/`](docs/changelog/):
   millisecond read as an outage. The notice now carries the server's own reason
   for a rejection, and keeps the outage wording only for a server the launcher
   could not reach. (#1277)
+- Updated rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349,
+  in the server and in the importer, relay and wikisync companions, and the
+  importer's anyhow to 1.0.104 for RUSTSEC-2026-0190. (#1286)
 
 ## [3.0.0] - 2026-10-13
 
