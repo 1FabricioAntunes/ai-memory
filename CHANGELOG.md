@@ -18,6 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   session's consolidation, so the valid pages in the same answer were never
   written. That page is now skipped with a warning and the others are
   written, as already happened for paths that fail the portability check.
+  (#1315)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and
