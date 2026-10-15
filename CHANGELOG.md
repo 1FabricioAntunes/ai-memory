@@ -12,6 +12,13 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `/web/health` warning that hook events wait in the local spool during
+  every active session. Hooks spool each event first and deliver it at the turn,
+  compaction or session boundary, so a few fresh events in the spool are normal,
+  and `ai-memory doctor` already reports them as information. The page now warns
+  only when an event has failed a delivery attempt, when the oldest event has
+  waited 15 minutes or more, or when its age is unknown; a full spool is still
+  an error. (#1320)
 - Fixed a hook claiming a handoff from the wrong project when an event named
   no directory. A `SessionStart` (or Kimi Code's `UserPromptSubmit`, or Grok's
   first `PostToolUse`) whose payload carried no `cwd` sent `GET /handoff` with
