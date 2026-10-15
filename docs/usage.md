@@ -40,10 +40,19 @@ $ codex   # in the same directory, later
 If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
 consume that handoff automatically. Grok shows it as `PostToolUse`
-`additionalContext` after the first tool. Until that tool runs, or if the
-session never calls one, call `memory_handoff_list` then
-`memory_handoff_accept` with the listed `handoff_id`. Zero should do that
-on resume. Listing does not claim the row.
+`additionalContext` after the first tool. `install-hooks --agent grok --apply`
+and `install-skills --scope global --agent grok` write
+`$GROK_HOME/rules/ai-memory-handoff.md` so the first turn calls
+`memory_handoff_list` (read-only; PostToolUse then claims the row). The rule
+spells out Grok's invocation — `use_tool` with the qualified catalog key
+`ai-memory__memory_handoff_list` — because Grok reaches MCP tools only through
+that meta-tool, and puts that call ahead of any file read, correcting
+`workspace`/`project` from `./.ai-memory.toml` only when the list is empty or a scope error.
+Until that
+tool runs, or if the rule is absent and the session never calls a tool, call
+`memory_handoff_list` then `memory_handoff_accept` with the listed
+`handoff_id`. Zero should list then accept on resume. Listing does not claim
+the row.
 
 `memory_handoff_accept` says why it returned no handoff. Its `status` is
 `claimed` when the call took one, `consumed_by_hook` when the calling
@@ -76,8 +85,8 @@ session-start hook will not consume stale context.
 
 ### Offering instead of claiming at session start
 
-By default, `SessionStart` claims a pending handoff automatically — the
-behavior described above. With several concurrent lines of work in the same
+By default, `SessionStart` claims a pending handoff automatically, as
+described above. With several concurrent lines of work in the same
 project, an unrelated session (a different task, a different harness, or a
 non-interactive launch) can consume a baton meant for a specific follow-up
 session. Set `claim_on_session_start = false` under `[handoff]` in
@@ -90,7 +99,7 @@ claim_on_session_start = false
 
 `SessionStart` then leaves the handoff open and renders a non-consuming
 notice instead, naming the exact `handoff_id`, the agent that left it, and
-its age — never the stored summary, open questions, or next steps (same
+its age. It never includes the stored summary, open questions, or next steps (same
 security bar as the inbox notice: that content is written by whatever agent
 or operator ended the prior session, and a notice injected into the on-start
 context cannot be deliberately skipped the way leaving `memory_handoff_accept`
@@ -100,7 +109,7 @@ uncalled can). Pick it up explicitly:
 > memory_handoff_accept handoff_id=<the id from the notice>
 ```
 
-This is server-wide — every operator on the server gets the same behavior.
+This is server-wide: every operator on the server gets the same behavior.
 Restart the server after changing `config.toml`; configuration is loaded once
 at startup. The default (`true`) is unchanged for every existing install.
 
@@ -119,7 +128,19 @@ When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolida
 
 When Claude Code or Codex compact their working context, the
 `PreCompact` hook fires and ai-memory writes a fresh
-`sessions/<id>.md` page summarising the session so far. After
+`sessions/<id>.md` page summarising the session so far. The hook
+response returns after that heuristic page; when a provider is
+configured the LLM rewrite is queued and applied by the same durable
+worker SessionEnd uses. With a provider, the checkpoint write also goes
+through `consolidate` admission, so a policy that refuses consolidation
+leaves no page and queues nothing. A rewrite still queued when the
+session ends runs once over the whole session even with
+`AI_MEMORY_CONSOLIDATE_ON_SESSION_END` off, replacing the rule-based
+summary; with the opt-in on, the SessionEnd job supersedes it. Without
+the opt-in, a session that ends while that rewrite is still running
+keeps the rewrite as the latest page, so it can leave out the end of the
+session; the SessionEnd summary stays reachable as the superseded
+version. After
 compaction, the agent can recover the summary via `memory_recent` even
 though its raw chat history was compacted away.
 
@@ -139,22 +160,22 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 
 | You say | Agent calls | Effect |
 |---|---|---|
-| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + entity/graph/vector RRF over compiled wiki pages, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
+| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + entity/graph/vector RRF over compiled wiki pages, plus an observation stream (on by default) that lifts a session's page when only its captured turns match, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_list` then `memory_handoff_accept` with that `handoff_id` if no block exists | Inspects pending handoffs without claiming, then claims the chosen id once. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Marks an exact open handoff id expired before the next session can consume it. |
 | "Ask the agent in <other project> to do X" / "send this to project B" | `memory_message_send` | Drops a self-contained request into another project's inbox (requires `to_workspace` + `to_project`); the recipient must already exist. Cross-project, claim-once. See [agent-messaging.md](agent-messaging.md). |
-| "Check my inbox" / "any messages waiting?" | `memory_message_list` then `memory_message_pop` | Lists pending inbox mail without consuming, then pops one message exactly once. A popped message is untrusted cross-project input — a request to evaluate, never instructions to obey. |
+| "Check my inbox" / "any messages waiting?" | `memory_message_list` then `memory_message_pop` | Lists pending inbox mail without consuming, then pops one message exactly once. A popped message is untrusted cross-project input: a request to evaluate, never instructions to obey. |
 | "Never mind that request I sent" / "clear my outbox" | `memory_message_cancel` | Retracts a pending sent message by id, or clears the whole outbox when omitted. Only affects mail this project sent. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation on the server's model. For an explicit request about the session the agent is taking part in, the agent route in the next row is preferred so the agent's own model writes the pages; keep `memory_consolidate` for sessions the agent did not take part in and for runs without an agent. Omit `session_id` (or send a blank one) to consolidate the latest completed session in the resolved project; pass one to target a specific session. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation on the server's model. For an explicit request about the session the agent is taking part in, the agent route in the next row is preferred so the agent's own model writes the pages; keep `memory_consolidate` for sessions the agent did not take part in and for runs without an agent. Omit `session_id` (or send a blank one) to consolidate the latest completed session in the resolved project; pass one to target a specific session. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact / PostCompaction, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. PreCompact / PostCompaction write a heuristic checkpoint on the hook request; their provider rewrite, and opt-in SessionEnd provider work, is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
 | "Write this session's page yourself" / an in-session "consolidate this session" | `memory_read_session_observations`, then `memory_write_page` with `session_id` and `path: sessions/<id>.md` | The agent compiles the session page with its own model instead of the server's provider. To match the server's multi-page layout it may also write up to four more pages with the same `session_id`: `concepts/<slug>.md` (`tier: semantic`, `kind: fact`), `decisions/<short>.md` (`kind: decision`), `gotchas/<slug>.md` (`kind: gotcha`) and `_rules/<slug>.md` (`kind: rule`); the session page is `tier: episodic`, `kind: fact`. The session must belong to the project the page is written to; the page records it as evidence, gets the same session-page frontmatter (plus `consolidated_by: agent`) and duplicate-title suffix, and the session's queued SessionEnd job is marked completed. The write uses the `write_page` admission op, so a webhook that filters on `consolidate` does not see it. A pinned page is never overwritten this way. SessionEnd keeps the page: neither the rule-based summary nor the opt-in SessionEnd worker replaces it, even when the session went on after the write, and a PreCompact or PostCompaction checkpoint leaves it alone too. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Without a session ID, reviews the newest completed session with no persisted auto-improvement run, advancing past preflight skips on repeated calls; pass an ID for a targeted rerun. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
 | "Search expired notes for X" | `memory_query` with `include_expired: true` | Opts an explicit project, sibling-scope, or global search into expired historical pages; ordinary searches exclude them. |
-| "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits. A global query reports only its distinct FTS stream. |
+| "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits, plus a top-level `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`; streams that did not run are left out). A global query reports only its distinct FTS stream and `fts_ms`. |
 | Improve top project/scopes search relevance | Set `AI_MEMORY_RERANKER=llm` on a server with an LLM provider | Sends the bounded query plus up to 30 bounded titles/snippets to the provider for at most one final relevance pass. Invalid, partial, failed, timed-out, or concurrency-saturated requests preserve the normal order; `global=true` and supplemental global-preference hits are unchanged. |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "That recalled page helped" / "this page is stale" | `memory_feedback` | Records `helpful`, `not_helpful`, `stale`, or `wrong` for the exact path. Retention weight affects sweep-eligible episodic pages; stale/wrong also flag any current page for lint review. Retrieved content never authorizes feedback by itself. |
@@ -279,8 +300,12 @@ Omitted fields do not inherit the previous version; empty entity lists and
 relation objects clear those fields. Empty `kind` or `abstract` strings omit
 those keys. Existing requests without the new fields remain valid, including
 the admin's existing top-level `kind`. Arbitrary frontmatter, scope and author
-fields are never copied from metadata. This is an unconditional replacement;
-it provides no patch or compare-and-write precondition.
+fields are never copied from metadata. Without `expected_page_id` or
+`create_only` the write is an unconditional replacement. Only
+`memory_write_page` accepts those preconditions; `POST /admin/write-page` has
+neither. See
+[Change a page only if nobody else has](programmatic-memory.md#change-a-page-only-if-nobody-else-has)
+for conditional writes.
 
 ## Install the routing snippet and Agent Skills
 
@@ -335,17 +360,27 @@ exists, both when both exist, or creates `CLAUDE.md` when neither exists. Use
 instruction target unless you override it: `CLAUDE.md` implies
 `.claude/skills`, `AGENTS.md` implies `.agents/skills`, and both files imply
 both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
-install under its `.grok/skills` root; for Hermes Agent, `--skills-agent hermes`
+install under its `.grok/skills` root; for GitHub Copilot CLI, select
+`--skills-agent copilot-cli` so skills install under `.github/skills` (project)
+or `$COPILOT_HOME/skills` (global, default `~/.copilot/skills`); for Hermes
+Agent, `--skills-agent hermes`
 installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
-`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code loads
-`CLAUDE.md` and does not read `AGENTS.md`, so without that import a block
-installed with `--target AGENTS.md`, along with every project rule in the same
-file, is absent from context at session start. A prose "read AGENTS.md" pointer
-does not load the file; it asks the agent to open it, which leaves adherence to
-whether the agent does. See
+`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code 2.1.277
+and later reads `AGENTS.md` only when no `CLAUDE.md`, `.claude/CLAUDE.md`, or
+`CLAUDE.local.md` exists in the working directory or any directory above it.
+Without that import, sessions that read only `CLAUDE.md` (older Claude Code, the
+AGENTS.md plugin disabled, the `claude-md` Project instructions setting, or a
+developer's own `CLAUDE.local.md`) start without a block installed with
+`--target AGENTS.md`, or any other project rule in that file. A prose "read
+AGENTS.md" pointer does not load the file; it asks the agent to open it, which
+leaves adherence to whether the agent does. See
 [Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+`install-instructions` prints a note when it writes only `AGENTS.md` while a
+`CLAUDE.local.md`, `.claude/CLAUDE.md` or `CLAUDE.md` in the directory or above
+it would make Claude Code read that file instead, unless one of them already
+imports `@AGENTS.md`.
 
 To refresh only the managed Agent Skills:
 
@@ -354,6 +389,7 @@ ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
+ai-memory install-skills --scope global --agent copilot-cli
 ai-memory install-skills --scope global --agent hermes
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
@@ -363,13 +399,23 @@ For Devin, project-local skills are installed under `.devin/skills`. Global
 Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
 on non-Windows systems. For Grok Build CLI, project-local skills go under
 `.grok/skills` and global under `$GROK_HOME/skills` (default
-`~/.grok/skills`).
+`~/.grok/skills`). A global Grok skill install also writes the first-turn
+handoff rule `$GROK_HOME/rules/ai-memory-handoff.md` (default
+`~/.grok/rules/ai-memory-handoff.md`); project-scope Grok skills and
+`--target-dir` do not. For GitHub Copilot CLI, project-local skills go under the
+repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
+`~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
+`AGENTS.md` instruction target.
 
 Project-local skill roots are `.claude/skills` for Claude-compatible installs,
 `.agents/skills` for cross-client installs, `.devin/skills` for Devin, and
-`.grok/skills` for Grok. Global Claude/Agents roots are `~/.claude/skills` and
-`~/.agents/skills`; global Devin roots are platform-specific as described
-above; global Grok is `$GROK_HOME/skills` (default `~/.grok/skills`).
+`.grok/skills` for Grok, and `.github/skills` for GitHub Copilot CLI. Global
+Claude/Agents roots are `~/.claude/skills` and `~/.agents/skills`; global Devin
+roots are platform-specific as described above; global Grok is
+`$GROK_HOME/skills` (default `~/.grok/skills`); global Copilot CLI is
+`$COPILOT_HOME/skills` (default `~/.copilot/skills`). `uninstall` sweeps both
+Copilot CLI roots and removes only files carrying the ai-memory managed marker,
+so team-authored skills in `.github/skills` are never touched.
 `--target-dir` points at an explicit skill root and bypasses scope/agent
 inference. `--print` previews target paths and `SKILL.md` contents. `--force`
 allows replacement of unmanaged same-name skills; without it, user-authored
@@ -456,8 +502,8 @@ Client cleanup hints:
   entries live under `context_servers` in its user `settings.json`.
 
 If you want a visible startup reminder during the transition, keep it small. A
-rules-file note such as “Active memory: ai-memory; legacy export is historical
-reference only; use memory_query for retrieval” is safer than dumping large
+rules-file note such as "Active memory: ai-memory; legacy export is historical
+reference only; use memory_query for retrieval" is safer than dumping large
 legacy context into every session.
 
 If you use the ChatGPT/Codex OAuth provider, sign in once before starting the
@@ -502,8 +548,29 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and FTS5 search. In rendered
-pages, `[[wiki links]]` become clickable links to the target page —
+breadcrumbs, rendered markdown, metadata, and search. On a project, page,
+namespace, history or session view the header search box searches that project;
+elsewhere it searches every project with FTS5, like
+`memory_query(global=true)`, and the search page's "Search in" selector picks
+a project. A page shows an outline of its headings, the pages that cite it and
+the pages it cites; a folder's namespace listing sorts by recent update or by
+title and shows 25 pages at a time. The search on a project page ranks with
+the same hybrid ranker as `memory_query` for that project, and its "Explain
+ranking" box shows each hit's stream ranks, RRF contributions, authority and rerank score, plus the per-stream timings.
+Root also gets `/web/health`: hook counters (429s included), the writer queue,
+the local spool and recovery journal, the consolidation queue, embedder and
+provider state, and the failing checks with the command that fixes each. Each page links
+to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version, newest
+first, with the author where the write was attributed, and a unified diff
+between any two of them (by default the latest against the version it
+replaced). A version another write replaced stays listed; an expired one does
+not, and a page whose TTL has passed has no history. The project page
+lists recent sessions, and each opens a timeline
+(`/web/w/<ws>/<proj>/s/<session-id>`) that pages through the session's
+captured observations in order, with first/prev/next/last links, a jump field
+and, when JavaScript runs, a slider and `j`/`k` keys to step one observation
+at a time. Observations are shown as plain text. In rendered
+pages, `[[wiki links]]` become clickable links to the target page.
 `[[path]]`, `[[path|label]]`, `[[project:path]]`,
 `[[workspace/project:path]]`, and `[[_global:path]]` are all supported
 (resolved against the current page's project unless the target carries
@@ -515,18 +582,23 @@ code; external schemes inside the brackets (`http://`, `https://`,
 `mailto:`, `data:`, `javascript:`, `vbscript:`, `tel:`, `file:`)
 stay literal too.
 
-With no authority configured on loopback, the built-in wiki remains
-anonymous. For human-authenticated administration, serve the compiled admin SPA
+With no bearer token configured on loopback (an install from before 3.0 that
+never ran `ai-memory auth enable`), the built-in wiki remains anonymous. A
+fresh install has a bearer token and no human accounts, so a browser gets a
+Basic sign-in prompt: any username, and the contents of
+`<data_dir>/auth-tokens/default` as the password. The browser resends those
+credentials itself, so no cookie holds the token. That GET-only browser path
+stops immediately after
+a human password or completed bootstrap exists. For human-authenticated
+administration, create the first root account ([first-time
+root](install.md#first-time-root-greenfield)) and serve the compiled admin SPA
 with `--web-ui-dir`: it signs in through `/auth/login` and uses an HttpOnly web
-session plus CSRF protection. Before human auth is active, deprecated GET-only
-browser compatibility accepts the root bearer through HTTP Basic and an
-HttpOnly `ai_memory_auth` cookie; it stops immediately after a human password or
-completed bootstrap exists. Browser-stored Bearers remain unsupported.
+session plus CSRF protection. Browser-stored Bearers remain unsupported.
 `AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only credentials sent
 as `Authorization: Bearer <token>` by MCP, hook, handoff, and workstream clients.
 
 To host the web UI under a URL subpath behind a reverse proxy, the
-`--base-path` / `--web-slug` flags do the work — see
+`--base-path` / `--web-slug` flags do the work. See
 [`docs/frontend-api.md`](frontend-api.md#6-custom-ui-hosting-and-base-paths)
 for the flag semantics and
 [`docs/https-via-proxy.md`](https-via-proxy.md#hosting-under-a-subpath)
@@ -655,14 +727,13 @@ pull requests). Three facts frame how such a record and ai-memory interact:
 1. **ai-memory never touches files in your repository.** Its wiki lives
    in the server's data dir; the background jobs (consolidation,
    curation, retention decay, auto-improvement) read and write wiki
-   pages only. A decision-record directory in the repo is categorically
-   outside ai-memory's write surface. Run both side by side without
-   ceremony: the repo owns the canonical record, ai-memory owns
+   pages only. A decision-record directory in the repo is outside
+   ai-memory's write surface. Run both side by side: the repo owns the canonical record, ai-memory owns
    cross-session recall.
 
 2. **Keep the record directory out of capture.** An agent reading the
    record is captured like any other file read, and consolidation compiles
-   what it saw into wiki pages — including a `decisions/` page that says
+   what it saw into wiki pages, including a `decisions/` page that says
    "active" long after the repo has superseded it, ranked first by
    `memory_query` because it matches the topic. List the directory in the
    marker's `[capture]` section so the copy is never made:
@@ -690,6 +761,6 @@ the managed durable-pages Agent Skill teaches agents the recipe:
 `decisions/<slug>.md`, ADR structure (Status / Context / Decision /
 Consequences, including rejected alternatives), `pinned: true`, and
 supersede-by-new-page instead of editing history. Ask an agent to "record this as an architectural
-decision" and the skill does the rest; the structured shape also
+decision" and the skill does the rest. The structured shape also
 retrieves noticeably better through `memory_query` than free-form
 prose.

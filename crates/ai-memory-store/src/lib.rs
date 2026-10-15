@@ -61,15 +61,15 @@ pub use error::{
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DateOnlyTtlPage,
-    DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
+    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalUpsert,
+    DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
     HookSessionAdmission, IdentityResolution, IngestObservationOutcome, LifecycleOnlyEndOutcome,
     MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
-    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode,
-    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
-    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
-    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
-    backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary,
+    PagesMode, ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary,
+    ReorgSummary, RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate,
+    SessionTimesSkipReason, SkippedSessionTimes, StaleAfterRepair, backfill_entity_index,
+    backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
@@ -86,14 +86,17 @@ pub use reader::{
     AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
-    GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder, ObservationPage,
-    ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
-    PageLinks, PageMeta, PageSummary, ProjectCoordinateCollisionReason,
-    ProjectCoordinateDiagnostic, ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH,
-    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
-    RrfContributions, ScopeRow, SearchExplain, SessionConsolidationSummary, SessionDependentRows,
+    GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
+    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
+    PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview,
+    PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
+    ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
+    ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
+    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
+    SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
     SessionEndDisposition, SessionSummary, SettledPage, StatusCounts, StorageStatus,
-    StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
+    WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -105,9 +108,7 @@ pub use scope::{
     resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
-pub use users::{
-    LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token,
-};
+pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
@@ -2126,6 +2127,58 @@ mod tests {
             .unwrap();
     }
 
+    /// V78 rebuilds `sessions`, which `observations` and `ingest_keys`
+    /// reference with ON DELETE CASCADE, and its own PRAGMA cannot switch
+    /// enforcement off inside refinery's transaction. `Store::open` is the
+    /// only production caller of the runner and must keep foreign keys off
+    /// around it, or upgrading a V77 store deletes every observation.
+    #[tokio::test]
+    async fn opening_a_v77_store_keeps_observations_and_ingest_keys_through_v78() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut conn = Connection::open(db_dir.join(DB_FILENAME)).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 77).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let ws = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let proj = crate::ops::get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+        let sid = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, started_at) \
+             VALUES (?1, ?2, ?3, 'codex', 1)",
+            params![sid.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'user_prompt', 'keep', 'this observation must survive', 1)",
+            params![
+                ObservationId::new().as_bytes(),
+                sid.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
+             VALUES (?1, 'k1', 1, ?2, 'codex')",
+            params![proj.as_bytes(), sid.as_bytes()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(tmp.path()).unwrap();
+        let count = store.reader.status_counts().await.unwrap().observations;
+        assert_eq!(count, 1, "V78 must not cascade-delete observations");
+        let conn = Connection::open(store.db_path()).unwrap();
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ingest_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(keys, 1, "V78 must not cascade-delete ingest keys");
+    }
+
     #[tokio::test]
     async fn serialises_parallel_writes() {
         let tmp = TempDir::new().unwrap();
@@ -3381,7 +3434,12 @@ mod tests {
             .unwrap();
         let session_a = SessionId::new();
         let session_b = SessionId::new();
-        for (session_id, project_id) in [(session_a, proj_a), (session_b, proj_b)] {
+        let session_c = SessionId::new();
+        for (session_id, project_id) in [
+            (session_a, proj_a),
+            (session_b, proj_b),
+            (session_c, proj_a),
+        ] {
             store
                 .writer
                 .begin_session(NewSession {
@@ -3479,6 +3537,74 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(reused, IngestObservationOutcome::Inserted(_)));
+
+        let recovery_key = format!("recovery_{}", "a".repeat(55));
+        let recovery_first = store
+            .writer
+            .insert_observation_ingest(
+                Sanitized::new(obs(session_a, proj_a), &Sanitizer::builtin()),
+                recovery_key.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            recovery_first,
+            IngestObservationOutcome::Inserted(_)
+        ));
+        store
+            .writer
+            .complete_observation_ingest(proj_a, recovery_key.clone())
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE ingest_keys SET seen_at = 1 WHERE project_id = ?1 AND key = ?2",
+            params![proj_a.as_bytes(), recovery_key],
+        )
+        .unwrap();
+        drop(conn);
+        let recovery_replay = store
+            .writer
+            .insert_observation_ingest(
+                Sanitized::new(obs(session_a, proj_a), &Sanitizer::builtin()),
+                recovery_key.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery_replay, IngestObservationOutcome::AlreadyComplete);
+        assert!(matches!(
+            store
+                .writer
+                .insert_observation_ingest(
+                    Sanitized::new(obs(session_c, proj_a), &Sanitizer::builtin()),
+                    recovery_key.clone(),
+                )
+                .await,
+            Err(StoreError::SessionCollision)
+        ));
+        let mut changed = obs(session_a, proj_a);
+        changed.body = "different event body".into();
+        assert!(matches!(
+            store
+                .writer
+                .insert_observation_ingest(
+                    Sanitized::new(changed, &Sanitizer::builtin()),
+                    recovery_key,
+                )
+                .await,
+            Err(StoreError::SessionCollision)
+        ));
+        let conn = Connection::open(store.db_path()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                params![proj_a.as_bytes()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3,
+            "a different session cannot preclaim or suppress a recovery key"
+        );
     }
 
     #[tokio::test]
@@ -4538,6 +4664,86 @@ mod tests {
         assert_eq!(s.project_name, "my-project");
         assert_eq!(s.page_count, 2);
         assert!(s.last_updated.is_some());
+    }
+
+    /// #1208: a project id is an address, so it must be exposed exactly where
+    /// the name is -- no wider. Boundary row 9's rule is that a restricted
+    /// project is hidden from a caller without a grant, and this pins that the
+    /// new id column inherits that rule rather than bypassing it. The filter is
+    /// on the row, so a restricted row is absent entirely; the control proves
+    /// the id IS returned once the caller may see the row, so a blanket deny
+    /// would not pass for a working guard.
+    #[tokio::test]
+    async fn list_projects_with_stats_hides_a_restricted_projects_id_from_an_ungranted_viewer() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let open = store
+            .writer
+            .get_or_create_project(ws, "open-project", None)
+            .await
+            .unwrap();
+        let secret = store
+            .writer
+            .get_or_create_project(ws, "secret-project", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(secret, crate::AccessMode::Restricted)
+            .await
+            .unwrap();
+
+        let outsider = ai_memory_core::UserId::new();
+
+        // Adversarial: the ungranted viewer sees neither the restricted
+        // project's name NOR its id -- the id must not be a side channel
+        // around the name-hiding rule.
+        let visible = store
+            .reader
+            .list_projects_with_stats(Some(outsider))
+            .await
+            .unwrap();
+        assert!(
+            visible.iter().any(|s| s.project_name == "open-project"),
+            "the open project (and its id) must still be listed: {visible:?}"
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|s| s.project_id == secret.to_string())
+                .count(),
+            0,
+            "a restricted project's id must not leak to an ungranted viewer: {visible:?}"
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|s| s.project_name == "secret-project")
+                .count(),
+            0,
+            "and neither may its name: {visible:?}"
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .find(|s| s.project_name == "open-project")
+                .map(|s| s.project_id.as_str()),
+            Some(open.to_string().as_str()),
+            "the visible row still carries its own id: {visible:?}"
+        );
+
+        // Control: the operator (no viewer filter) sees both, ids included.
+        let all = store.reader.list_projects_with_stats(None).await.unwrap();
+        assert_eq!(all.len(), 2, "the operator surface lists both: {all:?}");
+        assert!(
+            all.iter().any(|s| s.project_id == secret.to_string()),
+            "the operator may see the restricted id: {all:?}"
+        );
     }
 
     #[tokio::test]

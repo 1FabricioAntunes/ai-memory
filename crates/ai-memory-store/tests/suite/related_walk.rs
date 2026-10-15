@@ -393,13 +393,15 @@ async fn the_walk_hides_and_does_not_cross_projects_the_viewer_cannot_read() {
     }
     let viewer = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "vera".into(),
                 name: None,
                 email: None,
             },
-            [7; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -737,4 +739,112 @@ async fn cross_project_edges_hide_edges_touching_an_expired_page() {
             "scope {scope:?}: edges touching an expired page must be hidden"
         );
     }
+}
+
+/// `page_links_preview` cuts each direction in SQL and counts the rest under
+/// the same filters: a back-link from a project the viewer cannot read is
+/// neither listed nor counted, so "and N more" leaks nothing either.
+///
+/// ```text
+///   app:b1..b5 ──▶ app:a ◀── secret:s1..s3   (secret restricted, no grant)
+/// ```
+#[tokio::test]
+async fn page_links_preview_caps_in_sql_and_counts_only_readable_neighbours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+    let secret = store
+        .writer
+        .get_or_create_project(ws, "secret".to_string(), None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page_with_links(ws, app, "notes/a.md", vec![]))
+        .await
+        .unwrap();
+    for i in 1..=5 {
+        let path = format!("notes/b{i}.md");
+        let page = page_with_links(ws, app, &path, vec![same_project_link("notes/a.md")]);
+        store.writer.upsert_page(page).await.unwrap();
+    }
+    for i in 1..=3 {
+        let path = format!("notes/s{i}.md");
+        let page = page_with_links(
+            ws,
+            secret,
+            &path,
+            vec![cross_project_link("app", "notes/a.md")],
+        );
+        store.writer.upsert_page(page).await.unwrap();
+    }
+    store
+        .writer
+        .set_access_mode(secret, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let viewer = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "vera".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let preview = |who: Option<UserId>, limit: usize| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .page_links_preview(ws, app, "notes/a.md".into(), who, limit)
+                .await
+                .unwrap()
+        }
+    };
+
+    let cut = preview(Some(viewer), 2).await;
+    let paths: Vec<&str> = cut.backlinks.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(paths, ["notes/b1.md", "notes/b2.md"]);
+    assert_eq!(
+        cut.backlinks_total, 5,
+        "the secret back-links are not counted"
+    );
+    assert!(cut.links.is_empty() && cut.links_total == 0);
+
+    let all = preview(Some(viewer), 10).await;
+    assert_eq!(all.backlinks.len(), 5);
+    assert_eq!(all.backlinks_total, 5);
+    assert!(all.backlinks.iter().all(|p| p.project == "app"));
+
+    // Control: no viewer (root, or authorization off) counts all eight, and
+    // the cut keeps `page_links` order.
+    let root = preview(None, 2).await;
+    assert_eq!(root.backlinks_total, 8);
+    let full = store
+        .reader
+        .page_links(ws, app, "notes/a.md".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(full.backlinks.len(), 8);
+    let head: Vec<&str> = full.backlinks[..2]
+        .iter()
+        .map(|p| p.path.as_str())
+        .collect();
+    let cut_root: Vec<&str> = root.backlinks.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(cut_root, head);
 }

@@ -39,21 +39,39 @@ const LEGACY_ORPHAN_TAIL_CRLF: &str =
 /// # Errors
 /// Returns an error if the target path can't be written or if the
 /// existing file isn't valid UTF-8.
-pub fn run(_config: &Config, args: InstallInstructionsArgs) -> Result<()> {
-    run_inner(args, true)
+pub fn run(config: &Config, args: InstallInstructionsArgs) -> Result<()> {
+    run_inner(args, &config.runtime_env, true)
 }
 
-pub(super) fn run_quiet(args: InstallInstructionsArgs) -> Result<()> {
-    run_inner(args, false)
+pub(super) fn run_quiet(
+    args: InstallInstructionsArgs,
+    env: &crate::config::RuntimeEnv,
+) -> Result<()> {
+    run_inner(args, env, false)
 }
 
-fn run_inner(args: InstallInstructionsArgs, report: bool) -> Result<()> {
+fn run_inner(
+    args: InstallInstructionsArgs,
+    env: &crate::config::RuntimeEnv,
+    report: bool,
+) -> Result<()> {
     let block = if args.compact {
         compact_block()
     } else {
         full_block()
     };
     let targets = resolve_targets(args.target.as_ref())?;
+    if report {
+        let home = env
+            .var_os("HOME")
+            .or_else(|| env.var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        if let Ok(cwd) = std::env::current_dir()
+            && let Some(note) = claude_code_skips_agents_md(&targets, &cwd, home.as_deref())
+        {
+            eprintln!("{note}");
+        }
+    }
     let skill_args = if args.no_skills {
         None
     } else {
@@ -62,7 +80,7 @@ fn run_inner(args: InstallInstructionsArgs, report: bool) -> Result<()> {
     let prepared_skills = if !args.print {
         skill_args
             .as_ref()
-            .map(install_skills::prepare_install)
+            .map(|args| install_skills::prepare_install(args, env))
             .transpose()?
     } else {
         None
@@ -146,6 +164,54 @@ fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::pat
             Ok(vec![claude_md])
         }
     }
+}
+
+/// A note for when the block goes only into `AGENTS.md` but Claude Code will
+/// not read that file (#1297). Claude Code 2.1.277 and later reads
+/// `AGENTS.md` only when no `CLAUDE.md`, `.claude/CLAUDE.md` or
+/// `CLAUDE.local.md` exists in the working directory or above it; when one
+/// does, it reads those instead. The block then reaches Claude Code only if one
+/// of them imports `@AGENTS.md`. The user file `~/.claude/CLAUDE.md` does not
+/// count.
+fn claude_code_skips_agents_md(
+    targets: &[PathBuf],
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    let named = |name: &str| {
+        targets
+            .iter()
+            .any(|target| target.file_name().and_then(|n| n.to_str()) == Some(name))
+    };
+    if !named("AGENTS.md") || named("CLAUDE.md") {
+        return None;
+    }
+    let mut found = Vec::new();
+    for dir in cwd.ancestors() {
+        for name in ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"] {
+            if name == ".claude/CLAUDE.md" && home == Some(dir) {
+                continue;
+            }
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                found.push(candidate);
+            }
+        }
+    }
+    let imports_agents_md = |path: &PathBuf| {
+        std::fs::read_to_string(path)
+            .is_ok_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md"))
+    };
+    let first = found.first()?;
+    if found.iter().any(imports_agents_md) {
+        return None;
+    }
+    Some(format!(
+        "note: {} exists, so Claude Code reads it instead of AGENTS.md and will not see \
+         this block. Add a bare `@AGENTS.md` line to a CLAUDE.md there, or set Claude \
+         Code's Project instructions to `claude-md-and-agents-md`.",
+        first.display()
+    ))
 }
 
 fn skill_args_from_instruction_args(

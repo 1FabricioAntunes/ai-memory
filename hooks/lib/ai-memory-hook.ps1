@@ -780,6 +780,7 @@ function Invoke-AiMemoryDrainSpool {
         }
         if (-not $entry.url) { continue }
         $headers = @{}
+        $headers["X-AI-Memory-Client"] = "hook-ps"
         if ($entry.auth_mode -eq "static" -and $entry.token) {
             $headers["Authorization"] = "Bearer $($entry.token)"
         }
@@ -1014,7 +1015,11 @@ function Invoke-AiMemoryHook {
     if ($Agent -eq "devin") {
         $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event
     }
+    # Every request names this client: an unauthenticated server reached
+    # through a non-loopback host name refuses a handoff fetch without the
+    # header, because a web page cannot add it to a request it makes.
     $Headers = @{}
+    $Headers["X-AI-Memory-Client"] = "hook-ps"
 
     if ($env:AI_MEMORY_AUTH_TOKEN) {
         $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
