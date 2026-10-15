@@ -4321,8 +4321,7 @@ mod tests {
             .expect("the heading after the block is found");
         let steps = sections.iter().find(|s| s.anchor == "## Steps").unwrap();
         assert_eq!(
-            steps.end,
-            verify.start,
+            steps.end, verify.start,
             "## Steps ends where ## Verify starts"
         );
 
