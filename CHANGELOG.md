@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-10-15
+
 ### Fixed
 - Fixed the WinSW v2.12.0 service-account example using the v3
   `<username>` element. WinSW v2.12.0 expects separate `<domain>` and `<user>`
@@ -835,5 +837,6 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.0.1...HEAD
+[3.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.0.1
 [3.0.0]: https://github.com/akitaonrails/ai-memory/compare/v2.6.7...v3.0.0
