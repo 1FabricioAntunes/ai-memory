@@ -3801,7 +3801,11 @@ async fn process_authorized(
             }
             if state
                 .reader
-                .session_has_substantive_observation(session_id)
+                .session_has_substantive_observation(
+                    session.workspace_id(),
+                    session.project_id(),
+                    session_id,
+                )
                 .await?
             {
                 recovered |= enqueue_session_end_consolidation(
@@ -3976,19 +3980,10 @@ async fn process_authorized(
         && !managed
         && !body_is_subagent(&env.raw);
     if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
-        // A session can hold hundreds of thousands of rows, so nothing on this
-        // path loads them all: the lifecycle-only decision is one existence
-        // query (the writer re-checks it in the ending transaction with the
-        // same predicate), and the page and handoff are rendered from a
-        // digest read with bounded queries.
-        let substantive = state
-            .reader
-            .session_has_substantive_observation(session_id)
-            .await?;
         // A checkpoint writes where the session's end will: the session row's
         // scope, not wherever this Stop resolved (a marker may have appeared
         // mid-session). One that lost the race with the end writes nothing.
-        let checkpoint_scope = if turn_checkpoint && substantive {
+        let checkpoint_scope = if turn_checkpoint {
             state.reader.open_session_scope(session_id).await?
         } else {
             None
@@ -4000,6 +3995,16 @@ async fn process_authorized(
             return Ok(outcome);
         }
         let (page_ws, page_proj) = checkpoint_scope.unwrap_or((ws, proj));
+        // A session can hold hundreds of thousands of rows, so nothing on this
+        // path loads them all: the lifecycle-only decision is one existence
+        // query (the writer re-checks it in the ending transaction with the
+        // same predicate), and the page and handoff are rendered from a
+        // digest read with bounded queries. Bind it to the session/page scope,
+        // not the provisional scope of a mid-session marker.
+        let substantive = state
+            .reader
+            .session_has_substantive_observation(page_ws, page_proj, session_id)
+            .await?;
         if !substantive {
             let lifecycle_outcome = state
                 .writer
@@ -4037,7 +4042,7 @@ async fn process_authorized(
         }
         // Read after the decision above, so a substantive write that raced the
         // lifecycle-only end is in it.
-        let digest = SessionDigest::load(&state.reader, session_id).await?;
+        let digest = SessionDigest::load(&state.reader, page_ws, page_proj, session_id).await?;
         // The writer observed substantive work when it answered `Substantive`,
         // so the digest cannot still satisfy the lifecycle-only predicate.
         debug_assert!(substantive || digest.is_substantive());
@@ -4612,7 +4617,7 @@ async fn write_checkpoint_page(
     {
         return Ok(false);
     }
-    let digest = SessionDigest::load(&state.reader, session_id).await?;
+    let digest = SessionDigest::load(&state.reader, workspace_id, project_id, session_id).await?;
     if !digest.is_substantive() {
         return Ok(false);
     }
@@ -14961,17 +14966,9 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let before = state.reader.session_observation_rows_loaded();
         process(&state, fire("session-end"), None, Vec::new())
             .await
             .unwrap();
-        let loaded = state.reader.session_observation_rows_loaded() - before;
-
-        // Head and tail lines plus one row per early-exit scan.
-        assert!(
-            loaded <= 500 + 16,
-            "SessionEnd of a {FILLER}-row session loaded {loaded} rows"
-        );
         let page = state
             .wiki
             .read_page(

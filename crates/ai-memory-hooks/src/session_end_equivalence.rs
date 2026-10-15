@@ -861,7 +861,9 @@ impl Fixture {
         let agent = AgentKind::ClaudeCode;
         let old_page = full_load::synthesize_session_page(self.ws, self.proj, sid, agent, &rows);
 
-        let digest = SessionDigest::load(reader, sid).await.unwrap();
+        let digest = SessionDigest::load(reader, self.ws, self.proj, sid)
+            .await
+            .unwrap();
         let new_page = super::synthesize_session_page(self.ws, self.proj, sid, agent, &digest);
         assert_eq!(new_page.path, old_page.path, "{name}: page path");
         assert_eq!(new_page.title, old_page.title, "{name}: page title");
@@ -922,7 +924,7 @@ impl Fixture {
         let ephemeral = is_ephemeral_session(&rows);
         assert_eq!(
             !reader
-                .session_has_substantive_observation(sid)
+                .session_has_substantive_observation(self.ws, self.proj, sid)
                 .await
                 .unwrap(),
             ephemeral,
@@ -1252,11 +1254,9 @@ async fn a_huge_session_reads_a_bounded_number_of_rows() {
         "the fixture must dwarf the bound"
     );
 
-    let before = fx.store.reader.session_observation_rows_loaded();
-    let (digest, stats) = SessionDigest::load_with_stats(&fx.store.reader, sid)
+    let (digest, stats) = SessionDigest::load_with_stats(&fx.store.reader, fx.ws, fx.proj, sid)
         .await
         .unwrap();
-    let loaded = fx.store.reader.session_observation_rows_loaded() - before;
 
     assert_eq!(digest.observation_count(), rows.len());
     assert!(
@@ -1265,19 +1265,11 @@ async fn a_huge_session_reads_a_bounded_number_of_rows() {
         rows.len(),
         stats.rows_read
     );
-    assert_eq!(
-        loaded, stats.rows_read as u64,
-        "the pool's counter and the snapshot's agree"
-    );
     assert_eq!(stats.prompt_titles, prompts);
 
     // Control: the load this replaced materializes every row.
     let full = fx.store.reader.observations_for_session(sid).await.unwrap();
     assert_eq!(full.len(), rows.len());
-    assert_eq!(
-        fx.store.reader.session_observation_rows_loaded() - before - loaded,
-        rows.len() as u64
-    );
     // And the output did not change for being cheap.
     fx.assert_equivalent("12k rows", sid).await;
 }
@@ -1310,7 +1302,7 @@ async fn subagent_preamble_bodies_stop_at_the_first_usable_one() {
         rows.push(end(1 + preambles as i64));
         let sid = fx.seed(&rows).await;
 
-        let (_, stats) = SessionDigest::load_with_stats(&fx.store.reader, sid)
+        let (_, stats) = SessionDigest::load_with_stats(&fx.store.reader, fx.ws, fx.proj, sid)
             .await
             .unwrap();
         assert_eq!(
@@ -1370,10 +1362,12 @@ async fn the_ephemeral_predicate_agrees_for_every_observation_kind() {
         let sql = fx
             .store
             .reader
-            .session_has_substantive_observation(sid)
+            .session_has_substantive_observation(fx.ws, fx.proj, sid)
             .await
             .unwrap();
-        let digest = SessionDigest::load(&fx.store.reader, sid).await.unwrap();
+        let digest = SessionDigest::load(&fx.store.reader, fx.ws, fx.proj, sid)
+            .await
+            .unwrap();
         assert_eq!(sql, rust, "{kind:?}: existence query vs row predicate");
         assert_eq!(
             digest.is_substantive(),

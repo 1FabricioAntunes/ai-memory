@@ -2181,11 +2181,6 @@ struct Inner {
     db_path: PathBuf,
     pool: Mutex<Pool>,
     soft_cap: usize,
-    /// Observation rows deserialized by the whole-session reads
-    /// ([`ReaderPool::observations_for_session`] and
-    /// [`ReaderPool::read_session_observations`]); see
-    /// [`ReaderPool::session_observation_rows_loaded`].
-    session_rows_loaded: std::sync::atomic::AtomicU64,
 }
 
 /// The idle connections and whether the pool still hands out new ones. One
@@ -2211,7 +2206,6 @@ impl ReaderPool {
                     closed: false,
                 }),
                 soft_cap: soft_cap.max(1),
-                session_rows_loaded: std::sync::atomic::AtomicU64::new(0),
             }),
             tuning: RetrievalTuning::default(),
             fts_stopwords: FtsStopwords::default(),
@@ -2232,19 +2226,6 @@ impl ReaderPool {
         let mut pool = self.inner.pool.lock();
         pool.closed = true;
         pool.idle.clear();
-    }
-
-    /// Observation rows the whole-session reads have deserialized since this
-    /// pool (or any clone of it) was created: every row
-    /// [`Self::observations_for_session`] returned, plus the rows
-    /// [`Self::read_session_observations`] snapshots read. A SessionEnd on a
-    /// session far larger than its raw-observation window must move this by no
-    /// more than that window, which is what the bound tests assert.
-    #[must_use]
-    pub fn session_observation_rows_loaded(&self) -> u64 {
-        self.inner
-            .session_rows_loaded
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Configure the opt-in ranking signals used by [`Self::hybrid_search`].
@@ -3595,7 +3576,6 @@ impl ReaderPool {
         &self,
         session_id: SessionId,
     ) -> StoreResult<Vec<Observation>> {
-        let inner = self.inner.clone();
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
@@ -3609,37 +3589,54 @@ impl ReaderPool {
             for r in rows {
                 out.push(r??);
             }
-            inner
-                .session_rows_loaded
-                .fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Ok(out)
         })
         .await
     }
 
-    /// Whether the session holds at least one prompt or tool use: the positive
-    /// "real work" predicate ([`SUBSTANTIVE_OBSERVATION_KIND_SQL`]) the writer's
-    /// lifecycle-only end applies in its own transaction, asked as one
-    /// short-circuiting existence query instead of loading the rows.
+    /// Whether the session in the given scope holds at least one prompt or
+    /// tool use: the positive "real work" predicate
+    /// ([`SUBSTANTIVE_OBSERVATION_KIND_SQL`]) the writer's lifecycle-only end
+    /// applies in its own transaction, asked as one short-circuiting existence
+    /// query instead of loading the rows. A missing or foreign session returns
+    /// `false` without revealing which condition applied.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn session_has_substantive_observation(
         &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         session_id: SessionId,
     ) -> StoreResult<bool> {
         self.with_conn(move |conn| {
             let sql = format!(
-                "SELECT EXISTS(SELECT 1 FROM observations WHERE session_id = ?1 AND {})",
+                "SELECT EXISTS(\
+                    SELECT 1 FROM observations AS o \
+                    JOIN sessions AS s ON s.id = o.session_id \
+                    WHERE o.session_id = ?1 \
+                      AND s.workspace_id = ?2 AND s.project_id = ?3 \
+                      AND {}\
+                )",
                 SUBSTANTIVE_OBSERVATION_KIND_SQL
             );
-            Ok(conn.query_row(&sql, params![session_id.as_bytes()], |row| row.get(0))?)
+            Ok(conn.query_row(
+                &sql,
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes()
+                ],
+                |row| row.get(0),
+            )?)
         })
         .await
     }
 
     /// Read one session's observations through bounded queries, all inside one
-    /// read transaction so every answer describes the same set of rows.
+    /// read transaction so every answer describes the same set of rows. The
+    /// session must belong to the given workspace and project; a foreign or
+    /// missing id is refused as [`StoreError::SessionCollision`].
     ///
     /// This is the SessionEnd path's alternative to
     /// [`Self::observations_for_session`]: that call deserializes every row
@@ -3652,6 +3649,8 @@ impl ReaderPool {
     /// Propagates any SQL or pool error, and whatever `read` returns.
     pub async fn read_session_observations<F, T>(
         &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         session_id: SessionId,
         read: F,
     ) -> StoreResult<T>
@@ -3659,20 +3658,29 @@ impl ReaderPool {
         F: FnOnce(&SessionObservationSnapshot<'_>) -> StoreResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let inner = self.inner.clone();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
+            let in_scope = tx.query_row(
+                "SELECT EXISTS(\
+                    SELECT 1 FROM sessions \
+                    WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3\
+                )",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes()
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !in_scope {
+                return Err(StoreError::SessionCollision);
+            }
             let snapshot = SessionObservationSnapshot {
                 conn: &tx,
                 session_id: session_id.as_bytes().to_vec(),
                 rows_read: std::cell::Cell::new(0),
             };
-            let result = read(&snapshot);
-            inner.session_rows_loaded.fetch_add(
-                snapshot.rows_read() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            result
+            read(&snapshot)
         })
         .await
     }

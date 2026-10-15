@@ -12424,7 +12424,7 @@ pub(crate) mod tests {
             // Asked before the writer ends the session: the question is the
             // same one, put to the rows as they are.
             let reader_says_substantive = runtime
-                .block_on(reader.session_has_substantive_observation(session))
+                .block_on(reader.session_has_substantive_observation(ws, proj, session))
                 .unwrap();
             let writer_says_substantive = matches!(
                 end_lifecycle_only_session(&mut conn, &session).unwrap(),

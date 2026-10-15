@@ -169,7 +169,7 @@ pub struct SessionDigest {
 
 /// What loading a [`SessionDigest`] cost, for a bound test and for debugging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DigestLoadStats {
+pub(crate) struct DigestLoadStats {
     /// Rows deserialized: the raw-observation lines plus every row an
     /// early-exit scan visited (one resident at a time).
     pub rows_read: usize,
@@ -184,20 +184,31 @@ impl SessionDigest {
     ///
     /// # Errors
     /// Propagates any store error.
-    pub async fn load(reader: &ReaderPool, session_id: SessionId) -> StoreResult<Self> {
-        Ok(Self::load_with_stats(reader, session_id).await?.0)
+    pub async fn load(
+        reader: &ReaderPool,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<Self> {
+        Ok(
+            Self::load_with_stats(reader, workspace_id, project_id, session_id)
+                .await?
+                .0,
+        )
     }
 
     /// [`Self::load`], also reporting what the load read.
     ///
     /// # Errors
     /// Propagates any store error.
-    pub async fn load_with_stats(
+    pub(crate) async fn load_with_stats(
         reader: &ReaderPool,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         session_id: SessionId,
     ) -> StoreResult<(Self, DigestLoadStats)> {
         reader
-            .read_session_observations(session_id, move |snapshot| {
+            .read_session_observations(workspace_id, project_id, session_id, move |snapshot| {
                 build_digest(snapshot, session_id)
             })
             .await
