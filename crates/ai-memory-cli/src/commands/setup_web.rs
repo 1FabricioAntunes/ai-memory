@@ -475,7 +475,10 @@ async fn stdin_closed(mut input: impl tokio::io::AsyncRead + Unpin) {
     while matches!(input.read(&mut buffer).await, Ok(read) if read > 0) {}
 }
 
-async fn finish(State(wizard): State<Arc<Wizard>>) -> Response {
+// The page posts `{}` here. Taking the body reads it off the socket: a
+// response sent with the request body still unread, on a connection that then
+// closes, can reach the client as a TCP reset instead of the response.
+async fn finish(State(wizard): State<Arc<Wizard>>, _body: axum::body::Bytes) -> Response {
     {
         let run = wizard.run.lock();
         if run.started && !run.done {
