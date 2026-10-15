@@ -98,8 +98,16 @@
         </div>
         <p class="text-xs text-slate-500 dark:text-slate-400 font-mono break-all">id {{ row.id }}</p>
         {% if read_only %}
-        <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.cli_approve }}
-{{ row.cli_reject }}</pre>
+        <div>
+          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">POSIX shell</h2>
+          <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.posix_cli_approve }}
+{{ row.posix_cli_reject }}</pre>
+        </div>
+        <div>
+          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">PowerShell</h2>
+          <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.powershell_cli_approve }}
+{{ row.powershell_cli_reject }}</pre>
+        </div>
         {% else %}
         <div class="flex flex-wrap items-center gap-2">
           <button type="button" data-action="approve"

@@ -3051,14 +3051,11 @@ impl Wiki {
     /// #929): hybrid search silently fell back to FTS-only ranking for
     /// every rewritten page.
     ///
-    /// Best-effort: an embedder failure is logged and recorded via
-    /// `record_embed_failure` but never propagated, so a working page write
-    /// is never undone by an embedding hiccup.
-    ///
-    /// # Errors
-    /// Returns [`WikiError`] only for a store error while persisting a
-    /// successfully computed vector; provider/embedder failures are caught
-    /// and recorded instead.
+    /// Best-effort: provider and embedding-store failures are logged and
+    /// recorded but never propagated. The page mutation has already committed
+    /// before this method runs, so reporting the whole operation as failed
+    /// would invite a duplicate retry and can skip later post-commit work such
+    /// as admission-webhook dispatch.
     async fn embed_page_version(
         &self,
         page_id: PageId,
@@ -3071,7 +3068,8 @@ impl Wiki {
         match embedder.embed_document(body).await {
             Ok(vec) => {
                 let bytes = f32_vec_to_bytes(&vec);
-                self.writer
+                if let Err(e) = self
+                    .writer
                     .store_embedding(
                         page_id,
                         bytes,
@@ -3083,7 +3081,18 @@ impl Wiki {
                         embedder.model_identity(),
                         embedder.dim(),
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(error = %e, path = %page_id, "embedding store failed; page indexed without it");
+                    let _ = self
+                        .writer
+                        .record_embed_failure(
+                            page_id,
+                            ai_memory_store::EmbedOutcome::Failed,
+                            Some(e.to_string()),
+                        )
+                        .await;
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, path = %page_id, "embedding failed; page indexed without it");
@@ -3109,7 +3118,8 @@ impl Wiki {
         match abstract_text {
             Some(abstract_text) => match embedder.embed_document(abstract_text).await {
                 Ok(vec) => {
-                    self.writer
+                    if let Err(e) = self
+                        .writer
                         .store_abstract_embeddings(vec![ai_memory_store::EmbeddingWrite {
                             page_id,
                             vector_bytes: f32_vec_to_bytes(&vec),
@@ -3118,7 +3128,18 @@ impl Wiki {
                             model: embedder.model_identity(),
                             dim: embedder.dim(),
                         }])
-                        .await?;
+                        .await
+                    {
+                        tracing::warn!(error = %e, path = %page_id, "abstract embedding store failed; page indexed without it");
+                        let _ = self
+                            .writer
+                            .record_embed_failure(
+                                page_id,
+                                ai_memory_store::EmbedOutcome::Failed,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, path = %page_id, "abstract embedding failed; page indexed without it");
@@ -3132,7 +3153,19 @@ impl Wiki {
                         .await;
                 }
             },
-            None => self.writer.delete_abstract_embedding(page_id).await?,
+            None => {
+                if let Err(e) = self.writer.delete_abstract_embedding(page_id).await {
+                    tracing::warn!(error = %e, path = %page_id, "stale abstract embedding cleanup failed");
+                    let _ = self
+                        .writer
+                        .record_embed_failure(
+                            page_id,
+                            ai_memory_store::EmbedOutcome::Failed,
+                            Some(e.to_string()),
+                        )
+                        .await;
+                }
+            }
         }
         Ok(())
     }
@@ -3628,6 +3661,46 @@ mod tests {
         StageAutoImproveRun, Store,
     };
     use tempfile::TempDir;
+
+    struct StoreFailingEmbedder {
+        db_path: PathBuf,
+        broke_body_table: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for StoreFailingEmbedder {
+        fn provider(&self) -> &'static str {
+            "store-failure-test"
+        }
+
+        fn model(&self) -> &str {
+            "store-failure-test-v1"
+        }
+
+        fn dim(&self) -> u32 {
+            4
+        }
+
+        async fn embed(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            if !self
+                .broke_body_table
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                rusqlite::Connection::open(&self.db_path)
+                    .unwrap()
+                    .execute_batch("DROP TABLE page_embeddings")
+                    .unwrap();
+            }
+            Ok(vec![0.5; 4])
+        }
+    }
+
+    fn store_failing_embedder(store: &Store) -> Arc<dyn Embedder> {
+        Arc::new(StoreFailingEmbedder {
+            db_path: store.db_path().to_owned(),
+            broke_body_table: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
 
     #[test]
     fn expires_at_accepts_rfc3339_and_date_only_utc() {
@@ -5105,6 +5178,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auto_improve_approval_stays_successful_when_embedding_storage_fails() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one(&store, ws, proj, "notes/approved-store-failure.md", "kept").await;
+        let wiki = wiki.with_embedder(store_failing_embedder(&store));
+
+        let result = wiki
+            .approve_auto_improve_proposal(ws, proj, id, ActorContext::default(), None, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/approved-store-failure.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "kept"
+        );
+    }
+
     /// Body and abstract vector sets for the synthetic test embedder.
     async fn synthetic_embedded(
         store: &Store,
@@ -5194,6 +5295,42 @@ mod tests {
         let (body, abstracts) = synthetic_embedded(&store, ws, proj).await;
         assert_eq!(body, vec![id], "the restored version is embedded");
         assert_eq!(abstracts, vec![id], "with its restored abstract");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restore_stays_successful_when_embedding_storage_fails() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/restored-store-failure.md").unwrap();
+        wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "checkpoint body",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+        wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "later body",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let wiki = wiki.with_embedder(store_failing_embedder(&store));
+
+        wiki.restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wiki.read_page(ws, proj, &path).unwrap().body,
+            "checkpoint body"
+        );
     }
 
     #[tokio::test]

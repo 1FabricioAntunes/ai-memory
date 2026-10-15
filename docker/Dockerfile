@@ -16,7 +16,7 @@ WORKDIR /work
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config build-essential curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml LICENSE ./
 COPY crates ./crates
 # `evals/` is a workspace member (off-tree A/B harness, not shipped
 # in the image — but Cargo refuses to parse the workspace manifest

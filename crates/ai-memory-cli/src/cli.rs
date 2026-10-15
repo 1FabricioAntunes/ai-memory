@@ -2057,6 +2057,10 @@ pub struct BackfillArgs {
     /// been attempted for this checkout. Not for interactive use.
     #[arg(long, hide = true)]
     pub auto: bool,
+    /// Internal ownership token for the automatic backfill's in-flight marker.
+    /// The SessionStart hook mints and passes it to its detached child.
+    #[arg(long, hide = true, requires = "auto")]
+    pub inflight_claim: Option<String>,
     /// Internal: deliver to the server the spawning hook is installed
     /// against, instead of the configured one. Set by the SessionStart
     /// trigger so the backfill cannot depend on the agent's environment.

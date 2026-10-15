@@ -574,17 +574,34 @@ as that user** rather than as `LocalSystem`. In the WinSW XML add a
 
 ```xml
   <serviceaccount>
-    <username>.\you</username>
+    <domain>.</domain>
+    <user>you</user>
     <password>your-account-password</password>
+    <allowservicelogon>true</allowservicelogon>
   </serviceaccount>
 ```
 
 (or set it from the service's **Log On** tab in `services.msc` after
-install, then `restart`). Use `.\you` for a local account or
-`DOMAIN\you` for a domain account. `LocalSystem` is only appropriate when
-the data directory is in a location that account owns outright (e.g. a
-dedicated `C:\ProgramData\ai-memory` created and owned by the service
-account).
+install, then `restart`). This is the WinSW v2.12.0 XML shape used by this
+guide. For a local account, keep `<domain>.</domain>`; for a domain account,
+put the domain in `<domain>` and the account name in `<user>`. WinSW v3 uses
+the combined `<username>DOMAIN\you</username>` form instead, so follow the
+schema for the release you pinned.
+
+Add the block before the first `install`. If the service is already installed,
+stop and uninstall it, update the XML, then install and start it again. Verify
+the account recorded by the Service Control Manager rather than relying only
+on the wrapper's running state:
+
+```powershell
+Get-CimInstance Win32_Service -Filter "Name='ai-memory'" |
+  Select-Object Name, StartName, State
+```
+
+`StartName` must name the intended account, not `LocalSystem`. `LocalSystem`
+is only appropriate when the data directory is in a location that account
+owns outright (e.g. a dedicated `C:\ProgramData\ai-memory` created and owned
+by the service account).
 
 > **WinSW error 1069 / stale password.** If `start` fails with *"The
 > service did not start due to a logon failure"* (error 1069), the

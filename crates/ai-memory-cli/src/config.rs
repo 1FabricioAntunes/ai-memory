@@ -287,6 +287,14 @@ pub struct Config {
     /// something an operator states.
     #[serde(skip)]
     pub server_url_derived_from_bind: bool,
+    /// Whether the operator explicitly set `server_url` in config or the
+    /// process environment, including an explicit value equal to the default.
+    ///
+    /// This is loader provenance, not persisted configuration. Comparing the
+    /// loaded value with [`DEFAULT_SERVER_URL`] loses this distinction and can
+    /// make installers overwrite an intentional default URL (#1269 follow-up).
+    #[serde(skip)]
+    pub server_url_explicit: bool,
     /// Optional override for the GitHub Releases base URL used by
     /// `ai-memory upgrade` (archive + `.sha256` download). Empty/unset
     /// means `https://github.com/akitaonrails/ai-memory/releases`. Set via
@@ -1329,6 +1337,7 @@ impl Default for Config {
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
             server_url_derived_from_bind: false,
+            server_url_explicit: false,
             release_base_url: None,
             base_path: String::new(),
             home_dir: None,
@@ -2277,6 +2286,7 @@ impl Config {
                 && Figment::from(Toml::file(&resolved_config_path))
                     .find_value("server_url")
                     .is_ok());
+        config.server_url_explicit = explicit_server_url;
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
         }
@@ -2569,7 +2579,8 @@ impl Config {
     /// which is exactly why [`Self::server_url_derived_from_bind`] exists.
     #[must_use]
     pub fn server_url_configured(&self) -> bool {
-        self.server_url != DEFAULT_SERVER_URL && !self.server_url_derived_from_bind
+        self.server_url_explicit
+            || self.server_url != DEFAULT_SERVER_URL && !self.server_url_derived_from_bind
             || self.runtime_env.server_url.is_some()
     }
 
@@ -3740,6 +3751,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
 
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");

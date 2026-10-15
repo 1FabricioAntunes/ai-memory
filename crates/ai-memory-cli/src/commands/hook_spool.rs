@@ -51,8 +51,9 @@ impl MaxAttempts {
 /// Drop a spooled event older than this regardless of attempts (7 days), so a
 /// long-dead instance can't leave the spool growing without bound.
 const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-/// Hard cap on queued events per data dir. Enqueue prunes oldest files beyond
-/// this so a down server cannot grow the hook spool without bound.
+/// Hard cap on queued events per data dir. Once full, enqueue preserves the
+/// existing backlog and drops the new event so a down server cannot grow the
+/// hook spool without bound.
 #[cfg(not(test))]
 const MAX_SPOOL_FILES: usize = 10_000;
 #[cfg(test)]
@@ -160,8 +161,7 @@ pub struct SpoolHealth {
     pub oldest_age_ms: Option<u64>,
     /// Sum of failed-delivery attempts across all queued events.
     pub retries_total: u64,
-    /// Most events the spool holds; past it the oldest undelivered ones are
-    /// evicted to make room.
+    /// Most events the spool holds; new events are dropped while it is full.
     pub capacity: usize,
 }
 
@@ -177,9 +177,9 @@ impl Default for SpoolHealth {
 }
 
 impl SpoolHealth {
-    /// The spool is full, so each new event evicts the oldest undelivered one.
+    /// The spool is full, so each new event is dropped.
     #[must_use]
-    pub fn evicting(&self) -> bool {
+    pub fn at_capacity(&self) -> bool {
         self.pending >= self.capacity
     }
 }

@@ -4306,6 +4306,20 @@ mod tests {
     }
 
     #[test]
+    fn heading_parser_ignores_headings_after_an_indented_pseudo_closer() {
+        let body = "# Release\n\n````md\n    ````\n## Injected Anchor\n````\n\n## Verify\nTwo\n";
+        let sections = parse_markdown_sections(body);
+        assert!(
+            !sections.iter().any(|s| s.anchor == "## Injected Anchor"),
+            "the four-space pseudo-closer must remain code"
+        );
+        assert!(
+            sections.iter().any(|s| s.anchor == "## Verify"),
+            "the real closer must expose the following heading"
+        );
+    }
+
+    #[test]
     fn patch_rejects_duplicate_headings_and_extra_h1_introduced_by_edits() {
         let body = "# Release\n\n## Steps\nOne\n";
         let duplicate = patch_proposal("append", "## Steps", "## Steps\nAgain");

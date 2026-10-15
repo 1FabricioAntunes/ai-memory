@@ -19,7 +19,11 @@ impl CodeFence {
     /// code inside a fence.
     pub(crate) fn step(current: Option<Self>, line: &str) -> (Option<Self>, bool) {
         let in_fence = current.is_some();
-        let trimmed = line.trim_start();
+        let leading_spaces = line.as_bytes().iter().take_while(|&&b| b == b' ').count();
+        if leading_spaces > 3 {
+            return (current, in_fence);
+        }
+        let trimmed = &line[leading_spaces..];
         let glyph = match trimmed.chars().next() {
             Some(c @ ('`' | '~')) => c,
             _ => return (current, in_fence),
@@ -87,5 +91,30 @@ mod tests {
     #[test]
     fn a_run_shorter_than_three_is_not_a_fence() {
         assert_eq!(code_lines("``\nprose"), [false, false]);
+    }
+
+    #[test]
+    fn only_zero_to_three_ascii_spaces_may_prefix_a_fence() {
+        for spaces in 0..=3 {
+            let prefix = " ".repeat(spaces);
+            assert_eq!(
+                code_lines(&format!("{prefix}````md\ninside\n{prefix}````\nafter")),
+                [true, true, true, false],
+                "{spaces} spaces"
+            );
+        }
+
+        for prefix in ["    ", "\t", "\u{2003}"] {
+            assert_eq!(
+                code_lines(&format!("{prefix}````md\ninside\n{prefix}````\nafter")),
+                [false, false, false, false],
+                "prefix {prefix:?} must not delimit a fence"
+            );
+            assert_eq!(
+                code_lines(&format!("````md\n{prefix}````\nstill code\n````\nafter")),
+                [true, true, true, true, false],
+                "prefix {prefix:?} must not close a fence"
+            );
+        }
     }
 }

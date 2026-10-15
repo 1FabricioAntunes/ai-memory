@@ -360,6 +360,10 @@ fn docker_source_build_uses_vendored_tailwind() {
     let dockerfile = read_repo("docker/Dockerfile");
     assert!(dockerfile.contains("cargo build --locked --release -p ai-memory-cli"));
     assert!(
+        dockerfile.contains("COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml LICENSE ./"),
+        "the source builder must copy files embedded by ai-memory-cli"
+    );
+    assert!(
         !dockerfile.contains("TAILWIND"),
         "the vendored stylesheet is the default; the image build must not opt into a regeneration"
     );

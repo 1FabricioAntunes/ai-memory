@@ -171,10 +171,10 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     eprintln!("  pending:    {}", spool.pending);
     eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
     eprintln!("  retries:    {}", spool.retries_total);
-    if spool.evicting() {
+    if spool.at_capacity() {
         eprintln!(
-            "  The spool is full ({} events): each new event evicts the oldest \
-             undelivered one, which is lost. Bring the server back to stop the loss.",
+            "  The spool is full ({} events): newly captured events are dropped until \
+             space is available. Bring the server back to stop the loss.",
             spool.capacity
         );
     } else if spool.pending > 0 {
