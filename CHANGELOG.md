@@ -147,7 +147,7 @@ version in [`docs/changelog/`](docs/changelog/):
   webhook keeps the file, which the sweep counts in `ledgers_undeleted`, keeps
   going and retries on the next run, and non-blocking observers are told only
   after the unlink. The deletion is permanent on disk; the wiki's git history
-  keeps the blobs a checkpoint already captured. (#PRNUM)
+  keeps the blobs a checkpoint already captured. (#1322)
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question
