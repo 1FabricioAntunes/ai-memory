@@ -30,6 +30,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `claude setup-token` token as a plain rate limit: that 429 now carries a hint
   that it is not a real rate limit and names the alternatives, and
   `docs/llm-providers.md` documents the behavior. (#1170)
+- Fixed auto-improve patches losing track of a page's sections after a code
+  block that contains a different fence. A line of three backticks inside a
+  `~~~` block (or a shorter run inside a longer fence) ended the block early,
+  so the headings after it were missed, and a `replace_section` on the
+  section before them replaced those sections too. A fence now closes only on
+  a run of the same character that is at least as long. (#1316)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and

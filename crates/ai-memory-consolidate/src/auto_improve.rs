@@ -1510,22 +1510,45 @@ fn parse_markdown_sections(body: &str) -> Vec<MarkdownSection> {
 fn heading_positions(body: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut offset = 0;
-    let mut in_fence = false;
+    // The open fence's glyph and run length: only a run of the same glyph,
+    // at least as long and with no info string, closes it (CommonMark §4.5,
+    // as `ai_memory_wiki`'s `CodeFence` tracks it). Toggling on any fence
+    // line let a lone ``` inside a ~~~ block end it early and hide every
+    // heading after the block.
+    let mut fence: Option<(char, usize)> = None;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if is_fence_line(trimmed) {
-            in_fence = !in_fence;
-        } else if !in_fence && let Some(level) = heading_level(trimmed) {
-            out.push((offset, level, trimmed.to_string()));
+        match (fence, fence_run(trimmed)) {
+            // A backtick fence's info string cannot contain a backtick.
+            (None, Some((glyph, len, info))) if glyph == '~' || !info.contains('`') => {
+                fence = Some((glyph, len));
+            }
+            (Some((open, open_len)), Some((glyph, len, info)))
+                if glyph == open && len >= open_len && info.trim().is_empty() =>
+            {
+                fence = None;
+            }
+            (None, _) => {
+                if let Some(level) = heading_level(trimmed) {
+                    out.push((offset, level, trimmed.to_string()));
+                }
+            }
+            (Some(_), _) => {}
         }
         offset += line.len();
     }
     out
 }
 
-fn is_fence_line(line: &str) -> bool {
+/// The glyph, run length and info string of a fence line, if it is one.
+fn fence_run(line: &str) -> Option<(char, usize, &str)> {
     let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    let glyph = trimmed.chars().next().filter(|&c| matches!(c, '`' | '~'))?;
+    let len = trimmed.chars().take_while(|&c| c == glyph).count();
+    if len < 3 {
+        return None;
+    }
+    Some((glyph, len, &trimmed[len..]))
 }
 
 fn heading_level(line: &str) -> Option<usize> {
@@ -4285,6 +4308,28 @@ mod tests {
         let sections = parse_markdown_sections(body);
         assert!(sections.iter().any(|s| s.anchor == "## Steps"));
         assert!(!sections.iter().any(|s| s.anchor == "## Not Anchor"));
+    }
+
+    #[test]
+    fn heading_parser_closes_a_fence_only_on_its_own_glyph_and_length() {
+        // A lone ``` inside a ~~~ block is code, not the end of the block.
+        let body = "# Release\n\n## Steps\n~~~sh\ncat <<'EOF'\n```\nEOF\n~~~\n\n## Verify\nTwo\n";
+        let sections = parse_markdown_sections(body);
+        let verify = sections
+            .iter()
+            .find(|s| s.anchor == "## Verify")
+            .expect("the heading after the block is found");
+        let steps = sections.iter().find(|s| s.anchor == "## Steps").unwrap();
+        assert_eq!(
+            steps.end, verify.start,
+            "## Steps ends where ## Verify starts"
+        );
+
+        // A shorter run does not close a longer fence.
+        let body = "# Release\n\n````md\n```\n## Not Anchor\n```\n````\n\n## Steps\nOne\n";
+        let sections = parse_markdown_sections(body);
+        assert!(!sections.iter().any(|s| s.anchor == "## Not Anchor"));
+        assert!(sections.iter().any(|s| s.anchor == "## Steps"));
     }
 
     #[test]
