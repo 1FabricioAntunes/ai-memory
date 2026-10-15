@@ -33,6 +33,14 @@ ai-memory removes those limits.
   off, what failed, and what is still open. Handoffs are a typed protocol:
   each one has an owner and is claimed exactly once.
 
+- **It can carry the session, not just a summary.** Start agents with
+  `ai-memory run`: quit Claude Code, run `ai-memory run codex`, and Codex gets
+  the shared workstream plus a private, temporary local projection of Claude's
+  visible native history for exact details the bounded startup packet omitted.
+  The remote server receives only the harness and session identity, never the
+  local transcript path or body. Direct harness launches behave exactly as
+  before.
+
 - **It follows you across projects.** A small profile of how you usually
   work (your package manager, test layout, architecture habits) reaches
   every new repository at session start, so you stop re-explaining yourself.
@@ -442,7 +450,7 @@ Pass `--require-server` to fail closed instead.
 
 ```bash
 ai-memory run claude
-ai-memory run codex --yolo   # later: same workstream, different harness
+ai-memory run codex --yolo   # same workstream + local Claude history dossier
 ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
 # after a dead launcher left its lease behind (same operator only)
@@ -457,6 +465,15 @@ use it only when you know the previous launcher is gone. It does not kill a
 native process, and it cannot evict another authenticated operator's run. See
 the [managed-workstream recovery notes](docs/managed-workstreams.md#lease-recovery)
 for the full safety contract.
+
+On a real harness switch, the receiving managed agent is told to consult
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY` when you ask to continue and the bounded
+portable packet lacks a detail. The variable names a private temporary
+Markdown projection created from the previous harness's checkout-validated,
+read-only adapter; the file disappears when the managed child exits. It is
+local to the launcher machine. A switch on another machine still gets the
+server's portable ledger and handoff, but cannot read a native transcript that
+exists only on the first machine.
 
 In `resume`, type to search, use Up/Down to select a workstream, and Left/Right
 to choose its harness. Enter launches the selection; Escape clears a search,

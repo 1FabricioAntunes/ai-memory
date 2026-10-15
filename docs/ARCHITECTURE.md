@@ -295,7 +295,12 @@ newest usable local/linked harness, creates or resumes that harness's native
 session, and marks lifecycle calls with an invocation-scoped run id.
 SessionStart injects an unseen bounded event range; Crush receives it through a
 temporary supported global-context path because it lacks SessionStart. The host
-imports the native transcript tail and a Git checkpoint when the child exits.
+also pins the newest other-harness session identity when a launch is a real
+harness switch. The client revalidates that identity against the checkout and
+materializes a private temporary visible-history dossier for the child through
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY`; its path and body remain client-local and
+the file is removed with the child. The host imports the native transcript tail
+and a Git checkpoint when the child exits.
 Every injected packet starts with a versioned origin marker. The Claude
 transcript normalizer excludes a marked packet if Claude persists and reads it
 back, preventing delivered history from recursively re-entering the ledger.

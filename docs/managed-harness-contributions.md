@@ -97,6 +97,15 @@ The adapter must:
 - exclude system/developer prompts, hidden reasoning, binary payloads,
   credentials, provider metadata, and unsupported records.
 
+The same exporter is used to build the local previous-session dossier during a
+cross-harness switch. It must therefore support a bounded full-session read
+from a `None` cursor, validate the native session against the exact checkout
+before returning any event, and remain safe when the native store is shared by
+many projects. The server must receive only the typed harness/session identity:
+never add a workstation path or dossier content to a request, run row, event,
+page, or raw segment. A contributor should add a switch test proving a foreign
+checkout's session cannot produce a dossier, alongside a legitimate control.
+
 Extraction gaps should become bounded loss annotations. If the conversation
 payload is opaque or undocumented, return such an annotation and rely on
 sanitized lifecycle-hook capture instead of guessing. Never copy a private

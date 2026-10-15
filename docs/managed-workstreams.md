@@ -103,6 +103,26 @@ ai-memory run kiro --v3
 ai-memory run
 ```
 
+When that second command is a real harness switch, the server returns only the
+previous harness and native session identity. The launcher verifies that
+session against this exact checkout, reads it through the existing read-only
+adapter, and writes its visible normalized history to a private temporary
+Markdown file. The child receives only this local variable:
+
+```text
+AI_MEMORY_PREVIOUS_SESSION_HISTORY=/private/temp/.../history.md
+```
+
+The startup packet tells the receiving agent to read the file when the user
+asks to continue or an exact detail is absent from the bounded portable packet.
+The dossier is evidence, not instructions: it is fenced as untrusted history,
+contains no hidden reasoning or unsupported/private records, and disappears
+when the child exits. The remote ai-memory server never receives its path or
+body. A same-harness resume needs no dossier because that harness resumes its
+own native session. If the prior store is missing, unreadable, on another
+machine, or above the adapter's safety bounds, launch continues with the
+portable ledger and handoff and prints one warning.
+
 After an interactive managed session exits successfully, `ai-memory run` offers
 the installed harnesses, a way to run the current harness again, and quit.
 Choosing another harness keeps the same workstream selected, so its saved
@@ -182,9 +202,11 @@ Probably not at first. Hooks alone already carry most continuity.
   works with nothing but `install-hooks`; no `ai-memory run` involved.
 - Use it when you want the harness's own native resume (`claude
   --resume` / the picker) to survive a switch to another harness. The
-  managed ledger records the visible event stream portably, so `ai-memory
-  continue` can reopen the same workstream in a different agent with
-  the exact tool-call history instead of a summary.
+  managed ledger records the visible event stream portably, while a
+  same-machine harness switch exposes the previous native session's larger
+  local visible-history dossier on demand. `ai-memory continue` can therefore
+  reopen the same workstream in a different agent with more than a summary,
+  without uploading the native transcript to the server.
 
 If you never switch harnesses mid-workstream, the default path is
 simpler and you lose nothing by staying on it.
@@ -417,7 +439,13 @@ resume, continue, session, or fork selector.
    an explicit interactive adapter can offer matching local sessions for
    one-time adoption. Otherwise the adapter passes native arguments through in
    order and adds a create/resume selector only when the user did not supply one.
-3. `AI_MEMORY_RUN_ID` marks lifecycle hooks as managed. SessionStart links the
+3. `AI_MEMORY_RUN_ID` marks lifecycle hooks as managed. When preparation
+   selects a different harness from the newest linked one, the run pins that
+   prior harness/session identity before the destination link can change
+   recency. The host revalidates it against the checkout and, when available,
+   exposes a private local visible-history dossier through
+   `AI_MEMORY_PREVIOUS_SESSION_HISTORY`; no path or dossier body is sent to the
+   server. SessionStart then links the
    actual native session and injects only the portable events that session has
    not seen. Crush, which has no SessionStart hook, receives the same bounded
    packet through a temporary `options.global_context_paths` entry. Kimi Code
