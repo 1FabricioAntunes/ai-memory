@@ -383,7 +383,8 @@ it would make Claude Code read that file instead, unless one of them imports
 the `AGENTS.md` being written. The import is resolved from the file that
 contains it (`@AGENTS.md` in `.claude/CLAUDE.md` points at `.claude/AGENTS.md`;
 that file needs `@../AGENTS.md`), `~/` expands from the home directory, and an
-`@path` inside a code span or fenced block does not count.
+`@path` inside a code span or fenced block does not count. Imports are followed
+through other imported files up to four hops, as Claude Code follows them.
 
 To refresh only the managed Agent Skills:
 

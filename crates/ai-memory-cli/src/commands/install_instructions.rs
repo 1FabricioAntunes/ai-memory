@@ -232,13 +232,40 @@ fn written_agents_files(targets: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// How many import hops Claude Code follows from a memory file: an imported
+/// file may import others, up to this depth.
+const MAX_IMPORT_HOPS: usize = 4;
+
 fn file_imports_written_agents(path: &Path, agents: &[PathBuf], home: Option<&Path>) -> bool {
+    imports_within(
+        path,
+        agents,
+        home,
+        MAX_IMPORT_HOPS,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+/// Whether `path`, or a file it imports within `hops` hops, imports one of
+/// `agents`. A file already visited is not read again, so an import cycle
+/// ends.
+fn imports_within(
+    path: &Path,
+    agents: &[PathBuf],
+    home: Option<&Path>,
+    hops: usize,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> bool {
+    if hops == 0 || !seen.insert(path.to_path_buf()) {
+        return false;
+    }
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     claude_import_paths(&text).into_iter().any(|raw| {
         let resolved = resolve_claude_import(&raw, path, home);
         agents.iter().any(|target| paths_match(&resolved, target))
+            || (resolved.is_file() && imports_within(&resolved, agents, home, hops - 1, seen))
     })
 }
 
@@ -647,6 +674,52 @@ mod tests {
     /// importing file, including mid-sentence, and a fenced `@AGENTS.md` is
     /// not an import. Two of these are silent misses on the exact-line check
     /// and two are false notes; the parent-directory row is the third miss.
+    /// Claude Code follows imports through other imported files, up to four
+    /// hops, so an `AGENTS.md` reached through an intermediate file needs no
+    /// note; one five hops away, or only reachable through a cycle, does.
+    #[test]
+    fn agents_md_reached_through_nested_imports_counts_up_to_four_hops() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# rules\n").unwrap();
+        let agents = [dir.join("AGENTS.md")];
+
+        std::fs::write(dir.join("CLAUDE.md"), "@docs/a.md\n").unwrap();
+        std::fs::write(dir.join("docs/a.md"), "@../AGENTS.md\n").unwrap();
+        assert!(file_imports_written_agents(
+            &dir.join("CLAUDE.md"),
+            &agents,
+            None
+        ));
+
+        // CLAUDE.md -> h1 -> h2 -> h3 -> h4 -> AGENTS.md is five hops.
+        for (from, to) in [
+            ("CLAUDE.md", "@docs/h1.md"),
+            ("docs/h1.md", "@h2.md"),
+            ("docs/h2.md", "@h3.md"),
+            ("docs/h3.md", "@h4.md"),
+            ("docs/h4.md", "@../AGENTS.md"),
+        ] {
+            std::fs::write(dir.join(from), format!("{to}\n")).unwrap();
+        }
+        assert!(!file_imports_written_agents(
+            &dir.join("CLAUDE.md"),
+            &agents,
+            None
+        ));
+
+        // A cycle that never reaches AGENTS.md ends.
+        std::fs::write(dir.join("CLAUDE.md"), "@docs/c1.md\n").unwrap();
+        std::fs::write(dir.join("docs/c1.md"), "@c2.md\n").unwrap();
+        std::fs::write(dir.join("docs/c2.md"), "@c1.md\n").unwrap();
+        assert!(!file_imports_written_agents(
+            &dir.join("CLAUDE.md"),
+            &agents,
+            None
+        ));
+    }
+
     #[test]
     fn claude_code_agents_import_matches_five_measured_cases() {
         struct Case<'a> {
