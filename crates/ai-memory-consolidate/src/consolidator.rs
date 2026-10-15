@@ -736,19 +736,19 @@ impl Consolidator {
             // `build_update`. Skip that page like the `ensure_portable`
             // guard below does, rather than let one bad path fail every
             // other page of the batch (#848).
-            let (mut req, mut outcome) =
-                match build_update(ws, proj, upd, false, &actor, author_id) {
-                    Ok(built) => built,
-                    Err(ConsolidatorError::Memory(e)) => {
-                        warn!(
-                            path = %upd.path,
-                            error = %e,
-                            "skipped consolidation page update: path is invalid",
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+            let (mut req, mut outcome) = match build_update(ws, proj, upd, false, &actor, author_id)
+            {
+                Ok(built) => built,
+                Err(ConsolidatorError::Memory(e)) => {
+                    warn!(
+                        path = %upd.path,
+                        error = %e,
+                        "skipped consolidation page update: path is invalid",
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // Deterministic backstop for the title-uniqueness prompt
