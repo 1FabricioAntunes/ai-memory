@@ -163,7 +163,8 @@ fn inflight_path(data_dir: &Path, cwd: &Path) -> PathBuf {
 /// [`release_inflight`] if the spawn fails). `O_CREAT|O_EXCL` makes the claim
 /// atomic, so a burst of SessionStart hooks in a directory with no sentinel
 /// launches one backfill, not one per session. A marker older than
-/// [`INFLIGHT_STALE_AFTER`] is replaced.
+/// [`INFLIGHT_STALE_AFTER`] is replaced; a running worker keeps its marker
+/// fresh with [`refresh_inflight`], so only a dead worker's marker goes stale.
 pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> bool {
     let path = inflight_path(data_dir, cwd);
     if let Some(parent) = path.parent() {
@@ -186,9 +187,21 @@ pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> bool {
                     .ok()
                     .and_then(|modified| modified.elapsed().ok())
                     .is_some_and(|age| age >= INFLIGHT_STALE_AFTER);
-                if !stale || std::fs::remove_file(&path).is_err() {
+                if !stale {
                     return false;
                 }
+                // Two hooks can see the same stale marker. Renaming it to a
+                // name only this process uses is atomic, so exactly one of
+                // them moves it aside and retries the claim; the other's
+                // rename fails and it backs off. Removing the marker in
+                // place would let the slower hook delete the faster one's
+                // fresh claim.
+                let mut aside = path.clone().into_os_string();
+                aside.push(format!(".stale.{}", std::process::id()));
+                if std::fs::rename(&path, &aside).is_err() {
+                    return false;
+                }
+                let _ = std::fs::remove_file(&aside);
             }
             // An unwritable state dir must not turn into a spawn storm either:
             // the pre-guard behavior is not worth keeping for this case.
@@ -196,6 +209,14 @@ pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> bool {
         }
     }
     false
+}
+
+/// Re-stamp the in-progress marker with this worker's pid and the current
+/// time. The worker calls it as it starts and after each imported session, so
+/// a backfill that runs longer than [`INFLIGHT_STALE_AFTER`] is not mistaken
+/// for a dead one and joined by a second worker.
+fn refresh_inflight(data_dir: &Path, cwd: &Path) {
+    let _ = std::fs::write(inflight_path(data_dir, cwd), std::process::id().to_string());
 }
 
 /// Drop the in-progress marker taken by [`claim_inflight`].
@@ -279,6 +300,9 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
         data_dir: &config.data_dir,
         cwd: &cwd,
     });
+    if args.auto {
+        refresh_inflight(&config.data_dir, &cwd);
+    }
     // The automatic (SessionStart-spawned) path honors the opt-out and records
     // that it has been attempted for this checkout, so it runs at most once per
     // machine regardless of outcome. Manual runs ignore both.
@@ -349,6 +373,9 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
             Ok(events) => {
                 report.imported_sessions += 1;
                 report.imported_events += events;
+                if args.auto {
+                    refresh_inflight(&config.data_dir, &cwd);
+                }
             }
             Err(error) => {
                 report.failed_sessions += 1;
@@ -1330,6 +1357,53 @@ mod tests {
             "stale marker is taken over"
         );
         assert!(!claim_inflight(data.path(), cwd), "the new claim holds");
+    }
+
+    /// A worker's refresh makes an old marker fresh again, so a long backfill
+    /// keeps its claim; the refreshed marker names the worker.
+    #[test]
+    fn a_refreshed_marker_is_not_taken_over() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        assert!(claim_inflight(data.path(), cwd));
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        refresh_inflight(data.path(), cwd);
+        assert!(!claim_inflight(data.path(), cwd), "a live worker keeps it");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            std::process::id().to_string()
+        );
+    }
+
+    /// The stale takeover leaves no `.stale.*` file behind and exactly one
+    /// marker in place.
+    #[test]
+    fn a_stale_takeover_leaves_one_marker_and_no_debris() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        assert!(claim_inflight(data.path(), cwd));
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(claim_inflight(data.path(), cwd));
+        let names: Vec<String> = std::fs::read_dir(marker.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].ends_with(".inflight"), "{names:?}");
     }
 
     #[test]
@@ -3036,6 +3110,34 @@ mod tests {
         assert!(
             sentinel_path(&config.data_dir, &cwd).exists(),
             "the opt-out must still record the attempt so it does not re-spawn"
+        );
+    }
+
+    /// The worker frees the marker the hook claimed, however it ends, so the
+    /// next SessionStart can spawn again when one is needed.
+    #[tokio::test]
+    async fn an_auto_run_releases_the_marker_its_hook_claimed() {
+        let home = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data_dir.path().to_path_buf();
+        config.backfill_on_start = false;
+        config.server_url = "http://127.0.0.1:9".to_string();
+        let cwd = data_dir.path().join("checkout");
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(claim_inflight(&config.data_dir, &cwd));
+
+        run_in(&config, spawned_args(None, None), cwd.clone())
+            .await
+            .unwrap();
+        assert!(
+            !inflight_path(&config.data_dir, &cwd).exists(),
+            "the worker must release its marker"
+        );
+        assert!(
+            claim_inflight(&config.data_dir, &cwd),
+            "free for the next run"
         );
     }
 }
