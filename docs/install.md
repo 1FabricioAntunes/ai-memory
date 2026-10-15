@@ -424,10 +424,11 @@ managed Agent Skills are installed or updated alongside it.
 
 If you install into `AGENTS.md` and the project is also used from Claude Code,
 make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
-2.1.277 and later reads `AGENTS.md` when no `CLAUDE.md` or `CLAUDE.local.md`
-is present; when `CLAUDE.md` exists it still wins, so without that import
-older Claude Code and the CLAUDE.md-first mode miss the installed block at
-session start. See
+2.1.277 and later reads `AGENTS.md` only when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` is present. Without that import,
+sessions that read only `CLAUDE.md` (older Claude Code, the `claude-md`
+Project instructions setting, or a project that also keeps a `CLAUDE.md`)
+miss the installed block at session start. See
 [Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
 
 ---

@@ -109,11 +109,13 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
-Claude Code 2.1.277 and later reads `AGENTS.md` when no `CLAUDE.md` or
-`CLAUDE.local.md` is present; when `CLAUDE.md` exists it still wins. In a
-project where `AGENTS.md` is canonical, give `CLAUDE.md` a bare
-`@AGENTS.md` import line so older Claude Code and the CLAUDE.md-first
-mode load the same rules at session start.
+Claude Code 2.1.277 and later reads `AGENTS.md` when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` is present; when one exists, it
+reads that file instead. In a project where `AGENTS.md` is canonical, give
+`CLAUDE.md` a bare `@AGENTS.md` import line so sessions that read only
+`CLAUDE.md` (older Claude Code, the `claude-md` Project instructions
+setting, or a project that also keeps a `CLAUDE.md`) load the same rules at
+session start.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -331,6 +333,14 @@ mod tests {
         assert!(
             SNIPPET_BODY.contains("`CLAUDE.local.md`"),
             "a CLAUDE.local.md also blocks the AGENTS.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("`.claude/CLAUDE.md`"),
+            "a .claude/CLAUDE.md also blocks the AGENTS.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("the `claude-md` Project instructions"),
+            "name Claude Code's real setting, not an invented mode"
         );
     }
 
