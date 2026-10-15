@@ -35,6 +35,16 @@ version in [`docs/changelog/`](docs/changelog/):
   embedding backfill ran, which by default is only at the next server
   start. These paths now embed each written page the same way
   `memory_write_page` does. (#1258)
+- Fixed `ai-memory run` reporting `server unavailable` for a heartbeat the
+  server answered and rejected. A heartbeat is rejected once its managed run
+  stops being active, which on a workstation usually means a later `run`
+  prepared a workstream and expired every active run whose lease had already
+  passed. The launcher printed the outage notice for a failure of any kind and
+  sent the real reason to a `debug` line nobody sees at the default level, so a
+  server that answered `409 managed run lease is not active` in about a
+  millisecond read as an outage. The notice now carries the server's own reason
+  for a rejection, and keeps the outage wording only for a server the launcher
+  could not reach. (#1277)
 
 ## [3.0.0] - 2026-10-13
 
