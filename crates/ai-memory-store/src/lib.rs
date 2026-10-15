@@ -95,9 +95,9 @@ pub use reader::{
     ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, SESSION_LINE_TITLE_CHARS,
     SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain, SessionConsolidationQueue,
     SessionConsolidationSummary, SessionDependentRows, SessionEndDisposition, SessionKindSummary,
-    SessionLine, SessionObservationSnapshot, SessionPromptTitle, SessionSummary, SessionToolTitles,
-    SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings,
-    VectorQuery, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    SessionLine, SessionObservationSnapshot, SessionSummary, SessionToolTitles, SettledPage,
+    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{

@@ -11952,16 +11952,6 @@ pub struct SessionToolTitles {
     pub titles: Vec<String>,
 }
 
-/// A user prompt's title, plus its body when the caller asked for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionPromptTitle {
-    /// The prompt's stored title.
-    pub title: String,
-    /// The body, loaded only for a title containing the `body_for_titles_like`
-    /// marker the caller passed (a superset the caller filters exactly).
-    pub body: Option<String>,
-}
-
 /// What a page prints about one observation, without the body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLine {
@@ -12080,8 +12070,13 @@ impl SessionObservationSnapshot<'_> {
         Ok(out)
     }
 
-    /// Every user prompt's title in capture order, with the body only for a
-    /// title that contains `body_for_titles_like`.
+    /// Every user prompt's title in capture order.
+    ///
+    /// `visit` sees each prompt in that order, with its body only when the
+    /// title contains `body_for_titles_like` (a superset the caller filters
+    /// exactly), until it returns `false`; later prompts contribute their
+    /// title alone. At most one body is resident at a time, so a session full
+    /// of subagent preambles costs one body, not all of them.
     ///
     /// The titles are the one part of a SessionEnd that grows with the
     /// session: the page it renders lists each of them, so the output cannot
@@ -12094,31 +12089,27 @@ impl SessionObservationSnapshot<'_> {
     pub fn prompt_titles(
         &self,
         body_for_titles_like: &str,
-    ) -> StoreResult<Vec<SessionPromptTitle>> {
+        mut visit: impl FnMut(&str, Option<&str>) -> bool,
+    ) -> StoreResult<Vec<String>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END \
-             FROM observations \
-             WHERE session_id = ?1 AND kind = ?2 \
-             ORDER BY created_at ASC, rowid ASC",
+            "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END              FROM observations              WHERE session_id = ?1 AND kind = ?2              ORDER BY created_at ASC, rowid ASC",
         )?;
-        let rows = stmt.query_map(
-            params![
-                self.session_id,
-                ObservationKind::UserPrompt.as_str(),
-                body_for_titles_like,
-            ],
-            |row| {
-                Ok(SessionPromptTitle {
-                    title: row.get(0)?,
-                    body: row.get(1)?,
-                })
-            },
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+        let mut rows = stmt.query(params![
+            self.session_id,
+            ObservationKind::UserPrompt.as_str(),
+            body_for_titles_like,
+        ])?;
+        let mut titles = Vec::new();
+        let mut visiting = true;
+        while let Some(row) = rows.next()? {
+            let title: String = row.get(0)?;
+            if visiting {
+                let body: Option<String> = row.get(1)?;
+                visiting = visit(&title, body.as_deref());
+            }
+            titles.push(title);
         }
-        Ok(out)
+        Ok(titles)
     }
 
     /// The first `limit` rows of the session, oldest first, as page lines.

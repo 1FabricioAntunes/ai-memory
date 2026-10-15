@@ -21,7 +21,7 @@ use ai_memory_core::{
 };
 use ai_memory_store::{
     ObservationOrder, ReaderPool, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionPromptTitle, StoreError, StoreResult,
+    StoreError, StoreResult,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -175,6 +175,8 @@ pub struct DigestLoadStats {
     pub rows_read: usize,
     /// User prompts whose title the digest keeps.
     pub prompt_titles: usize,
+    /// Prompt bodies read to settle the page title (one resident at a time).
+    pub prompt_bodies_read: usize,
 }
 
 impl SessionDigest {
@@ -315,19 +317,19 @@ fn build_digest(
 
     // Bodies only for a title that could be the subagent preamble: the title
     // rule is the one reader of a prompt body.
-    let prompt_rows: Vec<SessionPromptTitle> = snapshot.prompt_titles(SUBAGENT_PROMPT_PREAMBLE)?;
-    let title = match title_from_prompts(
-        prompt_rows
-            .iter()
-            .map(|p| (p.title.as_str(), p.body.as_deref().unwrap_or(""))),
-    ) {
+    let mut title_scan = PromptTitleScan::default();
+    let mut prompt_bodies_read = 0;
+    let prompt_titles = snapshot.prompt_titles(SUBAGENT_PROMPT_PREAMBLE, |title, body| {
+        prompt_bodies_read += usize::from(body.is_some());
+        title_scan.push(title, body.unwrap_or(""))
+    })?;
+    let title = match title_scan.finish() {
         PromptTitle::Found(title) => title,
         PromptTitle::RejectedPreamble => format!("Session {session_id}"),
         PromptTitle::Unusable => snapshot
             .scan(ObservationOrder::Asc, &[], None, fallback_title)?
             .unwrap_or_else(|| title_without_candidate(session_id, total)),
     };
-    let prompt_titles: Vec<String> = prompt_rows.into_iter().map(|p| p.title).collect();
 
     let tools = snapshot.tool_titles()?;
     let tool_counts: BTreeMap<String, usize> = tools.completed.into_iter().collect();
@@ -382,6 +384,7 @@ fn build_digest(
     let stats = DigestLoadStats {
         rows_read: snapshot.rows_read(),
         prompt_titles: prompt_titles.len(),
+        prompt_bodies_read,
     };
     Ok((
         SessionDigest {
@@ -408,6 +411,19 @@ enum PromptTitle {
     RejectedPreamble,
     /// No prompt was usable: fall back to the other observations.
     Unusable,
+}
+
+/// [`PromptTitleScan`] over a whole prompt list: the row-list form the
+/// test-only digest builder walks.
+#[cfg(test)]
+fn title_from_prompts<'a>(prompts: impl Iterator<Item = (&'a str, &'a str)>) -> PromptTitle {
+    let mut scan = PromptTitleScan::default();
+    for (title, body) in prompts {
+        if !scan.push(title, body) {
+            break;
+        }
+    }
+    scan.finish()
 }
 
 /// Title for a synthesised session page.
@@ -441,28 +457,44 @@ enum PromptTitle {
 /// any other usable observation title, then the session's own path. The
 /// literal "session" remains only for the case where there is nothing else
 /// at all.
-fn title_from_prompts<'a>(prompts: impl Iterator<Item = (&'a str, &'a str)>) -> PromptTitle {
-    let mut rejected_subagent_preamble = false;
-    for (title, body) in prompts {
+///
+/// Fed one prompt at a time, so a caller streaming prompts from the store
+/// holds one body at most and stops reading bodies once the title is settled.
+#[derive(Default)]
+struct PromptTitleScan {
+    found: Option<String>,
+    rejected_subagent_preamble: bool,
+}
+
+impl PromptTitleScan {
+    /// Feed the next prompt in capture order. Returns `false` once the title
+    /// is found: later prompts cannot change it.
+    fn push(&mut self, title: &str, body: &str) -> bool {
         if title.trim() == SUBAGENT_PROMPT_PREAMBLE {
-            rejected_subagent_preamble = true;
-            if let Some(title) = body
+            self.rejected_subagent_preamble = true;
+            if let Some(line) = body
                 .lines()
                 .map(str::trim)
                 .find(|line| !line.is_empty() && !looks_like_title_scaffolding(line))
             {
-                return PromptTitle::Found(truncate_for_title(title));
+                self.found = Some(truncate_for_title(line));
+                return false;
             }
-            continue;
+            return true;
         }
         if !title.is_empty() && !looks_like_scaffolding(title) {
-            return PromptTitle::Found(title.to_string());
+            self.found = Some(title.to_string());
+            return false;
         }
+        true
     }
-    if rejected_subagent_preamble {
-        PromptTitle::RejectedPreamble
-    } else {
-        PromptTitle::Unusable
+
+    fn finish(self) -> PromptTitle {
+        match self.found {
+            Some(title) => PromptTitle::Found(title),
+            None if self.rejected_subagent_preamble => PromptTitle::RejectedPreamble,
+            None => PromptTitle::Unusable,
+        }
     }
 }
 

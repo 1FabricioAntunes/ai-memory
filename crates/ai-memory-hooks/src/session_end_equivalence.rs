@@ -1282,6 +1282,50 @@ async fn a_huge_session_reads_a_bounded_number_of_rows() {
     fx.assert_equivalent("12k rows", sid).await;
 }
 
+/// Subagent preambles carry the only prompt bodies a SessionEnd reads, and a
+/// session can hold thousands of them: the title is settled by the first
+/// usable one, so the bodies after it are never read.
+#[tokio::test]
+async fn subagent_preamble_bodies_stop_at_the_first_usable_one() {
+    let fx = fixture().await;
+    let filler = "x".repeat(4096);
+    let unusable = format!("<ide_opened_file>{filler}\n\n");
+    let usable = format!("Review the diff in src/lib.rs\n{filler}");
+    let preambles = 2_000;
+    for (name, leading_unusable) in [("first usable", 0), ("three unusable first", 3)] {
+        let mut rows = vec![start(0)];
+        for i in 0..preambles {
+            let body = if i < leading_unusable {
+                &unusable
+            } else {
+                &usable
+            };
+            rows.push(row(
+                ObservationKind::UserPrompt,
+                SUBAGENT_PREAMBLE,
+                body,
+                1 + i as i64,
+            ));
+        }
+        rows.push(end(1 + preambles as i64));
+        let sid = fx.seed(&rows).await;
+
+        let (_, stats) = SessionDigest::load_with_stats(&fx.store.reader, sid)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.prompt_titles, preambles,
+            "{name}: every title is kept"
+        );
+        assert_eq!(
+            stats.prompt_bodies_read,
+            leading_unusable + 1,
+            "{name}: bodies read past the one that named the page"
+        );
+        fx.assert_equivalent(name, sid).await;
+    }
+}
+
 /// The Rust predicate the original code used and the existence query the
 /// router asks now classify every observation kind alike. (The writer's
 /// lifecycle-only re-check is pinned to the same query in
