@@ -181,6 +181,7 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // `tool_name`/`tool_input`/`tool_use_id` (captured live, Cursor 3.24.9).
         // Meta Muse Code sends the same three fields, `tool_use_id` being the
         // provider's call id (`call_…`, captured offline on Muse Code 1.4.7).
+        // CodeBuddy Code sends the same Claude Code fields (#1299).
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
@@ -189,7 +190,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::Grizzybot
         | AgentKind::Zcode
         | AgentKind::CopilotCli
-        | AgentKind::Muse => (
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -261,6 +263,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Grizzybot
                             | AgentKind::Droid
                             | AgentKind::Muse
+                            | AgentKind::CodeBuddy
                     ) {
                         "tool_input"
                     } else {
@@ -1103,7 +1106,10 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // Factory Droid's hooks send the same Claude Code shape (#1240).
         | AgentKind::Droid
         // Meta Muse Code too, with its own tool names (Muse Code 1.4.7).
-        | AgentKind::Muse => object
+        // CodeBuddy Code uses Claude Code's names and the same two fields
+        // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -4587,6 +4593,7 @@ mod tests {
             AgentKind::CopilotCli,
             AgentKind::Droid,
             AgentKind::Muse,
+            AgentKind::CodeBuddy,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,

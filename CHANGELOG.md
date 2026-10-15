@@ -94,6 +94,22 @@ version in [`docs/changelog/`](docs/changelog/):
   through `UserPromptSubmit` `additionalContext`, OpenCode V1/V2 through the
   plugin's system/context hook, and Grok Build on the next `PostToolUse`.
   Serving the recap writes nothing, so a reload never consumes a baton (#1230).
+- Added first-party CodeBuddy Code (Tencent) support. `codebuddy` is an
+  `AgentKind` (migration V81), so hook events are attributed to it and a
+  Claude Code-shaped tool payload (`tool_name`, `tool_input`, `tool_response`)
+  is stored as a closed tool observation instead of an empty `other` capture.
+  `install-hooks --agent codebuddy` (alias `code-buddy`) merges native
+  `ai-memory hook --event … --agent codebuddy` commands for seven events
+  (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `PreCompact`, `Stop`, `SessionEnd`) into the `hooks` key of
+  `~/.codebuddy/settings.json`, keeps sibling settings and your own hooks,
+  and changes nothing on a re-run. There is no script bundle. The
+  `SessionStart` hook delivers the pending handoff through
+  `hookSpecificOutput.additionalContext`. `setup` wires CodeBuddy when
+  `~/.codebuddy` exists, `setup-agent --agent codebuddy` prints the hook
+  block, and `uninstall` removes the entries. Transcript backfill and
+  headless `codebuddy -p` session close are not part of this change.
+  Requested in #1299. (#1312)
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question
