@@ -15,6 +15,7 @@ description = "MCP server transport and tool router for ai-memory."
 [features]
 default = []
 session-management = []
+self-service-keys = []
 
 [dependencies]
 ai-memory-core.workspace = true

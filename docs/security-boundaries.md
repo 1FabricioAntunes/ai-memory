@@ -115,6 +115,8 @@ means the boundary is not built yet.
 
 | 17 | Human-session session inspection and owned purging | `mcp/src/session_management.rs`: human session/CSRF, completed password change, guarded scope lookup, exact ownership; `ops::purge_session_with_owner`: transaction ownership/write-grant checks and collateral refusal; `Wiki::purge_owned_session`: mutation lock, admission/checkpoints, partial cleanup/tombstones. | MCP `session_management` suite (foreign/shared/raw ids, wrong/partial scopes, anonymous/machine/CSRF, admission refusal, owner/Admin controls); store `multi_session::owned_session_purge_*`; wiki `owned_session_purge_authorization_failure_preserves_page_and_index`, `owned_session_purge_cleanup_failure_is_reported_and_tombstoned`. | Adversarial controls and guard-removal proofs. |
 
+| 18 | Human-session self-service native API keys | `mcp/src/self_service_keys.rs`: human session/CSRF and completed password change; creation takes authenticated `UserId`, never a supplied username; revocation verifies immutable owner; existing native keys remain User-level. | `self_service_keys_refuse_foreign_ids_csrf_machine_and_pending_password_with_owner_controls` (anonymous/machine/CSRF/pending-password/foreign-id refusal, supplied username ignored, legitimate User/Root controls). | Adversarial controls and guard-removal proofs. |
+
 ## Keeping this current (the standing protocol)
 
 1. **Touch a guard, add/extend its adversarial test.** Any change to code in the

@@ -41,3 +41,6 @@ mod integration;
 
 #[cfg(feature = "session-management")]
 pub mod session_management;
+
+#[cfg(feature = "self-service-keys")]
+pub mod self_service_keys;

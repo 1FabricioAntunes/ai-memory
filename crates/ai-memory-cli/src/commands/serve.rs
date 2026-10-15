@@ -1155,6 +1155,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     if args.enable_session_management && !matches!(args.transport, TransportKind::Http) {
         anyhow::bail!("--enable-session-management requires --transport http");
     }
+    #[cfg(feature = "self-service-keys")]
+    if args.enable_self_service_keys && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-self-service-keys requires --transport http");
+    }
     config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -1845,6 +1849,24 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                         reader: store.reader.clone(),
                         writer: store.writer.clone(),
                         wiki: wiki.clone(),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            #[cfg(feature = "self-service-keys")]
+            let router = if args.enable_self_service_keys {
+                router.merge(ai_memory_mcp::self_service_keys::router(
+                    ai_memory_mcp::self_service_keys::SelfServiceKeysState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        pepper: config
+                            .auth
+                            .token_pepper
+                            .clone()
+                            .filter(|p| !p.trim().is_empty())
+                            .map(TokenPepper::new),
                     },
                     auth_state.clone(),
                 ))

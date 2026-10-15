@@ -805,3 +805,5 @@ ones who should keep access; nothing is granted automatically.
   `workspace` + `project` / `scopes`.
 
 See [Human-session session inspection and owned purging](session-management.md) for the opt-in HTTP surface.
+
+See [Self-service MCP API keys](self-service-keys.md) for the opt-in HTTP surface.

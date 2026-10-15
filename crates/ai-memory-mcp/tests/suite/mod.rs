@@ -44,3 +44,6 @@ mod web_search_parity;
 
 #[cfg(feature = "session-management")]
 mod session_management;
+
+#[cfg(feature = "self-service-keys")]
+mod self_service_keys;

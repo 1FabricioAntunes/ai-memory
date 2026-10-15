@@ -26,6 +26,7 @@ test = false
 [features]
 default = []
 session-management = ["ai-memory-mcp/session-management"]
+self-service-keys = ["ai-memory-mcp/self-service-keys"]
 
 [dependencies]
 ai-memory-consolidate.workspace = true

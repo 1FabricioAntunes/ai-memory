@@ -58,6 +58,19 @@ jobs:
       - run: cargo test -p ai-memory-mcp --features session-management session_management
       - run: cargo test -p ai-memory-cli --features session-management --lib session_management
 
+  self-service-keys:
+    name: optional self-service-keys
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - run: cargo clippy --workspace --all-targets --features ai-memory-cli/self-service-keys -- -D warnings
+      - run: cargo test -p ai-memory-mcp --features self-service-keys self_service_keys
+      - run: cargo test -p ai-memory-cli --features self-service-keys --lib self_service_keys
+
   test:
     name: test (${{ matrix.os }})
     strategy:

@@ -694,3 +694,6 @@ This codebase is being built collaboratively with Claude Code
 
 The optional [human-session session inspection and owned purging](docs/session-management.md)
 uses existing browser authentication and is disabled by default.
+
+Optional [self-service MCP API keys](docs/self-service-keys.md) reuse existing
+browser authentication and are disabled by default.
