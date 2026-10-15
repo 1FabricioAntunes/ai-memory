@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::code_fence::CodeFence;
 use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
 
@@ -1510,22 +1511,17 @@ fn parse_markdown_sections(body: &str) -> Vec<MarkdownSection> {
 fn heading_positions(body: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut offset = 0;
-    let mut in_fence = false;
+    let mut fence = None;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if is_fence_line(trimmed) {
-            in_fence = !in_fence;
-        } else if !in_fence && let Some(level) = heading_level(trimmed) {
+        let (next_fence, is_code) = CodeFence::step(fence, trimmed);
+        fence = next_fence;
+        if !is_code && let Some(level) = heading_level(trimmed) {
             out.push((offset, level, trimmed.to_string()));
         }
         offset += line.len();
     }
     out
-}
-
-fn is_fence_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 fn heading_level(line: &str) -> Option<usize> {
@@ -4285,6 +4281,28 @@ mod tests {
         let sections = parse_markdown_sections(body);
         assert!(sections.iter().any(|s| s.anchor == "## Steps"));
         assert!(!sections.iter().any(|s| s.anchor == "## Not Anchor"));
+    }
+
+    #[test]
+    fn heading_parser_closes_a_fence_only_on_its_own_glyph_and_length() {
+        // A lone ``` inside a ~~~ block is code, not the end of the block.
+        let body = "# Release\n\n## Steps\n~~~sh\ncat <<'EOF'\n```\nEOF\n~~~\n\n## Verify\nTwo\n";
+        let sections = parse_markdown_sections(body);
+        let verify = sections
+            .iter()
+            .find(|s| s.anchor == "## Verify")
+            .expect("the heading after the block is found");
+        let steps = sections.iter().find(|s| s.anchor == "## Steps").unwrap();
+        assert_eq!(
+            steps.end, verify.start,
+            "## Steps ends where ## Verify starts"
+        );
+
+        // A shorter run does not close a longer fence.
+        let body = "# Release\n\n````md\n```\n## Not Anchor\n```\n````\n\n## Steps\nOne\n";
+        let sections = parse_markdown_sections(body);
+        assert!(!sections.iter().any(|s| s.anchor == "## Not Anchor"));
+        assert!(sections.iter().any(|s| s.anchor == "## Steps"));
     }
 
     #[test]

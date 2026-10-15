@@ -688,7 +688,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
 /// The trust state of the installed ai-memory Codex hooks, when there are
 /// any: asking Codex starts it, so a machine without ai-memory's Codex hooks
 /// is left alone.
-async fn codex_hook_trust(
+pub(super) async fn codex_hook_trust(
     env: &crate::config::RuntimeEnv,
     cwd: &Path,
 ) -> Option<super::codex_hook_trust::CodexHookTrust> {

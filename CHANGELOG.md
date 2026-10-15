@@ -12,6 +12,12 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `ai-memory setup` reporting "ai-memory is set up" after it installed
+  Codex hooks that Codex had not trusted yet. Codex skips an untrusted hook,
+  so Codex sessions went uncaptured. When Codex was wired, `setup` now asks
+  Codex for the hooks' trust state, the way `doctor` does, and when any are
+  untrusted or modified it names them and says to open Codex, run `/hooks`,
+  and trust them. It still exits 0. (#1313)
 - Fixed `install-instructions` treating a line that is exactly `@AGENTS.md` as
   proof that Claude Code loads the `AGENTS.md` being written. Claude Code
   resolves `@path` from the file that contains the import, including in the
@@ -44,6 +50,14 @@ version in [`docs/changelog/`](docs/changelog/):
   written. That page is now skipped with a warning and the others are
   written, as already happened for paths that fail the portability check.
   (#1315)
+- Fixed auto-improve patches losing track of a page's sections after a code
+  block that contains a different fence. A line of three backticks inside a
+  `~~~` block (or a shorter run inside a longer fence) ended the block early,
+  so the headings after it were missed, and a `replace_section` on the
+  section before them replaced those sections too. Profile harvesting had the
+  same flaw: the code after such a line was read as prose and could be
+  harvested as a preference. A fence now closes only on a run of the same
+  character that is at least as long. (#1316)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and
