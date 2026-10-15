@@ -588,6 +588,7 @@ async fn run_once_with_wiring(
     // jailed process opens its own, so preparing one out here would only be
     // cancelled again.
     if let (JailMode::Explicit(spec), Some(ai_jail)) = (&jail_plan.mode, &ai_jail) {
+        ensure_jail_does_not_export_config_token(config)?;
         let support = ai_jail_support(ai_jail)
             .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
         // With a project `.ai-jail` nothing is pre-checked, so a bare
@@ -2521,6 +2522,7 @@ async fn confirm_yolo_and_maybe_reexec(
         .context("waiting for the ai-jail checklist")?
         .context("reading the ai-jail checklist from stdin")?
     };
+    ensure_jail_does_not_export_config_token(config)?;
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
@@ -2586,16 +2588,11 @@ fn jail_forwarded_names(config: &Config, resolved: &[(&'static str, String)]) ->
         .collect()
 }
 
-/// Values this run resolved from its config and data dir that the jailed
-/// re-run cannot resolve again: ai-jail's private home hides the data dir that
-/// holds `config.toml` and `auth-tokens/`, so a bearer read from
-/// `[auth].bearer_token_file` (the default since `init` provisions one) or a
-/// `server_url` set in the config file would be gone inside, and every
-/// server call would fail with 401 or reach the wrong server. They go on the
-/// ai-jail child's environment, never its argv, and cross into the jail by
-/// name like every other [`FORWARDED_ENV_NAMES`] entry. When the environment
-/// variable was set already it won in [`Config::load`], so this re-sets the
-/// same value.
+/// Values this run resolved from config that the jailed re-run cannot resolve
+/// again because ai-jail's private home hides the data dir. These are routing
+/// values only. Authentication is forwarded solely when the operator supplied
+/// `AI_MEMORY_AUTH_TOKEN` in the process environment; a config-file token must
+/// never be promoted into the managed harness's environment.
 fn jail_resolved_env(config: &Config) -> Vec<(&'static str, String)> {
     let mut env = Vec::new();
     // A URL derived from a custom `bind` counts: the jail's private home has
@@ -2603,15 +2600,32 @@ fn jail_resolved_env(config: &Config) -> Vec<(&'static str, String)> {
     if config.server_url_configured() || config.server_url_derived_from_bind {
         env.push(("AI_MEMORY_SERVER_URL", config.server_url.clone()));
     }
-    if let Some(token) = config
+    if !config.base_path.is_empty() {
+        env.push(("AI_MEMORY_BASE_PATH", config.base_path.clone()));
+    }
+    env
+}
+
+/// A token loaded from `config.toml` or its referenced file is server
+/// authority that the harness did not previously possess. ai-jail's private
+/// home cannot read it, but copying it into the re-exec environment would let
+/// the harness exfiltrate a root bearer. Refuse that launch instead. An
+/// operator-provided environment token already belongs to the child process
+/// boundary and is forwarded unchanged.
+fn ensure_jail_does_not_export_config_token(config: &Config) -> Result<()> {
+    if config
         .auth
         .bearer_token
         .as_deref()
-        .filter(|token| !token.trim().is_empty())
+        .is_some_and(|token| !token.trim().is_empty())
+        && config.runtime_env.var_os("AI_MEMORY_AUTH_TOKEN").is_none()
     {
-        env.push(("AI_MEMORY_AUTH_TOKEN", token.to_owned()));
+        return Err(anyhow!(
+            "--jail cannot forward the server bearer loaded from config into the managed harness; \
+             use a least-privilege AI_MEMORY_AUTH_TOKEN for this launch, or run without --jail"
+        ));
     }
-    env
+    Ok(())
 }
 
 /// Replace this process with `<ai_jail> <jail_args>` on Unix (never returns
@@ -4678,25 +4692,32 @@ mod tests {
         );
     }
 
-    /// Regression: the jailed re-run cannot see the data dir, so a bearer the
-    /// outer run read from `[auth].bearer_token_file` must cross into the jail,
-    /// or every server call inside fails with 401.
+    /// A jailed re-run keeps routing but must not turn a server bearer loaded
+    /// from a private config file into a secret exposed to the harness.
     #[test]
-    fn jail_resolved_env_carries_a_file_sourced_token_and_configured_url() {
+    fn jail_refuses_a_config_sourced_token_and_forwards_routing() {
         let mut config = Config {
             server_url: "http://memory.lan:49374".into(),
+            server_url_explicit: true,
+            base_path: "/memory".into(),
             ..Config::default()
         };
         config.auth.adopt_token_file(
             PathBuf::from("/data/auth-tokens/default"),
             "file-token".into(),
         );
+        let error = ensure_jail_does_not_export_config_token(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot forward the server bearer")
+        );
         let env = jail_resolved_env(&config);
         assert_eq!(
             env,
             [
                 ("AI_MEMORY_SERVER_URL", "http://memory.lan:49374".to_owned()),
-                ("AI_MEMORY_AUTH_TOKEN", "file-token".to_owned()),
+                ("AI_MEMORY_BASE_PATH", "/memory".to_owned()),
             ]
         );
         for (name, _) in &env {
@@ -4709,17 +4730,24 @@ mod tests {
 
     #[test]
     fn jail_forwarded_names_come_from_the_captured_env_and_resolved_values() {
-        let config = Config {
+        let mut config = Config {
             runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[
+                ("AI_MEMORY_AUTH_TOKEN", "operator-token"),
                 ("CLAUDE_CONFIG_DIR", "/home/op/.claude"),
                 ("UNRELATED", "x"),
             ]),
             ..Config::default()
         };
-        let resolved = [("AI_MEMORY_AUTH_TOKEN", "file-token".to_owned())];
+        config.auth.bearer_token = Some("operator-token".into());
+        assert!(ensure_jail_does_not_export_config_token(&config).is_ok());
+        let resolved = [("AI_MEMORY_BASE_PATH", "/memory".to_owned())];
         assert_eq!(
             jail_forwarded_names(&config, &resolved),
-            ["AI_MEMORY_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"]
+            [
+                "AI_MEMORY_BASE_PATH",
+                "AI_MEMORY_AUTH_TOKEN",
+                "CLAUDE_CONFIG_DIR"
+            ]
         );
         assert!(jail_forwarded_names(&Config::default(), &[]).is_empty());
     }
@@ -6943,13 +6971,12 @@ mod tests {
     // Degraded offline launches (server unreachable)
     // ----------------------------------------------------------------
 
-    /// A loopback address that nothing listens on: bind, capture, release.
-    /// Rebinding races exist but are vanishingly rare under a test load.
-    async fn closed_port_url() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        format!("http://{address}")
+    /// A loopback endpoint that accepts and closes every connection.
+    ///
+    /// Keeping the listener alive avoids an ephemeral-port reuse race with
+    /// the many HTTP fixtures running alongside these tests.
+    fn offline_server_url() -> String {
+        ai_memory_test_support::dead_http_endpoint()
     }
 
     #[cfg(unix)]
@@ -6999,7 +7026,7 @@ mod tests {
         let mut config = Config::load(None, Some(temp.path().join("data"))).unwrap();
         config.data_dir = temp.path().join("data");
         config.home_dir = Some(home.to_string_lossy().into_owned());
-        config.server_url = closed_port_url().await;
+        config.server_url = offline_server_url();
         config.run_autowire = false;
 
         let args = RunArgs {
@@ -7236,14 +7263,14 @@ mod tests {
     /// retention, and the opt-outs.
     #[tokio::test]
     async fn offline_launch_warning_names_the_tradeoffs() {
-        let url = closed_port_url().await;
+        let url = offline_server_url();
         let endpoint = ServerEndpoint::from_config_resolving_auth(&Config {
             server_url: url,
             ..Config::load(None, None).unwrap()
         })
         .await;
         let ServerProbe::Unreachable(error) = probe_server(&endpoint).await else {
-            panic!("closed port is unreachable");
+            panic!("the no-answer endpoint is unreachable");
         };
         let warning = offline_launch_warning(&endpoint, ManagedHarness::Claude, 8, error);
 
@@ -7287,7 +7314,7 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_errors_are_transport_errors_not_server_answers() {
-        let url = closed_port_url().await;
+        let url = offline_server_url();
         let endpoint = ServerEndpoint::from_config_resolving_auth(&Config {
             server_url: url,
             ..Config::load(None, None).unwrap()
@@ -7296,7 +7323,7 @@ mod tests {
         let transport =
             post_json::<_, FinishManagedRunResponse>(&endpoint, "/workstream/runs/x/finish", &())
                 .await
-                .expect_err("closed port");
+                .expect_err("no-answer endpoint");
         assert!(is_unreachable_error(&transport));
 
         let answered = crate::http_client::server_response_error_for_test(

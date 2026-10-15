@@ -725,11 +725,15 @@ pub(crate) struct PendingRow {
     pub is_rule: bool,
     /// The proposal rewrites an existing page.
     pub rewrites_existing: bool,
-    /// `ai-memory pending-writes approve` for this row, shell-quoted, shown to
-    /// a browser that can only read the page.
-    pub cli_approve: String,
-    /// The matching `reject` command.
-    pub cli_reject: String,
+    /// `ai-memory pending-writes approve` for this row, quoted for a POSIX
+    /// shell and shown to a browser that can only read the page.
+    pub posix_cli_approve: String,
+    /// The matching POSIX-shell `reject` command.
+    pub posix_cli_reject: String,
+    /// The matching command quoted for PowerShell.
+    pub powershell_cli_approve: String,
+    /// The matching PowerShell `reject` command.
+    pub powershell_cli_reject: String,
 }
 
 /// One `<option>` in a triage-page filter.

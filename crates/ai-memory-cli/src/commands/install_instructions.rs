@@ -13,6 +13,7 @@
 //! file. Idempotent via HTML-comment markers so re-running picks up
 //! whatever the snippet evolves into without duplicating the block.
 
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -235,14 +236,22 @@ fn written_agents_files(targets: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
 /// How many import hops Claude Code follows from a memory file: an imported
 /// file may import others, up to this depth.
 const MAX_IMPORT_HOPS: usize = 4;
+/// One imported instruction file can be user-controlled. Detection only needs
+/// enough text to find ordinary `@path` directives, so do not allocate an
+/// arbitrarily large file merely to decide whether Claude reads AGENTS.md.
+const MAX_IMPORT_FILE_BYTES: usize = 256 * 1024;
+/// Bound a broad import graph as well as each individual file.
+const MAX_IMPORT_TOTAL_BYTES: usize = 1024 * 1024;
 
 fn file_imports_written_agents(path: &Path, agents: &[PathBuf], home: Option<&Path>) -> bool {
+    let mut remaining = MAX_IMPORT_TOTAL_BYTES;
     imports_within(
         path,
         agents,
         home,
         MAX_IMPORT_HOPS,
         &mut std::collections::HashSet::new(),
+        &mut remaining,
     )
 }
 
@@ -255,18 +264,38 @@ fn imports_within(
     home: Option<&Path>,
     hops: usize,
     seen: &mut std::collections::HashSet<PathBuf>,
+    remaining: &mut usize,
 ) -> bool {
     if hops == 0 || !seen.insert(path.to_path_buf()) {
         return false;
     }
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_bounded_import(path, remaining) else {
         return false;
     };
     claude_import_paths(&text).into_iter().any(|raw| {
         let resolved = resolve_claude_import(&raw, path, home);
         agents.iter().any(|target| paths_match(&resolved, target))
-            || (resolved.is_file() && imports_within(&resolved, agents, home, hops - 1, seen))
+            || (resolved.is_file()
+                && imports_within(&resolved, agents, home, hops - 1, seen, remaining))
     })
+}
+
+fn read_bounded_import(path: &Path, remaining: &mut usize) -> Option<String> {
+    let allowance = (*remaining).min(MAX_IMPORT_FILE_BYTES);
+    if allowance == 0 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(allowance.min(8 * 1024));
+    file.take((allowance + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let consumed = bytes.len().min(allowance);
+    *remaining = remaining.saturating_sub(consumed);
+    if bytes.len() > allowance {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// `@path` relative to the importing file, so `.claude/CLAUDE.md` needs
@@ -716,6 +745,52 @@ mod tests {
         assert!(!file_imports_written_agents(
             &dir.join("CLAUDE.md"),
             &agents,
+            None
+        ));
+    }
+
+    #[test]
+    fn claude_import_detection_refuses_oversized_and_non_utf8_files() {
+        let root = tempfile::tempdir().unwrap();
+        let agents = root.path().join("AGENTS.md");
+        std::fs::write(&agents, "# rules\n").unwrap();
+
+        let mut oversized = b"@AGENTS.md\n".to_vec();
+        oversized.resize(MAX_IMPORT_FILE_BYTES + 1, b'x');
+        let claude = root.path().join("CLAUDE.md");
+        std::fs::write(&claude, oversized).unwrap();
+        assert!(!file_imports_written_agents(
+            &claude,
+            std::slice::from_ref(&agents),
+            None
+        ));
+
+        std::fs::write(&claude, [b'@', 0xff, b'\n']).unwrap();
+        assert!(!file_imports_written_agents(
+            &claude,
+            std::slice::from_ref(&agents),
+            None
+        ));
+    }
+
+    #[test]
+    fn claude_import_detection_bounds_the_whole_import_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let agents = root.path().join("AGENTS.md");
+        std::fs::write(&agents, "# rules\n").unwrap();
+        std::fs::write(
+            root.path().join("CLAUDE.md"),
+            "@one.md\n@two.md\n@three.md\n@four.md\n@leaf.md\n",
+        )
+        .unwrap();
+        for name in ["one.md", "two.md", "three.md", "four.md"] {
+            std::fs::write(root.path().join(name), vec![b'x'; MAX_IMPORT_FILE_BYTES]).unwrap();
+        }
+        std::fs::write(root.path().join("leaf.md"), "@AGENTS.md\n").unwrap();
+
+        assert!(!file_imports_written_agents(
+            &root.path().join("CLAUDE.md"),
+            std::slice::from_ref(&agents),
             None
         ));
     }

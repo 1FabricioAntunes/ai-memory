@@ -177,7 +177,7 @@ struct DoctorReport {
     /// established convention are simply absent from this list.
     native_memory: Vec<NativeMemoryReport>,
     /// The local hook spool: events waiting for the server, and whether it is
-    /// full and evicting undelivered ones.
+    /// full and dropping newly captured events.
     spool: super::hook_spool::SpoolHealth,
     /// Nothing answered at the server URL; capture counts are unavailable and
     /// hook events are being spooled.
@@ -973,10 +973,10 @@ fn render_capture_health(report: &DoctorReport) -> String {
         ));
     }
     let spool = &report.spool;
-    if spool.evicting() {
+    if spool.at_capacity() {
         out.push_str(&format!(
-            "⚠ The hook spool is full ({} events, oldest {}): each new event evicts the \
-             oldest undelivered one, which is lost until the server is back.\n",
+            "⚠ The hook spool is full ({} events, oldest {}): newly captured events are \
+             dropped until space is available.\n",
             spool.pending,
             spool_age(spool.oldest_age_ms),
         ));

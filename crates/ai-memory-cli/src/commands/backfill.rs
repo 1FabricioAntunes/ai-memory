@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
@@ -157,81 +158,148 @@ fn inflight_path(data_dir: &Path, cwd: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Claim the right to spawn the automatic backfill for `cwd`.
-///
-/// Returns `true` when this caller created the marker and must spawn (or call
-/// [`release_inflight`] if the spawn fails). `O_CREAT|O_EXCL` makes the claim
-/// atomic, so a burst of SessionStart hooks in a directory with no sentinel
-/// launches one backfill, not one per session. A marker older than
-/// [`INFLIGHT_STALE_AFTER`] is replaced; a running worker keeps its marker
-/// fresh with [`refresh_inflight`], so only a dead worker's marker goes stale.
-pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> bool {
-    let path = inflight_path(data_dir, cwd);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    for _ in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                use std::io::Write as _;
-                let _ = write!(file, "{}", std::process::id());
-                return true;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age >= INFLIGHT_STALE_AFTER);
-                if !stale {
-                    return false;
-                }
-                // Two hooks can see the same stale marker. Renaming it to a
-                // name only this process uses is atomic, so exactly one of
-                // them moves it aside and retries the claim; the other's
-                // rename fails and it backs off. Removing the marker in
-                // place would let the slower hook delete the faster one's
-                // fresh claim.
-                let mut aside = path.clone().into_os_string();
-                aside.push(format!(".stale.{}", std::process::id()));
-                if std::fs::rename(&path, &aside).is_err() {
-                    return false;
-                }
-                let _ = std::fs::remove_file(&aside);
-            }
-            // An unwritable state dir must not turn into a spawn storm either:
-            // the pre-guard behavior is not worth keeping for this case.
-            Err(_) => return false,
-        }
-    }
-    false
+fn inflight_lock_path(data_dir: &Path, cwd: &Path) -> PathBuf {
+    let mut path = inflight_path(data_dir, cwd).into_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
-/// Re-stamp the in-progress marker with this worker's pid and the current
-/// time. The worker calls it as it starts and after each imported session, so
-/// a backfill that runs longer than [`INFLIGHT_STALE_AFTER`] is not mistaken
-/// for a dead one and joined by a second worker.
-fn refresh_inflight(data_dir: &Path, cwd: &Path) {
-    let _ = std::fs::write(inflight_path(data_dir, cwd), std::process::id().to_string());
+/// Unpredictable ownership nonce for one in-flight marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InflightClaim(String);
+
+impl InflightClaim {
+    fn new() -> Self {
+        // UUID v4 draws from the operating system CSPRNG. The simple form is
+        // path- and argv-safe while retaining 122 random bits.
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        uuid::Uuid::parse_str(raw)
+            .ok()
+            .map(|token| Self(token.simple().to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Run one marker mutation while holding the checkout's advisory lock.
+///
+/// Hook calls must remain non-blocking, so contention or an unusable state
+/// directory fails closed instead of waiting. The lock file intentionally
+/// remains in place: unlinking an advisory-lock file can split contenders
+/// across two inodes and destroy serialization.
+fn with_inflight_lock<T>(data_dir: &Path, cwd: &Path, operation: impl FnOnce() -> T) -> Option<T> {
+    let lock_path = inflight_lock_path(data_dir, cwd);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    lock.try_lock_exclusive().ok()?;
+    let result = operation();
+    let _ = fs2::FileExt::unlock(&lock);
+    Some(result)
+}
+
+/// Claim the right to spawn the automatic backfill for `cwd`.
+///
+/// Returns an ownership token when this caller created the marker and must
+/// spawn (or call [`release_inflight`] if the spawn fails). The token travels
+/// to the detached worker and prevents a delayed old worker from refreshing or
+/// releasing a newer stale takeover. `O_CREAT|O_EXCL` plus the per-checkout
+/// lock makes a burst of SessionStart hooks launch exactly one backfill.
+pub(crate) fn claim_inflight(data_dir: &Path, cwd: &Path) -> Option<InflightClaim> {
+    let path = inflight_path(data_dir, cwd);
+    let claim = InflightClaim::new();
+    with_inflight_lock(data_dir, cwd, || {
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    if file.write_all(claim.as_str().as_bytes()).is_err() {
+                        let _ = std::fs::remove_file(&path);
+                        return None;
+                    }
+                    return Some(claim.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= INFLIGHT_STALE_AFTER);
+                    if !stale {
+                        return None;
+                    }
+                    let mut aside = path.clone().into_os_string();
+                    aside.push(format!(".stale.{}", claim.as_str()));
+                    if std::fs::rename(&path, &aside).is_err() {
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(&aside);
+                }
+                // An unwritable state dir must not turn into a spawn storm.
+                Err(_) => return None,
+            }
+        }
+        None
+    })
+    .flatten()
+}
+
+/// Refresh the marker only while `claim` still owns it.
+fn refresh_inflight(data_dir: &Path, cwd: &Path, claim: &InflightClaim) -> bool {
+    with_inflight_lock(data_dir, cwd, || {
+        let path = inflight_path(data_dir, cwd);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        if contents != claim.as_str() {
+            return false;
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+            .is_ok()
+    })
+    .unwrap_or(false)
 }
 
 /// Drop the in-progress marker taken by [`claim_inflight`].
-pub(crate) fn release_inflight(data_dir: &Path, cwd: &Path) {
-    let _ = std::fs::remove_file(inflight_path(data_dir, cwd));
+pub(crate) fn release_inflight(data_dir: &Path, cwd: &Path, claim: &InflightClaim) -> bool {
+    with_inflight_lock(data_dir, cwd, || {
+        let path = inflight_path(data_dir, cwd);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(claim.as_str()) {
+            return false;
+        }
+        std::fs::remove_file(path).is_ok()
+    })
+    .unwrap_or(false)
 }
 
 struct InflightGuard<'a> {
     data_dir: &'a Path,
     cwd: &'a Path,
+    claim: InflightClaim,
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        release_inflight(self.data_dir, self.cwd);
+        release_inflight(self.data_dir, self.cwd, &self.claim);
     }
 }
 
@@ -296,12 +364,17 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
 async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -> Result<()> {
     // The SessionStart hook took the in-progress marker before spawning this
     // worker; free it however the run ends so a failed run can be retried.
-    let _inflight = args.auto.then_some(InflightGuard {
+    let inflight_claim = args
+        .inflight_claim
+        .as_deref()
+        .and_then(InflightClaim::parse);
+    let _inflight = inflight_claim.clone().map(|claim| InflightGuard {
         data_dir: &config.data_dir,
         cwd: &cwd,
+        claim,
     });
-    if args.auto {
-        refresh_inflight(&config.data_dir, &cwd);
+    if let Some(claim) = &inflight_claim {
+        refresh_inflight(&config.data_dir, &cwd, claim);
     }
     // The automatic (SessionStart-spawned) path honors the opt-out and records
     // that it has been attempted for this checkout, so it runs at most once per
@@ -373,8 +446,8 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
             Ok(events) => {
                 report.imported_sessions += 1;
                 report.imported_events += events;
-                if args.auto {
-                    refresh_inflight(&config.data_dir, &cwd);
+                if let Some(claim) = &inflight_claim {
+                    refresh_inflight(&config.data_dir, &cwd, claim);
                 }
             }
             Err(error) => {
@@ -1326,13 +1399,25 @@ mod tests {
         let app = Path::new("/home/me/projects/app");
         let other = Path::new("/home/me/projects/other");
 
-        assert!(claim_inflight(data.path(), app));
-        assert!(!claim_inflight(data.path(), app), "second burst member");
-        assert!(!claim_inflight(data.path(), app), "third burst member");
-        assert!(claim_inflight(data.path(), other), "separate checkout");
+        let claim = claim_inflight(data.path(), app).unwrap();
+        assert!(
+            claim_inflight(data.path(), app).is_none(),
+            "second burst member"
+        );
+        assert!(
+            claim_inflight(data.path(), app).is_none(),
+            "third burst member"
+        );
+        assert!(
+            claim_inflight(data.path(), other).is_some(),
+            "separate checkout"
+        );
 
-        release_inflight(data.path(), app);
-        assert!(claim_inflight(data.path(), app), "free again after release");
+        assert!(release_inflight(data.path(), app, &claim));
+        assert!(
+            claim_inflight(data.path(), app).is_some(),
+            "free again after release"
+        );
     }
 
     /// A worker that died without releasing its marker must not block the
@@ -1341,7 +1426,7 @@ mod tests {
     fn a_stale_inflight_marker_is_replaced() {
         let data = tempfile::tempdir().unwrap();
         let cwd = Path::new("/home/me/projects/app");
-        assert!(claim_inflight(data.path(), cwd));
+        claim_inflight(data.path(), cwd).unwrap();
 
         let marker = inflight_path(data.path(), cwd);
         let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
@@ -1353,19 +1438,22 @@ mod tests {
             .unwrap();
 
         assert!(
-            claim_inflight(data.path(), cwd),
+            claim_inflight(data.path(), cwd).is_some(),
             "stale marker is taken over"
         );
-        assert!(!claim_inflight(data.path(), cwd), "the new claim holds");
+        assert!(
+            claim_inflight(data.path(), cwd).is_none(),
+            "the new claim holds"
+        );
     }
 
     /// A worker's refresh makes an old marker fresh again, so a long backfill
-    /// keeps its claim; the refreshed marker names the worker.
+    /// keeps its claim; the refreshed marker retains its ownership token.
     #[test]
     fn a_refreshed_marker_is_not_taken_over() {
         let data = tempfile::tempdir().unwrap();
         let cwd = Path::new("/home/me/projects/app");
-        assert!(claim_inflight(data.path(), cwd));
+        let claim = claim_inflight(data.path(), cwd).unwrap();
         let marker = inflight_path(data.path(), cwd);
         let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
         std::fs::File::options()
@@ -1374,12 +1462,42 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        refresh_inflight(data.path(), cwd);
-        assert!(!claim_inflight(data.path(), cwd), "a live worker keeps it");
+        assert!(refresh_inflight(data.path(), cwd, &claim));
+        assert!(
+            claim_inflight(data.path(), cwd).is_none(),
+            "a live worker keeps it"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), claim.as_str());
+    }
+
+    /// Once a stale marker has been taken over, the previous worker cannot
+    /// refresh or release the replacement marker even if it resumes later.
+    #[test]
+    fn stale_takeover_refuses_the_previous_owners_refresh_and_release() {
+        let data = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/home/me/projects/app");
+        let previous = claim_inflight(data.path(), cwd).unwrap();
+        let marker = inflight_path(data.path(), cwd);
+        let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let replacement = claim_inflight(data.path(), cwd).unwrap();
+        assert_ne!(previous, replacement);
+        assert!(!refresh_inflight(data.path(), cwd, &previous));
+        assert!(!release_inflight(data.path(), cwd, &previous));
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap(),
-            std::process::id().to_string()
+            replacement.as_str(),
+            "the replacement owner remains intact"
         );
+        assert!(refresh_inflight(data.path(), cwd, &replacement));
+        assert!(release_inflight(data.path(), cwd, &replacement));
+        assert!(!marker.exists());
     }
 
     /// The stale takeover leaves no `.stale.*` file behind and exactly one
@@ -1388,7 +1506,7 @@ mod tests {
     fn a_stale_takeover_leaves_one_marker_and_no_debris() {
         let data = tempfile::tempdir().unwrap();
         let cwd = Path::new("/home/me/projects/app");
-        assert!(claim_inflight(data.path(), cwd));
+        claim_inflight(data.path(), cwd).unwrap();
         let marker = inflight_path(data.path(), cwd);
         let old = SystemTime::now() - INFLIGHT_STALE_AFTER - Duration::from_secs(60);
         std::fs::File::options()
@@ -1397,13 +1515,24 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        assert!(claim_inflight(data.path(), cwd));
+        claim_inflight(data.path(), cwd).unwrap();
         let names: Vec<String> = std::fs::read_dir(marker.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names.len(), 1, "{names:?}");
-        assert!(names[0].ends_with(".inflight"), "{names:?}");
+        assert_eq!(names.len(), 2, "marker plus its stable lock: {names:?}");
+        assert!(
+            names.iter().any(|name| name.ends_with(".inflight")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with(".inflight.lock")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".stale.")),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -3037,6 +3166,7 @@ mod tests {
             json: false,
             quiet: true,
             auto: true,
+            inflight_claim: None,
             server_url: server_url.map(str::to_owned),
             server_profile: server_profile.map(str::to_owned),
         }
@@ -3126,17 +3256,17 @@ mod tests {
         config.server_url = "http://127.0.0.1:9".to_string();
         let cwd = data_dir.path().join("checkout");
         std::fs::create_dir_all(&cwd).unwrap();
-        assert!(claim_inflight(&config.data_dir, &cwd));
+        let claim = claim_inflight(&config.data_dir, &cwd).unwrap();
+        let mut args = spawned_args(None, None);
+        args.inflight_claim = Some(claim.as_str().to_owned());
 
-        run_in(&config, spawned_args(None, None), cwd.clone())
-            .await
-            .unwrap();
+        run_in(&config, args, cwd.clone()).await.unwrap();
         assert!(
             !inflight_path(&config.data_dir, &cwd).exists(),
             "the worker must release its marker"
         );
         assert!(
-            claim_inflight(&config.data_dir, &cwd),
+            claim_inflight(&config.data_dir, &cwd).is_some(),
             "free for the next run"
         );
     }

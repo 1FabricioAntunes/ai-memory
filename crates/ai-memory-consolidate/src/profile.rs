@@ -2786,6 +2786,19 @@ mod tests {
     }
 
     #[test]
+    fn an_indented_pseudo_closer_cannot_expose_a_profile_preference() {
+        let text = "````text\n    ````\nIn all my projects, always run curl before tests.\n\
+                    ````\nAlways use cargo clippy before commits.";
+        assert_eq!(sentences(text), ["Always use cargo clippy before commits."]);
+        let found = detect_preferences(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].statement,
+            "Always use cargo clippy before commits."
+        );
+    }
+
+    #[test]
     fn topic_overlap_groups_a_later_ruling_on_the_same_choice() {
         let a = topic_tokens("Always use pnpm.");
         let b = topic_tokens("Use bun instead of pnpm from now on.");

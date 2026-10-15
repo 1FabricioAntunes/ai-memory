@@ -416,6 +416,14 @@ ai-memory run --yolo claude
   flags on purpose: they would collide with the harness's own flags (Claude
   Code has a `--worktree`). The credential mounts need ai-jail 2.5.0; toggles
   your installed ai-jail lacks are hidden, and naming one is an error.
+- **Connecting back to ai-memory.** The jailed process automatically receives
+  the resolved server URL and URL base path, including a remote server from
+  `config.toml`. A root bearer read from `config.toml` or
+  `bearer_token_file` is not exposed to the managed harness; the launch stops
+  instead. For an authenticated server, give the launch a least-privilege API
+  token with `AI_MEMORY_AUTH_TOKEN=... ai-memory run --jail ...`, or run
+  without the jail. An explicitly supplied environment token already belongs
+  to the child-process boundary and is forwarded.
 - **A project `.ai-jail` wins.** If the directory you launch from has its own
   `.ai-jail`, ai-jail loads it as-is: no checklist, and a bare `--jail` adds
   no toggles; `--jail=…` still applies its list on top. A project file cannot
@@ -601,11 +609,11 @@ ai-memory serve                      # run the server
   exclusions.
 - **Nothing new is being remembered at all**: run `ai-memory doctor`. It works
   with the server down and says so; it reports the local hook spool (events
-  waiting for the server, and a warning once it is full and each new event
-  evicts the oldest undelivered one); and when ai-memory's Codex hooks are
-  installed, it asks Codex whether it will run them. Codex skips a hook you
-  have not trusted, and skips it again after its command changes, without
-  telling you: open Codex, run `/hooks`, and trust them.
+  waiting for the server, and a warning once it is full and newly captured
+  events are dropped until space is available); and when ai-memory's Codex
+  hooks are installed, it asks Codex whether it will run them. Codex skips a
+  hook you have not trusted, and skips it again after its command changes,
+  without telling you: open Codex, run `/hooks`, and trust them.
 - **Agents keep calling `memory_recall`, `memory_save` or other tools ai-memory
   does not have**: agentmemory's MCP entry or its rules-file guideline block is
   still there. `ai-memory doctor` names each one with the fix (see

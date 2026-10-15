@@ -43,7 +43,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `.claude/CLAUDE.md` loads `.claude/AGENTS.md`, a fenced `@AGENTS.md` loads
   nothing, and `@AGENTS.md` in a parent directory loads that directory's file.
   The note now compares the resolved path with the file being written and
-  names the import that reaches it. (#1298)
+  names the import that reaches it. Recursive detection reads at most 256 KiB
+  per file and 1 MiB per import graph, and skips oversized or non-UTF-8 files.
+  (#1298)
 - Fixed Antigravity CLI posting a session start and claiming a handoff on every
   user turn: `invocationNum` restarts at 0 each turn, so only the first turn of
   a conversation (keyed by `conversationId`) now maps to SessionStart, in the
@@ -74,7 +76,10 @@ version in [`docs/changelog/`](docs/changelog/):
   section before them replaced those sections too. Profile harvesting had the
   same flaw: the code after such a line was read as prose and could be
   harvested as a preference. A fence now closes only on a run of the same
-  character that is at least as long. (#1316)
+  character that is at least as long, with no more than the three leading
+  ASCII spaces CommonMark permits. Four-space, tab and Unicode-whitespace
+  pseudo-fences stay code in profile harvesting, section patches and wiki
+  link extraction or rewriting. (#1316)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and
@@ -91,7 +96,8 @@ version in [`docs/changelog/`](docs/changelog/):
   `bind` resolves to the same URL as before, so an install that never changed
   either key is unaffected. `install-hooks` and `install-mcp` still prefer an
   existing MCP entry's URL, and otherwise write the derived URL instead of the
-  default port. (#1269)
+  default port. The loader now retains that explicit provenance when the file
+  deliberately names the default URL. (#1269)
 - Fixed a burst of sessions in a directory with no backfill marker launching
   one `backfill --auto` per session. The SessionStart hook now takes an
   atomic in-progress marker before it spawns the backfill, so concurrent
@@ -99,14 +105,18 @@ version in [`docs/changelog/`](docs/changelog/):
   ends and a leftover one stops blocking after 30 minutes. The backfill's
   emptiness check against the server also gives up after 30 seconds instead
   of waiting forever on a saturated server. Keying the trigger on the project
-  rather than the directory is not part of this change. (#1287)
+  rather than the directory is not part of this change. Each marker now has an
+  unpredictable ownership nonce under an advisory lock, so a delayed worker
+  cannot refresh or remove a newer stale takeover. (#1287)
 - Fixed `/web/pending` offering Approve and Reject buttons that always failed
   with `401: unknown error` on a server with a bearer token and no password
   sign-in. The browser reaches `/web` there with the root token over HTTP
   Basic, which only admits reads. The page now says so, points to password
   sign-in, and shows each proposal's `ai-memory pending-writes approve` /
-  `reject` command instead; a decision that fails for another reason now shows
-  the server's message even when it is plain text. (#1288)
+  `reject` command instead, separately quoted for POSIX shells and PowerShell;
+  stored workspace or project names cannot inject shell syntax. A decision
+  that fails for another reason now shows the server's message even when it is
+  plain text. (#1288)
 - Fixed the managed routing snippet's claim that Claude Code never reads
   `AGENTS.md`. Claude Code 2.1.277 and later reads it when no `CLAUDE.md`,
   `.claude/CLAUDE.md`, or `CLAUDE.local.md` is present, and reads that file
@@ -150,7 +160,9 @@ version in [`docs/changelog/`](docs/changelog/):
   it, so it stayed out of the vector stream of hybrid search until an
   embedding backfill ran, which by default is only at the next server
   start. These paths now embed each written page the same way
-  `memory_write_page` does. (#1258)
+  `memory_write_page` does. A provider or embedding-store failure after the
+  durable page commit is recorded for backfill but no longer reports the whole
+  mutation as failed or prevents later post-commit webhook dispatch. (#1258)
 - Fixed `ai-memory run` reporting `server unavailable` for a heartbeat the
   server answered and rejected. A heartbeat is rejected once its managed run
   stops being active, which on a workstation usually means a later `run`
@@ -160,13 +172,16 @@ version in [`docs/changelog/`](docs/changelog/):
   server that answered `409 managed run lease is not active` in about a
   millisecond read as an outage. The notice now carries the server's own reason
   for a rejection, and keeps the outage wording only for a server the launcher
-  could not reach. (#1277)
-- Fixed `ai-memory run --yolo` failing with `401 Unauthorized` after it
-  re-ran itself under ai-jail on an install whose bearer token lives in
-  `[auth].bearer_token_file`. ai-jail's private home hides the data dir, so
-  the jailed run had no token. The outer run now passes the token it resolved,
-  and a `server_url` set in `config.toml` or derived from `bind`, into the
-  jail through the environment, never the command line. (#1284)
+  could not reach. A peer that accepts the connection but closes before an HTTP
+  response is also classified as unreachable, and the tests no longer race to
+  reuse a released ephemeral port. (#1277)
+- Fixed `ai-memory run --jail` losing the configured server route inside
+  ai-jail's private home. The outer run forwards an explicit or bind-derived
+  `server_url` and `base_path`. It does not promote a root bearer read from
+  `config.toml` or `bearer_token_file` into the harness environment: that case
+  now stops with an actionable error and requires a least-privilege
+  `AI_MEMORY_AUTH_TOKEN`, while a token the operator already supplied in the
+  environment continues across the existing child-process boundary. (#1284)
 - Updated rustls to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349,
   in the server and in the importer, relay and wikisync companions, and the
   importer's anyhow to 1.0.104 for RUSTSEC-2026-0190. (#1286)
