@@ -32,7 +32,7 @@ version in [`docs/changelog/`](docs/changelog/):
   to Claude Opus 5.5 and Sonnet 5.5 with a 400. Both reject
   `thinking: {"type": "disabled"}`. Opus 5.5 now gets no `thinking` field, as
   Fable and Mythos already did, and Sonnet 5.5 gets
-  `thinking: {"type": "between_tools"}`, its way to turn thinking off.
+  `thinking: {"type": "between_tools"}`, its way to turn thinking off. (#1326)
 
 ## [3.0.1] - 2026-10-15
 
