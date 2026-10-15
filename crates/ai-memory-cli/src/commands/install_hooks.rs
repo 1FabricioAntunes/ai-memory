@@ -12582,11 +12582,17 @@ process.exit(0);
             let tmp = TempDir::new().unwrap();
             let project = tmp.path().join("project");
             fs::create_dir(&project).unwrap();
-            fs::write(
-                tmp.path().join("ext.template.ts"),
-                build_omp_extension(PLACEHOLDER_SERVER, None, None, "denylist"),
-            )
-            .unwrap();
+            // This test proves scope selection, not the production handoff
+            // deadline. A Windows runner executes it beside the full Rust
+            // suite, where a cold Node fetch can exceed one second.
+            let extension = build_omp_extension(PLACEHOLDER_SERVER, None, None, "denylist")
+                .replacen(
+                    "signal: timeoutSignal(1000)",
+                    "signal: timeoutSignal(5000)",
+                    1,
+                );
+            assert!(extension.contains("signal: timeoutSignal(5000)"));
+            fs::write(tmp.path().join("ext.template.ts"), extension).unwrap();
             fs::write(tmp.path().join("harness.ts"), HARNESS).unwrap();
             let mut command = Command::new("node");
             for (key, _) in std::env::vars_os() {
