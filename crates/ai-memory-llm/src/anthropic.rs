@@ -178,6 +178,9 @@ struct AnthropicOutputConfig {
 enum AnthropicThinking {
     Adaptive,
     Disabled,
+    /// Sonnet 5.5's lowest setting, no extended thinking: the model's way to
+    /// turn thinking off, since it answers `disabled` with a 400.
+    BetweenTools,
 }
 
 #[derive(Debug, Serialize)]
@@ -519,7 +522,8 @@ impl ClaudeId {
         self.meets(self.family().adaptive_since())
     }
 
-    /// Fable 5, Mythos 5, and Mythos Preview reject `thinking.type=disabled`.
+    /// Fable 5, Mythos 5, Mythos Preview, and Opus 5.5 reject
+    /// `thinking.type=disabled` at every effort.
     fn thinking_always_on(self) -> bool {
         match self {
             Self::MythosPreview => true,
@@ -528,8 +532,26 @@ impl ClaudeId {
                 major,
                 ..
             } => major >= 5,
+            Self::Released {
+                family: ClaudeFamily::Opus,
+                major,
+                minor,
+            } => (major, minor) >= (5, 5),
             _ => false,
         }
+    }
+
+    /// Sonnet 5.5 rejects `thinking.type=disabled` too, but turns thinking
+    /// off with `between_tools`.
+    fn turns_thinking_off_between_tools(self) -> bool {
+        matches!(
+            self,
+            Self::Released {
+                family: ClaudeFamily::Sonnet,
+                major,
+                minor,
+            } if (major, minor) >= (5, 5)
+        )
     }
 
     fn accepts_thinking_disabled(self) -> bool {
@@ -568,6 +590,9 @@ impl ClaudeId {
         effort: ReasoningEffort,
     ) -> (Option<AnthropicOutputConfig>, Option<AnthropicThinking>) {
         match effort {
+            ReasoningEffort::None if self.turns_thinking_off_between_tools() => {
+                (None, Some(AnthropicThinking::BetweenTools))
+            }
             ReasoningEffort::None => (
                 None,
                 self.accepts_thinking_disabled()
@@ -775,6 +800,26 @@ mod tests {
         None
     )]
     #[case::fable_5_none_omits_disabled("claude-fable-5", ReasoningEffort::None, None, None)]
+    #[case::opus_55_none_omits_disabled("claude-opus-5-5", ReasoningEffort::None, None, None)]
+    #[case::bedrock_opus_55_none_omits_disabled(
+        "anthropic.claude-opus-5-5",
+        ReasoningEffort::None,
+        None,
+        None
+    )]
+    #[case::sonnet_5_disabled("claude-sonnet-5", ReasoningEffort::None, None, Some("disabled"))]
+    #[case::sonnet_55_none_between_tools(
+        "claude-sonnet-5-5",
+        ReasoningEffort::None,
+        None,
+        Some("between_tools")
+    )]
+    #[case::sonnet_55_low_adaptive(
+        "claude-sonnet-5-5",
+        ReasoningEffort::Low,
+        Some("low"),
+        Some("adaptive")
+    )]
     #[case::sonnet_46_xhigh_clamps_max(
         "claude-sonnet-4-6",
         ReasoningEffort::XHigh,
