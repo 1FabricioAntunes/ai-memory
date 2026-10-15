@@ -2429,12 +2429,16 @@ fn end_lifecycle_only_session_in_tx(
     // re-check would silently revert the router's verdict. Everything else,
     // including `stop` and `notification` (some harnesses, e.g. OpenCode,
     // fire these for purely internal work), is ephemeral.
+    // The predicate text is shared with the reader's SessionEnd aggregates
+    // (`SUBSTANTIVE_OBSERVATION_KIND_SQL`), so the two cannot drift.
     let has_substantive_observation: bool = tx.query_row(
-        "SELECT EXISTS( \
-             SELECT 1 FROM observations \
-             WHERE session_id = ?1 \
-               AND kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use') \
-         )",
+        &format!(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM observations \
+                 WHERE session_id = ?1 AND {} \
+             )",
+            crate::reader::SUBSTANTIVE_OBSERVATION_KIND_SQL
+        ),
         params![session_id.as_bytes()],
         |row| row.get(0),
     )?;
@@ -12384,6 +12388,76 @@ pub(crate) mod tests {
             end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
             LifecycleOnlyEndOutcome::Substantive
         );
+    }
+
+    /// The writer's lifecycle-only re-check and the reader's existence query
+    /// (the router's early SessionEnd decision) must classify every
+    /// observation kind alike: a disagreement would have the writer revert the
+    /// router's verdict on a session the router just rendered a page for.
+    #[test]
+    fn the_lifecycle_only_verdict_follows_the_reader_predicate() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let reader = crate::reader::ReaderPool::new(&tmp.path().join("test.sqlite"), 1).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for kind in [
+            ObservationKind::SessionStart,
+            ObservationKind::UserPrompt,
+            ObservationKind::PreToolUse,
+            ObservationKind::PostToolUse,
+            ObservationKind::PreCompact,
+            ObservationKind::PostCompaction,
+            ObservationKind::Notification,
+            ObservationKind::Stop,
+            ObservationKind::SessionEnd,
+            ObservationKind::Other,
+        ] {
+            let session = SessionId::new();
+            begin_session(
+                &mut conn,
+                &NewSession {
+                    occurred_at: None,
+                    id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                },
+            )
+            .unwrap();
+            insert_observation(
+                &mut conn,
+                &NewObservation {
+                    occurred_at: None,
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind,
+                    extension: None,
+                    source_event: None,
+                    title: "t".into(),
+                    body: "b".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+            // Asked before the writer ends the session: the question is the
+            // same one, put to the rows as they are.
+            let reader_says_substantive = runtime
+                .block_on(reader.session_has_substantive_observation(ws, proj, session))
+                .unwrap();
+            let writer_says_substantive = matches!(
+                end_lifecycle_only_session(&mut conn, &session).unwrap(),
+                LifecycleOnlyEndOutcome::Substantive
+            );
+            assert_eq!(
+                reader_says_substantive, writer_says_substantive,
+                "{kind:?}: reader and writer classify the same single-row session differently"
+            );
+        }
     }
 
     #[test]

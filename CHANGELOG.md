@@ -21,6 +21,22 @@ version in [`docs/changelog/`](docs/changelog/):
   count now share one exclusion: a session with a `pending` or `running`
   consolidation job keeps every observation, however old; `completed`,
   `failed` and `superseded` jobs do not block. (#1324)
+- Fixed SessionEnd loading every observation of the session into memory, up to
+  three times, on the hook path. One production claude-code session held
+  948,136 observations, so ending it deserialized close to a million rows
+  (bodies included) per read. The lifecycle-only decision is now one `EXISTS`
+  query, and the summary page and the auto-handoff are rendered from bounded
+  reads taken in one read transaction: SQL aggregates for the counts and the
+  "last of a kind" markers, the 250 first and 250 last rows the raw list
+  prints, and early-exit scans for the first or last prompt that passes the
+  usual filters; subagent-preamble prompt bodies are read one at a time and
+  only until one names the page. The page, the handoff and the lifecycle-only
+  decision are unchanged byte for byte (an equivalence test holds them to the
+  original row-list code on sessions of every shape). What still grows with
+  the session is what the page itself lists: the title of every user prompt.
+  The PreCompact and PostCompaction checkpoint page uses the same bounded
+  reads. The writer's lifecycle-only re-check and the reader now build their
+  query from one shared predicate. (#1323)
 
 ## [3.0.1] - 2026-10-15
 
