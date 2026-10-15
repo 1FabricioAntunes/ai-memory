@@ -104,6 +104,25 @@ version in [`docs/changelog/`](docs/changelog/):
   through `UserPromptSubmit` `additionalContext`, OpenCode V1/V2 through the
   plugin's system/context hook, and Grok Build on the next `PostToolUse`.
   Serving the recap writes nothing, so a reload never consumes a baton (#1230).
+- Added first-party CodeBuddy Code (Tencent) support. `codebuddy` is an
+  `AgentKind` (migration V81), so hook events are attributed to it and a
+  Claude Code-shaped tool payload (`tool_name`, `tool_input`, `tool_response`)
+  is stored as a closed tool observation instead of an empty `other` capture.
+  `install-hooks --agent codebuddy` (alias `code-buddy`) merges native
+  `ai-memory hook --event … --agent codebuddy` commands for seven events
+  (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `PreCompact`, `Stop`, `SessionEnd`) into the `hooks` key of
+  `~/.codebuddy/settings.json`, keeps sibling settings and your own hooks,
+  and changes nothing on a re-run. There is no script bundle. The
+  `SessionStart` hook delivers the pending handoff through
+  `hookSpecificOutput.additionalContext`, and a capture-only `SessionStart` or
+  `UserPromptSubmit` prints nothing, since CodeBuddy appends that output to
+  the session. A `SessionStart` without `cwd` falls back to
+  `CODEBUDDY_PROJECT_DIR`. `setup` wires CodeBuddy when
+  `~/.codebuddy` exists, `setup-agent --agent codebuddy` prints the hook
+  block, and `uninstall` removes the entries. Transcript backfill and
+  headless `codebuddy -p` session close are not part of this change.
+  Requested in #1299. (#1312)
 
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question
@@ -132,6 +151,14 @@ version in [`docs/changelog/`](docs/changelog/):
   and no migration. (#1264)
 
 ### Fixed
+- Fixed the native hook claiming a handoff from the wrong project when an
+  event named no directory. A `SessionStart` (or Kimi Code's
+  `UserPromptSubmit`, or Grok's first `PostToolUse`) whose payload carried no
+  `cwd` sent `GET /handoff` with no scope, so the server resolved its default
+  project or the caller's last active one and the hook consumed that
+  project's baton. The hook now fetches no handoff without a directory and
+  says so on stderr; the handoff stays open for `memory_handoff_accept`.
+  (#1312)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and

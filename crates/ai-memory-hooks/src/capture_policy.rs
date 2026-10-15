@@ -181,6 +181,7 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // `tool_name`/`tool_input`/`tool_use_id` (captured live, Cursor 3.24.9).
         // Meta Muse Code sends the same three fields, `tool_use_id` being the
         // provider's call id (`call_…`, captured offline on Muse Code 1.4.7).
+        // CodeBuddy Code sends the same Claude Code fields (#1299).
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
@@ -189,7 +190,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::Grizzybot
         | AgentKind::Zcode
         | AgentKind::CopilotCli
-        | AgentKind::Muse => (
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -261,6 +263,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Grizzybot
                             | AgentKind::Droid
                             | AgentKind::Muse
+                            | AgentKind::CodeBuddy
                     ) {
                         "tool_input"
                     } else {
@@ -1103,7 +1106,10 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // Factory Droid's hooks send the same Claude Code shape (#1240).
         | AgentKind::Droid
         // Meta Muse Code too, with its own tool names (Muse Code 1.4.7).
-        | AgentKind::Muse => object
+        // CodeBuddy Code uses Claude Code's names and the same two fields
+        // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
+        | AgentKind::Muse
+        | AgentKind::CodeBuddy => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -4587,6 +4593,7 @@ mod tests {
             AgentKind::CopilotCli,
             AgentKind::Droid,
             AgentKind::Muse,
+            AgentKind::CodeBuddy,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -4726,6 +4733,71 @@ mod tests {
     /// `Execute` is matched like any shell. The same payloads under
     /// `AgentKind::Other` stay unrecognized and keep their output, which is
     /// what the Droid mapping changes.
+    /// CodeBuddy Code sends Claude Code's tool names and fields (#1299), so an
+    /// ignored path in a `Read`, `Write`, `Edit` or `Bash` call drops. Under
+    /// `AgentKind::Other` the same calls are not recognized and keep, so the
+    /// test fails if the CodeBuddy `extract` arm is removed.
+    #[test]
+    fn codebuddy_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "codebuddy-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        for (name, input, control) in [
+            (
+                "Read",
+                json!({"file_path": "secret/a"}),
+                json!({"file_path": "src/lib.rs"}),
+            ),
+            (
+                "Write",
+                json!({"file_path": "/repo/secret/a", "content": "x"}),
+                json!({"file_path": "/repo/src/lib.rs", "content": "x"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path": "secret/a", "old_string": "a", "new_string": "b"}),
+                json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            (
+                "Bash",
+                json!({"command": "cat secret/a"}),
+                json!({"command": "cat src/lib.rs"}),
+            ),
+        ] {
+            assert_eq!(
+                disposition(AgentKind::CodeBuddy, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Drop,
+                "{name}"
+            );
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the CodeBuddy mapping the call is not recognized"
+            );
+            assert_eq!(
+                disposition(AgentKind::CodeBuddy, &call(name, control)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+    }
+
     #[test]
     fn droid_tool_calls_honor_capture_exclusions() {
         let policy = CapturePolicy::resolve(

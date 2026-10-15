@@ -2462,6 +2462,13 @@ pub enum AgentChoice {
     /// Muse's own `SessionEnd` closes the session.
     #[value(alias = "muse-code", alias = "musecode")]
     Muse,
+    /// Tencent CodeBuddy Code (`codebuddy`) — lifecycle hooks merged into the
+    /// `hooks` key of `~/.codebuddy/settings.json`. CodeBuddy sends Claude
+    /// Code-shaped hook payloads on stdin, so each entry runs ai-memory's
+    /// native `hook` command directly; there is no script bundle. SessionStart
+    /// stdout (`hookSpecificOutput.additionalContext`) carries the handoff.
+    #[value(name = "codebuddy", alias = "code-buddy")]
+    CodeBuddy,
 }
 
 impl AgentChoice {
@@ -2495,6 +2502,7 @@ impl AgentChoice {
             Self::CopilotCli => AgentKind::CopilotCli,
             Self::Droid => AgentKind::Droid,
             Self::Muse => AgentKind::Muse,
+            Self::CodeBuddy => AgentKind::CodeBuddy,
         }
     }
 
@@ -2515,7 +2523,8 @@ impl AgentChoice {
             | Self::Zcode
             | Self::Hermes
             | Self::Droid
-            | Self::Muse => None,
+            | Self::Muse
+            | Self::CodeBuddy => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -4690,6 +4699,20 @@ mod tests {
                 panic!("expected install-mcp");
             };
             assert_eq!(args.client, McpClient::Droid);
+        }
+    }
+
+    #[test]
+    fn codebuddy_install_hooks_parses_with_the_kebab_alias() {
+        for alias in ["codebuddy", "code-buddy"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::CodeBuddy);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
+            assert_eq!(args.agent.script_hook_subdir(), None);
         }
     }
 

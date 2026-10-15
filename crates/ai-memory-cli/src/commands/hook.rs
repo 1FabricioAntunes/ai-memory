@@ -350,10 +350,21 @@ fn resolve_hook_cwd_with(
         canonical_cwd
     } else if agent_kind == AgentKind::Devin {
         resolve_cwd_with_fallbacks(raw, env_lookup, current_dir)
+    } else if agent_kind == AgentKind::CodeBuddy {
+        // CodeBuddy's interactive SessionStart can arrive without `cwd`; the
+        // hook process then carries the documented `CODEBUDDY_PROJECT_DIR`.
+        // Its process cwd is not documented, so it is never a fallback.
+        let mut env_lookup = env_lookup;
+        extract_cwd(raw)
+            .or_else(|| env_lookup(CODEBUDDY_PROJECT_DIR_ENV))
+            .filter(|s| !s.trim().is_empty())
     } else {
         extract_cwd(raw).filter(|s| !s.trim().is_empty())
     }
 }
+
+/// The project directory CodeBuddy Code exports to every hook process.
+const CODEBUDDY_PROJECT_DIR_ENV: &str = "CODEBUDDY_PROJECT_DIR";
 
 fn cwd_query_suffix(
     agent: &str,
@@ -541,12 +552,13 @@ fn write_success_response<W: std::io::Write>(
         // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
         Ok(())
-    } else if agent == AgentKind::Muse
+    } else if matches!(agent, AgentKind::Muse | AgentKind::CodeBuddy)
         && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
     {
         // Muse adds SessionStart and UserPromptSubmit stdout to the turn as
-        // developer context, so a capture-only reply stays empty rather than
-        // put `{}` in front of the model on every prompt.
+        // developer context, and CodeBuddy appends exit-0 stdout of both to
+        // the session, so a capture-only reply stays empty rather than put
+        // `{}` in front of the model on every prompt.
         Ok(())
     } else if event == HookEvent::UserPrompt && agent.user_prompt_injects_handoff() {
         // Kimi Code injects any non-empty UserPromptSubmit stdout into the turn
@@ -1015,6 +1027,12 @@ where
         },
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
+    // `GET /handoff` claims the newest open baton in whatever project the
+    // server resolves. With no cwd the request names none, and the server
+    // falls back to its default or the caller's last active project, so an
+    // unscoped claim could consume another repository's handoff. Without a
+    // resolved directory the handoff stays open for `memory_handoff_accept`.
+    let handoff_scoped = policy_cwd.is_some();
     let spool = hook_spool::spool_dir(&dd);
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
@@ -1142,7 +1160,13 @@ where
         // consume the handoff server-side (the GET is destructive) and then
         // discard the result — silently losing it. Those agents recover the
         // handoff on demand via the MCP `memory_handoff_accept` tool.
-        if agent_kind.session_start_injects_handoff() {
+        if agent_kind.session_start_injects_handoff() && !handoff_scoped {
+            eprintln!(
+                "ai-memory hook warning: the event named no project directory, so no handoff \
+                 was fetched; recover a pending one with memory_handoff_accept"
+            );
+        }
+        if agent_kind.session_start_injects_handoff() && handoff_scoped {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -1229,6 +1253,7 @@ where
     // canonicalizes both (and the snake/native spellings) to UserPrompt.
     if HookEvent::parse(&args.event) == HookEvent::UserPrompt
         && AgentKind::from_wire(&args.agent).user_prompt_injects_handoff()
+        && handoff_scoped
     {
         let client = build_client();
         let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
@@ -1330,7 +1355,7 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        let wants_handoff = !shown.is_file();
+        let wants_handoff = handoff_scoped && !shown.is_file();
         let wants_recap = canonical_session_id.is_some() && recap_pending_is_fresh(&recap_pending);
         if wants_handoff || wants_recap {
             let client = build_client();
@@ -1420,21 +1445,9 @@ fn parse_hook_payload(mut payload: String) -> serde_json::Result<(String, serde_
 }
 
 fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option<String>) {
-    let (cwd, session_id) = canonical_context(raw);
-    if cwd.is_some() {
-        return (cwd, session_id);
-    }
-    if AgentKind::from_wire(agent) == AgentKind::Devin {
-        (
-            resolve_cwd_with_fallbacks(raw, env_lookup, || std::env::current_dir().ok()),
-            session_id,
-        )
-    } else {
-        (
-            extract_cwd(raw).filter(|cwd| !cwd.trim().is_empty()),
-            session_id,
-        )
-    }
+    let (_, session_id) = canonical_context(raw);
+    let cwd = resolve_hook_cwd_with(agent, raw, env_lookup, || std::env::current_dir().ok());
+    (cwd, session_id)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2311,6 +2324,19 @@ mod tests {
             (AgentKind::KiroCli, HookEvent::UserPrompt, b"".as_slice()),
             (AgentKind::KiroCli, HookEvent::PostToolUse, b"".as_slice()),
             (AgentKind::KiroCli, HookEvent::Stop, b"".as_slice()),
+            // CodeBuddy appends exit-0 SessionStart / UserPromptSubmit stdout
+            // to the session; other events keep the usual empty object.
+            (
+                AgentKind::CodeBuddy,
+                HookEvent::SessionStart,
+                b"".as_slice(),
+            ),
+            (AgentKind::CodeBuddy, HookEvent::UserPrompt, b"".as_slice()),
+            (
+                AgentKind::CodeBuddy,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
         ] {
             let mut output = Vec::new();
             write_success_response(&mut output, agent, event).unwrap();
@@ -2646,6 +2672,84 @@ mod tests {
         );
     }
 
+    /// `GET /handoff` claims a baton in whatever project the server resolves,
+    /// so an event that names no directory must not send one: the server
+    /// would fall back to its default or the caller's last active project and
+    /// consume another repository's handoff. Control: the same event with a
+    /// `cwd` claims, scoped to that directory.
+    #[tokio::test]
+    async fn a_handoff_is_never_claimed_without_a_project_directory() {
+        let cases = [
+            ("codebuddy", "session-start", serde_json::json!({})),
+            ("claude-code", "session-start", serde_json::json!({})),
+            (
+                "kimi-code",
+                "user-prompt-submit",
+                serde_json::json!({"prompt": "continue"}),
+            ),
+            (
+                "grok",
+                "post-tool-use",
+                serde_json::json!({"tool_name": "read_file", "tool_input": {}}),
+            ),
+        ];
+        for (agent, event, extra) in cases {
+            for with_cwd in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let project = tmp.path().join("project");
+                std::fs::create_dir(&project).unwrap();
+                let (base, mut requests) = serve_requests("200 OK", "OTHER-PROJECT-HANDOFF").await;
+                let mut payload = extra.clone();
+                payload["session_id"] = "11111111-2222-3333-4444-555555555555".into();
+                if with_cwd {
+                    payload["cwd"] = project.to_string_lossy().into_owned().into();
+                }
+                let mut stdout = Vec::new();
+                run_with_payload(
+                    Some(tmp.path().join("data")),
+                    HookArgs {
+                        agent: agent.into(),
+                        server_url: base,
+                        ..devin_hook_args(event)
+                    },
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| Ok(()),
+                )
+                .await
+                .unwrap();
+                let mut recorded = Vec::new();
+                while let Some(request) = first_request(&mut requests).await {
+                    recorded.push(request);
+                }
+                let claims: Vec<_> = recorded
+                    .iter()
+                    .filter(|request| request.starts_with("GET /handoff?"))
+                    .collect();
+                let stdout = String::from_utf8(stdout).unwrap();
+                if with_cwd {
+                    assert_eq!(claims.len(), 1, "{agent}: {recorded:?}");
+                    let target = claims[0].split_whitespace().nth(1).unwrap();
+                    assert_eq!(
+                        query_param(target, "cwd"),
+                        Some(url_encode(&project.to_string_lossy()).as_str()),
+                        "{agent}: the claim names its directory: {target}"
+                    );
+                    assert!(
+                        stdout.contains("OTHER-PROJECT-HANDOFF"),
+                        "{agent}: {stdout}"
+                    );
+                } else {
+                    assert!(claims.is_empty(), "{agent}: unscoped claim: {recorded:?}");
+                    assert!(
+                        !stdout.contains("OTHER-PROJECT-HANDOFF"),
+                        "{agent}: {stdout}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn devin_generated_session_id_reaches_startup_handoff_claim() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2858,6 +2962,46 @@ mod tests {
         assert_eq!(
             stored_session_id(data_dir, AgentKind::Zcode).as_deref(),
             Some("stable-zcode-session")
+        );
+    }
+
+    /// CodeBuddy's interactive SessionStart can omit `cwd`; the documented
+    /// `CODEBUDDY_PROJECT_DIR` fills it, the payload wins over it, and the
+    /// hook process's own directory never stands in for either.
+    #[test]
+    fn codebuddy_missing_cwd_uses_codebuddy_project_dir_only() {
+        let bare = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup"});
+        let project_dir =
+            |name: &str| (name == "CODEBUDDY_PROJECT_DIR").then(|| "env-project".to_owned());
+        let process = || Some(PathBuf::from("process-project"));
+
+        assert_eq!(
+            resolve_hook_cwd_with("codebuddy", &bare, project_dir, process).as_deref(),
+            Some("env-project")
+        );
+        assert_eq!(
+            resolve_hook_cwd_with("codebuddy", &bare, |_| None, process),
+            None
+        );
+        assert_eq!(
+            resolve_hook_cwd_with(
+                "codebuddy",
+                &bare,
+                |name| (name == "CODEBUDDY_PROJECT_DIR").then(|| "  ".to_owned()),
+                process
+            ),
+            None
+        );
+        let with_cwd =
+            serde_json::json!({"hook_event_name": "SessionStart", "cwd": "payload-project"});
+        assert_eq!(
+            resolve_hook_cwd_with("codebuddy", &with_cwd, project_dir, process).as_deref(),
+            Some("payload-project")
+        );
+        // Another agent never reads CodeBuddy's variable.
+        assert_eq!(
+            resolve_hook_cwd_with("claude-code", &bare, project_dir, process),
+            None
         );
     }
 
