@@ -43,4 +43,7 @@ mod self_service_keys;
 mod session_management;
 mod slot_identity;
 mod stress_autoscope;
+
+#[cfg(feature = "management-ui")]
+mod management;
 mod web_search_parity;

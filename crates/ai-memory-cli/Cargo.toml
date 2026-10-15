@@ -23,6 +23,10 @@ path = "src/main.rs"
 # a second ~120 MB harness binary for it that contains no tests.
 test = false
 
+[features]
+default = []
+management-ui = ["ai-memory-mcp/management-ui", "ai-memory-web/management-ui"]
+
 [dependencies]
 ai-memory-consolidate.workspace = true
 ai-memory-core.workspace = true

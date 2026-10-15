@@ -3437,6 +3437,10 @@ pub struct ServeArgs {
     /// Bearer.
     #[arg(long, env = "AI_MEMORY_ENABLE_WEB")]
     pub enable_web: bool,
+    /// Enable the server-rendered management console at /manage (requires management-ui build feature).
+    #[cfg(feature = "management-ui")]
+    #[arg(long, env = "AI_MEMORY_ENABLE_MANAGEMENT_UI")]
+    pub enable_management_ui: bool,
     /// Mount only the read-only `/api/v1` JSON API. Off by default.
     ///
     /// `--enable-web` implies this API as before. Use this flag for
@@ -3638,6 +3642,35 @@ mod tests {
         };
         assert!(args.enable_api);
         assert!(!args.enable_web);
+    }
+
+    #[cfg(feature = "management-ui")]
+    #[test]
+    fn management_ui_requires_explicit_runtime_opt_in() {
+        let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(!args.enable_management_ui);
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--enable-management-ui",
+        ])
+        .unwrap();
+        let Command::Serve(args) = parsed.command else {
+            panic!("serve")
+        };
+        assert!(args.enable_management_ui);
+        assert!(!args.enable_web);
+    }
+
+    #[cfg(not(feature = "management-ui"))]
+    #[test]
+    fn management_ui_flag_is_absent_from_default_builds() {
+        assert!(Cli::try_parse_from(["ai-memory", "serve", "--enable-management-ui"]).is_err());
     }
 
     /// The management surface uses the design's spelling (#708):

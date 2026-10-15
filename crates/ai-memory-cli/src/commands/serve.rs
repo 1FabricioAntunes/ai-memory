@@ -1150,6 +1150,17 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let mut shutdown = ShutdownSignals::install();
 
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-management-ui requires --transport http");
+    }
+
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && args.enable_web && normalize_prefix(&args.web_slug) == "/manage"
+    {
+        anyhow::bail!("the management console reserves /manage; choose a different --web-slug");
+    }
+
     refuse_a_missing_token_file(&config.auth)?;
     if args.enable_session_management && !matches!(args.transport, TransportKind::Http) {
         anyhow::bail!("--enable-session-management requires --transport http");
@@ -1843,7 +1854,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
                 )));
-            let router = if args.enable_session_management {
+            #[cfg(not(feature = "management-ui"))]
+            let management_ui_enabled = false;
+            #[cfg(feature = "management-ui")]
+            let management_ui_enabled = args.enable_management_ui;
+            let router = if args.enable_session_management || management_ui_enabled {
                 router.merge(ai_memory_mcp::session_management::router(
                     ai_memory_mcp::session_management::SessionManagementState {
                         reader: store.reader.clone(),
@@ -1855,7 +1870,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             } else {
                 router
             };
-            let router = if args.enable_self_service_keys {
+            let router = if args.enable_self_service_keys || management_ui_enabled {
                 router.merge(ai_memory_mcp::self_service_keys::router(
                     ai_memory_mcp::self_service_keys::SelfServiceKeysState {
                         reader: store.reader.clone(),
@@ -1869,6 +1884,14 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     },
                     auth_state.clone(),
                 ))
+            } else {
+                router
+            };
+            #[cfg(feature = "management-ui")]
+            let router = if management_ui_enabled {
+                // Delegate forms to the same already-authenticated engine routers.
+                let backend = router.clone();
+                router.merge(ai_memory_web::management::router(&base_path, backend))
             } else {
                 router
             };
@@ -3393,6 +3416,41 @@ fn host_without_port(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "management-ui")]
+    #[tokio::test]
+    async fn management_ui_rejects_invalid_mounts_before_opening_the_store() {
+        use clap::Parser;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            data_dir: tmp.path().join("unopened"),
+            ..Default::default()
+        };
+        for args in [
+            vec!["ai-memory", "serve", "--enable-management-ui"],
+            vec![
+                "ai-memory",
+                "serve",
+                "--transport",
+                "http",
+                "--enable-management-ui",
+                "--enable-web",
+                "--web-slug",
+                "/manage/",
+            ],
+        ] {
+            let parsed = crate::cli::Cli::try_parse_from(args).unwrap();
+            let crate::cli::Command::Serve(args) = parsed.command else {
+                panic!("serve")
+            };
+            let error = super::run(&config, args).await.unwrap_err();
+            assert!(
+                error.to_string().contains("--transport http")
+                    || error.to_string().contains("reserves /manage")
+            );
+            assert!(!config.data_dir.exists());
+        }
+    }
+
     use super::*;
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,

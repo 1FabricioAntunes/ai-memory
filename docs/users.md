@@ -71,6 +71,10 @@ Human password login is **not** a bearer rung. A browser session cookie never
 authenticates `/mcp`, `/hook`, `/handoff`, or `/workstream/*`, and a password
 never authenticates as `Authorization: Bearer`.
 
+The optional [management console](management-ui.md) exposes existing user
+administration and adds authorized self-service session deletion and personal
+API-key management in the browser.
+
 ## Human login (password + web session)
 
 The console signs in with username and password. The engine issues an

@@ -16,6 +16,9 @@ version in [`docs/changelog/`](docs/changelog/):
   colors, consistent margins and terminal-width wrapping, retaining every
   diagnostic field and remedy. Redirected, `NO_COLOR`,
   `TERM=dumb` and JSON reports kept their existing stdout format. (#1313)
+- Added an opt-in server-rendered management console for users, sessions, and
+  personal MCP API keys, using existing authentication and SQLite storage.
+  Required the `management-ui` build feature and runtime switch. (#1231)
 - Added opt-in session inspection and owned-session purging for signed-in
   browser users, enabled at runtime with `serve --enable-session-management`
   (`AI_MEMORY_ENABLE_SESSION_MANAGEMENT`). A user can purge only a session they

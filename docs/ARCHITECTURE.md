@@ -20,6 +20,14 @@ each other, and episodic logs decay. A
 companion SQLite index gives FTS5 + lexical entity + link-neighbor retrieval,
 with optional vectors; the markdown stays the source of truth.
 
+The optional `management-ui` feature enables an askama/Tailwind console at
+`/manage`, enabled separately at runtime. Its login page is public; its
+`/management/v1` data and mutation routes reuse human-session authentication and
+CSRF. Admin actions use existing root-only handlers. Self-service session purges
+recheck exact ownership and current project write access inside the writer
+transaction, then remove files through `Wiki`. Shared pages keep their existing
+read behavior. See [management-ui.md](management-ui.md).
+
 ## Data flow
 
 ![ai-memory architecture overview](architecture-overview.svg)

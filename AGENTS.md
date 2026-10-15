@@ -301,6 +301,10 @@ covers the same tests, slower, no tiers.
   ai-memory-web` downloads the pinned Tailwind CLI and rewrites
   `static/tailwind.css`; commit the result. CI regenerates it on Linux and
   fails if the committed file is stale, so nothing else needs the download.
+- **Management console.** Its askama templates and plain POST form adapters
+  live in `ai-memory-web`. Follow [`docs/management-ui.md`](docs/management-ui.md)
+  for feature-enabled checks. Regenerate the vendored Tailwind stylesheet
+  when changing templates or styles; no JavaScript toolchain is needed.
 - Run each Cargo companion separately (`ai-memory-client`,
   `ai-memory-importer`, `ai-memory-relay` and `ai-memory-wikisync`):
   `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
