@@ -32,6 +32,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `claude setup-token` token as a plain rate limit: that 429 now carries a hint
   that it is not a real rate limit and names the alternatives, which
   `docs/llm-providers.md` already describes. (#1170)
+- Fixed the curator report treating a per-user focus slot
+  (`_slots/<operator>/current-focus.md`) as an ordinary slot. It only
+  recognised the shared `_slots/current-focus.md`, so with per-user slots the
+  focus slot got the 30-day stale threshold instead of the 7-day one and was
+  reported three weeks late. (#1314)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and

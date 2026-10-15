@@ -16,7 +16,7 @@ const US_PER_DAY: f64 = 86_400_000_000.0;
 pub struct CuratorParams {
     /// Maximum findings returned per signal class.
     pub max_findings_per_kind: usize,
-    /// Age threshold for `_slots/current-focus.md`.
+    /// Age threshold for `_slots/current-focus.md`, shared or per-user.
     pub current_focus_stale_days: f64,
     /// Age threshold for other `_slots/*` pages.
     pub other_slot_stale_days: f64,
@@ -184,7 +184,9 @@ pub async fn run_curator_report_with_breadth(
             && let Ok(updated) = page.updated_at.parse::<Timestamp>()
         {
             let slot_age_days = age_days(now_us, updated.as_microsecond());
-            let threshold = if page.path == "_slots/current-focus.md" {
+            // `is_slot_named`, not equality: with per-user slots the focus
+            // slot lives at `_slots/<operator>/current-focus.md`.
+            let threshold = if ai_memory_core::is_slot_named(&page.path, "current-focus.md") {
                 params.current_focus_stale_days
             } else {
                 params.other_slot_stale_days
@@ -633,6 +635,47 @@ mod tests {
         let old_detail = stale[1].detail.as_ref().unwrap();
         assert_eq!(old_detail["threshold_days"].as_f64().unwrap(), 30.0);
         assert!(old_detail["age_days"].as_f64().unwrap() >= 31.0);
+    }
+
+    #[tokio::test]
+    async fn a_per_user_focus_slot_gets_the_current_focus_threshold() {
+        let fx = seed_fixture().await;
+        // 8 days old: past the 7-day current-focus threshold, under the
+        // 30-day one a literal `_slots/current-focus.md` compare gave it.
+        let focus = write(
+            &fx,
+            "_slots/u-alice/current-focus.md",
+            "Current Focus",
+            Tier::Semantic,
+            false,
+            "focus body",
+        )
+        .await;
+        // Control: another per-user slot of the same age keeps 30 days.
+        let notes = write(
+            &fx,
+            "_slots/u-alice/recent-notes.md",
+            "Recent Notes",
+            Tier::Semantic,
+            false,
+            "recent body",
+        )
+        .await;
+        backdate(&fx, focus, 8);
+        backdate(&fx, notes, 8);
+
+        let report = run_report(&fx).await;
+
+        let stale = findings_of_kind(&report, "stale_slot");
+        assert_eq!(
+            report.findings.len(),
+            1,
+            "only the per-user focus slot is stale: {:?}",
+            report.findings
+        );
+        assert_eq!(stale[0].pages, ["_slots/u-alice/current-focus.md"]);
+        let detail = stale[0].detail.as_ref().unwrap();
+        assert_eq!(detail["threshold_days"].as_f64().unwrap(), 7.0);
     }
 
     #[tokio::test]
