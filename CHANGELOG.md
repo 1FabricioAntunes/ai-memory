@@ -20,7 +20,7 @@ version in [`docs/changelog/`](docs/changelog/):
   the job would consolidate a truncated session. The prune and its dry-run
   count now share one exclusion: a session with a `pending` or `running`
   consolidation job keeps every observation, however old; `completed`,
-  `failed` and `superseded` jobs do not block. (#PRNUM)
+  `failed` and `superseded` jobs do not block. (#1324)
 
 ## [3.0.1] - 2026-10-15
 
