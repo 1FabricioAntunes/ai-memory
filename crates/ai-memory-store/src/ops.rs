@@ -203,6 +203,66 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
+/// What a conditional page write requires of the current latest version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePrecondition {
+    /// No latest version exists at the path: the write creates the page.
+    Absent,
+    /// The latest version at the path is this one.
+    Latest(PageId),
+}
+
+/// The outcome of [`upsert_page_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalUpsert {
+    /// The precondition held and the page was written; the id is current.
+    Upserted(PageId),
+    /// The precondition did not hold and nothing was written.
+    Mismatch {
+        /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
+}
+
+/// [`upsert_page`] only when `precondition` holds, checked in the same
+/// transaction as the write so no other writer can land in between.
+pub fn upsert_page_if(
+    conn: &mut Connection,
+    page: &NewPage,
+    precondition: PagePrecondition,
+) -> StoreResult<ConditionalUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let current = latest_page_id_in_tx(&tx, page)?;
+    let holds = match precondition {
+        PagePrecondition::Absent => current.is_none(),
+        PagePrecondition::Latest(expected) => current == Some(expected),
+    };
+    if !holds {
+        return Ok(ConditionalUpsert::Mismatch { current });
+    }
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(ConditionalUpsert::Upserted(id))
+}
+
+fn latest_page_id_in_tx(tx: &Transaction<'_>, page: &NewPage) -> StoreResult<Option<PageId>> {
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|bytes| PageId::from_slice(&bytes).map_err(StoreError::from))
+        .transpose()
+}
+
 /// Resolve a workspace by name, creating it if missing. Atomic.
 pub fn get_or_create_workspace(
     conn: &mut Connection,
@@ -2299,8 +2359,8 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
     // be sitting undelivered in a client hook spool; without this check the
     // next drain recreates the session row and the observations land again,
     // silently undoing a deletion an application already promised its user
-    // (#387). Every ingest path funnels through here, so this is the one
-    // place the guard has to live.
+    // (#387). The other place a session row is created, hook admission in
+    // `admit_hook_session_event`, repeats the guard.
     if session_is_purged(conn, session)? {
         return Err(StoreError::SessionPurged(session.id.to_string()));
     }
@@ -2744,9 +2804,38 @@ pub fn insert_observation(
 }
 
 /// Ingest-keys older than this are swept opportunistically on every keyed
-/// insert. Keys only need to outlive the client spool (7 days + retry
-/// backoff); 30 days is a generous margin.
+/// insert. Ordinary keys only need to outlive the client spool (7 days + retry
+/// backoff); recovery keys remain tied to their stored session until it is purged.
 const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
+fn recovery_ingest_key(key: &str) -> bool {
+    key.strip_prefix("recovery_").is_some_and(|digest| {
+        digest.len() == 55 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn recovery_event_identity(obs: &NewObservation, agent: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    let session_id = obs.session_id.to_string();
+    for value in [
+        Some(session_id.as_str()),
+        agent,
+        Some(obs.kind.as_str()),
+        obs.extension.as_deref(),
+        obs.source_event.as_deref(),
+        Some(obs.title.as_str()),
+        Some(obs.body.as_str()),
+    ] {
+        if let Some(value) = value {
+            hasher.update(value.len().to_be_bytes());
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update(usize::MAX.to_be_bytes());
+        }
+    }
+    hasher.update(obs.occurred_at.unwrap_or_default().to_be_bytes());
+    format!("{digest:x}", digest = hasher.finalize())
+}
 
 /// Claim a project-scoped ingest key and append its observation atomically.
 ///
@@ -2766,18 +2855,48 @@ pub fn insert_observation_keyed(
     // Sweep before looking up the current key so an expired key can be reused
     // even when no unrelated keyed event arrived in the meantime.
     tx.execute(
-        "DELETE FROM ingest_keys WHERE seen_at < ?1",
+        "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
         params![now - INGEST_KEY_TTL_MICROS],
     )?;
-    let existing: Option<Option<i64>> = tx
+    let recovery = recovery_ingest_key(ingest_key);
+    let session_agent = if recovery {
+        tx.query_row(
+            "SELECT agent_kind FROM sessions WHERE id = ?1",
+            params![obs.session_id.as_bytes()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let event_identity = recovery.then(|| recovery_event_identity(obs, session_agent.as_deref()));
+    type IngestKeyRow = (
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    if recovery && session_agent.is_none() {
+        return Err(StoreError::SessionCollision);
+    }
+    let existing: Option<IngestKeyRow> = tx
         .query_row(
-            "SELECT completed_at FROM ingest_keys \
+            "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys \
              WHERE project_id = ?1 AND key = ?2",
             params![obs.project_id.as_bytes(), ingest_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    if let Some(completed_at) = existing {
+    if let Some((completed_at, session_id, agent, kind, identity)) = existing {
+        if recovery
+            && (session_id.as_deref() != Some(obs.session_id.as_bytes())
+                || agent.as_deref() != session_agent.as_deref()
+                || kind.as_deref() != Some(obs.kind.as_str())
+                || identity.as_deref() != event_identity.as_deref())
+        {
+            return Err(StoreError::SessionCollision);
+        }
         tx.commit()?;
         return Ok(if completed_at.is_some() {
             IngestObservationOutcome::AlreadyComplete
@@ -2787,9 +2906,18 @@ pub fn insert_observation_keyed(
     }
 
     tx.execute(
-        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
-         VALUES (?1, ?2, ?3, NULL)",
-        params![obs.project_id.as_bytes(), ingest_key, now],
+        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            obs.project_id.as_bytes(),
+            ingest_key,
+            now,
+            recovery.then_some(obs.session_id.as_bytes()),
+            session_agent,
+            recovery.then_some(obs.kind.as_str()),
+            event_identity,
+            i64::from(recovery)
+        ],
     )?;
     let id = insert_observation_row(&tx, obs)?;
     tx.commit()?;
@@ -2896,6 +3024,13 @@ pub fn admit_hook_session_event(
             if !owner_filter.admits(session.actor_user.as_deref()) {
                 return Err(StoreError::SessionCollision);
             }
+            // Hook ingest creates its session row here rather than through
+            // `begin_session_row`, so a purge must hold against it too: a
+            // late delivery for a purged session would otherwise bring the
+            // session back (#387).
+            if session_is_purged(&tx, session)? {
+                return Err(StoreError::SessionPurged(session.id.to_string()));
+            }
             // `now` is also the ingest-key TTL clock above; started_at honors
             // the caller's original event time (backfill) and only falls
             // back to it when absent (live capture).
@@ -2945,18 +3080,36 @@ pub fn admit_hook_session_event(
     }
     let ingest = if let Some(key) = ingest_key {
         tx.execute(
-            "DELETE FROM ingest_keys WHERE seen_at < ?1",
+            "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
             params![now - INGEST_KEY_TTL_MICROS],
         )?;
-        let old: Option<Option<i64>> = tx
+        let recovery = recovery_ingest_key(key);
+        let event_identity =
+            recovery.then(|| recovery_event_identity(obs, Some(session.agent_kind.as_str())));
+        type IngestKeyRow = (
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let old: Option<IngestKeyRow> = tx
             .query_row(
-                "SELECT completed_at FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
                 params![obs.project_id.as_bytes(), key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         match old {
-            Some(done) => {
+            Some((done, keyed_session, keyed_agent, keyed_kind, keyed_identity)) => {
+                if recovery
+                    && (keyed_session.as_deref() != Some(obs.session_id.as_bytes())
+                        || keyed_agent.as_deref() != Some(session.agent_kind.as_str())
+                        || keyed_kind.as_deref() != Some(obs.kind.as_str())
+                        || keyed_identity.as_deref() != event_identity.as_deref())
+                {
+                    return Err(StoreError::SessionCollision);
+                }
                 if done.is_some() {
                     IngestObservationOutcome::AlreadyComplete
                 } else {
@@ -2964,7 +3117,20 @@ pub fn admit_hook_session_event(
                 }
             }
             None => {
-                tx.execute("INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, NULL)", params![obs.project_id.as_bytes(), key, now])?;
+                tx.execute(
+                    "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        obs.project_id.as_bytes(),
+                        key,
+                        now,
+                        recovery.then_some(obs.session_id.as_bytes()),
+                        recovery.then_some(session.agent_kind.as_str()),
+                        recovery.then_some(obs.kind.as_str()),
+                        event_identity,
+                        i64::from(recovery)
+                    ],
+                )?;
                 IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
             }
         }
@@ -6023,6 +6189,19 @@ pub fn purge_session(
         rusqlite::params![&sid[..], &wid[..], &pid[..]],
     )? as u64;
 
+    // Profile evidence harvested from this session's prompts. A candidate
+    // keeps the user's own sentence (`statement`, `quote`), so one left behind
+    // would let a later convergence write that sentence into a profile page.
+    // Not scoped to this project: the harvest files a candidate under the
+    // project of the prompt it came from, and a prompt this session recorded
+    // in another project is deleted with it by the `observations` cascade
+    // (`collateral_observations_deleted`). A session id names one session, so
+    // `session:<id>` matches only this session's evidence.
+    tx.execute(
+        "DELETE FROM profile_candidates WHERE source_kind = 'prompt' AND source_ref = ?1",
+        rusqlite::params![format!("session:{session_id}")],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -6842,6 +7021,37 @@ pub fn move_project_workspace(
         "UPDATE workstreams SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    // The remaining tables that carry the workspace beside the project id.
+    // Left behind, an entity or a feedback row stops matching reads keyed on
+    // the new workspace, and a purge tombstone stops matching the moved
+    // project's session ids, so a purged session could be recreated.
+    for table in [
+        "entities",
+        "page_feedback",
+        "purged_sessions",
+        "profile_candidates",
+        "profile_entry_ledger",
+        "profile_harvest_marks",
+    ] {
+        tx.execute(
+            &format!(
+                "UPDATE {table} SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3"
+            ),
+            params![&to[..], &pid[..], &from[..]],
+        )?;
+    }
+    // A message names the project on both ends: pending mail addressed to the
+    // moved project and mail it sent, which it can still cancel.
+    tx.execute(
+        "UPDATE agent_messages SET to_workspace_id = ?1 \
+          WHERE to_project_id = ?2 AND to_workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )?;
+    tx.execute(
+        "UPDATE agent_messages SET from_workspace_id = ?1 \
+          WHERE from_project_id = ?2 AND from_workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )?;
 
     let projects_updated = tx.execute(
         "UPDATE projects SET workspace_id = ?1 WHERE id = ?2 AND workspace_id = ?3",
@@ -6964,9 +7174,10 @@ pub struct MoveSessionSummary {
 }
 
 /// Re-stamp one session and every row that hangs off it (`observations`,
-/// `handoffs` it produced, its consolidation jobs, auto-improve runs and
-/// scheduler claim) into `(target_workspace, target_project)` in ONE
-/// transaction, plus its `sessions/<session_id>.md` page per `pages`.
+/// `handoffs` it produced, its consolidation jobs, auto-improve runs,
+/// scheduler claim, profile prompt candidates, and ingest keys) into
+/// `(target_workspace, target_project)` in ONE transaction, plus its
+/// `sessions/<session_id>.md` page per `pages`.
 ///
 /// Dependent rows are matched by session id alone, so a hybrid session whose
 /// events were scattered over other scopes (mid-session routing before the
@@ -7127,6 +7338,36 @@ pub fn move_session(
     summary.consolidation_jobs = restamp("session_consolidation_jobs", "session_id")?;
     summary.auto_improve_runs = restamp("auto_improve_runs", "session_id")?;
     summary.auto_improve_claims = restamp("auto_improve_scheduler_claims", "session_id")?;
+
+    // Profile evidence harvested from this session's prompts, keyed by
+    // `session:<id>`. Re-stamped so later convergence attributes the
+    // statements to the target project, and a subsequent purge of the
+    // source project does not delete them via CASCADE.
+    let session_ref = format!("session:{session_id}");
+    tx.execute(
+        "UPDATE OR IGNORE profile_candidates SET workspace_id = ?1, project_id = ?2 \
+         WHERE source_kind = 'prompt' AND source_ref = ?3 \
+           AND NOT (workspace_id = ?1 AND project_id = ?2)",
+        params![&to_ws[..], &to_proj[..], session_ref.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM profile_candidates \
+         WHERE source_kind = 'prompt' AND source_ref = ?1 \
+           AND NOT (workspace_id = ?2 AND project_id = ?3)",
+        params![session_ref.as_str(), &to_ws[..], &to_proj[..]],
+    )?;
+
+    // Ingest idempotency and recovery keys tied to the session.
+    tx.execute(
+        "UPDATE OR IGNORE ingest_keys SET project_id = ?1 \
+         WHERE session_id = ?2 AND project_id != ?1",
+        params![&to_proj[..], &sid[..]],
+    )?;
+    tx.execute(
+        "DELETE FROM ingest_keys \
+         WHERE session_id = ?1 AND project_id != ?2",
+        params![&sid[..], &to_proj[..]],
+    )?;
 
     // Page rows to handle: the source scope's in a real move; in a re-home,
     // any scope other than the target (the source IS the target).
@@ -8732,6 +8973,14 @@ pub(crate) mod tests {
     fn purge_session_removes_the_session_and_everything_derived_from_it() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let (sid, _page) = seed_session(&mut conn, ws, proj, "target");
+        let recovery_key = format!("recovery_{}", "a".repeat(55));
+        conn.execute(
+            "INSERT INTO ingest_keys \
+             (project_id, key, seen_at, completed_at, session_id, recovery_retained) \
+             VALUES (?1, ?2, 1, 1, ?3, 1)",
+            params![proj.as_bytes(), recovery_key, sid.as_bytes()],
+        )
+        .unwrap();
 
         let summary = purge_session(
             &mut conn,
@@ -8755,6 +9004,11 @@ pub(crate) mod tests {
             "observations=0"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0, "pages=0");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM ingest_keys"),
+            0,
+            "session-bound recovery keys cascade with the purged session"
+        );
         assert_eq!(summary.observations_deleted, 1);
         assert_eq!(summary.pages_deleted, 1);
         assert_eq!(
@@ -10084,6 +10338,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// The cross-project profile keeps the user's own sentence from a prompt
+    /// in `profile_candidates`, keyed `session:<id>`. Purging the session must
+    /// take that evidence with it, including the candidate harvested from a
+    /// prompt the session recorded in another project: the purge deletes that
+    /// observation through the cascade, so its sentence must not outlive it.
+    /// A sibling session's candidates (in both projects) and a page candidate
+    /// are the controls.
+    #[test]
+    fn purge_session_deletes_the_profile_candidates_harvested_from_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (purged, _) = seed_session(&mut conn, ws, proj, "target");
+        let (sibling, _) = seed_session(&mut conn, ws, proj, "sibling");
+        // A prompt the purged session recorded in `other` (follow-cwd routing).
+        let mut stray = hook_observation(&hook_session(purged, ws, proj, None));
+        stray.project_id = other;
+        stray.body = "obs-in-other-project".into();
+        insert_observation(&mut conn, &stray).unwrap();
+        let candidate = |project: ProjectId, kind: &str, source_ref: String| {
+            conn.execute(
+                "INSERT INTO profile_candidates \
+                 (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+                  statement, quote, observed_at, generality) \
+                 VALUES (?1, ?2, ?3, ?4, 'topic', 'workflow', 'statement', 'quote', 1, 'general')",
+                params![ws.as_bytes(), project.as_bytes(), kind, source_ref],
+            )
+            .unwrap();
+        };
+        candidate(proj, "prompt", format!("session:{purged}"));
+        candidate(proj, "prompt", format!("session:{sibling}"));
+        candidate(proj, "page", "page:_rules/keep.md".into());
+        candidate(other, "prompt", format!("session:{purged}"));
+        candidate(other, "prompt", format!("session:{sibling}"));
+
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        assert_eq!(summary.collateral_observations_deleted, 1);
+
+        let remaining: Vec<(Vec<u8>, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT project_id, source_ref FROM profile_candidates ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            remaining,
+            [
+                (proj.as_bytes().to_vec(), format!("session:{sibling}")),
+                (proj.as_bytes().to_vec(), "page:_rules/keep.md".to_owned()),
+                (other.as_bytes().to_vec(), format!("session:{sibling}")),
+            ]
+        );
+    }
+
     /// A purge must be terminal. The events that produced a session can sit
     /// undelivered in a client hook spool for days (#493 measured spools with
     /// thousands), so without a tombstone the next drain recreates the session
@@ -10116,6 +10435,52 @@ pub(crate) mod tests {
             "still gone"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 0);
+    }
+
+    /// `begin_session` is not the only way a hook event creates a session:
+    /// live ingest goes through `admit_hook_session_event`, which inserts the
+    /// row itself. The purge must hold against it as well (#387). A sibling
+    /// session and the same id in another project are the controls.
+    #[test]
+    fn a_purged_session_is_not_recreated_by_hook_admission() {
+        let admit = |conn: &mut Connection, session: &NewSession| {
+            admit_hook_session_event(
+                conn,
+                session,
+                &hook_observation(session),
+                &OwnerFilter::Any,
+                None,
+                None,
+            )
+        };
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (purged, _) = seed_session(&mut conn, ws, proj, "target");
+        let (sibling, _) = seed_session(&mut conn, ws, proj, "sibling");
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let session = hook_session(purged, ws, proj, None);
+        let err = admit(&mut conn, &session).expect_err("must stay purged");
+        assert!(matches!(err, StoreError::SessionPurged(_)), "got {err:?}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 1);
+
+        let sibling_session = hook_session(sibling, ws, proj, None);
+        let admitted = admit(&mut conn, &sibling_session).unwrap();
+        assert!(matches!(admitted, HookSessionAdmission::Observation { .. }));
+
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let elsewhere = hook_session(purged, ws, other, None);
+        let admitted = admit(&mut conn, &elsewhere).unwrap();
+        assert!(matches!(admitted, HookSessionAdmission::Observation { .. }));
     }
 
     /// The tombstone is scoped: purging a session id in one project must not
@@ -13207,6 +13572,148 @@ pub(crate) mod tests {
         assert_eq!(still_there, 1);
     }
 
+    /// Tables that carry the workspace beside the project id must follow a
+    /// move too: pending mail on both ends, entities, page feedback, the purge
+    /// tombstone and the profile evidence. The other project's side of a
+    /// message stays where it is.
+    #[test]
+    fn move_project_workspace_restamps_the_remaining_workspace_columns() {
+        let (_tmp, mut conn, src_ws, proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "djalmajr").unwrap();
+        let other = get_or_create_project(&mut conn, &src_ws, "other", None).unwrap();
+
+        let mut with_entity = page(src_ws, proj, "notes/e.md", "body");
+        with_entity.entities = vec!["postgres".into()];
+        let page_id = upsert_page(&mut conn, &with_entity).unwrap();
+        conn.execute(
+            "INSERT INTO page_feedback \
+             (id, page_id, workspace_id, project_id, kind, salience_after, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'stale', 1.0, 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                &page_id.as_bytes()[..],
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO purged_sessions (session_id, workspace_id, project_id, purged_at) \
+             VALUES (?1, ?2, ?3, 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'page', 'page:_rules/a.md', 'topic', 'workflow', 's', 'q', 1, 'general')",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_entry_ledger (workspace_id, project_id, path, topic_key, written_at) \
+             VALUES (?1, ?2, 'profile/a.md', 'topic', 1)",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_harvest_marks (workspace_id, project_id) VALUES (?1, ?2)",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        let message = |from: ProjectId, to: ProjectId| {
+            conn.execute(
+                "INSERT INTO agent_messages \
+                 (id, from_workspace_id, from_project_id, from_agent, \
+                  to_workspace_id, to_project_id, body, created_at) \
+                 VALUES (?1, ?2, ?3, 'other', ?2, ?4, 'hello', 1)",
+                params![
+                    uuid::Uuid::new_v4().as_bytes(),
+                    src_ws.as_bytes(),
+                    from.as_bytes(),
+                    to.as_bytes(),
+                ],
+            )
+            .unwrap();
+        };
+        message(other, proj);
+        message(proj, other);
+
+        move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
+
+        let in_workspace = |table: &str, ws: &ai_memory_core::WorkspaceId| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id = ?1"),
+                params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for table in [
+            "entities",
+            "page_feedback",
+            "purged_sessions",
+            "profile_candidates",
+            "profile_entry_ledger",
+            "profile_harvest_marks",
+        ] {
+            assert_eq!(in_workspace(table, &dst_ws), 1, "{table} must follow");
+            assert_eq!(in_workspace(table, &src_ws), 0, "{table} must leave");
+        }
+        let side = |column: &str, ws: &ai_memory_core::WorkspaceId| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM agent_messages WHERE {column} = ?1"),
+                params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // One message is addressed to the moved project, the other sent by it;
+        // the `other` project's end of each stays in the source workspace.
+        assert_eq!(side("to_workspace_id", &dst_ws), 1);
+        assert_eq!(side("from_workspace_id", &dst_ws), 1);
+        assert_eq!(side("to_workspace_id", &src_ws), 1);
+        assert_eq!(side("from_workspace_id", &src_ws), 1);
+    }
+
+    /// The purge tombstone is keyed on `(session, workspace, project)`, so it
+    /// has to follow a move or a late event recreates the purged session in
+    /// the destination (#387). A session that was never purged is the control.
+    #[test]
+    fn a_purged_session_stays_purged_after_its_project_moves() {
+        let (_tmp, mut conn, src_ws, proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "destination").unwrap();
+        let (purged, _) = seed_session(&mut conn, src_ws, proj, "target");
+        purge_session(
+            &mut conn,
+            src_ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
+
+        let err = begin_session(&mut conn, &hook_session(purged, dst_ws, proj, None))
+            .expect_err("the purge must survive the move");
+        assert!(matches!(err, StoreError::SessionPurged(_)), "got {err:?}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 0);
+        begin_session(
+            &mut conn,
+            &hook_session(SessionId::new(), dst_ws, proj, None),
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
+    }
+
     /// A same-named project already in the destination workspace makes the
     /// projects UPDATE collide with UNIQUE(workspace_id, name); the whole
     /// transaction must roll back, leaving the source intact. The admin
@@ -13315,6 +13822,20 @@ pub(crate) mod tests {
             params![ws.as_bytes(), proj.as_bytes(), sid.as_bytes()],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'topic', 'workflow', 'statement', 'quote', 1, 'general')",
+            params![ws.as_bytes(), proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, ?2, 1, 1, ?3)",
+            params![proj.as_bytes(), format!("key-{sid}"), sid.as_bytes()],
+        )
+        .unwrap();
         let path = format!("sessions/{sid}.md");
         upsert_page(conn, &page(ws, proj, &path, "first version")).unwrap();
         upsert_page(conn, &page(ws, proj, &path, "second version")).unwrap();
@@ -13414,6 +13935,65 @@ pub(crate) mod tests {
                 session_rows_in_scope(conn, table, col, sid, gone.0, gone.1),
                 0,
                 "{table} rows must not sit in the other scope"
+            );
+        }
+        let candidate_here: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    here.0.as_bytes(),
+                    here.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_here, 1,
+            "profile_candidates must sit in the expected scope"
+        );
+        let candidate_gone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    gone.0.as_bytes(),
+                    gone.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_gone, 0,
+            "profile_candidates must not sit in the other scope"
+        );
+
+        let ingest_here: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND session_id = ?2",
+                params![here.1.as_bytes(), sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ingest_here, 1,
+            "ingest_keys must sit in the expected project"
+        );
+        if here.1 != gone.1 {
+            let ingest_gone: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND session_id = ?2",
+                    params![gone.1.as_bytes(), sid.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                ingest_gone, 0,
+                "ingest_keys must not sit in the other project"
             );
         }
     }
@@ -13914,6 +14494,308 @@ pub(crate) mod tests {
         assert_eq!(summary.page_versions_moved, 0);
         assert_eq!(session_page_versions(&conn, sid, ws, stray), (1, 0));
         assert_eq!(session_page_versions(&conn, sid, ws, target), (2, 1));
+    }
+
+    #[test]
+    fn move_session_restamps_profile_candidates_and_ingest_keys() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+
+        let (moved_sid, _) = seed_session(&mut conn, src_ws, src_proj, "moved");
+        let (sibling_sid, _) = seed_session(&mut conn, src_ws, src_proj, "sibling");
+
+        let insert_candidate =
+            |ws: WorkspaceId, proj: ProjectId, kind: &str, source_ref: &str, topic: &str| {
+                conn.execute(
+                    "INSERT INTO profile_candidates \
+                     (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+                      statement, quote, observed_at, generality) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'workflow', 'statement', 'quote', 1, 'general')",
+                    params![ws.as_bytes(), proj.as_bytes(), kind, source_ref, topic],
+                )
+                .unwrap();
+            };
+
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{moved_sid}"),
+            "topic1",
+        );
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{sibling_sid}"),
+            "topic1",
+        );
+        insert_candidate(src_ws, src_proj, "page", "page:_rules/keep.md", "topic1");
+
+        let insert_ingest_key = |proj: ProjectId, key: &str, sid: Option<SessionId>| {
+            conn.execute(
+                "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+                 VALUES (?1, ?2, 1, 1, ?3)",
+                params![
+                    proj.as_bytes(),
+                    key,
+                    sid.as_ref().map(|s| &s.as_bytes()[..])
+                ],
+            )
+            .unwrap();
+        };
+
+        insert_ingest_key(src_proj, "key-moved", Some(moved_sid));
+        insert_ingest_key(src_proj, "key-sibling", Some(sibling_sid));
+        insert_ingest_key(src_proj, "key-unattached", None);
+
+        // Move `moved_sid` from src to dst.
+        let summary = move_session(
+            &mut conn,
+            moved_sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.session_moved);
+
+        // Verify `moved_sid` candidate moved to (dst_ws, dst_proj).
+        let moved_candidate_in_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_candidate_in_dst, 1);
+
+        let moved_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_candidate_in_src, 0);
+
+        // Verify sibling and page candidates stayed in (src_ws, src_proj).
+        let sibling_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sibling_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling_candidate_in_src, 1);
+
+        let page_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'page' AND source_ref = 'page:_rules/keep.md'",
+                params![src_ws.as_bytes(), src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_candidate_in_src, 1);
+
+        // Verify ingest keys: moved key sits in dst_proj, sibling and unattached in src_proj.
+        let moved_key_in_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-moved'",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_key_in_dst, 1);
+
+        let moved_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-moved'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_key_in_src, 0);
+
+        let sibling_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-sibling'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling_key_in_src, 1);
+
+        let unattached_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-unattached'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unattached_key_in_src, 1);
+
+        // Now purge src_proj: because moved_sid's candidate and ingest key
+        // were re-stamped to dst_proj, they MUST survive the purge cascade.
+        purge_project(
+            &mut conn,
+            &src_ws,
+            &src_proj,
+            "default/source",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let dst_candidates_after_purge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2",
+                params![dst_ws.as_bytes(), dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dst_candidates_after_purge, 1,
+            "moved session's profile candidate must survive source project purge"
+        );
+
+        let dst_ingest_keys_after_purge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dst_ingest_keys_after_purge, 1,
+            "moved session's ingest key must survive source project purge"
+        );
+    }
+
+    #[test]
+    fn move_session_handles_duplicate_candidate_and_ingest_key_conflicts() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+
+        let (sid, _) = seed_session(&mut conn, src_ws, src_proj, "conflict-test");
+
+        // Seed duplicate candidate in both src and dst with same topic_key
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'duptopic', 'workflow', 'stmt1', 'quote1', 1, 'general')",
+            params![src_ws.as_bytes(), src_proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'duptopic', 'workflow', 'stmt2', 'quote2', 2, 'general')",
+            params![dst_ws.as_bytes(), dst_proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+
+        // Seed duplicate ingest key in both src and dst
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, 'dupkey', 1, 1, ?2)",
+            params![src_proj.as_bytes(), sid.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, 'dupkey', 2, 2, NULL)",
+            params![dst_proj.as_bytes()],
+        )
+        .unwrap();
+
+        // Move must not fail with UNIQUE constraint error
+        let summary = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.session_moved);
+
+        // Exactly 1 candidate in dst for this session, 0 in src
+        let count_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_dst, 1);
+        let count_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_src, 0);
+
+        // Exactly 1 ingest key in dst with key 'dupkey', 0 in src
+        let key_count_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'dupkey'",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_count_dst, 1);
+        let key_count_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'dupkey'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_count_src, 0);
     }
 
     #[test]

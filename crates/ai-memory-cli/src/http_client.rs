@@ -24,6 +24,9 @@ use serde::de::DeserializeOwned;
 use crate::config::{Config, DEFAULT_SERVER_URL};
 use ai_memory_web::normalize_prefix;
 
+/// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] value for CLI subcommands.
+const CLI_CLIENT_KIND: &str = "cli";
+
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
 pub(crate) struct ServerResponseError {
@@ -238,8 +241,11 @@ impl ServerEndpoint {
         parsed.as_str().trim_end_matches('/').to_owned()
     }
 
-    /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
+    /// Mark a request to this server as first-party
+    /// ([`ai_memory_hooks::CLIENT_MARKER_HEADER`]) and attach the bearer when a
+    /// token is set.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.header(ai_memory_hooks::CLIENT_MARKER_HEADER, CLI_CLIENT_KIND);
         match &self.auth_token {
             Some(t) => req.bearer_auth(t),
             None => req,
@@ -432,6 +438,15 @@ pub(crate) fn augment_connect_error(
     }
 }
 
+/// Whether a request failed because nothing answered — a refused connection
+/// or a timeout — rather than because the server answered with an error.
+pub(crate) fn server_unreachable(err: &anyhow::Error) -> bool {
+    let answered = err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some());
+    !answered && err.chain().any(error_chain_indicates_no_answer)
+}
+
 /// Whether an error chain means "nothing answered at the transport
 /// layer": reqwest classified it as a connect-phase or timeout failure,
 /// or a `ConnectionRefused`/`TimedOut` io::Error — or its platform
@@ -558,6 +573,24 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn only_an_unanswered_request_is_unreachable() {
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("HTTP request to http://127.0.0.1:1/admin/status failed");
+        assert!(server_unreachable(&refused));
+        let answered = server_response_error_for_test(
+            reqwest::Method::GET,
+            "/admin/status",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "down for maintenance".to_owned(),
+        );
+        assert!(!server_unreachable(&answered));
+        assert!(!server_unreachable(&anyhow::anyhow!(
+            "malformed response body"
+        )));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -822,7 +855,7 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn authenticate_no_token_leaves_request_unchanged() {
+    fn authenticate_no_token_sets_only_the_client_marker() {
         let ep = ServerEndpoint::from_pair(None, None);
         let client = reqwest::Client::new();
         // Build a request, authenticate it, then build to inspect.
@@ -834,6 +867,14 @@ mod tests {
         assert!(
             req.headers().get("authorization").is_none(),
             "no Authorization header expected"
+        );
+        // An unauthenticated server reached by a LAN name refuses a handoff
+        // fetch without the marker, so every CLI request carries it.
+        assert_eq!(
+            req.headers()
+                .get(ai_memory_hooks::CLIENT_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("cli")
         );
     }
 

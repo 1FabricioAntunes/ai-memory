@@ -67,6 +67,11 @@ A reviewed decision record kept in the repository (an ADR directory, a Keep the 
 decisions there under the project's convention; ai-memory keeps recall, handoffs and
 session history and does not duplicate that record as a page.
 
+Cross-project messaging exists: `memory_message_send` is the ONLY way to
+reach another project's inbox (send a report, notify, leave a message for
+that project's agent). A wiki page written into the target project is NOT a
+message and is never surfaced as one.
+
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
 and reports that active stream without per-hit RRF details. The installed
@@ -101,13 +106,16 @@ install or refresh work.
 If you're about to write a durable project rule ("always X", "never
 Y", "all PRs must ..."), write it in the project's canonical agent instruction file.
 Many projects use CLAUDE.md for Claude Code and
-AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
+AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code / GitHub Copilot CLI / Muse Code,
 but if the project says one file is canonical, use that file.
 
-Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
-where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
-line. Without it a rule written to `AGENTS.md` is absent from context at
-session start and reaches Claude Code only if the agent opens the file.
+Claude Code 2.1.277 and later reads `AGENTS.md` only when no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` exists in the working directory or
+any directory above it; when one does, it reads that file instead. In a
+project where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md`
+import line so sessions that read only `CLAUDE.md` (older Claude Code, the
+AGENTS.md plugin disabled, the `claude-md` Project instructions setting, or a
+developer's own `CLAUDE.local.md`) load the same rules at session start.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -123,7 +131,7 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
+  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code / Copilot CLI / Muse Code -> `AGENTS.md`),
   uses its Write / Edit tool to replace or append the returned
   `markered_block` while preserving
   non-ai-memory user content, then writes or updates each returned
@@ -158,6 +166,8 @@ Lifecycle hooks automatically capture sanitized, bounded prompt and tool-lifecyc
 Do not manually record routine session activity. Write durable memory only when the user explicitly asks to remember or permanently annotate something. For time-bounded memory, set `expires_at`; expired pages are hidden from normal reads and removed by the next forget sweep, and TTL takes precedence over `pinned`.
 
 ai-memory is the cross-harness memory of record for durable project knowledge. Do not duplicate the same durable project facts in harness-local memory stores that other agents cannot see.
+
+`memory_message_send` is the only path into another project's inbox (send a report, notify, leave a message for that project's agent); a wiki page written there is not a message and is never surfaced as one.
 
 ### Retrieval and trust
 
@@ -296,6 +306,42 @@ mod tests {
         assert!(COMPACT_SNIPPET_BODY.contains("Session-aware clients"));
         assert!(COMPACT_SNIPPET_BODY.contains("Static clients"));
         assert!(COMPACT_SNIPPET_BODY.contains("omit `workspace`, `project`, and `cwd`"));
+    }
+
+    #[test]
+    fn snippet_does_not_claim_claude_code_ignores_agents_md() {
+        assert!(
+            !SNIPPET_BODY.contains("does not read `AGENTS.md`"),
+            "Claude Code 2.1.277+ reads AGENTS.md when no CLAUDE.md exists"
+        );
+        assert!(
+            !COMPACT_SNIPPET_BODY.contains("does not read `AGENTS.md`"),
+            "compact snippet must not repeat the stale CLAUDE.md-only claim"
+        );
+    }
+
+    #[test]
+    fn snippet_describes_claude_code_agents_md_fallback() {
+        assert!(
+            SNIPPET_BODY.contains("2.1.277"),
+            "full snippet should name the Claude Code version that reads AGENTS.md"
+        );
+        assert!(
+            SNIPPET_BODY.contains("reads `AGENTS.md` only when"),
+            "full snippet should state the no-CLAUDE.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("`CLAUDE.local.md`"),
+            "a CLAUDE.local.md also blocks the AGENTS.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("`.claude/CLAUDE.md`"),
+            "a .claude/CLAUDE.md also blocks the AGENTS.md fallback"
+        );
+        assert!(
+            SNIPPET_BODY.contains("the `claude-md` Project instructions"),
+            "name Claude Code's real setting, not an invented mode"
+        );
     }
 
     #[test]

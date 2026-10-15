@@ -9,10 +9,13 @@ pub mod active_project;
 pub mod actor;
 pub mod agent_backup;
 pub mod error;
+pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod latency;
+pub use latency::{LatencyHistogram, LatencySnapshot, LatencyTimer};
 pub mod log_ledger;
 pub mod message;
 pub mod observation;
@@ -23,7 +26,9 @@ pub mod repository_identity;
 pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
-pub use scaffolding::{looks_like_markup_block, looks_like_scaffolding};
+pub use scaffolding::{
+    looks_like_codex_instructions, looks_like_markup_block, looks_like_scaffolding,
+};
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod slots;
@@ -51,9 +56,9 @@ pub use active_project::{
     DEFAULT_PER_KEY_TTL, MidSessionRouting, ReadPointer,
 };
 pub use actor::{
-    ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey, OwnerFilter,
-    SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
-    skip_admission_chain_for,
+    ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey,
+    LegacyBrowserAuth, OwnerFilter, SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp,
+    parse_skip_admission_chain, skip_admission_chain_for,
 };
 pub use agent_backup::{
     AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
