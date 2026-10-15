@@ -237,6 +237,9 @@ version in [`docs/changelog/`](docs/changelog/):
   version committed is dropped from the git index, never from disk, by the next
   checkpoint. Existing history keeps its old blobs; `docs/lifecycle-ops.md`
   explains how an operator can rewrite it. (#1318)
+- Fixed source-built Docker images failing after the plugin renderer began
+  embedding the project license. The builder now copies `LICENSE` before
+  compiling, and the packaging test guards that compile-time input.
 
 ## [3.0.0] - 2026-10-13
 
