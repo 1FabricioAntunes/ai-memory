@@ -24,6 +24,9 @@
 //! `--yes` the plan is shown first and confirmed on a terminal; with no
 //! terminal to ask on, `setup` changes nothing and exits non-zero.
 
+mod connections;
+mod presentation;
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
@@ -38,8 +41,8 @@ use super::{
     agent_plugins, doctor, init, install_hooks, install_mcp, install_skills, run_autowire,
 };
 use crate::cli::{
-    AgentChoice, DoctorArgs, HookInstallScope, InitArgs, InstallHooksArgs, InstallMcpArgs,
-    InstallSkillsAgent, InstallSkillsArgs, InstallSkillsScope, McpClient, SetupArgs,
+    AgentChoice, HookInstallScope, InitArgs, InstallHooksArgs, InstallMcpArgs, InstallSkillsAgent,
+    InstallSkillsArgs, InstallSkillsScope, McpClient, SetupArgs,
 };
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, ServerProbe, probe_server};
@@ -200,7 +203,13 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         detected: args.agents.is_empty(),
     };
 
-    print_plan(&plan);
+    print!(
+        "{}",
+        presentation::plan(
+            &plan,
+            &crate::terminal::Terminal::stdout(&config.runtime_env)
+        )
+    );
     if !args.yes {
         confirm()?;
     }
@@ -366,63 +375,6 @@ fn plan_service(
     }
 }
 
-fn print_plan(plan: &SetupPlan) {
-    println!("ai-memory setup will:");
-    if plan.fresh {
-        println!(
-            "  - create the data dir {} and write {} (with a new root bearer token in \
-             auth-tokens/default when the data dir is new)",
-            plan.data_dir.display(),
-            plan.config_path.display()
-        );
-    } else {
-        println!(
-            "  - keep the existing install at {} ({})",
-            plan.data_dir.display(),
-            plan.config_path.display()
-        );
-    }
-    match &plan.service {
-        ServicePlan::Install(unit) => println!(
-            "  - install and start a {} at {}",
-            unit.manager.describe(),
-            unit.path.display()
-        ),
-        ServicePlan::Skip(reason) => println!("  - service: {reason}"),
-    }
-    if plan.agents.is_empty() {
-        println!(
-            "  - wire no agent: none {}; name one with --agent <name>",
-            if plan.detected {
-                "was detected"
-            } else {
-                "was named"
-            }
-        );
-    }
-    for agent in &plan.agents {
-        let name = agent.agent.kind().as_str();
-        if agent.plugin {
-            println!(
-                "  - leave {name} to its enabled ai-memory plugin ({}), which carries the \
-                 hooks, MCP entry and skills",
-                agent_plugins::PLUGIN_ID
-            );
-            continue;
-        }
-        let mcp = if agent.mcp.is_some() {
-            "MCP + hooks"
-        } else {
-            "hooks"
-        };
-        println!(
-            "  - wire {name}{}: {mcp} + skills",
-            if plan.detected { " (detected)" } else { "" }
-        );
-    }
-    println!("  - check /healthz, memory_status and doctor (read-only)");
-}
-
 /// Ask on a terminal; refuse without one.
 fn confirm() -> Result<()> {
     if !std::io::stdin().is_terminal() {
@@ -456,8 +408,9 @@ async fn execute(
 ) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
 
-    println!("\n== init");
-    let outcome = init::initialize(config, &InitArgs { force: false }, config_path)?;
+    let terminal = crate::terminal::Terminal::stdout(&config.runtime_env);
+    print!("{}", terminal.section("Installing"));
+    let outcome = init::initialize(config, &InitArgs { force: false }, config_path, false)?;
     let mut config = config.clone();
     if let Some(token) = outcome.root_token
         && config.auth.bearer_token.is_none()
@@ -465,31 +418,33 @@ async fn execute(
         config.auth.adopt_token_file(token.path, token.token);
     }
     println!(
-        "config: {} {}",
-        if outcome.config_written {
-            "wrote"
-        } else {
-            "kept"
-        },
-        outcome.config_path.display()
+        "{}",
+        terminal.paint(&format!(
+            "  ✓ Storage {}",
+            if outcome.config_written {
+                "initialized"
+            } else {
+                "preserved"
+            }
+        ))
     );
-
-    println!("\n== service");
     let mut wait_for_server = false;
     match &plan.service {
-        ServicePlan::Skip(reason) => println!("service: {reason}"),
+        ServicePlan::Skip(reason) => println!("  · Service: {reason}"),
         ServicePlan::Install(unit) => match user_service::install(unit, runner) {
             Ok(change) => {
                 wait_for_server = change != ServiceChange::Unchanged;
                 println!(
-                    "service: {} {}",
-                    match change {
-                        ServiceChange::Installed => "installed and started",
-                        ServiceChange::Updated => "updated and restarted",
-                        ServiceChange::Started => "started",
-                        ServiceChange::Unchanged => "already running from",
-                    },
-                    unit.path.display()
+                    "{}",
+                    terminal.paint(&format!(
+                        "  ✓ Background service {}",
+                        match change {
+                            ServiceChange::Installed => "installed and started",
+                            ServiceChange::Updated => "updated and restarted",
+                            ServiceChange::Started => "started",
+                            ServiceChange::Unchanged => "already running",
+                        }
+                    ))
                 );
             }
             Err(error) => problems.push(format!(
@@ -499,7 +454,14 @@ async fn execute(
         },
     }
     let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
-    if wait_for_server && !wait_until_reachable(&endpoint, ready_timeout).await {
+    if wait_for_server
+        && !terminal
+            .waiting(
+                "Waiting for the background service",
+                wait_until_reachable(&endpoint, ready_timeout),
+            )
+            .await
+    {
         problems.push(format!(
             "service: the server did not answer at {} within {}s",
             endpoint.url,
@@ -507,32 +469,72 @@ async fn execute(
         ));
     }
 
-    let mut skills_done = BTreeSet::new();
-    for agent in &plan.agents {
-        println!("\n== {}", agent.agent.kind().as_str());
-        for problem in wire_agent(&config, *agent, &mut skills_done) {
-            problems.push(format!("{}: {problem}", agent.agent.kind().as_str()));
-        }
-    }
+    problems.extend(connections::run(&config, &plan.agents, &terminal));
 
-    println!("\n== self-check");
+    print!("{}", terminal.section("Checking connections"));
     for problem in self_check(&config, &endpoint).await {
         problems.push(format!("self-check: {problem}"));
     }
 
-    println!();
-    if config.auth.bearer_token.is_none() {
-        println!("auth: none (loopback); run `ai-memory auth enable` to require a bearer token");
+    let agents: Vec<_> = plan
+        .agents
+        .iter()
+        .map(|agent| agent.agent.kind().as_str())
+        .collect();
+    let diagnostics = match terminal
+        .waiting(
+            "Checking agent readiness",
+            doctor::setup_diagnostics(&config, &agents),
+        )
+        .await
+    {
+        Ok(report) => Some(report),
+        Err(error) => {
+            problems.push(format!("doctor: {error:#}"));
+            None
+        }
+    };
+    let (title, tone) = if !problems.is_empty() {
+        ("Installation incomplete", crate::terminal::Tone::Bad)
+    } else if diagnostics
+        .as_ref()
+        .is_some_and(|report| report.action_required)
+        || plan.agents.is_empty()
+    {
+        (
+            "Installation complete · Action required",
+            crate::terminal::Tone::Warn,
+        )
     } else {
-        println!("auth: bearer token (owner-only file; never printed)");
-    }
-    if let Some(hint) = web_sign_in_hint(&config, &endpoint) {
-        println!("{hint}");
+        (
+            "Installation complete · Restart your agents",
+            crate::terminal::Tone::Good,
+        )
+    };
+    print!(
+        "{}",
+        presentation::finish(
+            &terminal,
+            title,
+            tone,
+            diagnostics.as_ref().map(|report| report.text.as_str()),
+            !problems.is_empty(),
+            &config,
+            &endpoint,
+            &outcome.config_path
+        )
+    );
+    if plan.agents.is_empty() {
+        print!(
+            "{}",
+            terminal.notice(
+                crate::terminal::Tone::Warn,
+                "NO AGENTS CONNECTED",
+                "Re-run setup with --agent <name>."
+            )
+        );
     }
     if problems.is_empty() {
-        println!(
-            "ai-memory is set up. Restart your agents so they load the new hooks and MCP entry."
-        );
         return Ok(());
     }
     for problem in &problems {
@@ -547,6 +549,7 @@ async fn execute(
 /// How a browser signs in to the web UI on a token-file install. With no
 /// human accounts the server answers `/web` with a Basic challenge, and the
 /// token file's contents are the password. The token itself is never printed.
+#[cfg(test)]
 fn web_sign_in_hint(config: &Config, endpoint: &ServerEndpoint) -> Option<String> {
     let file = config.auth.token_file.as_ref().filter(|file| file.loaded)?;
     Some(format!(
@@ -575,24 +578,24 @@ async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> b
 /// first so an OpenCode major-version move has one entry before the hook
 /// installer reads it (the order `ai-memory run` auto-wire uses). Returns the
 /// failures.
-fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<String>) -> Vec<String> {
+fn wire_agent(
+    config: &Config,
+    plan: AgentPlan,
+    skills_done: &mut BTreeSet<String>,
+    report: &mut connections::AgentReport,
+) -> Vec<String> {
     let mut problems = Vec::new();
     if plan.plugin {
         // Writing the settings-file wiring as well would load every skill
         // twice and register a second MCP server; the hook copies would be
         // de-duplicated, but nothing would be gained.
-        println!(
-            "plugin: {} is enabled; leaving the settings-file hooks, MCP entry and skills \
-             alone (run `ai-memory install-hooks --agent {} --apply` to add them anyway)",
-            agent_plugins::PLUGIN_ID,
-            plan.agent.kind().as_str()
-        );
+        report.plugin(plan.agent);
         return problems;
     }
     let dialect = opencode_dialect(plan.agent);
     if let Some(client) = plan.mcp {
         if install_mcp::existing_entry_is_session_aware(client, None, ENTRY_NAME) {
-            println!("mcp: keeping the existing session-aware entry");
+            report.message("MCP", "Keeping the existing session-aware entry".to_owned());
         } else {
             let args = InstallMcpArgs {
                 client,
@@ -607,7 +610,9 @@ fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<Strin
                 stdio_bridge: false,
                 bridge_data_dir: None,
             };
-            if let Err(error) = install_mcp::run_with_opencode_dialect(config, args, dialect) {
+            if let Err(error) = report.collect("MCP", || {
+                install_mcp::run_with_opencode_dialect(config, args, dialect)
+            }) {
                 problems.push(format!("install-mcp: {error:#}"));
             }
         }
@@ -628,9 +633,9 @@ fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<Strin
         capture_prompts: false,
         profile: None,
     };
-    if let Err(error) =
+    if let Err(error) = report.collect("Hooks", || {
         install_hooks::run_with_opencode_dialect_and_mcp_path(config, hooks, dialect, None)
-    {
+    }) {
         problems.push(format!("install-hooks: {error:#}"));
     }
     let skills_key = format!("{:?}", plan.skills);
@@ -642,8 +647,12 @@ fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<Strin
             print: false,
             force: false,
         };
-        if let Err(error) = install_skills::run(config, args) {
+        if let Err(error) = install_skills::prepare_install(&args, &config.runtime_env)
+            .and_then(install_skills::run_prepared_quiet)
+        {
             problems.push(format!("install-skills: {error:#}"));
+        } else {
+            report.message("Skills", "installed".to_owned());
         }
     }
     problems
@@ -654,13 +663,21 @@ fn wire_agent(config: &Config, plan: AgentPlan, skills_done: &mut BTreeSet<Strin
 async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
     let mut problems = Vec::new();
     let healthz = endpoint.build_url("/healthz");
-    match reqwest::Client::new()
-        .get(&healthz)
-        .timeout(Duration::from_secs(5))
-        .send()
+    let terminal = crate::terminal::Terminal::stdout(&config.runtime_env);
+    match terminal
+        .waiting(
+            "Checking server connection",
+            reqwest::Client::new()
+                .get(&healthz)
+                .timeout(Duration::from_secs(5))
+                .send(),
+        )
         .await
     {
-        Ok(response) if response.status().is_success() => println!("healthz: ok ({healthz})"),
+        Ok(response) if response.status().is_success() => println!(
+            "{}",
+            crate::terminal::Terminal::stdout(&config.runtime_env).paint("  ✓ Server responding")
+        ),
         Ok(response) => problems.push(format!("{healthz} answered {}", response.status())),
         Err(error) => {
             problems.push(format!("{healthz} did not answer: {error}"));
@@ -668,18 +685,16 @@ async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
             return problems;
         }
     }
-    match memory_status(config).await {
-        Ok(()) => println!("memory_status: ok"),
+    match terminal
+        .waiting("Checking authenticated memory API", memory_status(config))
+        .await
+    {
+        Ok(()) => println!(
+            "{}",
+            crate::terminal::Terminal::stdout(&config.runtime_env)
+                .paint("  ✓ Memory API responding")
+        ),
         Err(error) => problems.push(format!("memory_status: {error:#}")),
-    }
-    let doctor = DoctorArgs {
-        workspace: None,
-        project: None,
-        since_days: 30,
-        json: false,
-    };
-    if let Err(error) = doctor::run(config, doctor).await {
-        problems.push(format!("doctor: {error:#}"));
     }
     problems
 }

@@ -29,6 +29,7 @@ mod logging;
 mod marker;
 mod process_guard;
 mod server_profiles;
+mod terminal;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -75,7 +76,14 @@ pub async fn run() -> Result<()> {
     } else {
         logging::DegradeWarnings::Quiet
     };
-    let _logging_guard = logging::init(&config, degrade_warnings)?;
+    let _logging_guard = if matches!(
+        command,
+        Command::Setup(_) | Command::Doctor(_) | Command::Status(_)
+    ) {
+        logging::init_for_console(&config, degrade_warnings, true)?
+    } else {
+        logging::init(&config, degrade_warnings)?
+    };
 
     info!(
         version = env!("CARGO_PKG_VERSION"),

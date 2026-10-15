@@ -64,6 +64,7 @@ pub mod init;
 pub mod install_hooks;
 pub mod install_instructions;
 pub mod install_mcp;
+pub(crate) mod install_output;
 pub mod install_skills;
 pub mod lint;
 pub mod list_projects;

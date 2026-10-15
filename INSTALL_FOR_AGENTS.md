@@ -47,3 +47,6 @@ Afterwards:
   no service step there.
 
 Full reference: [`docs/install.md`](docs/install.md#one-step-native-install-installsh--ai-memory-setup).
+
+For the final summary, hook approval, first-capture checks, and terminal output,
+see [First-run checks](docs/first-run.md).

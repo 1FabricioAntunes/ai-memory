@@ -23,8 +23,10 @@ use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde_json::json;
 
+use super::install_output::{eprintln, println};
+
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
-use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
+use crate::commands::apply_shared::{apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::commands::render_shared::{bearer_header_value, yaml_single_quote};
 use crate::config::{Config, DEFAULT_MCP_URL};
@@ -970,34 +972,7 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
             mutate_json(existing, |root| upsert_json_mcp_entry(root, args))
         })?,
     };
-    println!(
-        "✓ {} {} ({})",
-        outcome.verb(),
-        path.display(),
-        match outcome {
-            ApplyOutcome::Created => "new file",
-            ApplyOutcome::Updated => "backup written next to it",
-            ApplyOutcome::NoOp => "already up to date",
-        }
-    );
-    if matches!(args.client, McpClient::PrimeAgent)
-        && (args.auth_token.is_some() || args.token_env_var)
-    {
-        println!(
-            "  Prime Agent reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch prime-agent."
-        );
-    }
-    if matches!(args.client, McpClient::Droid) && (args.auth_token.is_some() || args.token_env_var)
-    {
-        println!(
-            "  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect."
-        );
-    }
-    if matches!(args.client, McpClient::Codex) && args.token_env_var {
-        println!(
-            "  Codex reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex."
-        );
-    }
+    super::install_output::mcp_applied(args, &path, outcome, PRIME_AGENT_TOKEN_ENV);
     Ok(())
 }
 

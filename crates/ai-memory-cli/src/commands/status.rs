@@ -4,10 +4,13 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+mod presentation;
+
 use ai_memory_core::fix_lines;
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 
 use super::hook_spool::{SpoolHealth, spool_dir, spool_health};
 use crate::cli::StatusArgs;
@@ -242,6 +245,14 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     let report: Report = match get_json::<Report>(&ep, "/admin/status", &[]).await {
         Ok(report) => report,
         Err(err) => {
+            if !args.json {
+                let terminal = crate::terminal::Terminal::stdout(&config.runtime_env);
+                eprint!(
+                    "{}",
+                    terminal.header("STATUS / connection unavailable", env!("CARGO_PKG_VERSION"))
+                );
+                eprint!("{}", terminal.notice(crate::terminal::Tone::Bad, "SERVER UNREACHABLE", &format!("No response from {}.\nLocal queue information follows; start the server before retrying.",ep.url)));
+            }
             report_offline_spool(&spool, args.json);
             report_offline_recovery_hint(config, &spool, args.json);
             return Err(err);
@@ -269,181 +280,22 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             ))?
         );
     } else {
-        println!("ai-memory {} (server)", report.version);
-        println!("  server:       {}", ep.url);
-        println!("  data-dir:     {}", report.data_dir);
-        println!("  db:           {}", report.db_path);
-        println!("  bind:         {}", report.bind);
-        println!("  auth:         {}", auth_posture.line());
-        println!(
-            "  pages:        {} (all versions: {})",
-            report.counts.pages_latest, report.counts.pages_all
+        let details = details(
+            &report,
+            &spool,
+            journal_pending,
+            journal_degraded,
+            journal_finish_failed,
+            &journal_error,
+            capture_mode,
+            &ep,
+            auth_posture,
         );
-        println!("  sessions:     {}", report.counts.sessions);
-        println!("  observations: {}", report.counts.observations);
-        println!(
-            "  fts:          pages {}/{}; observations {}/{}",
-            report.derived.pages_fts_rows,
-            report.derived.pages_rows,
-            report.derived.observations_fts_rows,
-            report.derived.observations_rows
+        let terminal = crate::terminal::Terminal::stdout(&config.runtime_env);
+        print!(
+            "{}",
+            presentation::render(&terminal, &report, &spool, &ep, &details)
         );
-        println!(
-            "  embeddings:   {} rows; {} latest pages missing",
-            report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
-        );
-        if report.derived.latest_pages_unembeddable > 0 {
-            println!(
-                "    unembeddable: {} (empty body; no embedder can cover these)",
-                report.derived.latest_pages_unembeddable
-            );
-        }
-        for triple in &report.derived.embedding_triples {
-            println!(
-                "    {}/{} dim {}: {} rows",
-                triple.provider, triple.model, triple.dim, triple.count
-            );
-        }
-        // Only shown when there is something to act on. A recovered count with
-        // no outstanding failures is history, not a problem.
-        if report.derived.embed_failures_unresolved > 0 {
-            println!(
-                "    embed failures: {} unresolved ({} recovered since)",
-                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
-            );
-        }
-        // The figure that makes a `compact` decision possible. Reported
-        // always, so "should I VACUUM?" has an answer other than a guess; the
-        // advisory line only appears once it is worth the exclusive lock.
-        if report.storage.database_bytes > 0 {
-            let pct = (report.storage.reclaimable_bytes as f64
-                / report.storage.database_bytes as f64)
-                * 100.0;
-            println!(
-                "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
-                super::compact::human_bytes(report.storage.database_bytes),
-                super::compact::human_bytes(report.storage.reclaimable_bytes),
-            );
-            if let Some(free) = report.storage.data_dir_free_bytes {
-                println!("    filesystem free: {}", super::compact::human_bytes(free));
-            }
-            if fix_lines::reclaim_advised(
-                report.storage.reclaimable_bytes,
-                report.storage.database_bytes,
-            ) {
-                println!(
-                    "    `{}` would return it (blocks writes while it runs)",
-                    fix_lines::COMPACT
-                );
-            }
-        }
-        println!(
-            "  links:        {} latest-page links (unresolved: {}, stale: {})",
-            report.derived.links_from_latest_pages,
-            report.derived.unresolved_links_from_latest_pages,
-            report.derived.stale_links_from_latest_pages
-        );
-        if !report.derived.typed_links_from_latest_pages.is_empty() {
-            let typed: Vec<String> = report
-                .derived
-                .typed_links_from_latest_pages
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect();
-            println!("    typed edges: {}", typed.join(", "));
-        }
-        if let Some(wiki) = &report.wiki_format {
-            let migrated = if wiki.okf_migrated {
-                "OKF v0.2 (migrated)"
-            } else {
-                "OKF v0.2 (native, no migration needed)"
-            };
-            match (&wiki.backup_archive, wiki.backup_archive_bytes) {
-                (Some(path), Some(bytes)) => println!(
-                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
-                     {path} ({})",
-                    super::compact::human_bytes(bytes)
-                ),
-                _ => println!("  wiki format:  {migrated}"),
-            }
-        }
-        if let Some((queued, capacity)) = report.write_queue {
-            // A queue pinned near capacity is the wedged-writer signal.
-            if queued > 0 {
-                println!("  write queue:  {queued}/{capacity}");
-            }
-        }
-        println!("  spool:");
-        println!("    pending:    {}", spool.pending);
-        println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
-        println!("    retries:    {}", spool.retries_total);
-        if journal_pending > 0 || journal_error.is_some() {
-            println!("  recovery:");
-            println!(
-                "    journal:    {journal_pending} pending ({journal_degraded} degraded, {journal_finish_failed} finish-failed)"
-            );
-            if let Some(error) = &journal_error {
-                println!("    error:      {error}");
-            }
-            println!("    action:     run `{}`", fix_lines::RECOVER);
-        }
-        if let Some(ingest) = &report.ingest {
-            println!("  ingest (server, this process):");
-            println!("    accepted:   {}", ingest.accepted);
-            println!(
-                "    dropped:    {} (capture policy)",
-                ingest.dropped_by_policy
-            );
-            println!(
-                "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
-                ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
-            );
-            println!(
-                "    drops:      {} unauthorized, {} collision, {} invalid",
-                ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
-            );
-            println!(
-                "    shed:       {} saturated, {} rate-limited",
-                ingest.shed_saturated, ingest.shed_rate_limited
-            );
-            println!(
-                "    last write: {}",
-                last_write_line(ingest.last_persisted_ms)
-            );
-        }
-        // #446 + #428 interact here: under allowlist mode an unmarked
-        // repository never sends, so zero counters read exactly like a broken
-        // install. Deliberately outside the ingest block above: the mode is a
-        // client-side fact, and an older server returns no ingest section at
-        // all — which is precisely a case where the operator needs telling.
-        if capture_mode == "allowlist" {
-            println!(
-                "  capture mode: allowlist — repositories without a \
-                 .ai-memory.toml marker send nothing"
-            );
-        }
-        println!("  providers:");
-        println!(
-            "    llm:       {}",
-            provider_health_line(&report.providers.llm)
-        );
-        println!(
-            "    embedding: {}",
-            provider_health_line(&report.providers.embedding)
-        );
-        if report.providers.llm.status == ProviderHealthStatus::Error
-            && let Some(hint) = &report.providers.llm.retry_hint
-        {
-            println!("    retry:     {hint}");
-        }
-        // Only present when `llm_fallbacks` is configured — an older server
-        // or a plain single-provider setup reports an empty list.
-        if !report.providers.llm_candidates.is_empty() {
-            println!("    fallback chain:");
-            for candidate in &report.providers.llm_candidates {
-                println!("      {}", fallback_candidate_line(candidate));
-            }
-        }
     }
     Ok(())
 }
@@ -573,6 +425,227 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
     } else {
         parts.join("; ")
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn details(
+    report: &Report,
+    spool: &SpoolHealth,
+    journal_pending: usize,
+    journal_degraded: usize,
+    journal_finish_failed: usize,
+    journal_error: &Option<String>,
+    capture_mode: &str,
+    ep: &ServerEndpoint,
+    auth_posture: crate::local_auth::AuthPosture,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "ai-memory {} (server)", report.version);
+    let _ = writeln!(out, "  server:       {}", ep.url);
+    let _ = writeln!(out, "  data-dir:     {}", report.data_dir);
+    let _ = writeln!(out, "  db:           {}", report.db_path);
+    let _ = writeln!(out, "  bind:         {}", report.bind);
+    let _ = writeln!(out, "  auth:         {}", auth_posture.line());
+    let _ = writeln!(
+        out,
+        "  pages:        {} (all versions: {})",
+        report.counts.pages_latest, report.counts.pages_all
+    );
+    let _ = writeln!(out, "  sessions:     {}", report.counts.sessions);
+    let _ = writeln!(out, "  observations: {}", report.counts.observations);
+    let _ = writeln!(
+        out,
+        "  fts:          pages {}/{}; observations {}/{}",
+        report.derived.pages_fts_rows,
+        report.derived.pages_rows,
+        report.derived.observations_fts_rows,
+        report.derived.observations_rows
+    );
+    let _ = writeln!(
+        out,
+        "  embeddings:   {} rows; {} latest pages missing",
+        report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
+    );
+    if report.derived.latest_pages_unembeddable > 0 {
+        let _ = writeln!(
+            out,
+            "    unembeddable: {} (empty body; no embedder can cover these)",
+            report.derived.latest_pages_unembeddable
+        );
+    }
+    for triple in &report.derived.embedding_triples {
+        let _ = writeln!(
+            out,
+            "    {}/{} dim {}: {} rows",
+            triple.provider, triple.model, triple.dim, triple.count
+        );
+    }
+    // Only shown when there is something to act on. A recovered count with
+    // no outstanding failures is history, not a problem.
+    if report.derived.embed_failures_unresolved > 0 {
+        let _ = writeln!(
+            out,
+            "    embed failures: {} unresolved ({} recovered since)",
+            report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
+        );
+    }
+    // The figure that makes a `compact` decision possible. Reported
+    // always, so "should I VACUUM?" has an answer other than a guess; the
+    // advisory line only appears once it is worth the exclusive lock.
+    if report.storage.database_bytes > 0 {
+        let pct = (report.storage.reclaimable_bytes as f64 / report.storage.database_bytes as f64)
+            * 100.0;
+        let _ = writeln!(
+            out,
+            "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
+            crate::commands::compact::human_bytes(report.storage.database_bytes),
+            crate::commands::compact::human_bytes(report.storage.reclaimable_bytes),
+        );
+        if let Some(free) = report.storage.data_dir_free_bytes {
+            let _ = writeln!(
+                out,
+                "    filesystem free: {}",
+                crate::commands::compact::human_bytes(free)
+            );
+        }
+        if fix_lines::reclaim_advised(
+            report.storage.reclaimable_bytes,
+            report.storage.database_bytes,
+        ) {
+            let _ = writeln!(
+                out,
+                "    `{}` would return it (blocks writes while it runs)",
+                fix_lines::COMPACT
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  links:        {} latest-page links (unresolved: {}, stale: {})",
+        report.derived.links_from_latest_pages,
+        report.derived.unresolved_links_from_latest_pages,
+        report.derived.stale_links_from_latest_pages
+    );
+    if !report.derived.typed_links_from_latest_pages.is_empty() {
+        let typed: Vec<String> = report
+            .derived
+            .typed_links_from_latest_pages
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect();
+        let _ = writeln!(out, "    typed edges: {}", typed.join(", "));
+    }
+    if let Some(wiki) = &report.wiki_format {
+        let migrated = if wiki.okf_migrated {
+            "OKF v0.2 (migrated)"
+        } else {
+            "OKF v0.2 (native, no migration needed)"
+        };
+        match (&wiki.backup_archive, wiki.backup_archive_bytes) {
+            (Some(path), Some(bytes)) => {
+                let _ = writeln!(
+                    out,
+                    "  wiki format:  {migrated}; pre-migration backup still on disk: \
+             {path} ({})",
+                    crate::commands::compact::human_bytes(bytes)
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "  wiki format:  {migrated}");
+            }
+        }
+    }
+    if let Some((queued, capacity)) = report.write_queue {
+        // A queue pinned near capacity is the wedged-writer signal.
+        if queued > 0 {
+            let _ = writeln!(out, "  write queue:  {queued}/{capacity}");
+        }
+    }
+    let _ = writeln!(out, "  spool:");
+    let _ = writeln!(out, "    pending:    {}", spool.pending);
+    let _ = writeln!(
+        out,
+        "    oldest:     {}",
+        spool_age_line(spool.oldest_age_ms)
+    );
+    let _ = writeln!(out, "    retries:    {}", spool.retries_total);
+    if journal_pending > 0 || journal_error.is_some() {
+        let _ = writeln!(out, "  recovery:");
+        let _ = writeln!(
+            out,
+            "    journal:    {journal_pending} pending ({journal_degraded} degraded, {journal_finish_failed} finish-failed)"
+        );
+        if let Some(error) = &journal_error {
+            let _ = writeln!(out, "    error:      {error}");
+        }
+        let _ = writeln!(out, "    action:     run `{}`", fix_lines::RECOVER);
+    }
+    if let Some(ingest) = &report.ingest {
+        let _ = writeln!(out, "  ingest (server, this process):");
+        let _ = writeln!(out, "    accepted:   {}", ingest.accepted);
+        let _ = writeln!(
+            out,
+            "    dropped:    {} (capture policy)",
+            ingest.dropped_by_policy
+        );
+        let _ = writeln!(
+            out,
+            "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
+            ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
+        );
+        let _ = writeln!(
+            out,
+            "    drops:      {} unauthorized, {} collision, {} invalid",
+            ingest.dropped_unauthorized, ingest.dropped_collision, ingest.dropped_invalid
+        );
+        let _ = writeln!(
+            out,
+            "    shed:       {} saturated, {} rate-limited",
+            ingest.shed_saturated, ingest.shed_rate_limited
+        );
+        let _ = writeln!(
+            out,
+            "    last write: {}",
+            last_write_line(ingest.last_persisted_ms)
+        );
+    }
+    // #446 + #428 interact here: under allowlist mode an unmarked
+    // repository never sends, so zero counters read exactly like a broken
+    // install. Deliberately outside the ingest block above: the mode is a
+    // client-side fact, and an older server returns no ingest section at
+    // all — which is precisely a case where the operator needs telling.
+    if capture_mode == "allowlist" {
+        let _ = writeln!(
+            out,
+            "  capture mode: allowlist — repositories without a \
+         .ai-memory.toml marker send nothing"
+        );
+    }
+    let _ = writeln!(out, "  providers:");
+    let _ = writeln!(
+        out,
+        "    llm:       {}",
+        provider_health_line(&report.providers.llm)
+    );
+    let _ = writeln!(
+        out,
+        "    embedding: {}",
+        provider_health_line(&report.providers.embedding)
+    );
+    if report.providers.llm.status == ProviderHealthStatus::Error
+        && let Some(hint) = &report.providers.llm.retry_hint
+    {
+        let _ = writeln!(out, "    retry:     {hint}");
+    }
+    // Only present when `llm_fallbacks` is configured — an older server
+    // or a plain single-provider setup reports an empty list.
+    if !report.providers.llm_candidates.is_empty() {
+        let _ = writeln!(out, "    fallback chain:");
+        for candidate in &report.providers.llm_candidates {
+            let _ = writeln!(out, "      {}", fallback_candidate_line(candidate));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -830,5 +903,62 @@ mod tests {
         assert_eq!(spool_age_line(Some(60_000)), "1m 0s");
         assert_eq!(spool_age_line(Some(3_661_000)), "1h 1m");
         assert_eq!(spool_age_line(Some(172_800_000)), "2d 0h");
+    }
+
+    #[test]
+    fn empty_overview_keeps_capture_unverified_and_diagnostics_available() {
+        let report: Report = serde_json::from_value(serde_json::json!({
+            "version":"3.0.0", "data_dir":"/fixture/data", "bind":"127.0.0.1:49374",
+            "db_path":"/fixture/data",
+            "counts":{"pages_latest":0,"pages_all":0,"sessions":0,"observations":0}
+        }))
+        .unwrap();
+        let spool = SpoolHealth::default();
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
+        let terminal = crate::terminal::Terminal::stdout(&Config::default().runtime_env);
+        let details = details(
+            &report,
+            &spool,
+            0,
+            0,
+            0,
+            &None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+        );
+        let text = presentation::render(&terminal, &report, &spool, &endpoint, &details);
+        assert!(text.contains("WAITING FOR YOUR FIRST SESSION"), "{text}");
+        assert!(text.contains("capture has not been verified"), "{text}");
+        for field in [
+            "/fixture/data",
+            "auth:",
+            "none (loopback)",
+            "OPTIONAL MODELS",
+            "fts:",
+            "ai-memory status --json",
+        ] {
+            assert!(text.contains(field), "missing {field}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_evicting_queue_takes_priority_over_the_empty_state() {
+        let report: Report = serde_json::from_value(serde_json::json!({
+            "version":"3.0.0", "data_dir":"/fixture/data", "bind":"127.0.0.1:49374",
+            "db_path":"/fixture/data",
+            "counts":{"pages_latest":0,"pages_all":0,"sessions":0,"observations":0}
+        }))
+        .unwrap();
+        let spool = SpoolHealth {
+            pending: 4,
+            capacity: 3,
+            ..SpoolHealth::default()
+        };
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
+        let terminal = crate::terminal::Terminal::stdout(&Config::default().runtime_env);
+        let text = presentation::render(&terminal, &report, &spool, &endpoint, "");
+        assert!(text.contains("CAPTURE NEEDS ATTENTION"), "{text}");
+        assert!(!text.contains("WAITING FOR YOUR FIRST SESSION"), "{text}");
     }
 }

@@ -112,9 +112,9 @@ fn setup_without_yes_and_without_a_terminal_changes_nothing() {
     let out = sandbox.cmd(Some(port)).arg("setup").output().unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("ai-memory setup will:"), "{}", text(&out));
+    assert!(stdout.contains("SETUP / connect"), "{}", text(&out));
     assert!(
-        stdout.contains("wire claude-code (detected)"),
+        stdout.contains("Connect claude-code (detected)"),
         "{}",
         text(&out)
     );
@@ -268,8 +268,8 @@ esac
         let first = setup(&sandbox, &service, port, &["--yes"]);
         assert!(first.status.success(), "{}", text(&first));
         let stdout = String::from_utf8_lossy(&first.stdout);
-        assert!(stdout.contains("healthz: ok"), "{}", text(&first));
-        assert!(stdout.contains("memory_status: ok"), "{}", text(&first));
+        assert!(stdout.contains("Server responding"), "{}", text(&first));
+        assert!(stdout.contains("Memory API responding"), "{}", text(&first));
 
         let data_dir = sandbox.data_dir();
         let token = std::fs::read_to_string(data_dir.join("auth-tokens/default"))
@@ -470,4 +470,5 @@ esac
         assert_eq!(std::fs::read_to_string(&unit_path).unwrap(), foreign);
         assert!(service.calls().is_empty(), "{:?}", service.calls());
     }
+    include!("setup_e2e/first_run.rs");
 }

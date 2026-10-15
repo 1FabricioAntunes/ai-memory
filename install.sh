@@ -31,12 +31,35 @@ set -eu
 
 DEFAULT_RELEASE_BASE="https://github.com/akitaonrails/ai-memory/releases"
 
+# Color is presentation only: redirected output and NO_COLOR stay plain.
+install_color=0
+ui_init() {
+    if [ -t 1 ] && [ "${TERM:-}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then
+        install_color=1
+        printf '\n  \033[1;36m◈ ai-memory\033[0m\n  INSTALL / native release\n'
+        printf '  \033[90m────────────────────────────────────────\033[0m\n\n'
+    fi
+}
+
 say() {
-    printf 'ai-memory install: %s\n' "$*"
+    if [ "$install_color" = 0 ]; then
+        printf 'ai-memory install: %s\n' "$*"
+        return
+    fi
+    case "$*" in
+        downloading*) printf '  \033[1;36m↓\033[0m  %s\n' "$*" ;;
+        next:*) printf '\n  \033[1;36mNEXT\033[0m\n  %s\n\n' "${*#next: }" ;;
+        *'not on PATH'*) printf '  \033[1;33m!\033[0m  %s\n' "$*" ;;
+        *) printf '  \033[1;32m✓\033[0m  %s\n' "$*" ;;
+    esac
 }
 
 die() {
-    printf 'ai-memory install: error: %s\n' "$*" >&2
+    if [ "$install_color" = 1 ] && [ -t 2 ]; then
+        printf '\n  \033[1;31mINSTALLATION STOPPED\033[0m\n  %s\n\n' "$*" >&2
+    else
+        printf 'ai-memory install: error: %s\n' "$*" >&2
+    fi
     exit 1
 }
 
@@ -146,6 +169,7 @@ check_members() {
 }
 
 main() {
+    ui_init
     home="${HOME:-}"
     [ -n "$home" ] || die "HOME is not set"
     bin_dir="${AI_MEMORY_BIN_DIR:-$home/.local/bin}"

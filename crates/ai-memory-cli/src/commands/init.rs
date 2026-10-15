@@ -80,7 +80,11 @@ bearer_token_file = {}
 ///   another way gets a new token at `auth-tokens/default`.
 /// - Anything else, an existing install above all, records nothing and keeps
 ///   the loopback no-auth behaviour it had (`ai-memory auth enable` opts in).
-fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<RecordedBearer>> {
+fn root_bearer_for_new_config(
+    config: &Config,
+    fresh: bool,
+    announce: bool,
+) -> Result<Option<RecordedBearer>> {
     if let Some(raw) = config
         .auth
         .bearer_token_file
@@ -104,11 +108,13 @@ fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<Rec
     let minted =
         crate::local_auth::provision_root_token(&crate::server_profiles::root_token_path(root))?;
     crate::local_auth::seed_hook_credential(root, &minted.token)?;
-    println!(
-        "Generated a root bearer token in {} (owner-only). The server requires it on every \
+    if announce {
+        println!(
+            "Generated a root bearer token in {} (owner-only). The server requires it on every \
          route but /healthz; hooks, the CLI and `ai-memory mcp-bridge` read it from there.",
-        minted.path.display()
-    );
+            minted.path.display()
+        );
+    }
     Ok(Some(RecordedBearer {
         raw: crate::server_profiles::ROOT_TOKEN_RELATIVE.to_owned(),
         token: Some(minted),
@@ -149,7 +155,7 @@ pub(crate) struct InitOutcome {
 /// Returns an error if directories cannot be created or the config file
 /// cannot be written.
 pub fn run(config: &Config, args: InitArgs, config_path: Option<&Path>) -> Result<()> {
-    initialize(config, &args, config_path).map(|_| ())
+    initialize(config, &args, config_path, true).map(|_| ())
 }
 
 /// [`run`], reporting what it did.
@@ -160,6 +166,7 @@ pub(crate) fn initialize(
     config: &Config,
     args: &InitArgs,
     config_path: Option<&Path>,
+    announce: bool,
 ) -> Result<InitOutcome> {
     let root = &config.data_dir;
     let cfg_path = init_config_path(root, config_path);
@@ -198,7 +205,7 @@ pub(crate) fn initialize(
         // (anyhow's `with_context` would conflict), so map manually.
         let pepper = generate_token_hex(TOKEN_PEPPER_BYTES)
             .map_err(|e| anyhow::anyhow!("generating auth token_pepper: {e}"))?;
-        let recorded = root_bearer_for_new_config(config, fresh)?;
+        let recorded = root_bearer_for_new_config(config, fresh, announce)?;
         let bearer_line = recorded
             .as_ref()
             .map(|bearer| render_bearer_token_file_line(&bearer.raw))

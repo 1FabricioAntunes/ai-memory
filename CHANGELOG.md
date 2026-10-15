@@ -12,6 +12,15 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Clarified first-run setup and capture diagnostics: separated installation
+  from hook approval and first-capture verification, stopped recommending
+  reinstalling detected Codex/Claude Code hooks, and kept inactive agents
+  neutral. Summarized skill installation, reduced routine console tracing,
+  and added terminal-aware status colors with `NO_COLOR` support. Added
+  consistent headers, grouped status details, clearer installer results, and
+  a single in-place indicator during setup waits. Grouped setup integration
+  reports while retaining file paths, backups, policy details and agent-specific
+  instructions; standalone installer and JSON output stayed unchanged. (#1313)
 - Fixed the thin-client commands ignoring a custom `bind`, which could write
   into the wrong store. `server_url` defaulted to `http://127.0.0.1:49374`
   and was never derived from `bind`, so `ai-memory --data-dir X status` (and

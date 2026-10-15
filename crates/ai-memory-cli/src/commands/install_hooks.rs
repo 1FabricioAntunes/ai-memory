@@ -14,6 +14,8 @@
 //!   idempotent — a second `--apply` with unchanged content is a no-op
 //!   and produces no backup.
 
+use super::install_output::{eprintln, print, println};
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -766,15 +768,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             | AgentChoice::Pi
             | AgentChoice::Openclaw
     );
-    if generated || local_hook_policy_v1_supported() {
-        eprintln!(
-            "[ai-memory] capture-policy capability v1 enforced by this selected integration; re-run --apply to refresh existing installs."
-        );
-    } else {
-        eprintln!(
-            "[ai-memory] selected shell/PowerShell compatibility path does not enforce capture-policy v1; use a native platform selection or generated integration."
-        );
-    }
+    super::install_output::capture_policy_capability(generated || local_hook_policy_v1_supported());
     // Assistant capture requires a native client-side sanitizer. No
     // silent fallback: bail so an operator on a script-fallback platform or a
     // different agent is told the flag has no effect instead of installing a
@@ -2742,12 +2736,7 @@ fn apply_to_codex_settings_with_payload(
     // hooks on startup; users must explicitly trust them before
     // they fire.
     if !matches!(outcome, ApplyOutcome::NoOp) {
-        println!();
-        println!("Codex requires explicit trust for new hooks. Next time you start `codex`:");
-        println!("  → the TUI will surface 'Hooks need review' for each new event");
-        println!("  → choose 'Trust all and continue' (or trust individually)");
-        println!("To bypass the prompt for automated installs, start with");
-        println!("`codex --dangerously-bypass-hook-trust` (review hook scripts first).");
+        super::install_output::codex_trust_hint();
     }
     Ok(())
 }

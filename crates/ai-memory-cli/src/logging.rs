@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer as _};
 
 use crate::config::Config;
 
@@ -130,6 +130,15 @@ fn default_filter(log_level: &str) -> String {
 /// I/O problems degrade instead of erroring so a read-only filesystem can
 /// never take down a command that would otherwise succeed.
 pub fn init(config: &Config, warnings: DegradeWarnings) -> Result<Option<WorkerGuard>> {
+    init_for_console(config, warnings, false)
+}
+
+/// Keep routine onboarding logs in the file, while preserving warnings and explicit RUST_LOG.
+pub(crate) fn init_for_console(
+    config: &Config,
+    warnings: DegradeWarnings,
+    concise: bool,
+) -> Result<Option<WorkerGuard>> {
     let log_dir = config.data_dir.join("logs");
     let (file, notices) = resolve_file_appender(&log_dir, &std::env::temp_dir());
     if warnings == DegradeWarnings::Loud {
@@ -143,7 +152,18 @@ pub fn init(config: &Config, warnings: DegradeWarnings) -> Result<Option<WorkerG
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
-        .with_writer(std::io::stderr);
+        .with_writer(std::io::stderr)
+        .with_ansi(
+            std::io::IsTerminal::is_terminal(&std::io::stderr())
+                && config.runtime_env.var_os("NO_COLOR").is_none(),
+        )
+        .with_filter(
+            if concise && config.runtime_env.var_os("RUST_LOG").is_none() {
+                LevelFilter::WARN
+            } else {
+                LevelFilter::TRACE
+            },
+        );
 
     let registry = tracing_subscriber::registry()
         .with(env_filter)

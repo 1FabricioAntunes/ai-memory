@@ -23,9 +23,12 @@
 //! or a guideline block in a rules file) with the line to fix by hand; see
 //! [`super::agentmemory_residue`]. That check only reads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+mod summary;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+pub(crate) use summary::setup_diagnostics;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -156,6 +159,8 @@ struct DoctorReport {
     server: String,
     since_days: u32,
     rows: Vec<CoverageRow>,
+    #[serde(skip)]
+    installed_hooks: BTreeSet<String>,
     capture_coverage_problem: Option<CaptureCoverageProblem>,
     /// The agent kinds (kebab form) flagged as uncaptured, for quick scripting.
     uncaptured: Vec<String>,
@@ -498,13 +503,7 @@ async fn project_coordinate_report(
     }
 }
 
-/// Run the capture-coverage doctor.
-///
-/// # Errors
-/// Returns an error when the current scope cannot be resolved, the working
-/// directory is unreadable, or the server cannot be reached / its response
-/// cannot be parsed.
-pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
+async fn collect(config: &Config, args: &crate::cli::DoctorArgs) -> Result<DoctorReport> {
     let (identity_cwd, lookup_cwd) = super::scope_directories(config)
         .ok_or_else(|| anyhow::anyhow!("resolving the current working directory"))?;
     let explicit_scope = args
@@ -661,6 +660,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         project,
         server: ep.url.clone(),
         since_days: args.since_days,
+        installed_hooks: installed_hooks(&home, &cwd, &config.runtime_env),
         rows,
         capture_coverage_problem,
         uncaptured,
@@ -677,10 +677,27 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         muse,
     };
 
+    Ok(report)
+}
+
+/// Run the capture-coverage doctor.
+///
+/// # Errors
+/// Returns an error when the current scope cannot be resolved, the working
+/// directory is unreadable, or the server cannot be reached / its response
+/// cannot be parsed.
+pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
+    let report = collect(config, &args).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        render_human(&report);
+        print!(
+            "{}",
+            render_terminal(
+                &crate::terminal::Terminal::stdout(&config.runtime_env),
+                &report
+            )
+        );
     }
     Ok(())
 }
@@ -965,28 +982,7 @@ fn uninstall_line(harness: super::agent_plugins::PluginHarness) -> String {
 /// Human lines for the spool, the server and the Codex hook trust; empty
 /// when there is nothing to warn about.
 fn render_capture_health(report: &DoctorReport) -> String {
-    let mut out = String::new();
-    if report.server_unreachable {
-        out.push_str(&format!(
-            "⚠ The server at {} did not answer. Hook events are being spooled locally.\n",
-            report.server
-        ));
-    }
-    let spool = &report.spool;
-    if spool.evicting() {
-        out.push_str(&format!(
-            "⚠ The hook spool is full ({} events, oldest {}): each new event evicts the \
-             oldest undelivered one, which is lost until the server is back.\n",
-            spool.pending,
-            spool_age(spool.oldest_age_ms),
-        ));
-    } else if spool.pending > 0 {
-        out.push_str(&format!(
-            "  hook spool: {} event(s) waiting for the server (oldest {}).\n",
-            spool.pending,
-            spool_age(spool.oldest_age_ms),
-        ));
-    }
+    let mut out = render_transport_health(report);
     if let Some(trust) = &report.codex_hooks
         && !trust.skipped.is_empty()
     {
@@ -1076,51 +1072,58 @@ fn render_project_coordinate(coordinate: &ProjectCoordinateReport) -> String {
     output
 }
 
-fn render_human(report: &DoctorReport) {
-    println!(
+fn render_human(report: &DoctorReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "Capture coverage for {}/{} (server {})",
         report.workspace, report.project, report.server
     );
     if let Some(identity) = &report.identity {
-        println!(
+        let _ = writeln!(
+            out,
             "  identity: {} ({}, server {})",
             identity.operator.as_deref().unwrap_or("anonymous"),
             identity.level,
             identity.version
         );
     } else {
-        println!("  identity: unavailable");
+        let _ = writeln!(out, "  identity: unavailable");
     }
     if let Some(posture) = report.auth_posture {
-        println!("  auth: {}", posture.line());
+        let _ = writeln!(out, "  auth: {}", posture.line());
     }
     if report.capture_owner_active {
-        println!(
+        let _ = writeln!(
+            out,
             "  AI_MEMORY_CAPTURE_OWNER is active: native capture is suppressed in this process.\n  \
              Confirm the external producer is delivering events."
         );
     }
     if let Some(coordinate) = &report.project_coordinate {
-        print!("{}", render_project_coordinate(coordinate));
+        let _ = write!(out, "{}", render_project_coordinate(coordinate));
     }
     if let Some(problem) = &report.capture_coverage_problem {
-        println!("  capture coverage: unavailable ({})", problem.reason);
+        let _ = writeln!(out, "  capture coverage: unavailable ({})", problem.reason);
     }
-    print!("{}", render_capture_health(report));
-    print!("{}", render_plugins(&report.plugins));
-    print!("{}", render_muse(report.muse.as_ref()));
-    print!(
+    let _ = write!(out, "{}", render_capture_health(report));
+    let _ = write!(out, "{}", render_plugins(&report.plugins));
+    let _ = write!(out, "{}", render_muse(report.muse.as_ref()));
+    let _ = write!(
+        out,
         "{}",
-        super::agentmemory_residue::render(&report.agentmemory_residue)
+        crate::commands::agentmemory_residue::render(&report.agentmemory_residue)
     );
     if report.since_days == 0 {
-        println!("  recent window: all on-disk sessions\n");
+        let _ = writeln!(out, "  recent window: all on-disk sessions\n");
     } else {
-        println!("  recent window: last {} days\n", report.since_days);
+        let _ = writeln!(out, "  recent window: last {} days\n", report.since_days);
     }
 
     if let Some(problem) = &report.marker_capture_problem {
-        println!(
+        let _ = writeln!(
+            out,
             "⚠ {}: the settings marker has an invalid `[capture]` section.\n  \
              It fails closed — file and shell tool content is reduced to metadata there, \
              nothing leaks — but its `ignore_paths` exclusions are NOT applying while it stays \
@@ -1130,7 +1133,8 @@ fn render_human(report: &DoctorReport) {
     }
 
     if !report.native_memory.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "Note: a shell/PowerShell hook install (the Docker-wrapper default) does not \
              enforce capture-policy v1 — \"excluded\" below only holds on a native hook \
              install or a generated integration. Check the configured hook command; a dry-run \
@@ -1140,76 +1144,215 @@ fn render_human(report: &DoctorReport) {
 
     if report.rows.is_empty() {
         if report.capture_coverage_problem.is_some() {
-            println!(
+            let _ = writeln!(
+                out,
                 "  No local harness sessions found for this project; server capture counts are unavailable."
             );
         } else {
-            println!(
+            let _ = writeln!(
+                out,
                 "  No local harness sessions found for this project and nothing captured yet."
             );
         }
-        return;
+        return out;
     }
 
     for row in &report.rows {
-        let mark = match row.uncaptured {
-            Some(true) => "⚠",
-            Some(false) => "✓",
-            None => "?",
+        let mark = if hooks_need_approval(report, &row.agent) {
+            "!"
+        } else {
+            match row.uncaptured {
+                Some(true) => "⚠",
+                Some(false) if row.captured.is_some_and(|count| count > 0) => "✓",
+                Some(false) => "·",
+                None => "?",
+            }
         };
         let captured = row
             .captured
             .map_or_else(|| "unavailable".to_owned(), |count| count.to_string());
-        println!(
+        let _ = writeln!(
+            out,
             "  {mark} {:<14} {:>4} local ({} recent) → {:>11} captured",
             row.agent, row.local_total, row.local_recent, captured
         );
-        if row.uncaptured == Some(true) {
+        if hooks_need_approval(report, &row.agent) {
+            let _ = writeln!(
+                out,
+                "      Action required: open Codex, run /hooks, and approve the ai-memory hooks."
+            );
+        } else if row.uncaptured == Some(true) {
             if report.capture_owner_active {
-                println!(
+                let _ = writeln!(
+                    out,
                     "      No captured session: check the external producer and repository policy."
                 );
+            } else if report.installed_hooks.contains(&row.agent)
+                || enabled_plugin(report, &row.agent)
+            {
+                let _ = writeln!(
+                    out,
+                    "      Hooks installed; capture not yet verified. Restart the agent and start a session in this project."
+                );
+                let _ = writeln!(
+                    out,
+                    "      If a new session is still missing, check hook delivery and repository policy."
+                );
             } else {
-                println!(
-                    "      └ ran here but nothing was captured — install its hook:\n        \
-                     ai-memory install-hooks --agent {} --apply",
+                let _ = writeln!(
+                    out,
+                    "      └ ran here but nothing was captured — check its hook registration:\n        ai-memory install-hooks --agent {} --apply",
                     row.agent
                 );
             }
+        } else if row.captured == Some(0) {
+            let _ = writeln!(
+                out,
+                "      No recent activity; capture has not been verified."
+            );
         }
         if let Some(count) = row.mixed_capture_sessions.filter(|count| *count > 0) {
-            println!(
+            let _ = writeln!(
+                out,
                 "      {count} session(s) contain events from multiple capture sources.\n      \
                  Backfill can also mix source metadata; this does not prove duplicate capture."
             );
         }
         if let Some(memory) = report.native_memory.iter().find(|m| m.agent == row.agent) {
-            println!(
+            let _ = writeln!(
+                out,
                 "      native memory: {} ({} file{})",
                 memory.path,
                 memory.file_count,
                 if memory.file_count == 1 { "" } else { "s" }
             );
-            println!("      capture: {}", memory.status);
+            let _ = writeln!(out, "      capture: {}", memory.status);
         }
     }
 
     if report.capture_coverage_problem.is_some() {
-        println!("\nCapture verdict unavailable: server capture counts could not be resolved.");
-    } else if report.uncaptured.is_empty() {
-        println!("\n✓ Every harness that ran in this project recently is captured on the server.");
-    } else {
-        let remedy = if report.capture_owner_active {
-            "Check the external producer and repository policy, then re-run `ai-memory doctor`."
-        } else {
-            "Install the hook(s) above, then re-run `ai-memory doctor` to confirm."
-        };
-        println!(
-            "\n⚠ {} harness(es) ran here recently with no captured sessions: {}.\n  {remedy}",
-            report.uncaptured.len(),
+        let _ = writeln!(
+            out,
+            "\nCapture verdict unavailable: server capture counts could not be resolved."
+        );
+    } else if report
+        .rows
+        .iter()
+        .any(|row| hooks_need_approval(report, &row.agent))
+    {
+        let _ = writeln!(
+            out,
+            "\nAction required: approve Codex hooks, then start a new session and re-run `ai-memory doctor`."
+        );
+    } else if !report.uncaptured.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nCapture not yet verified for: {}. Follow the steps above, then re-run `ai-memory doctor`.",
             report.uncaptured.join(", ")
         );
+    } else if report
+        .rows
+        .iter()
+        .all(|row| row.captured.is_some_and(|count| count > 0))
+    {
+        let _ = writeln!(
+            out,
+            "\n✓ Captured sessions found for every listed agent. This does not verify current hook delivery."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\nNo capture confirmed for inactive agents. Start a session to verify delivery."
+        );
     }
+    out
+}
+
+fn installed_hooks(home: &Path, cwd: &Path, env: &crate::config::RuntimeEnv) -> BTreeSet<String> {
+    let lookup = |name: &str| env.var_os(name);
+    let claude = crate::commands::agent_plugins::claude_root(home, &lookup).join("settings.json");
+    let project = crate::commands::install_hooks::project_claude_settings_local(cwd);
+    let mut installed = BTreeSet::new();
+    if [claude, project]
+        .iter()
+        .any(|path| crate::commands::install_hooks::settings_file_carries_ai_memory_hooks(path))
+    {
+        installed.insert("claude-code".to_owned());
+    }
+    if crate::commands::install_hooks::codex_hooks_path(env).is_ok_and(|path| {
+        crate::commands::install_hooks::settings_file_carries_ai_memory_hooks(&path)
+    }) {
+        installed.insert("codex".to_owned());
+    }
+    installed
+}
+
+fn render_transport_health(report: &DoctorReport) -> String {
+    let mut out = String::new();
+    if report.server_unreachable {
+        out.push_str(&format!(
+            "⚠ The server at {} did not answer. Hook events are being spooled locally.\n",
+            report.server
+        ));
+    }
+    let spool = &report.spool;
+    if spool.evicting() {
+        out.push_str(&format!(
+            "⚠ The hook spool is full ({} events, oldest {}): each new event evicts the \
+             oldest undelivered one, which is lost until the server is back.\n",
+            spool.pending,
+            spool_age(spool.oldest_age_ms),
+        ));
+    } else if spool.pending > 0 {
+        out.push_str(&format!(
+            "  hook spool: {} event(s) waiting for the server (oldest {}).\n",
+            spool.pending,
+            spool_age(spool.oldest_age_ms),
+        ));
+    }
+    out
+}
+
+fn render_terminal(terminal: &crate::terminal::Terminal, report: &DoctorReport) -> String {
+    let mut out = terminal.header("DOCTOR / capture diagnostics", env!("CARGO_PKG_VERSION"));
+    out.push_str(&terminal.field(
+        "Project",
+        &format!("{}/{}", report.workspace, report.project),
+    ));
+    let body = render_human(report);
+    out.push_str(&terminal.section("Coverage & readiness"));
+    out.push_str(
+        &terminal.document(
+            body.split_once('\n')
+                .map_or(body.as_str(), |(_, body)| body),
+        ),
+    );
+    out
+}
+
+fn enabled_plugin(report: &DoctorReport, agent: &str) -> bool {
+    report.plugins.iter().any(|plugin| {
+        plugin.plugin.enabled
+            && match plugin.plugin.harness {
+                crate::commands::agent_plugins::PluginHarness::Codex => agent == "codex",
+                crate::commands::agent_plugins::PluginHarness::ClaudeCode => agent == "claude-code",
+            }
+    })
+}
+
+fn hooks_need_approval(report: &DoctorReport, agent: &str) -> bool {
+    agent == "codex"
+        && (report
+            .codex_hooks
+            .as_ref()
+            .is_some_and(|trust| !trust.skipped.is_empty())
+            || report.plugins.iter().any(|plugin| {
+                plugin.plugin.enabled
+                    && plugin
+                        .hook_trust
+                        .as_ref()
+                        .is_some_and(|trust| !trust.skipped.is_empty())
+            }))
 }
 
 #[cfg(test)]
@@ -1227,6 +1370,7 @@ mod tests {
             server: "http://192.0.2.1:49374".into(),
             since_days: 7,
             rows: Vec::new(),
+            installed_hooks: BTreeSet::new(),
             capture_coverage_problem: None,
             uncaptured: Vec::new(),
             marker_capture_problem: None,
@@ -1915,5 +2059,79 @@ mod tests {
         let reports = native_memory_reports(home.path(), &subdir);
         let claude = find_claude_report(&reports);
         assert_eq!(claude.file_count, 1);
+    }
+
+    #[test]
+    fn installed_hooks_without_capture_need_a_first_session_not_reinstallation() {
+        let mut report = health_report(
+            crate::commands::hook_spool::SpoolHealth::default(),
+            false,
+            None,
+        );
+        report.rows = build_rows(
+            &[LocalScan {
+                agent: AgentKind::ClaudeCode,
+                total: 4,
+                recent: 4,
+            }],
+            &BTreeMap::new(),
+        );
+        report.uncaptured = vec!["claude-code".into()];
+        report.installed_hooks.insert("claude-code".into());
+        let text = render_human(&report);
+        assert!(
+            text.contains("Hooks installed; capture not yet verified"),
+            "{text}"
+        );
+        assert!(!text.contains("install-hooks"), "{text}");
+        assert!(!text.contains("Every harness"), "{text}");
+    }
+
+    #[test]
+    fn untrusted_hooks_override_historical_capture_success() {
+        let mut report = health_report(
+            crate::commands::hook_spool::SpoolHealth::default(),
+            false,
+            Some(crate::commands::codex_hook_trust::CodexHookTrust {
+                trusted: Vec::new(),
+                skipped: vec![("sessionStart".into(), "untrusted".into())],
+            }),
+        );
+        report.rows = build_rows(
+            &[LocalScan {
+                agent: AgentKind::Codex,
+                total: 4,
+                recent: 4,
+            }],
+            &BTreeMap::from([("codex".into(), 1)]),
+        );
+        let text = render_human(&report);
+        assert!(
+            text.contains("Action required: approve Codex hooks"),
+            "{text}"
+        );
+        assert!(!text.contains("install-hooks"), "{text}");
+        assert!(!text.contains("✓ codex"), "{text}");
+    }
+
+    #[test]
+    fn inactive_uncaptured_agents_are_neutral() {
+        let mut report = health_report(
+            crate::commands::hook_spool::SpoolHealth::default(),
+            false,
+            None,
+        );
+        report.rows = build_rows(
+            &[LocalScan {
+                agent: AgentKind::Codex,
+                total: 1,
+                recent: 0,
+            }],
+            &BTreeMap::new(),
+        );
+        let text = render_human(&report);
+        assert!(text.contains("· codex"), "{text}");
+        assert!(text.contains("No recent activity"), "{text}");
+        assert!(!text.contains("Every harness"), "{text}");
     }
 }
