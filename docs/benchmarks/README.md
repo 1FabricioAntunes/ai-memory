@@ -105,3 +105,11 @@ baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.00
   with the previous release (AGENTS.md, project maintenance rules). A drop
   does not block the release: the numbers are published and an issue opens
   for the next release to decide whether it is a regression.
+- **Pre-registration.** Before the release-candidate run, write down in the
+  release's tracking issue what the run is meant to show: the question, the
+  slices that matter for the change, and the expected direction for each.
+  Judge the result against run-to-run noise (about ±0.005 overall,
+  ±0.02–0.03 on small slices), not a percentage threshold. Writing the
+  expectation first keeps a run from being read in whichever way suits it;
+  a result that misses it still follows the release policy. The idea came
+  from #1255.
