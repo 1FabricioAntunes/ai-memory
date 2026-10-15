@@ -317,10 +317,11 @@ convention; `memory_message_send` and `memory_message_list` are the tools.
    that exact `decision-reply:` line. The oldest match is the answer. Pop it
    when you take it, then `memory_message_cancel` the question.
 
-Read `from_owner_user` on the reply before you act. A body line
-`requires_root: true` tells the companion to send that reply only for a root
-caller, and tells you to act only when the credential is root. `/web` shows
-the mailbox and leaves every message pending.
+Before you act on a `requires_root: true` decision, compare `from_owner_user`
+on the reply with the root identity you were configured with. It is
+attribution, not a role, and it is empty on anonymous and single-operator
+servers, so treat an empty value as not root. The server itself does not check
+who answers. `/web` shows the mailbox and leaves every message pending.
 
 The list is oldest-first, 50 rows by default and 200 at most, so keep the
 inbox you poll from drained. A companion can wake on the `message_send`

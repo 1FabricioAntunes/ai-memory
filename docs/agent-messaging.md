@@ -196,13 +196,18 @@ links:
 `id` values are the asker's. The asker keeps, locally, the action each id
 maps to, and the message carries the labels a person chooses from.
 
-`requires_root: true` marks a risky decision (merge, deploy, delete) for the
-companion and the asker. Write access is the server's rule: posting the
-question needs write on the mailbox project, and posting the reply needs write
-on the asking project ([per-project grants](design-per-project-authz.md)).
-The companion refuses to send a risky answer unless the caller is root, and
-the asker acts on a reply only when `from_owner_user` is a root credential.
-See [users](users.md).
+`requires_root: true` marks a risky decision (merge, deploy, delete) for
+whoever answers and for the asker. Write access is the only rule the server
+enforces: posting the question needs write on the mailbox project, and posting
+the reply needs write on the asking project
+([per-project grants](design-per-project-authz.md)). The server does not check
+who may answer a risky question. `from_owner_user` on the reply is attribution,
+not a role: it is empty on an anonymous server, for a root bearer without
+`[auth].root_username`, and on a single-operator server. An asker that gates a
+risky option therefore compares it with a root identity it was configured with
+and treats an empty value as not root. A server-enforced rule for who may
+answer is part of the primitive proposed in #1281, not something that exists
+today. See [users](users.md).
 
 The same text works from the terminal:
 
@@ -249,9 +254,9 @@ comment: Accepting the exception; the flake is already written down.
 `comment` is untrusted input, the same as any popped body. The asker weighs it
 with the user. It does not authorize a command on its own.
 
-A companion serves the page (open questions, options, answer buttons, the
-audit trail) and calls only the public MCP or admin message routes. The
-built-in `/web` mailbox stays read-only. See
+A companion could serve a page for this (open questions, options, answer
+buttons, the audit trail) through the public MCP or admin message routes; none
+ships today. The built-in `/web` mailbox stays read-only. See
 [companion crates](companion-crates.md).
 
 ### How the asker sees the answer
