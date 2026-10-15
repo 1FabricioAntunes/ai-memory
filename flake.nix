@@ -365,8 +365,10 @@
               src = ./.;
               cargoLock.lockFile = ./Cargo.lock;
 
-              # No nativeBuildInputs needed — the build is fully self-contained
-              # (SQLite bundled, libgit2 vendored, rustls with webpki-roots).
+              nativeBuildInputs = [
+                pkgs.makeBinaryWrapper
+                pkgs.installShellFiles
+              ];
 
               # Skip the Tailwind CLI download in the sandbox. The build script
               # falls back to the vendored static/tailwind.css committed to the
@@ -400,6 +402,17 @@
                 mkdir -p $out/etc/ai-memory
                 cp crates/ai-memory-cli/templates/config.default.toml \
                    $out/etc/ai-memory/config.default.toml
+              ''
+              + lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+                installShellCompletion --cmd ai-memory \
+                  --bash <($out/bin/ai-memory completions bash) \
+                  --fish <($out/bin/ai-memory completions fish) \
+                  --zsh <($out/bin/ai-memory completions zsh)
+              '';
+
+              # Wrap git on PATH so cli operations shelling out to git succeed in minimal environments.
+              postFixup = ''
+                wrapProgram $out/bin/ai-memory --prefix PATH : ${lib.makeBinPath [ pkgs.git ]}
               '';
 
               meta = {

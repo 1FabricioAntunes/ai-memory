@@ -725,6 +725,18 @@ fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -
         // Release tarball: `hooks/` sits in the same dir as the binary.
         if let Some(dir) = exe.parent() {
             v.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
+            // Standard Unix prefix layout: `<prefix>/bin/<bin>` -> `<prefix>/share/ai-memory/hooks/<sub>`
+            if dir.file_name().is_some_and(|name| name == "bin") {
+                if let Some(prefix) = dir.parent() {
+                    v.push(
+                        prefix
+                            .join("share")
+                            .join("ai-memory")
+                            .join(crate::install_layout::HOOKS_DIR_NAME)
+                            .join(sub),
+                    );
+                }
+            }
         }
         // Repo-local fallback for `cargo run setup-agent` during dev:
         // target/<profile>/<bin> → repo root.
@@ -776,6 +788,30 @@ mod tests {
     fn source_candidates_honour_explicit_override() {
         let candidates = source_candidates(Some(Path::new("/custom/src")), "codex", None);
         assert_eq!(candidates, vec![PathBuf::from("/custom/src/codex")]);
+    }
+
+    #[test]
+    fn source_candidates_include_standard_prefix_share_dir() {
+        let exe = PathBuf::from("/nix/store/pkg/bin/ai-memory");
+        let candidates = source_candidates(None, "claude-code", Some(exe));
+        assert!(
+            candidates.contains(&PathBuf::from(
+                "/nix/store/pkg/share/ai-memory/hooks/claude-code"
+            )),
+            "prefix share hooks/ dir must be probed; got {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn source_candidates_ignores_non_bin_parent_for_prefix_share() {
+        let exe = PathBuf::from("/opt/ai-memory/ai-memory");
+        let candidates = source_candidates(None, "claude-code", Some(exe));
+        assert!(
+            !candidates.contains(&PathBuf::from(
+                "/opt/share/ai-memory/hooks/claude-code"
+            )),
+            "flat tarball directory must not treat parent as prefix; got {candidates:?}"
+        );
     }
 
     #[test]

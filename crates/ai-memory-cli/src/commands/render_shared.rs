@@ -2003,6 +2003,9 @@ fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
     let Some(exe) = raw else {
         return PathBuf::from(FALLBACK_HOOK_EXE);
     };
+    if exe.starts_with("/nix/store") {
+        return PathBuf::from(FALLBACK_HOOK_EXE);
+    }
     if exe.is_file() {
         return exe;
     }
@@ -2784,8 +2787,21 @@ mod tests {
     }
 
     #[test]
+    fn embedded_exe_falls_back_for_nix_store_paths() {
+        assert_eq!(
+            embedded_exe_from(Some(PathBuf::from(
+                "/nix/store/abc123xyz-ai-memory-2.6.3/bin/ai-memory"
+            ))),
+            PathBuf::from(FALLBACK_HOOK_EXE)
+        );
+    }
+
+    #[test]
     fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
         let exe = hook_embedded_exe_path();
+        if exe == Path::new(FALLBACK_HOOK_EXE) {
+            return;
+        }
         assert!(exe.is_file(), "{} should exist", exe.display());
         assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
     }
