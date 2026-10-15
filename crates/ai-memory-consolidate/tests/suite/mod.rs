@@ -23,3 +23,4 @@ mod profile_harvest;
 mod recall_eval;
 mod search_quality;
 mod typed_edges;
+mod verbatim_residue_consolidation;

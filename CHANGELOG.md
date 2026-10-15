@@ -12,6 +12,14 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added opt-in `[consolidation] verbatim_residue = true`, which recovers a
+  bounded set of literal error lines, paths, URLs, status codes and versions
+  from observations omitted or truncated by the consolidation projection.
+  The residue is marked as untrusted, grouped and indented so captured text
+  cannot forge prompt structure, and never changes stored page content except
+  through the existing structured LLM response. The default remains off and
+  preserves existing prompt bytes. The eval harness can compare both states
+  with `ab --residue` and `projection --residue`. (#1215)
 - Grouped interactive `status` and `doctor` reports into sections with semantic
   colors, consistent margins and terminal-width wrapping, retaining every
   diagnostic field and remedy. Redirected, `NO_COLOR`,

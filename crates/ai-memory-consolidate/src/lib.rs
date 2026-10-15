@@ -85,7 +85,7 @@ pub use embed::{
 };
 pub use entropy_filter::{EntropyFilterConfig, FilterVerdict, SkipReason, classify};
 pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
-pub use keep_tokens::mine_keep_tokens;
+pub use keep_tokens::{mine_keep_tokens, mine_residue_tokens};
 pub use lint::{
     DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
     LintOptions, LintReport, run_lint, stale_days_for,

@@ -3100,6 +3100,22 @@ below 1,000, because the batch schema and a useful response cannot fit reliably
 below those floors. Lowering the safety margin shrinks the character budget, so
 a smaller margin needs a proportionally larger `max_input_tokens`.
 
+Long sessions can omit observations or truncate an individual body before the
+request reaches the model. To add a bounded set of literal error lines, paths,
+URLs, status codes and versions from that missing text, opt in with:
+
+```toml
+[consolidation]
+verbatim_residue = true
+```
+
+or `AI_MEMORY_CONSOLIDATION__VERBATIM_RESIDUE=true`. The default is false.
+Enabling it widens the subset of already-sanitized captured text sent to the
+configured LLM provider; it does not append anything directly to a wiki page.
+The block is capped, marked as untrusted observation data, and the provider's
+reply still passes through the existing structured-output and wiki-write
+boundaries.
+
 ---
 
 ## Common subcommands

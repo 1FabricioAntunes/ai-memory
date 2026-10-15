@@ -2962,6 +2962,7 @@ fn configure_consolidator(
         model = llm.model(),
         max_input_tokens = config.consolidation.max_input_tokens,
         max_output_tokens = config.consolidation.max_output_tokens,
+        verbatim_residue = config.consolidation.verbatim_residue,
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
     let consolidator = Arc::new(
@@ -2974,6 +2975,7 @@ fn configure_consolidator(
             project_id,
         )
         .with_per_user_slots(config.slots.per_user)
+        .with_verbatim_residue(config.consolidation.verbatim_residue)
         .with_prompt_limits(
             config.consolidation.max_input_tokens,
             config.consolidation.max_output_tokens,

@@ -76,6 +76,14 @@ stream recovered nearly all of that FTS gap (0.662 → 0.951).
 
 ## A/B comparisons (R2)
 
+The [2026-10-15 consolidation literal-fidelity
+run](consolidation-literal-fidelity-2026-10-15.md) compares the default
+projection with the opt-in `verbatim_residue` request on the same model over
+three runs. The residue reduced generated-session projection loss from 8/15
+facts to 3/15 and recovered a stable 1/5 newly visible facts on the pages,
+without changing kept-fact recall, parse rate or invention counts. It is a
+prompt-input benchmark and is separate from the retrieval baselines above.
+
 The harness can also A/B two configs over the same question set and report
 an accuracy + latency + context-tokens triple with a baseline→candidate
 delta (see [retrieval-ab-r2.md](retrieval-ab-r2.md)). That file publishes the

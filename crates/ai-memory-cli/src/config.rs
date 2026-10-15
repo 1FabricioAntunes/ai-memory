@@ -1483,6 +1483,10 @@ fn validate_run_profiles(run: &RunSettings) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConsolidationSettings {
+    /// Add bounded literal diagnostics from observations omitted or truncated
+    /// by the normal projection. Off by default because it widens the subset
+    /// of captured text sent to the configured provider.
+    pub verbatim_residue: bool,
     /// Approximate token target for the entire consolidation prompt:
     /// observation dump, current page body, system prompt, page conventions,
     /// slot snapshots, and the structured-output schema.
@@ -1507,6 +1511,7 @@ pub struct ConsolidationSettings {
 impl Default for ConsolidationSettings {
     fn default() -> Self {
         Self {
+            verbatim_residue: false,
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
@@ -4928,6 +4933,16 @@ max_input_tokens = {tokens}
             ConsolidationSettings::default().input_token_safety_margin,
             0.8
         );
+    }
+
+    #[test]
+    fn verbatim_residue_is_opt_in_and_loads_from_consolidation_settings() {
+        assert!(!ConsolidationSettings::default().verbatim_residue);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[consolidation]\nverbatim_residue = true\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.consolidation.verbatim_residue);
     }
 
     /// The small-context examples in `docs/install.md` and
