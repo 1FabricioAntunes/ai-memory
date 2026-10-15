@@ -34,7 +34,7 @@ version in [`docs/changelog/`](docs/changelog/):
   models think when a request leaves `thinking` out, and Claude models from
   4.6 on are sent adaptive thinking once `AI_MEMORY_LLM_REASONING_EFFORT` is
   set, so `memory_explore` and `ai-memory llm-test` failed as soon as the
-  model thought. The provider now skips the blocks it does not read.
+  model thought. The provider now skips the blocks it does not read. (#1325)
 
 ## [3.0.1] - 2026-10-15
 
