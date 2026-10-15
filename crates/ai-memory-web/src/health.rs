@@ -138,6 +138,11 @@ pub struct HealthCheck {
     pub fix: Option<String>,
 }
 
+/// How old the oldest spooled event may get before the spool counts as stuck.
+/// A healthy session drains at its next boundary (session start, stop,
+/// pre-compact, session end) or at the threshold catch-up, well inside this.
+/// An unreachable endpoint never charges an attempt, so for it age is the
+/// only signal.
 const SPOOL_STUCK_AFTER_MS: u64 = 15 * 60 * 1000;
 
 fn spool_is_stuck(spool: &SpoolState) -> bool {
@@ -213,7 +218,16 @@ pub fn checks(s: &HealthSnapshot) -> Vec<HealthCheck> {
             push(
                 "spool_pending",
                 CheckStatus::Warn,
-                format!("{} hook event(s) wait in the local spool.", spool.pending),
+                format!(
+                    "{} hook event(s) wait in the local spool and delivery looks stuck \
+                     (oldest {}, {} failed attempt(s)).",
+                    spool.pending,
+                    spool.oldest_age_ms.map_or_else(
+                        || "age unknown".to_owned(),
+                        |ms| format!("{} min", ms / 60_000)
+                    ),
+                    spool.retries_total
+                ),
                 Some(fix_lines::RECOVER),
             );
         }
