@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `install-mcp` now writes the absolute path of the `ai-memory` binary as the
+  `command` of every stdio bridge entry (Claude Code's session-aware entry,
+  Muse Code and the session-less bridge of the other clients), as hook
+  commands already did. A client started without `~/.local/bin` on its `PATH`
+  no longer fails to spawn the bridge. The Docker wrapper keeps the bare
+  `ai-memory`, and existing entries with either form are still recognized.
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
