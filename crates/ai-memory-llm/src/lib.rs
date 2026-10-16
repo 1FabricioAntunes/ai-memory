@@ -11,8 +11,9 @@
 //! Structured-output strategies:
 //!
 //! * **Anthropic**: `tools[0]` is set to a single tool whose input
-//!   schema we want filled, with `tool_choice = "tool"`. The
-//!   model's `tool_use` content block is the structured payload.
+//!   schema we want filled. Models that accept a forced tool get
+//!   `tool_choice = "tool"`; models that reject it keep the default `auto`
+//!   and may return either a `tool_use` block or the JSON object as text.
 //! * **OpenAI**: `response_format = { type: "json_schema", strict: true }`.
 //! * **OpenAI OAuth/Codex**: ChatGPT/Codex Responses API with
 //!   `text.format = { type: "json_schema", strict: true }`.
