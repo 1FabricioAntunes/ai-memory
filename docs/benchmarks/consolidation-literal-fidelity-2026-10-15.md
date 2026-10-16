@@ -1,11 +1,16 @@
 # Consolidation literal fidelity: verbatim residue
 
-Date: 2026-10-15  
+Date: 2026-10-15
+
 Base commit: `862ed0a0ea1d001d97544a94eb40340fa7b7b87d` plus the uncommitted
-`#1215` mechanism under test  
-Provider/model: Codex OAuth, `gpt-6-sol`, same on both sides  
-Runs: 3 per side  
-Generated seed: `1215`  
+`#1215` mechanism under test
+
+Provider/model: Codex OAuth, `gpt-6-sol`, same on both sides
+
+Runs: 3 per side
+
+Generated seed: `1215`
+
 Generated fixture sha256:
 `f25fbc436edf70647ff54b910dfa5ab72259e1b45f1c072db63b9e23d01879d4`
 
