@@ -210,8 +210,12 @@ struct AnthropicResponse {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContent {
-    Text { text: String },
-    ToolUse { input: serde_json::Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        input: serde_json::Value,
+    },
     /// A block this provider does not read, such as `thinking` or
     /// `redacted_thinking`. Models that think by default (Opus 5 and later,
     /// Sonnet 5 and later, Haiku 5.5, Fable, Mythos), and every model sent
