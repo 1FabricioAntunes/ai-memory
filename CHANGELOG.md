@@ -22,7 +22,7 @@ version in [`docs/changelog/`](docs/changelog/):
   delivers exactly seven events (no `PreCompact` or `SessionEnd`) and runs
   `SessionStart` detached, so finished sessions close with
   `finalize-session --agent dsh` and pending handoffs are recovered via
-  `memory_handoff_list` / `memory_handoff_accept`. (#NNN)
+  `memory_handoff_list` / `memory_handoff_accept`. (#1337)
 
 ## [3.1.0] - 2026-10-16
 
