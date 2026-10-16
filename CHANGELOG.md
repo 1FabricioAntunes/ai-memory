@@ -23,7 +23,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `pre-tool-use`: in one production store about 87% of those observations had
   an empty body, and each pairs with a `post-tool-use` that carries the
   content. With `pre-tool-use` dropped, a session whose only work was a tool
-  call that never finished now ends as lifecycle-only. (#PRNUM)
+  call that never finished now ends as lifecycle-only. (#1339)
 
 ## [3.1.0] - 2026-10-16
 
