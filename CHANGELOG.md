@@ -23,7 +23,7 @@ version in [`docs/changelog/`](docs/changelog/):
   sessions bound to an active managed run. A real `SessionEnd` or checkpoint
   that lands while the tick runs wins, and the tick leaves that session alone.
   `ended_at` is the time of the tick; the session's last activity goes in the
-  audit row. (#PRNUM)
+  audit row. (#1338)
 
 ## [3.1.0] - 2026-10-16
 
