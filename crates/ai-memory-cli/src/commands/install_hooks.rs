@@ -7876,14 +7876,42 @@ fn apply_to_dsh(
         strategy,
     );
     let hooks_json = command_dir.join("hooks.json");
-    fs::write(
+    write_private_dsh_config(
         &hooks_json,
-        serde_json::to_string_pretty(&payload).expect("static hook payload serializes"),
-    )
-    .with_context(|| format!("writing {}", hooks_json.display()))?;
+        serde_json::to_string_pretty(&payload)
+            .expect("static hook payload serializes")
+            .as_bytes(),
+    )?;
     eprintln!("✓ wrote DSH hook config → {}", hooks_json.display());
     print!("{}", dsh_bridge_patch_fragment(&command_dir));
     Ok(())
+}
+
+/// DSH's generated hook config can embed the server bearer. Keep it private
+/// from the first byte and refuse a final-component symlink instead of
+/// following an attacker-controlled target.
+fn write_private_dsh_config(path: &Path, content: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening private DSH hook config {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing DSH hook config {}", path.display()))?;
+    }
+    file.write_all(content)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", path.display()))
 }
 
 /// The Cordis patch-list fragment that mounts the
@@ -9740,6 +9768,102 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         for (event, _script) in DSH_EVENTS {
             assert!(hooks.contains_key(event), "missing {event}");
         }
+    }
+
+    #[test]
+    fn powershell_fallback_drops_raw_dsh_assistant_output() {
+        let helper = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks/lib/ai-memory-hook.ps1"),
+        )
+        .unwrap();
+        assert!(
+            helper.contains(
+                "($Agent -eq \"claude-code\" -or $Agent -eq \"dsh\") -and $Event -eq \"stop\""
+            ),
+            "DSH must share the raw Stop-field refusal with Claude Code"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_to_dsh_keeps_an_embedded_bearer_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let source = root.path().join("hooks").join("dsh");
+        fs::create_dir_all(&source).unwrap();
+        let scripts = DSH_EVENTS
+            .iter()
+            .map(|(_, script)| *script)
+            .collect::<Vec<_>>();
+        stub_scripts(&source, &scripts);
+        fs::write(root.path().join("hooks").join("_lib.sh"), "#!/bin/sh\n").unwrap();
+
+        let staged = data.path().join("hooks").join("dsh");
+        fs::create_dir_all(&staged).unwrap();
+        let hooks_json = staged.join("hooks.json");
+        fs::write(&hooks_json, "{}").unwrap();
+        fs::set_permissions(&hooks_json, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut args = default_hook_args();
+        args.agent = AgentChoice::Dsh;
+        apply_to_dsh(
+            &source,
+            "http://127.0.0.1:49374",
+            Some("private-bearer"),
+            data.path(),
+            &args,
+        )
+        .expect("apply_to_dsh succeeds");
+
+        assert_eq!(
+            fs::metadata(&hooks_json).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let content = fs::read_to_string(hooks_json).unwrap();
+        assert!(content.contains("private-bearer"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_to_dsh_refuses_a_symlinked_hook_config() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let source = root.path().join("hooks").join("dsh");
+        fs::create_dir_all(&source).unwrap();
+        let scripts = DSH_EVENTS
+            .iter()
+            .map(|(_, script)| *script)
+            .collect::<Vec<_>>();
+        stub_scripts(&source, &scripts);
+        fs::write(root.path().join("hooks").join("_lib.sh"), "#!/bin/sh\n").unwrap();
+
+        let staged = data.path().join("hooks").join("dsh");
+        fs::create_dir_all(&staged).unwrap();
+        let target = data.path().join("foreign.json");
+        fs::write(&target, "untouched").unwrap();
+        symlink(&target, staged.join("hooks.json")).unwrap();
+
+        let mut args = default_hook_args();
+        args.agent = AgentChoice::Dsh;
+        let error = apply_to_dsh(
+            &source,
+            "http://127.0.0.1:49374",
+            Some("private-bearer"),
+            data.path(),
+            &args,
+        )
+        .expect_err("a final symlink must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("opening private DSH hook config")
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
     }
 
     /// Hermes' output must state the manual paste step (ai-memory does not write
