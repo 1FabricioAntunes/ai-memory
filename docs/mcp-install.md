@@ -584,7 +584,8 @@ Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 
 ## DeepSeek Harness (DSH)
 
-**Status:** MCP supported (print-only). No lifecycle hooks or managed workstream claimed.
+**Status:** MCP supported (print-only) + lifecycle hooks via the official
+Claude Code hooks bridge. No managed workstream.
 
 DSH has no fixed JSON/TOML MCP config: the MCP client is a Cordis plugin entry
 (`@deepseek-ai/dsh-mcp-client`) inside a profile's `cordis.patch.yml`.
@@ -601,16 +602,49 @@ reloads its patch live), then reload or restart the profile. The fragment regist
 the default stateless HTTP endpoint and carries `Authorization: Bearer <token>`
 when `--auth-token` (or a configured server token) is present.
 
-DSH ships a bridge that runs an existing Claude Code `hooks.json` or settings
-file (`@deepseek-ai/dsh-hooks-claude-code`). Pointing it at ai-memory's Claude
-Code hooks is not a supported capture path: those hooks report every event as
-`agent=claude-code`, so DSH sessions would be stored as Claude Code sessions.
-ai-memory does not install or manage the bridge, and it delivers only seven Claude Code events
-(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-`Stop`, `SubagentStart`, `SubagentStop`). `PreCompact` and
-`SessionEnd` are not delivered, and its `SessionStart` injection runs
-detached. Treat DSH as MCP-only here and recover handoffs explicitly with
-`memory_handoff_list` then `memory_handoff_accept` when continuity matters.
+Lifecycle capture runs through DSH's official Claude Code hooks bridge
+(`@deepseek-ai/dsh-hooks-claude-code`), which consumes a Claude Code
+`hooks.json`. ai-memory ships a DSH hook bundle and a first-party installer:
+
+```bash
+ai-memory install-hooks --agent dsh --apply \
+    --server-url "$AI_MEMORY_SERVER" --auth-token "$TOKEN"
+```
+
+`--apply` stages the `hooks/dsh` scripts under the data dir and writes a
+generated Claude Code `hooks.json` next to them (native `ai-memory hook`
+commands by default, so capture enforces capture exclusions and keeps the
+local spool). It then prints the bridge patch fragment — a `- insert:` item
+mounted under the DSH profile patch — which you merge into
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` by hand, because that file is
+a hand-maintained YAML patch layer (the same reason `install-mcp --client
+dsh` refuses to write it):
+
+```yaml
+- insert:
+    - id: ai-memory-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: '<data-dir>/hooks/dsh/hooks.json'
+```
+
+Install the bridge package into the profile first (`dsh plugin --profile
+<profile> add @deepseek-ai/dsh-hooks-claude-code`), then reload or restart
+the profile. Without `--apply`, `install-hooks --agent dsh` prints the same
+`hooks.json` and patch fragment for a manual merge.
+
+Two bridge constraints shape DSH capture:
+
+- The bridge delivers only seven Claude Code events (`SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`,
+  `SubagentStop`). `PreCompact` and `SessionEnd` are not delivered, so a
+  finished session stays open until `ai-memory finalize-session --agent dsh`
+  closes it (the same close path as Command Code, Kiro CLI and Antigravity).
+- `SessionStart` runs detached, so its stdout cannot reliably deliver a
+  fetched handoff; the DSH hook bundle therefore never claims one. Recover a
+  pending handoff with `memory_handoff_list` then `memory_handoff_accept`, or
+  ask the model to. DSH sessions are stored as `agent=dsh`, never as
+  `claude-code`.
 
 ---
 

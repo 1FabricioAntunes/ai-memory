@@ -846,6 +846,10 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // path.
             | AgentKind::CodeBuddy
             | AgentKind::IbmBob
+            // DSH's Claude Code hooks bridge (`@deepseek-ai/dsh-hooks-claude-code`)
+            // forwards Claude Code's snake_case tool fields for PreToolUse /
+            // PostToolUse.
+            | AgentKind::Dsh
     )
 }
 

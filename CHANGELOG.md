@@ -11,6 +11,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+- Added first-party DeepSeek Harness (DSH) lifecycle capture. `install-hooks
+  --agent dsh` (aliases `deepseek-harness`, `deepseek_harness`) stages the
+  new `hooks/dsh` bundle, writes a generated Claude Code `hooks.json`, and
+  prints a Cordis patch fragment that mounts DSH's official
+  `@deepseek-ai/dsh-hooks-claude-code` bridge on
+  `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (the patch file itself is
+  never auto-written). DSH sessions are stored as `agent=dsh`. The bridge
+  delivers exactly seven events (no `PreCompact` or `SessionEnd`) and runs
+  `SessionStart` detached, so finished sessions close with
+  `finalize-session --agent dsh` and pending handoffs are recovered via
+  `memory_handoff_list` / `memory_handoff_accept`. (#NNN)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
