@@ -21,6 +21,7 @@ version in [`docs/changelog/`](docs/changelog/):
   wires the V2 `{ id, setup }` plugin and nested `mcp.servers` entry when it
   reports major 2. A failed probe writes no OpenCode wiring and is reported
   as a setup problem; `--agent opencode2` still forces V2 without probing.
+  (#1356)
 ## [3.1.0] - 2026-10-16
 
 ### Added
