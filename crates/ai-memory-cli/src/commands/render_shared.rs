@@ -4290,10 +4290,12 @@ if (inheritOnly) {
                 command.contains(&format!("hook --event {event_name} --agent ibm-bob")),
                 "{event}: {command}"
             );
-            assert!(
-                command.contains("--project-strategy repo-root"),
-                "{command}"
-            );
+            let expected_strategy = if cfg!(windows) {
+                r#"--project-strategy "repo-root""#
+            } else {
+                "--project-strategy repo-root"
+            };
+            assert!(command.contains(expected_strategy), "{command}");
             assert!(!command.contains(".sh"), "{command}");
         }
         assert!(value["hooks"].get("SessionEnd").is_none());
