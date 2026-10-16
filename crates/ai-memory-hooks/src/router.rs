@@ -4124,11 +4124,8 @@ async fn process_authorized(
     // and current actorless sessions use the same value; attributing either to
     // whoever delivers SessionEnd would silently rebucket shared context. A
     // store failure aborts this event rather than guessing an owner.
-    let session_owner = parse_session_owner(admitted.owner().map(str::to_owned))?;
-    let session_actor = session_owner
-        .as_ref()
-        .map(IdentityKey::to_actor_context)
-        .unwrap_or_default();
+    let (session_owner, session_actor) =
+        stored_session_identity(admitted.owner().map(str::to_owned))?;
     // A redelivery of a checkpoint whose LLM rewrite already ran (or is
     // running) must not put the rule-based page back over it: the enqueue of
     // that same generation would be ignored, so the LLM page would be lost.
@@ -4268,37 +4265,43 @@ async fn process_authorized(
         } else {
             None
         };
-        let page_id =
-            match agent_session_page_id(state, page_ws, page_proj, session_id, &new_page.path)
-                .await?
-            {
-                Some(page_id) => page_id,
-                None => {
-                    state
-                        .wiki
-                        .write_page(ai_memory_wiki::WritePageRequest {
-                            workspace_id: new_page.workspace_id,
-                            project_id: new_page.project_id,
-                            path: new_page.path.clone(),
-                            frontmatter: new_page.frontmatter_json.clone(),
-                            body: new_page.body.clone(),
-                            tier: new_page.tier,
-                            pinned: new_page.pinned,
-                            title: None,
-                            admission_ctx: None,
-                            author_id: None,
-                            // Attribute to the operator who OWNED the session, read back
-                            // from the session row, not to whoever delivered this
-                            // SessionEnd — a spool drain, an operator finalizing a stuck
-                            // session, or a shared hook token can all carry a different
-                            // identity. NULL stays anonymous/shared, including rows that
-                            // predate owner recording.
-                            actor: session_actor.clone(),
-                            evidence: Vec::new(),
-                        })
-                        .await?
-                }
-            };
+        let page_id = match agent_session_page_id(
+            &state.wiki,
+            &state.reader,
+            page_ws,
+            page_proj,
+            session_id,
+            &new_page.path,
+        )
+        .await?
+        {
+            Some(page_id) => page_id,
+            None => {
+                state
+                    .wiki
+                    .write_page(ai_memory_wiki::WritePageRequest {
+                        workspace_id: new_page.workspace_id,
+                        project_id: new_page.project_id,
+                        path: new_page.path.clone(),
+                        frontmatter: new_page.frontmatter_json.clone(),
+                        body: new_page.body.clone(),
+                        tier: new_page.tier,
+                        pinned: new_page.pinned,
+                        title: None,
+                        admission_ctx: None,
+                        author_id: None,
+                        // Attribute to the operator who OWNED the session, read back
+                        // from the session row, not to whoever delivered this
+                        // SessionEnd — a spool drain, an operator finalizing a stuck
+                        // session, or a shared hook token can all carry a different
+                        // identity. NULL stays anonymous/shared, including rows that
+                        // predate owner recording.
+                        actor: session_actor.clone(),
+                        evidence: Vec::new(),
+                    })
+                    .await?
+            }
+        };
         if track_page_write && previous_page_id != Some(page_id) {
             state.ingest_metrics.record_persisted(now_unix_ms());
         }
@@ -4493,6 +4496,23 @@ fn parse_session_owner(owner: Option<String>) -> anyhow::Result<Option<IdentityK
                 .ok_or_else(|| anyhow::anyhow!("malformed stored session owner identity"))
         })
         .transpose()
+}
+
+/// The session's persisted owner as both its parsed identity and the actor
+/// context every write on the session's behalf is attributed to — the
+/// `SessionEnd` path and the idle auto-end tick share this one parse so the
+/// two cannot drift. Only SQL NULL has the intentional legacy/shared meaning
+/// (and maps to the default shared actor); a malformed owned key fails
+/// closed rather than silently rebucketing the session's context to shared.
+pub(crate) fn stored_session_identity(
+    stored_owner: Option<String>,
+) -> anyhow::Result<(Option<IdentityKey>, ai_memory_core::ActorContext)> {
+    let owner = parse_session_owner(stored_owner)?;
+    let actor = owner
+        .as_ref()
+        .map(IdentityKey::to_actor_context)
+        .unwrap_or_default();
+    Ok((owner, actor))
 }
 
 fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
@@ -4817,9 +4837,16 @@ async fn write_checkpoint_page(
     // SessionEnd: the checkpoint would replace it with the server's model or
     // the rule-based summary.
     let path = PagePath::new(format!("sessions/{session_id}.md"))?;
-    if agent_session_page_id(state, workspace_id, project_id, session_id, &path)
-        .await?
-        .is_some()
+    if agent_session_page_id(
+        &state.wiki,
+        &state.reader,
+        workspace_id,
+        project_id,
+        session_id,
+        &path,
+    )
+    .await?
+    .is_some()
     {
         return Ok(false);
     }
@@ -4880,17 +4907,15 @@ async fn write_checkpoint_page(
 /// tool call, the Stop and the SessionEnd always land after that write, so
 /// no observation count separates a current page from a stale one. A page
 /// that cannot be read is replaced as before, with a warning.
-async fn agent_session_page_id(
-    state: &HookState,
+pub(crate) async fn agent_session_page_id(
+    wiki: &Wiki,
+    reader: &ai_memory_store::ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     session_id: SessionId,
     path: &PagePath,
 ) -> anyhow::Result<Option<PageId>> {
-    match state
-        .wiki
-        .session_page_written_by_agent(workspace_id, project_id, session_id)
-    {
+    match wiki.session_page_written_by_agent(workspace_id, project_id, session_id) {
         Ok(true) => {}
         Ok(false) => return Ok(None),
         Err(error) => {
@@ -4902,8 +4927,7 @@ async fn agent_session_page_id(
             return Ok(None);
         }
     }
-    let page_id = state
-        .reader
+    let page_id = reader
         .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_owned())
         .await?;
     if page_id.is_some() {

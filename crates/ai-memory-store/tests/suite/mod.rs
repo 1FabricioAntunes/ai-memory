@@ -14,6 +14,7 @@ mod fts_drift_status;
 mod fts_stopwords_config;
 mod handoff_ownership;
 mod identity_resolution;
+mod idle_session_end;
 mod most_recently_active_scope;
 mod multi_session;
 mod observation_prune;

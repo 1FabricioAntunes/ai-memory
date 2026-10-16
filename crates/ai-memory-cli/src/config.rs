@@ -567,6 +567,8 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Server-side session lifecycle (idle auto-end tick).
+    pub sessions: SessionsSettings,
     /// Lower edge (inclusive) of `memory_lint`'s A5 zero-LLM
     /// contradiction-detection cosine-similarity band. Two cold pages whose
     /// embeddings sit in `[contradiction_band_min, contradiction_band_max)`
@@ -1397,6 +1399,7 @@ impl Default for Config {
             embedding_document_prefix: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            sessions: SessionsSettings::default(),
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             dream: DreamSettings::default(),
@@ -1839,6 +1842,21 @@ impl Default for MaintenanceSettings {
             reconcile_tombstones_deleted_pages: false,
         }
     }
+}
+
+/// `[sessions]` server-side session lifecycle.
+///
+/// Env form: `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS=24`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionsSettings {
+    /// Hours of silence after which the maintenance tick ends an open
+    /// session that never received a `SessionEnd` (crashed harness, closed
+    /// terminal, timed-out hook): summary page + consolidation job, no
+    /// handoff. `0` (the default) disables the tick — the explicit
+    /// `finalize-on-exit` / `repair-backfill-timestamps` path stays the only
+    /// end for sessions an operator may still come back to.
+    pub idle_end_after_hours: u32,
 }
 
 /// `[dream]` — the opt-in LLM dream pass (docs/design-memory-aging.md §B2–B4).
@@ -2386,6 +2404,19 @@ impl Config {
         config.runtime_env = runtime_env;
 
         validate_run_profiles(&config.run)?;
+
+        // The idle auto-end tick turns `idle_end_after_hours` into a
+        // microsecond cutoff: a value above a year is a configuration
+        // mistake (a typo of minutes for days), and a huge value would also
+        // push the cutoff microsecond arithmetic toward `i64` overflow.
+        // Bound it at load rather than at 3am inside the tick.
+        if config.sessions.idle_end_after_hours > 8760 {
+            anyhow::bail!(
+                "sessions.idle_end_after_hours must be 0 (off) or at most 8760 hours \
+                 (one year); got {}",
+                config.sessions.idle_end_after_hours
+            );
+        }
 
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
@@ -6834,6 +6865,80 @@ fn ambient_llm_base_url_still_configures_opencode() {
     assert_eq!(
         provider.base_url.as_deref(),
         Some("https://opencode.ai/zen/v1")
+    );
+}
+
+// --- `[sessions] idle_end_after_hours` ------------------------------
+
+/// The key defaults to `0` (off) when absent, parses from TOML, and the
+/// load-time bound rejects a year-plus value by naming the key.
+#[test]
+fn sessions_idle_end_defaults_off_loads_from_toml_and_rejects_out_of_range() {
+    use tempfile::TempDir;
+    assert_eq!(Config::default().sessions.idle_end_after_hours, 0);
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    // Absent key keeps the default.
+    std::fs::write(&config_path, "# nothing\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 0);
+
+    // TOML parse.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 24\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 24);
+
+    // Boundary: one year is accepted.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 8760\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 8760);
+
+    // Above the bound the load fails and names the key.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 8761\n").unwrap();
+    let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+        .expect_err("above the bound must fail at load");
+    assert!(
+        error.to_string().contains("idle_end_after_hours"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// The env form `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS` outranks the
+/// TOML value, like every other flat config key.
+#[test]
+fn sessions_idle_end_env_overrides_config() {
+    use tempfile::TempDir;
+    const CHILD_MARKER: &str = "AI_MEMORY_TEST_SESSIONS_IDLE_END_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 24\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.sessions.idle_end_after_hours, 48);
+        println!("sessions-idle-end-env-applied");
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("config::sessions_idle_end_env_overrides_config")
+        .arg("--test-threads=1")
+        .arg("--nocapture")
+        .env(CHILD_MARKER, "1")
+        .env("AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS", "48")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child test failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("sessions-idle-end-env-applied"),
+        "child stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

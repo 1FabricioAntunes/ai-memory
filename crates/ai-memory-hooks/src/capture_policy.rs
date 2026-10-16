@@ -182,6 +182,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // Meta Muse Code sends the same three fields, `tool_use_id` being the
         // provider's call id (`call_…`, captured offline on Muse Code 1.4.7).
         // CodeBuddy Code sends the same Claude Code fields (#1299).
+        // DSH's Claude Code hooks bridge forwards the same Claude Code
+        // snake_case fields for PreToolUse / PostToolUse.
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
@@ -192,7 +194,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::CopilotCli
         | AgentKind::Muse
         | AgentKind::CodeBuddy
-        | AgentKind::IbmBob => (
+        | AgentKind::IbmBob
+        | AgentKind::Dsh => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -266,6 +269,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Muse
                             | AgentKind::CodeBuddy
                             | AgentKind::IbmBob
+                            | AgentKind::Dsh
                     ) {
                         "tool_input"
                     } else {

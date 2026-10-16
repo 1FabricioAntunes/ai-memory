@@ -301,6 +301,10 @@ pub enum AgentKind {
     /// but consume `SessionStart` stdout as plain context text.
     #[serde(rename = "ibm-bob", alias = "bob")]
     IbmBob,
+    /// DeepSeek Harness (DSH), whose Claude Code hooks bridge
+    /// (`@deepseek-ai/dsh-hooks-claude-code`) fires Claude Code-shaped
+    /// payloads for seven events (no `SessionEnd` or `PreCompact`).
+    Dsh,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -311,7 +315,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -338,6 +342,7 @@ impl AgentKind {
         Self::Muse,
         Self::CodeBuddy,
         Self::IbmBob,
+        Self::Dsh,
         Self::Other,
     ];
 
@@ -371,6 +376,7 @@ impl AgentKind {
             Self::Muse => "muse",
             Self::CodeBuddy => "codebuddy",
             Self::IbmBob => "ibm-bob",
+            Self::Dsh => "dsh",
             Self::Other => "other",
         }
     }
@@ -407,6 +413,7 @@ impl AgentKind {
             "muse" | "muse-code" | "musecode" => Self::Muse,
             "codebuddy" | "code-buddy" => Self::CodeBuddy,
             "ibm-bob" | "bob" => Self::IbmBob,
+            "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
             _ => Self::Other,
         }
     }
@@ -474,6 +481,9 @@ impl AgentKind {
                 | Self::KimiCode
                 | Self::Hermes
                 | Self::Pool
+                // DSH's bridge runs SessionStart detached, so its stdout
+                // cannot be relied on to deliver a fetched handoff.
+                | Self::Dsh
                 | Self::Other
         )
     }
@@ -696,6 +706,26 @@ mod tests {
         // destructive handoff fetch must not happen from its native hook.
         assert!(!AgentKind::Pool.session_start_injects_handoff());
         assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_dsh_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Dsh.as_str(), "dsh");
+        assert_eq!(AgentKind::from_wire("dsh"), AgentKind::Dsh);
+        assert_eq!(AgentKind::from_wire("deepseek-harness"), AgentKind::Dsh);
+        assert_eq!(AgentKind::from_wire("deepseek_harness"), AgentKind::Dsh);
+        // serde uses rename_all = "kebab-case" → "dsh".
+        assert_eq!(serde_json::to_string(&AgentKind::Dsh).unwrap(), "\"dsh\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"dsh\"").unwrap(),
+            AgentKind::Dsh
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("dsh-2"), AgentKind::Other);
+        // DSH's Claude Code hooks bridge runs SessionStart detached, so the
+        // destructive handoff fetch must not happen from its hook bundle.
+        assert!(!AgentKind::Dsh.session_start_injects_handoff());
+        assert!(!AgentKind::Dsh.user_prompt_injects_handoff());
     }
 
     #[test]

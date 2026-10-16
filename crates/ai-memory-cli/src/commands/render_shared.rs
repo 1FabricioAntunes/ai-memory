@@ -178,6 +178,27 @@ pub(crate) const IBM_BOB_EVENTS: [(&str, &str); 5] = [
     ("Stop", "stop.sh"),
 ];
 
+/// DeepSeek Harness (DSH) lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-the-Claude-Code-hooks.json, POSIX hook-script-filename)`.
+///
+/// DSH has no native hook protocol: capture runs through the official
+/// `@deepseek-ai/dsh-hooks-claude-code` bridge, which consumes a Claude Code
+/// `hooks.json` and delivers exactly these seven events — `PreCompact` and
+/// `SessionEnd` are not delivered, and `SessionStart` runs detached, so the
+/// bundle never fetches a handoff and finished sessions close with
+/// `ai-memory finalize-session --agent dsh`. Adding a hook event means
+/// updating this list AND adding the matching `.sh` and `.ps1` files under
+/// `hooks/dsh/`; the install-hooks parity test fails if the bundle drifts.
+pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
 /// seconds, like the Claude Code plugins it loads. The capture POST is
 /// fire-and-forget; `SessionStart` also fetches a handoff.
@@ -776,6 +797,36 @@ pub(crate) fn build_grok_payload(
             "grok",
             None,
             None,
+        ),
+    )
+}
+
+/// DeepSeek Harness (DSH) hook payload: a Claude Code `hooks.json` document
+/// the official `@deepseek-ai/dsh-hooks-claude-code` bridge consumes via its
+/// `configPath` setting. Commands are rendered for the current platform
+/// (native `ai-memory hook --event … --agent dsh` commands by default, so
+/// capture gets the local spool and capture-policy v1 enforcement; script
+/// commands under an `AI_MEMORY_HOOK_PLATFORM` override). The payload only
+/// covers [`DSH_EVENTS`] — no `PreCompact` or `SessionEnd`.
+#[must_use]
+pub(crate) fn build_dsh_hooks_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DSH_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::current(),
+            "dsh",
+            data_dir,
+            project_strategy,
         ),
     )
 }
