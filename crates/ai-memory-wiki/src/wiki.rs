@@ -37,6 +37,31 @@ pub struct PurgeSessionOutcome {
     pub files_failed: Vec<PagePath>,
 }
 
+/// One hook event ledger (`log-YYYY-MM.md`) found in a project's wiki
+/// directory by [`Wiki::list_event_ledgers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLedgerFile {
+    /// File name inside the project directory, e.g. `log-2026-07.md`.
+    pub file_name: String,
+    /// Size on disk, in bytes.
+    pub bytes: u64,
+}
+
+fn event_ledger_metadata(abs: &Path) -> WikiResult<Option<std::fs::Metadata>> {
+    let metadata = match std::fs::symlink_metadata(abs) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !metadata.is_file()
+        || crate::confinement::is_link_like(&metadata)
+        || !crate::ledger::opens_with_log_ledger(abs)
+    {
+        return Ok(None);
+    }
+    Ok(Some(metadata))
+}
+
 /// Summary of a [`Wiki::reindex_all`] run.
 #[derive(Debug, Default, Clone)]
 pub struct ReindexSummary {
@@ -96,6 +121,11 @@ enum PageStoreRemoval {
         expected_latest_id: PageId,
     },
 }
+
+/// Most commits [`Wiki::page_checkpoints`] inspects for one page. A
+/// checkpoint is one commit per write or consolidation pass, so this covers a
+/// long history while keeping a lookup on a page nobody touched lately bounded.
+pub const PAGE_CHECKPOINT_WALK_LIMIT: usize = 5_000;
 
 /// Body + optional L0 abstract text a caller of `reindex_page_locked` should
 /// embed once it is safe to do so (i.e. after releasing whatever lock it
@@ -383,6 +413,65 @@ impl Wiki {
     /// Propagates [`WikiError`] from the git adapter.
     pub fn recent_checkpoints(&self, limit: usize) -> WikiResult<Vec<Checkpoint>> {
         self.git.recent_checkpoints(limit)
+    }
+
+    /// Checkpoints, newest first, that changed one page (including the one
+    /// that deleted it), so a caller can pick a `rev` to restore from.
+    ///
+    /// The history walk runs on the blocking pool and inspects at most
+    /// [`PAGE_CHECKPOINT_WALK_LIMIT`] commits.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the path escapes the project tree or git
+    /// cannot be read.
+    pub async fn page_checkpoints(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        limit: usize,
+    ) -> WikiResult<Vec<Checkpoint>> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
+        let rel = PathBuf::from(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join(path.as_str());
+        let git = self.git.clone();
+        tokio::task::spawn_blocking(move || {
+            git.path_checkpoints(&rel, limit, PAGE_CHECKPOINT_WALK_LIMIT)
+        })
+        .await
+        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Parse one page as stored at checkpoint `rev`, without touching the
+    /// live tree or the index.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the revision/path does not exist or the
+    /// stored bytes are not parseable UTF-8 markdown.
+    pub async fn page_at_checkpoint(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        rev: &str,
+    ) -> WikiResult<Markdown> {
+        self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
+        let rel = PathBuf::from(workspace_id.to_string())
+            .join(project_id.to_string())
+            .join(path.as_str());
+        let git = self.git.clone();
+        let rev_owned = rev.to_owned();
+        let bytes = tokio::task::spawn_blocking(move || git.file_at_rev(&rev_owned, &rel))
+            .await
+            .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+        let raw = String::from_utf8(bytes).map_err(|e| {
+            WikiError::Io(std::io::Error::other(format!(
+                "{} at {rev} is not valid UTF-8 markdown: {e}",
+                path.as_str()
+            )))
+        })?;
+        parse(&raw)
     }
 
     /// Create the one-time baseline checkpoint for an existing wiki tree that
@@ -1577,6 +1666,150 @@ impl Wiki {
         }
     }
 
+    /// List the rotated hook event ledgers (`log-YYYY-MM.md`) directly under a
+    /// project's wiki directory, in file-name order.
+    ///
+    /// A file qualifies only when its name has the rotated-ledger shape AND its
+    /// content opens like a ledger (the [`ai_memory_core::log_ledger`]
+    /// predicates, the same gate the indexer, the OKF migration and the OKF
+    /// export apply): an ordinary page named `log-2025-01.md` is not listed.
+    /// The unrotated `log.md` is never listed. Symbolic links and anything
+    /// that is not a regular file are skipped. A project with no directory yet
+    /// lists nothing.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Confinement`] when the project tree crosses a
+    /// symbolic link, or [`WikiError::Io`] when the directory cannot be read.
+    pub fn list_event_ledgers(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<Vec<EventLedgerFile>> {
+        self.inspect_project_tree(workspace_id, project_id)?;
+        let root = self.confined_project_root(workspace_id, project_id, Prepare::Inspect)?;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ledgers = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !crate::ledger::is_rotated_log_filename(&file_name) {
+                continue;
+            }
+            let metadata = match std::fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                // Removed between the listing and the stat: not a ledger now.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if !metadata.is_file()
+                || crate::confinement::is_link_like(&metadata)
+                || !crate::ledger::opens_with_log_ledger(&entry.path())
+            {
+                continue;
+            }
+            ledgers.push(EventLedgerFile {
+                file_name,
+                bytes: metadata.len(),
+            });
+        }
+        ledgers.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+        Ok(ledgers)
+    }
+
+    /// Delete one rotated hook event ledger (`log-YYYY-MM.md`) from a
+    /// project's wiki directory and report the file's size.
+    ///
+    /// The only wiki path that removes a ledger: a ledger is not a page, so
+    /// none of the page-delete helpers (which address `pages` rows) fit. It
+    /// takes the exclusive mutation guard, then re-checks under it what the
+    /// caller may have decided from a stale listing: the name must have the
+    /// rotated-ledger shape (never `log.md`, never a path) and the file must be
+    /// a regular, non-linked file whose content still opens like a ledger, so
+    /// an ordinary page that carries the name is never deleted.
+    ///
+    /// Then it runs the same blocking admission check a page delete gets
+    /// (`remove_page_locked`): webhooks subscribed to `delete_event_ledger`
+    /// are notified with the ledger's file name BEFORE the removal, and a
+    /// `Reject`-policy webhook refuses the delete — the file is left in place
+    /// and the error propagates. Only after the file is gone are the chain's
+    /// non-blocking observers dispatched, the way page deletes tell them.
+    ///
+    /// The hook ledger appender does not take the mutation guard, so an append
+    /// that lands after the final check and before removal is deleted with the
+    /// file. Callers pass only old months; a late-delivered event may append
+    /// during the sweep or recreate a small ledger afterward. Never touches
+    /// the store: a legacy `pages` row for the ledger is left alone.
+    ///
+    /// Returns `Ok(Some(bytes))` when the file was deleted and `Ok(None)` when
+    /// there was nothing deletable: no such file, or one that is not a ledger.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Confinement`] when the project tree crosses a
+    /// symbolic link, [`WikiError::Io`] when `file_name` is not a rotated
+    /// ledger name, when a `reject`-policy webhook refuses the removal, or
+    /// when the filesystem fails.
+    pub async fn delete_event_ledger(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        file_name: &str,
+    ) -> WikiResult<Option<u64>> {
+        if !crate::ledger::is_rotated_log_filename(file_name) {
+            return Err(ai_memory_wiki_error(
+                "only a rotated event ledger (log-YYYY-MM.md) can be deleted",
+            ));
+        }
+        let _guard = self.mutation_lock.write().await;
+        self.inspect_project_tree(workspace_id, project_id)?;
+        let abs = project_path(
+            &self.root,
+            workspace_id,
+            project_id,
+            Path::new(file_name),
+            Prepare::Inspect,
+        )?;
+        let Some(_metadata) = event_ledger_metadata(&abs)? else {
+            return Ok(None);
+        };
+        // The blocking half, exactly as `remove_page_locked` runs it for a
+        // page delete: a `reject`-policy webhook refuses before anything is
+        // removed, and the refusal propagates with the file left in place.
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+            let mut ctx = AdmissionContext {
+                op: AdmissionOp::DeleteEventLedger,
+                ..Default::default()
+            };
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(Some(file_name), &ctx).await?;
+            Some(ctx)
+        } else {
+            None
+        };
+        // Admission is an external await point. Re-check afterward so a
+        // webhook or concurrent editor cannot replace the inspected ledger
+        // with an ordinary page and have that page removed by pathname.
+        let Some(metadata) = event_ledger_metadata(&abs)? else {
+            return Ok(None);
+        };
+        match self.git.remove_file_checked(&abs) {
+            Ok(()) => {
+                if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                    chain.dispatch_async(Some(file_name), &serde_json::Value::Null, "", ctx);
+                }
+                Ok(Some(metadata.len()))
+            }
+            Err(WikiError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Session ids this scope has tombstoned, as a set for the reindex gate.
     ///
     /// The session-level twin of [`WriterHandle::scope_is_purged`], and read
@@ -1615,6 +1848,51 @@ impl Wiki {
         author_id: Option<UserId>,
         compaction: ai_memory_store::Compaction,
     ) -> WikiResult<PurgeSessionOutcome> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
+            None,
+        )
+        .await
+    }
+
+    /// Purge an operator's own session through the canonical disk/SQL mutation path.
+    /// Shared sessions and cross-project cascades require the admin path.
+    ///
+    /// # Errors
+    /// Returns store ownership/scope failures before removing files.
+    pub async fn purge_owned_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        owner: ai_memory_core::IdentityKey,
+        author_id: Option<UserId>,
+    ) -> WikiResult<PurgeSessionOutcome> {
+        self.purge_session_with_owner(
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            ai_memory_store::Compaction::Skip,
+            Some(owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn purge_session_with_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<UserId>,
+        compaction: ai_memory_store::Compaction,
+        owner: Option<ai_memory_core::IdentityKey>,
+    ) -> WikiResult<PurgeSessionOutcome> {
         self.inspect_project_tree(workspace_id, project_id)?;
         let _guard = self.mutation_lock.write().await;
         self.inspect_project_tree(workspace_id, project_id)?;
@@ -1623,17 +1901,29 @@ impl Wiki {
         // `WriterHandle::purge_session` instead, bypassing this wrapper
         // entirely, so the file-removal loop below never runs over paths
         // that a preview only *predicts* would be removed.
-        let summary = self
-            .writer
-            .purge_session(
-                workspace_id,
-                project_id,
-                session_id,
-                author_id,
-                compaction,
-                ai_memory_store::PurgeMode::Commit,
-            )
-            .await?;
+        let summary = if let Some(owner) = owner {
+            self.writer
+                .purge_owned_session(
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    owner,
+                    author_id,
+                    ai_memory_store::PurgeMode::Commit,
+                )
+                .await?
+        } else {
+            self.writer
+                .purge_session(
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    author_id,
+                    compaction,
+                    ai_memory_store::PurgeMode::Commit,
+                )
+                .await?
+        };
         let mut files_deleted = Vec::with_capacity(summary.removed_paths.len());
         let mut files_failed = Vec::new();
         for path in &summary.removed_paths {
@@ -8280,6 +8570,180 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "disk and index agree after the guard is released"
+        );
+    }
+
+    async fn owned_session_with_page(
+        tmp: &TempDir,
+    ) -> (
+        Store,
+        Wiki,
+        WorkspaceId,
+        ProjectId,
+        UserId,
+        SessionId,
+        PagePath,
+    ) {
+        let (store, wiki, ws, proj) = scoped(tmp).await;
+        let user = store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "purge-owner".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: Some("user:purge-owner".into()),
+            })
+            .await
+            .unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let page = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "owned session body",
+                serde_json::json!({"title":"Owned session"}),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(sid, Some(page)).await.unwrap();
+        (store, wiki, ws, proj, user, sid, path)
+    }
+
+    #[tokio::test]
+    async fn owned_session_purge_authorization_failure_preserves_page_and_index() {
+        use ai_memory_core::IdentityKey;
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, user, sid, path) = owned_session_with_page(&tmp).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        let before = std::fs::read(&abs).unwrap();
+        assert!(matches!(
+            wiki.purge_owned_session(
+                ws,
+                proj,
+                sid,
+                IdentityKey::User("foreign".into()),
+                Some(user)
+            )
+            .await,
+            Err(WikiError::Store(ai_memory_store::StoreError::NotFound(_)))
+        ));
+        store
+            .writer
+            .set_access_mode(proj, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        assert!(matches!(
+            wiki.purge_owned_session(
+                ws,
+                proj,
+                sid,
+                IdentityKey::User("purge-owner".into()),
+                Some(user)
+            )
+            .await,
+            Err(WikiError::Store(ai_memory_store::StoreError::Forbidden(_)))
+        ));
+        assert_eq!(std::fs::read(&abs).unwrap(), before);
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !store
+                .reader
+                .search_pages("owned".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(wiki.purged_sessions(ws, proj).await.unwrap().is_empty());
+        // Removing the restriction provides a legitimate control for the same file.
+        store
+            .writer
+            .set_access_mode(proj, ai_memory_store::AccessMode::Open)
+            .await
+            .unwrap();
+        let outcome = wiki
+            .purge_owned_session(
+                ws,
+                proj,
+                sid,
+                IdentityKey::User("purge-owner".into()),
+                Some(user),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.files_deleted, vec![path]);
+        assert!(!abs.exists());
+    }
+
+    #[tokio::test]
+    async fn owned_session_purge_cleanup_failure_is_reported_and_tombstoned() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, user, sid, path) = owned_session_with_page(&tmp).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        let before = std::fs::read(&abs).unwrap();
+        // A directory in place of a file forces cleanup failure on every platform,
+        // including privileged test runners that ignore read-only permissions.
+        std::fs::remove_file(&abs).unwrap();
+        std::fs::create_dir(&abs).unwrap();
+        let outcome = wiki
+            .purge_owned_session(
+                ws,
+                proj,
+                sid,
+                ai_memory_core::IdentityKey::User("purge-owner".into()),
+                Some(user),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.files_failed, vec![path.clone()]);
+        assert!(outcome.files_deleted.is_empty());
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(wiki.purged_sessions(ws, proj).await.unwrap().contains(&sid));
+        // Simulate the leftover file returning during recovery. Reindex must
+        // honor the tombstone instead of resurrecting the deleted summary.
+        std::fs::remove_dir(&abs).unwrap();
+        std::fs::write(&abs, before).unwrap();
+        let summary = wiki.reindex_all().await.unwrap();
+        assert_eq!(summary.skipped_purged_sessions, 1);
+        assert!(
+            store
+                .reader
+                .search_pages("owned".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

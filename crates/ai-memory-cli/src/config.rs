@@ -106,6 +106,11 @@ pub struct DecaySettings {
     pub observation_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
+    /// Age, in whole UTC calendar months after a month ends, past which the
+    /// forget sweep deletes that month's hook event ledger
+    /// (`log-YYYY-MM.md`). `0` disables the pass; nothing is deleted until an
+    /// operator opts in. The current and the previous month are never deleted.
+    pub ledger_retention_months: i64,
     /// A2 extractive tier-down (`[decay] compact_cold_episodic`). When `true`,
     /// the forget sweep COMPACTS a cold episodic page — keeping its L0 abstract,
     /// an L1 summary and the L2 keep-token set, dropping the prose — instead of
@@ -145,6 +150,7 @@ impl Default for DecaySettings {
             breadth_weight: 0.0,
             observation_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
+            ledger_retention_months: 0,
             compact_cold_episodic: false,
             dedup_cold_clusters: false,
             dedup_min_pts: 0,
@@ -200,6 +206,15 @@ impl DecaySettings {
         ai_memory_consolidate::ObservationRetention {
             days: self.observation_retention_days,
             batch: self.observation_prune_batch,
+        }
+    }
+
+    /// Opt-in event ledger age bound consumed by the forget sweep. Disabled
+    /// (`months == 0`) unless `[decay] ledger_retention_months` is positive.
+    #[must_use]
+    pub fn ledger_retention(self) -> ai_memory_consolidate::LedgerRetention {
+        ai_memory_consolidate::LedgerRetention {
+            months: self.ledger_retention_months,
         }
     }
 
@@ -1468,6 +1483,10 @@ fn validate_run_profiles(run: &RunSettings) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConsolidationSettings {
+    /// Add bounded literal diagnostics from observations omitted or truncated
+    /// by the normal projection. Off by default because it widens the subset
+    /// of captured text sent to the configured provider.
+    pub verbatim_residue: bool,
     /// Approximate token target for the entire consolidation prompt:
     /// observation dump, current page body, system prompt, page conventions,
     /// slot snapshots, and the structured-output schema.
@@ -1492,6 +1511,7 @@ pub struct ConsolidationSettings {
 impl Default for ConsolidationSettings {
     fn default() -> Self {
         Self {
+            verbatim_residue: false,
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
@@ -2393,6 +2413,14 @@ impl Config {
         }
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+        // The same fail-closed rule for the opt-in ledger sweep: a negative
+        // age is not a cutoff, and this pass deletes files.
+        if config.decay.ledger_retention_months < 0 {
+            anyhow::bail!(
+                "decay.ledger_retention_months must be greater than or equal to zero \
+                 (0 disables ledger deletion)"
+            );
         }
         // A5 zero-LLM contradiction band (`memory_lint`): both edges must be
         // finite and inside cosine similarity's own range, and the band must
@@ -3880,6 +3908,9 @@ mod tests {
         assert_eq!(cfg.decay.observation_retention_days, 0);
         assert_eq!(cfg.decay.observation_prune_batch, 5_000);
         assert!(!cfg.decay.observation_retention().is_enabled());
+        // Same contract for the hook event ledgers: kept unless opted in.
+        assert_eq!(cfg.decay.ledger_retention_months, 0);
+        assert!(!cfg.decay.ledger_retention().is_enabled());
         assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
@@ -4733,6 +4764,32 @@ mod tests {
         }
     }
 
+    /// A negative ledger age is rejected at load, like the observation age: a
+    /// destructive pass is never configured into a nonsensical shape. `0` is
+    /// the valid "disabled" value and loads.
+    #[test]
+    fn load_rejects_a_negative_ledger_retention() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[decay]\nledger_retention_months = -1\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a negative ledger retention must fail closed");
+        assert!(
+            error.to_string().contains("ledger_retention_months"),
+            "unexpected error: {error:#}"
+        );
+
+        std::fs::write(&config_path, "[decay]\nledger_retention_months = 0\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect("zero disables the pass and must load");
+        assert!(!cfg.decay.ledger_retention().is_enabled());
+
+        std::fs::write(&config_path, "[decay]\nledger_retention_months = 12\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect("a positive age must load");
+        assert_eq!(cfg.decay.ledger_retention().months, 12);
+    }
+
     /// The consolidation budget must be big enough to leave room for
     /// observations after the fixed system prompt and page conventions.
     /// Below the floor every consolidation would be evidence-free, so it
@@ -4876,6 +4933,16 @@ max_input_tokens = {tokens}
             ConsolidationSettings::default().input_token_safety_margin,
             0.8
         );
+    }
+
+    #[test]
+    fn verbatim_residue_is_opt_in_and_loads_from_consolidation_settings() {
+        assert!(!ConsolidationSettings::default().verbatim_residue);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[consolidation]\nverbatim_residue = true\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.consolidation.verbatim_residue);
     }
 
     /// The small-context examples in `docs/install.md` and

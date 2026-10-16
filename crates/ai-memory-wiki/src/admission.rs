@@ -52,6 +52,13 @@ pub enum AdmissionOp {
     /// A single page is being deleted (`Wiki::delete_page`). Carries the
     /// page path; no body. Lets a mirror `git rm` the file.
     Delete,
+    /// A hook event ledger file (`log-YYYY-MM.md`) is being deleted by the
+    /// opt-in ledger retention pass of the forget sweep
+    /// (`Wiki::delete_event_ledger`). Carries the ledger file name in the
+    /// page path; no body, and no `pages` row to touch (ledgers are files,
+    /// not pages). Fired **before** the file is removed, so a `reject`-policy
+    /// webhook keeps it; a mirror subscribed to it can `git rm` the file.
+    DeleteEventLedger,
     /// A whole project is being purged (`Wiki::purge_project` →
     /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
     /// mirror remove the project's directory.
@@ -107,6 +114,7 @@ impl AdmissionOp {
             AdmissionOp::WritePage => "write_page",
             AdmissionOp::Consolidate => "consolidate",
             AdmissionOp::Delete => "delete",
+            AdmissionOp::DeleteEventLedger => "delete_event_ledger",
             AdmissionOp::PurgeProject => "purge_project",
             AdmissionOp::PurgeSession => "purge_session",
             AdmissionOp::PurgeWorkspace => "purge_workspace",

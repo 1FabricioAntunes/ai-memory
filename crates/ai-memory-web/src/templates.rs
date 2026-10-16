@@ -626,6 +626,14 @@ pub(crate) struct TimingRow {
     pub ms: String,
 }
 
+/// One option of the search page's kind or tier filter.
+pub(crate) struct FilterOption {
+    /// The value the select submits and shows.
+    pub value: String,
+    /// The current search filters on this value.
+    pub selected: bool,
+}
+
 /// One project in the search page's "Search in" selector.
 pub(crate) struct ScopeOption {
     /// `workspace/project`, the value the selector submits.
@@ -678,6 +686,15 @@ pub(crate) struct SearchView {
     pub scope_groups: Vec<ScopeGroup>,
     /// Link to the scoped project, for the breadcrumb.
     pub project_href: String,
+    /// A kind or tier filter narrowed the hits.
+    pub filtered: bool,
+    /// The kind filter names no standard kind (empty when it does, or when
+    /// there is none); a custom frontmatter kind or a typo.
+    pub unknown_kind: String,
+    /// Kinds the filter offers.
+    pub kind_options: Vec<FilterOption>,
+    /// Tiers the filter offers.
+    pub tier_options: Vec<FilterOption>,
 }
 
 impl SearchView {

@@ -551,7 +551,7 @@ pub struct DetectedPreference {
 /// Checked here as well as at import: hooks store harness turns as prompts,
 /// and `profile rebuild` re-reads observations stored before an import filter
 /// existed.
-fn user_written(body: &str) -> Option<String> {
+pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
         || ai_memory_core::looks_like_codex_instructions(body)
     {

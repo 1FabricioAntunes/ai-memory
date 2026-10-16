@@ -151,6 +151,53 @@ consolidation. Checkpoints and superseding versions therefore keep the same
 origin. Manual `memory_write_page` and `ai-memory write-page` calls do not
 infer an agent.
 
+### Reload context after a compaction
+
+A compaction keeps a model-written summary of the conversation, and the
+summary can drop or soften what you asked. Start a prompt with
+`reload context` to put the stretch it dropped back in front of the agent:
+
+```
+reload context after last compaction, then finish the screenshots for guide 12
+```
+
+The hooks see the phrase at the start of the prompt (any case; a sentence
+that only mentions it does not count) and inject a **compaction recap** built
+from what ai-memory captured for this session between its latest compaction
+and the one before it (or the session start):
+
+- your prompts in that stretch, verbatim, oldest first; harness markup and
+  task notifications are left out. When they do not all fit, the newest stay
+  whole, the next older one is cut to the room left, and older ones are
+  dropped with a note;
+- the agent's last reply before the compaction. Replies are captured only
+  with the assistant-capture double opt-in (`install-hooks --capture-assistant`
+  plus `capture_assistant` on the server); without it the recap says so;
+- the project's open handoffs, listed and never claimed, this session's own
+  first.
+
+The rest of the prompt runs as usual with the recap in context. Serving the
+recap writes nothing: no handoff is claimed and no page or extra observation
+is added (the prompt itself is captured like any other).
+
+Fetching the recap holds the prompt until it arrives. On a healthy local
+server that takes milliseconds. When the server is slow or unreachable, the
+hook first spends up to 3 seconds sending queued events and then waits up to
+3 seconds for the recap, so the prompt can take about 6 seconds to reach the
+agent, which then runs it without a recap. Prompts that do not start with
+`reload context` never wait for this.
+
+| Harness | When the agent sees the recap |
+|---|---|
+| Claude Code | With that prompt (`UserPromptSubmit` `additionalContext`, up to 8,000 chars) |
+| Codex | With that prompt (developer context, up to 6,000 chars to stay under Codex's hook-output preview limit) |
+| OpenCode V1 / V2 | With that prompt and later model calls, until the next compaction |
+| Grok Build | After the first tool result of that turn: Grok discards `UserPromptSubmit` output. The recap shares that field with a handoff delivered at the same time and is sized to fit; when the handoff leaves too little room, it comes with the next tool result. A request with no tool call expires after 30 minutes or at session end |
+
+A session that has not been compacted yet answers with a one-line notice. The
+full record stays available through `memory_read_session_observations` with
+the session id and `kinds: ["user-prompt", "stop"]`.
+
 ## Proactive memory queries
 
 Hooks handle capture without prompting. Proactive querying depends on
@@ -177,6 +224,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Search expired notes for X" | `memory_query` with `include_expired: true` | Opts an explicit project, sibling-scope, or global search into expired historical pages; ordinary searches exclude them. |
 | "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits, plus a top-level `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`; streams that did not run are left out). A global query reports only its distinct FTS stream and `fts_ms`. |
 | Improve top project/scopes search relevance | Set `AI_MEMORY_RERANKER=llm` on a server with an LLM provider | Sends the bounded query plus up to 30 bounded titles/snippets to the provider for at most one final relevance pass. Invalid, partial, failed, timed-out, or concurrency-saturated requests preserve the normal order; `global=true` and supplemental global-preference hits are unchanged. |
+| "Undo that change" / "bring back the page I deleted" | `memory_restore_page` | Call it without `rev` to list the page's checkpoints, then with the chosen `rev` to write that version back as the current one. The replaced version stays reachable. Admin only on a multi-user server; see [lifecycle-ops](lifecycle-ops.md#mcp-memory_restore_page). |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "That recalled page helped" / "this page is stale" | `memory_feedback` | Records `helpful`, `not_helpful`, `stale`, or `wrong` for the exact path. Retention weight affects sweep-eligible episodic pages; stale/wrong also flag any current page for lint review. Retrieved content never authorizes feedback by itself. |
 | "Audit the wiki" / "any contradictions?" | `memory_lint` | Runs stale-page, contradiction, and rule-suggestion checks. |
@@ -199,6 +247,33 @@ close. `semantic` / `procedural` tiers, `pinned: true`, and the tags
 a page: a query aimed at a session-specific term can still return that session.
 `pinned` remains primarily a retention and automation-mutation control, not an
 unconditional search override.
+
+## Search from the terminal
+
+`ai-memory search` runs an FTS5 query against the wiki from a shell. It skips
+the entity, vector and graph streams and the raw-observation fallback that the
+agent's hybrid `memory_query` uses.
+
+```bash
+ai-memory search "wal mode"                           # current project (cwd / marker)
+ai-memory search "wal mode" --workspace acme --project api
+ai-memory search "wal mode" --global                  # every project
+ai-memory search "wal mode" --global --json -n 20
+```
+
+Without a flag the scope comes from the current directory, the same way as
+every other client command (see [marker-file.md](marker-file.md)).
+`--global` sends no scope and searches the wiki pages of every project; each
+hit is printed with its `workspace/project`, and `--json` adds `workspace` and
+`project` fields to each hit. `--global` cannot be combined with `--workspace`
+or `--project`. It covers compiled wiki pages only, not raw observations.
+
+The command calls `GET /admin/search`, so on a multi-user server only the root
+operator can run it. A DB user searches across the projects they may read with
+`memory_query(global=true)` or the web search page instead. A repository's
+`[recall] default_global` marker setting changes what an agent's unscoped
+`memory_query` reads; it does not change this command, which stays
+project-scoped unless you pass `--global`.
 
 ## Historical memory and live code intelligence
 
@@ -556,7 +631,8 @@ breadcrumbs, rendered markdown, metadata, and search. On a project, page,
 namespace, history or session view the header search box searches that project;
 elsewhere it searches every project with FTS5, like
 `memory_query(global=true)`, and the search page's "Search in" selector picks
-a project. A page shows an outline of its headings, the pages that cite it and
+a project, and its "Kind" and "Tier" selects (`kind=` and `tier=`) keep only
+the pages of that kind or tier. A page shows an outline of its headings, the pages that cite it and
 the pages it cites; a folder's namespace listing sorts by recent update or by
 title and shows 25 pages at a time. The search on a project page ranks with
 the same hybrid ranker as `memory_query` for that project, and its "Explain

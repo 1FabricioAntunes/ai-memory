@@ -49,7 +49,9 @@ automatically, and (with an LLM) consolidation compiles them into pages.
 Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
-prepended to the agent's context automatically. To make it apply to **all** your
+prepended to the agent's context automatically: an excerpt of every rule first,
+whole bodies while the budget lasts, and `memory_read_page` for the rest. Pin
+the rule to have it shown in full before the others. To make it apply to **all** your
 projects, ask for it as a standing preference. It goes to your cross-project
 profile (see the next recipe), or to the shared `_global` scope with
 `scope: "global"`. On a multi-user
@@ -547,6 +549,11 @@ ai-memory server list                # server profiles a marker can route to
 ai-memory export-okf …               # export the wiki as an OKF bundle
 ai-memory serve                      # run the server
 ```
+
+On an interactive terminal, `status` and `doctor` group and wrap their output
+for readability. Redirected output, JSON, `NO_COLOR`, and `TERM=dumb` remain
+plain; see [Diagnostic report presentation](diagnostics.md) for the exact
+contract.
 
 ## When it isn't doing what you expect
 

@@ -11,7 +11,217 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-16
+
+### Added
+- Added first-party IBM Bob support. `install-mcp --client ibm-bob --apply`
+  (alias `bob`) merges a native Streamable HTTP server into
+  `~/.bob/settings/mcp.json`, using Bob's documented `legacy` protocol
+  negotiation so it skips the non-standard `server/discover` probe.
+  `install-hooks --agent ibm-bob --apply` merges the five events common to
+  Bob IDE and Bob Shell into `~/.bob/settings/settings.json`, preserves other
+  settings and hooks, enforces capture exclusions over Claude-shaped tool
+  payloads, and delivers the pending handoff as plain `SessionStart` context.
+  Bob has no true `SessionEnd`, so finished sessions use
+  `finalize-session --agent ibm-bob`. Managed transcript resume is not claimed
+  without a documented stable native transcript store. (#1331)
+- Added host-local native history continuation for managed harness switches.
+  When `ai-memory run` moves a workstream from one harness to another, it pins
+  the previous native session, validates it against the exact checkout, and
+  exposes a private temporary visible-history dossier to the receiving child
+  through `AI_MEMORY_PREVIOUS_SESSION_HISTORY`. The startup packet tells the
+  agent to consult it for details omitted by the bounded portable ledger. The
+  remote server receives no local path or transcript body; same-harness runs
+  create nothing, foreign/missing stores fail closed to the portable fallback,
+  and the dossier is deleted when the child exits. (#1327)
+- Added opt-in `[consolidation] verbatim_residue = true`, which recovers a
+  bounded set of literal error lines, paths, URLs, status codes and versions
+  from observations omitted or truncated by the consolidation projection.
+  The residue is marked as untrusted, grouped and indented so captured text
+  cannot forge prompt structure, and never changes stored page content except
+  through the existing structured LLM response. The default remains off and
+  preserves existing prompt bytes. The eval harness can compare both states
+  with `ab --residue` and `projection --residue`. (#1215)
+- Grouped interactive `status` and `doctor` reports into sections with semantic
+  colors, consistent margins and terminal-width wrapping, retaining every
+  diagnostic field and remedy. Redirected, `NO_COLOR`,
+  `TERM=dumb` and JSON reports kept their existing stdout format. (#1313)
+- Added an opt-in server-rendered management console for users, sessions, and
+  personal MCP API keys, using existing authentication and SQLite storage.
+  Required the `management-ui` build feature and runtime switch. (#1231)
+- Added opt-in session inspection and owned-session purging for signed-in
+  browser users, enabled at runtime with `serve --enable-session-management`
+  (`AI_MEMORY_ENABLE_SESSION_MANAGEMENT`). A user can purge only a session they
+  own in a project they may write; an Admin can purge any. Requested in #1231.
+  (#1267)
+- Added opt-in self-service `aim_` API keys for signed-in browser users,
+  enabled at runtime with `serve --enable-self-service-keys`
+  (`AI_MEMORY_ENABLE_SELF_SERVICE_KEYS`). Labels must be 1 to 128 characters
+  and a user may hold at most 20 active keys. A self-issued key survives a
+  password reset or account disable and must be revoked separately. Requested
+  in #1231. (#1268)
+- Added `ai-memory search --global`, which searches the wiki pages of every
+  project from the terminal instead of only the current one. Each hit shows
+  its `workspace/project` in the text output and carries `workspace` and
+  `project` fields in `--json`. The flag cannot be combined with
+  `--workspace` or `--project`, and a search without it still resolves its
+  scope from the current directory. The server side is `GET /admin/search`
+  with no `workspace`/`project`: its hits now include `workspace` and
+  `project` next to the fields they already had, and the route stays
+  root-only on a multi-user server. Global search covers wiki pages only;
+  raw observations and a search limited to one workspace are not part of
+  this change. (#1253)
+- Added kind and tier filters to the web search. The search page in `/web`
+  has "Kind" and "Tier" selects, and `/web/search` accepts `kind` and `tier`
+  for both a project search and a cross-project one. Every retrieval stream
+  applies the filter in its own query, so other kinds cannot crowd out a rare
+  one, a filtered search asks the streams for no more candidates than an
+  unfiltered one, and the reranker scores only pages the filter keeps. Kind
+  and tier both ignore case, a nonstandard kind is flagged on an empty
+  result, and "Search all projects" keeps the filters. An unknown `tier` is
+  a 400. (#1248)
+- Added `ai-memory setup --plan`, which prints the plan and changes nothing,
+  and `--plan --json`, which prints it as a JSON document with a `format`
+  version for a script or front end to render. The plan now says what each
+  detected agent was found by (its session store, its MCP config, or Muse's
+  directory), numbers the agents, and lists the other agents `--agent`
+  accepts. At the prompt you can type the numbers of the agents to wire
+  instead of `y`; a number outside the plan changes nothing. (#1270)
+- Added a native Windows path to the two-command install. `install.ps1`,
+  published with each release next to its own `.sha256`, checks the release
+  zip against that checksum, refuses archive entries that are absolute or
+  hold `..`, unpacks it under `%LOCALAPPDATA%\Programs\ai-memory` and adds
+  that directory to the user `PATH` (`AI_MEMORY_NO_MODIFY_PATH=1` skips it),
+  with no administrator rights. `ai-memory setup` now has a service step on
+  Windows: it writes an `ai-memory` value under the per-user `Run` key that
+  starts a hidden `ai-memory service-host` at logon, and starts it right away.
+  The value is written and read through the registry API, not by running
+  `reg.exe`: an unsigned binary running `reg.exe add` on the `Run` key is a
+  common persistence signal, and Bitdefender's behavioral engine quarantined
+  `ai-memory.exe` for it (#1280). Its paths are written plainly, without the
+  `\\?\` prefix a canonical path carries. Stopping the host does not run
+  `taskkill` either: `setup` and `uninstall` leave a stop request in the data
+  dir, and the host kills the server it started and exits. `taskkill` is
+  only the fallback for a host that does not answer within ten seconds (one
+  started by an older binary, or a hung one) or a server whose host already
+  died.
+  The host runs the server with no console window and restarts it after a
+  failure, giving up after five failures within ten seconds of starting.
+  `ai-memory uninstall --apply` stops the host and removes the value when it
+  still has the shape `setup` writes and names this install's data dir, so an
+  uninstall against another data dir (a second install, a test's temporary
+  one) leaves the entry alone. `ai-memory doctor` and `ai-memory status`
+  warn (`logon_binary_missing`, also in their `--json` output and when
+  `status` cannot reach the server) when that entry names an
+  `ai-memory.exe` that no longer exists, which is what an antivirus
+  quarantine leaves behind, and say how to restore the binary or remove the
+  entry. (#1271, #1280, #1300, #1311)
+- Added `ai-memory setup --web`, which shows the setup plan as a page in
+  your browser and applies the agents you tick there by running `ai-memory
+  setup --yes --agent ...` and streaming its output to the page. The page is
+  served on `127.0.0.1` behind a one-time address printed in the terminal
+  (opened in the browser unless `--no-open` or there is no desktop), refuses
+  requests with another `Host`, without the address's secret, or, for a
+  change, without the page's own `Origin` and CSRF token, and holds no token.
+  It stops on Finish, after 15 minutes without a request, or on Ctrl-C. (#1272)
+- Added a desktop installer preview, `companions/ai-memory-desktop`: a Tauri
+  app that uses an existing `ai-memory` install or copies its bundled one into
+  the same per-user location as `install.sh` and `install.ps1`, then shows the
+  `ai-memory setup --web` page in its own window. CI builds unsigned Linux,
+  macOS and Windows installers on manual dispatch; they are not attached to
+  releases until the project signs them. `setup --web` gained a hidden
+  `--stop-on-stdin-eof` flag so the page stops when the app does. (#1273)
+- A prompt that starts with `reload context` (for example `reload context
+  after last compaction, then …`) now puts the stretch of the session that
+  its last compaction dropped back in front of the agent: the prompts typed
+  between the latest two compactions, verbatim; the last captured reply (with
+  the assistant-capture opt-in); and the project's open handoffs, listed
+  without claiming them. The new read-only `GET /recap` route builds it from
+  captured observations. Claude Code and Codex receive it with that prompt
+  through `UserPromptSubmit` `additionalContext`, OpenCode V1/V2 through the
+  plugin's system/context hook, and Grok Build on the next `PostToolUse`.
+  Serving the recap writes nothing, so a reload never consumes a baton (#1230).
+- Added first-party CodeBuddy Code (Tencent) support. `codebuddy` is an
+  `AgentKind` (migration V81), so hook events are attributed to it and a
+  Claude Code-shaped tool payload (`tool_name`, `tool_input`, `tool_response`)
+  is stored as a closed tool observation instead of an empty `other` capture.
+  `install-hooks --agent codebuddy` (alias `code-buddy`) merges native
+  `ai-memory hook --event … --agent codebuddy` commands for seven events
+  (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `PreCompact`, `Stop`, `SessionEnd`) into the `hooks` key of
+  `~/.codebuddy/settings.json`, keeps sibling settings and your own hooks,
+  and changes nothing on a re-run. There is no script bundle. The
+  `SessionStart` hook delivers the pending handoff through
+  `hookSpecificOutput.additionalContext`, and a capture-only `SessionStart` or
+  `UserPromptSubmit` prints nothing, since CodeBuddy appends that output to
+  the session. A `SessionStart` without `cwd` falls back to
+  `CODEBUDDY_PROJECT_DIR`. `setup` wires CodeBuddy when
+  `~/.codebuddy` exists, `setup-agent --agent codebuddy` prints the hook
+  block, and `uninstall` removes the entries. Transcript backfill and
+  headless `codebuddy -p` session close are not part of this change.
+  Requested in #1299. (#1312)
+- Added the `memory_restore_page` MCP tool: without `rev` it lists the git
+  checkpoints that changed a page, and with `rev` it writes that version back
+  through the wiki write path (sanitizer, admission, slots and supersession
+  apply), keeping the checkpoint's frontmatter. Restoring can bring back text
+  a root deleted or purged, so both listing and restoring need the same admin
+  authority as `/admin/restore-page`. The MCP surface is now 24 tools. (#1307)
+- Added an opt-in sweep of old hook event ledgers by age. With `[decay]
+  ledger_retention_months = N` (env `AI_MEMORY_DECAY__LEDGER_RETENTION_MONTHS`;
+  `0`, the default, disables it; a negative value is rejected at startup), the
+  forget sweep deletes a project's `log-YYYY-MM.md` once `N` whole UTC calendar
+  months have passed after its month ended. A file qualifies only when its name
+  is a rotated ledger **and** its content opens like a ledger, so a page that
+  merely shares the name is never deleted; that content gate is repeated after
+  the blocking admission round-trip. `log.md`, the current month and the
+  previous month are never deleted whatever `N` is. The deletion goes through
+  the wiki (`Wiki::delete_event_ledger`, under the mutation guard) and never
+  writes the database; a dry run reports `ledgers_prunable` and
+  `ledger_bytes_prunable` and deletes nothing, and a real run reports
+  `ledgers_pruned`, `ledger_bytes_pruned` and `ledger_page_rows_left` (legacy
+  page rows it left alone) in the `forget-sweep` / `memory_forget_sweep`
+  report. Each removal consults the blocking admission chain on the new
+  `delete_event_ledger` op, the same check a page delete runs: a `reject`-policy
+  webhook keeps the file, which the sweep counts in `ledgers_undeleted`, keeps
+  going and retries on the next run, and non-blocking observers are told only
+  after the unlink. The deletion is permanent on disk; the wiki's git history
+  keeps the blobs a checkpoint already captured. (#1322)
+
+
+### Changed
+- `ai-memory setup` now ends by naming the agents to restart and the question
+  to ask one of them, "What do you remember about this project?", instead of
+  a generic restart line. `install.sh` names the link's full path in its
+  `next:` line when `~/.local/bin` is not on `PATH`, so the suggested command
+  no longer fails with "command not found". The AUR install and upgrade
+  messages, and the README Fedora, Arch and macOS app steps, point to
+  `ai-memory setup` instead of the manual `init`, `systemctl` and
+  `install-*` commands. (#1270)
+- Changed how the opt-in session-start brief (`[briefing]
+  inject_on_session_start`) spends `max_chars`. Every pinned, `_rules/` and
+  `_slots/` page now gets a short excerpt first, taken from its frontmatter
+  `abstract:` or `summary:`, or else from the prose it opens with (read on
+  into its first list items). The budget left deepens pages to a longer
+  excerpt and then the whole body: pinned and `_slots/` pages first, then
+  pages a few bytes short of whole, then the cheapest bodies. Before, the
+  brief printed whole bodies in order, so one long `_rules/` page was cut with
+  a `[truncated by ...]` note and every page after it became an "omitted"
+  path. Bodies are no longer cut: a body that does not fit whole shows its
+  excerpt. Four or more unpinned excerpts from one folder share a heading,
+  and the omitted list and the closing note point at `memory_read_page`.
+  Small wikis whose pages fit still get every body whole. A project with many
+  standing pages now sees all of them, fewer in full: pin a page, or give it
+  an `abstract:`, to control what it shows. The change adds no marker key
+  and no migration. (#1264)
+
+
 ### Fixed
+- Restored fresh source installs after crates.io yanked every `zip` release
+  compatible with Candle 0.11. Cargo now patches `zip` 8.6.0 to its immutable
+  upstream release commit, and `cargo-deny` permits only that repository with
+  an exact revision. Locked builds keep the same reviewed code, while
+  `cargo install --path crates/ai-memory-cli` can resolve from a clean graph
+  again. The patch can be removed when Candle publishes support for `zip` 9.
 - Fixed the forget sweep's raw-observation prune deleting the raw capture of
   a session that still has a queued consolidation. A session resumed after its
   first summary gets a new `session_consolidation_jobs` row (`pending` or
@@ -38,6 +248,12 @@ version in [`docs/changelog/`](docs/changelog/):
   The PreCompact and PostCompaction checkpoint page uses the same bounded
   reads. The writer's lifecycle-only re-check and the reader now build their
   query from one shared predicate. (#1323)
+- Fixed `ai-memory run --yolo` failing with `401 Unauthorized` after it
+  re-ran itself under ai-jail on an install whose bearer token lives in
+  `[auth].bearer_token_file`. ai-jail's private home hides the data dir, so
+  the jailed run had no token. The outer run now passes the token it resolved,
+  and a `server_url` set in `config.toml` or derived from `bind`, into the
+  jail through the environment, never the command line. (#1284)
 - Fixed every structured LLM call (consolidation, lint, auto-improve and the
   rest) failing with a 400 on Claude Opus 5.5, Sonnet 5.5, Fable 5.1 and
   Mythos 5.1. Those models reject a forced `tool_choice`, which the Anthropic
@@ -887,6 +1103,7 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.0.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.0
 [3.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.0.1
 [3.0.0]: https://github.com/akitaonrails/ai-memory/compare/v2.6.7...v3.0.0

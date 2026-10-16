@@ -14,6 +14,7 @@ mod embeddings;
 mod entropy_experience;
 #[cfg(unix)]
 mod eval_results;
+mod ledger_sweep;
 mod lifecycle;
 mod local_embeddings;
 mod multi_machine;
@@ -22,3 +23,4 @@ mod profile_harvest;
 mod recall_eval;
 mod search_quality;
 mod typed_edges;
+mod verbatim_residue_consolidation;

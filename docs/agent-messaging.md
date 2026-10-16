@@ -342,8 +342,9 @@ hook (or, for clients that discard SessionStart output like Kimi, its first
 user-prompt hook) fetches `GET /handoff`, which returns any pending single-use
 **handoff** plus, when the project's `.ai-memory.toml` opts in with
 `[briefing] inject_on_session_start = true`, a compiled **project brief** of
-pinned / `_rules/` / `_slots/` pages and recent-page pointers. That block is
-prepended to the new session's context automatically.
+pinned / `_rules/` / `_slots/` pages (an excerpt of each, whole bodies while
+the budget lasts) and recent-page pointers. That block is prepended to the new
+session's context automatically.
 
 As of 2.3, that same on-start block appends a **non-consuming inbox notice**
 when the project has pending mail:

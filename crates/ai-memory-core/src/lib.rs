@@ -8,7 +8,9 @@
 pub mod active_project;
 pub mod actor;
 pub mod agent_backup;
+pub mod compaction_recap;
 pub mod error;
+pub mod excerpt;
 pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
@@ -105,9 +107,9 @@ pub use user::{
 };
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse,
-    ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity, NewWorkstreamEvent,
-    PrepareManagedRunRequest, PrepareManagedRunResponse, RenameManagedWorkstreamRequest,
-    RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent,
-    WorkstreamEventKind, scrub_workstream_provenance,
+    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedNativeSessionReference,
+    ManagedRunContextResponse, ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
+    RenameManagedWorkstreamRequest, RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE,
+    WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind, scrub_workstream_provenance,
 };

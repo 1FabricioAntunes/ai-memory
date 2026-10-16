@@ -88,8 +88,8 @@ pub use reader::{
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
     GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
     ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview,
-    PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
+    PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter, PageHit, PageHitWithMeta,
+    PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
     ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
     ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
     ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, SESSION_LINE_TITLE_CHARS,
@@ -1956,6 +1956,47 @@ mod tests {
         );
     }
 
+    /// The brief's L0/L1 excerpts come from the frontmatter the core rows
+    /// carry, A2-compacted pages included.
+    #[tokio::test]
+    async fn session_brief_pages_carry_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        let mut summarized = sample_page(ws, proj, "_rules/a-summarized.md", "full body");
+        summarized.frontmatter_json =
+            serde_json::json!({"abstract": "one-line pointer", "summary": "longer summary"});
+        store.writer.upsert_page(summarized).await.unwrap();
+        let mut compacted = sample_page(ws, proj, "_rules/b-compacted.md", "L1 line");
+        compacted.frontmatter_json = serde_json::json!({"compacted": true});
+        store.writer.upsert_page(compacted).await.unwrap();
+
+        let (core, _) = store
+            .reader
+            .session_brief_pages(ws, proj, 24, 10)
+            .await
+            .unwrap();
+        let by_path = |path: &str| core.iter().find(|p| p.path == path).unwrap();
+
+        let summarized = by_path("_rules/a-summarized.md");
+        assert_eq!(summarized.frontmatter_json["abstract"], "one-line pointer");
+        assert_eq!(summarized.frontmatter_json["summary"], "longer summary");
+        assert_eq!(
+            by_path("_rules/b-compacted.md").frontmatter_json["compacted"],
+            true
+        );
+    }
+
     #[tokio::test]
     async fn cross_project_links_surface_in_graph_briefing_and_lint() {
         let tmp = TempDir::new().unwrap();
@@ -2476,7 +2517,7 @@ mod tests {
 
         let global = store
             .reader
-            .search_pages_with_meta(query.into(), 10, None, None)
+            .search_pages_with_meta(query.into(), 10, None, None, crate::PageFilter::default())
             .await
             .unwrap();
         assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
@@ -5814,10 +5855,68 @@ mod tests {
             .await
             .unwrap();
         assert!(codex.native_session_id.is_none());
+        assert_eq!(
+            codex.previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            })
+        );
         assert!(
             !codex.may_adopt_existing_session,
             "an established Claude workstream must start a fresh Codex session"
         );
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(codex.run_id, AgentKind::Codex, "codex-native")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_context(codex.run_id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            }),
+            "linking the destination must not replace the pinned source"
+        );
+        store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: codex.run_id,
+                    native_session_id: Some("codex-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+        let same_harness = store
+            .writer
+            .prepare_workstream_run(prepare(AgentKind::Codex, "codex-again"))
+            .await
+            .unwrap();
+        assert!(same_harness.previous_native_session.is_none());
     }
 
     #[tokio::test]

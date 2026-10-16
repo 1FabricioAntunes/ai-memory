@@ -219,6 +219,8 @@ companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace mem
                            and `./companions/ai-memory-macos/build.sh`.
 companions/ai-memory-ts/        optional TypeScript client SDK (npm, Node 22+); NOT a workspace
                            member and never shipped with the server.
+companions/ai-memory-desktop/   Tauri v2 desktop installer (plain HTML, no npm) that installs the
+                           binary and runs `setup --web` in a window; own workspace.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 plugins/                   generated Claude Code + Codex marketplace plugins (catalogs in
                            `.claude-plugin/`, `.agents/plugins/`); edit the templates in
@@ -299,6 +301,10 @@ covers the same tests, slower, no tiers.
   ai-memory-web` downloads the pinned Tailwind CLI and rewrites
   `static/tailwind.css`; commit the result. CI regenerates it on Linux and
   fails if the committed file is stale, so nothing else needs the download.
+- **Management console.** Its askama templates and plain POST form adapters
+  live in `ai-memory-web`. Follow [`docs/management-ui.md`](docs/management-ui.md)
+  for feature-enabled checks. Regenerate the vendored Tailwind stylesheet
+  when changing templates or styles; no JavaScript toolchain is needed.
 - Run each Cargo companion separately (`ai-memory-client`,
   `ai-memory-importer`, `ai-memory-relay` and `ai-memory-wikisync`):
   `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
@@ -310,6 +316,12 @@ covers the same tests, slower, no tiers.
   `swift test --package-path companions/ai-memory-macos`
   (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
   Root `--workspace` commands do not cover it.
+- Run the desktop installer separately (Linux needs the `webkit2gtk-4.1`,
+  `gtk3`, `librsvg` and `libsoup3` development packages): `cargo fmt --check`,
+  `cargo clippy --locked --all-targets -- -D warnings` and `cargo test
+  --locked`, each with `--manifest-path companions/ai-memory-desktop/Cargo.toml`.
+  `.github/workflows/desktop.yml` runs them on a pull request that touches it
+  and builds unsigned installers on dispatch.
 - Run the TypeScript SDK separately, from `companions/ai-memory-ts`:
   `npm ci --ignore-scripts`, `npm run check` (typecheck, unit tests, schema
   and generated-docs checks, TypeDoc) and
@@ -717,7 +729,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 23 (see `docs/ARCHITECTURE.md`). They also
+  The tool count is currently 24 (see `docs/ARCHITECTURE.md`). They also
   update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
   the schema snapshot (`npm run schema:update`), the wrapper or its
   classification in `src/coverage.ts`, types, tests and docs. The SDK's
