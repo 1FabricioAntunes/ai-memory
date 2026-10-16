@@ -214,6 +214,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Restored fresh source installs after crates.io yanked every `zip` release
+  compatible with Candle 0.11. Cargo now patches `zip` 8.6.0 to its immutable
+  upstream release commit, and `cargo-deny` permits only that repository with
+  an exact revision. Locked builds keep the same reviewed code, while
+  `cargo install --path crates/ai-memory-cli` can resolve from a clean graph
+  again. The patch can be removed when Candle publishes support for `zip` 9.
 - Fixed the forget sweep's raw-observation prune deleting the raw capture of
   a session that still has a queued consolidation. A session resumed after its
   first summary gets a new `session_consolidation_jobs` row (`pending` or

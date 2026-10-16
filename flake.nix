@@ -363,7 +363,12 @@
               version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
               src = ./.;
-              cargoLock.lockFile = ./Cargo.lock;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+                outputHashes = {
+                  "zip-8.6.0" = "sha256-TrN48XjjyMcZ3f6VF2eTMQDPqwzzH2QYavQaOUkolQA=";
+                };
+              };
 
               # No nativeBuildInputs needed — the build is fully self-contained
               # (SQLite bundled, libgit2 vendored, rustls with webpki-roots).
