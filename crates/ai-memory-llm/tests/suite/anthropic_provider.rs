@@ -90,8 +90,11 @@ async fn models_that_accept_a_forced_tool_choice_keep_it() {
 }
 
 #[tokio::test]
-async fn an_unforced_call_reads_a_json_reply_given_as_text() {
-    let fenced = text_reply("```json\n{\"answer\": \"ok\"}\n```");
+async fn an_unforced_call_reads_json_after_thinking_or_in_prose() {
+    let fenced = json!([
+        {"type": "thinking", "thinking": "", "signature": "sig"},
+        {"type": "text", "text": "```json\n{\"answer\": \"ok\"}\n```"}
+    ]);
     let (outcome, _) = structured_call("claude-opus-5-5", fenced).await;
     assert_eq!(outcome.unwrap(), json!({"answer": "ok"}));
 
