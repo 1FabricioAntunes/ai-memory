@@ -2932,8 +2932,9 @@ sends Chat Completions `reasoning_effort` (clamped to `low`/`medium`/`high`/
 OpenAI-style `reasoning_effort`. Anthropic and Anthropic-OAuth map the same
 key to `output_config.effort` and adaptive/disabled thinking on models that
 accept those fields (Haiku 4.5 omits them because it rejects them, while Haiku
-5.5 receives them; Fable 5 / Mythos 5 / Mythos Preview omit
-`thinking: disabled` because those models reject it). `ultra` and `persistent` clamp to `max` on OpenAI-style
+5.5 receives them; Fable 5 / Mythos 5 / Mythos Preview / Opus 5.5 omit
+`thinking: disabled` because those models reject it, and Sonnet 5.5, which
+rejects it too, receives `thinking: between_tools` for `none`). `ultra` and `persistent` clamp to `max` on OpenAI-style
 hosts. Gemini and Copilot ignore the key.
 
 [Atlas Cloud](https://www.atlascloud.ai/models/qwen/qwen3.5-flash) uses the
