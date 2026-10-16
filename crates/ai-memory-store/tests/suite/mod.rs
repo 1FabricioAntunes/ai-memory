@@ -16,6 +16,7 @@ mod handoff_ownership;
 mod identity_resolution;
 mod most_recently_active_scope;
 mod multi_session;
+mod observation_prune;
 mod page_first_created;
 mod pinned_pages;
 mod profile;
