@@ -226,6 +226,25 @@ version in [`docs/changelog/`](docs/changelog/):
   the jailed run had no token. The outer run now passes the token it resolved,
   and a `server_url` set in `config.toml` or derived from `bind`, into the
   jail through the environment, never the command line. (#1284)
+- Fixed every structured LLM call (consolidation, lint, auto-improve and the
+  rest) failing with a 400 on Claude Opus 5.5, Sonnet 5.5, Fable 5.1 and
+  Mythos 5.1. Those models reject a forced `tool_choice`, which the Anthropic
+  provider sent to make the model call its `result` tool. They now get the
+  default `auto`, with a tool description that asks for the call, and a reply
+  that carries the JSON as text is read as the result. Other Claude models keep
+  the forced call. (#1328)
+- Fixed `AI_MEMORY_LLM_REASONING_EFFORT=none` failing every Anthropic request
+  to Claude Opus 5.5 and Sonnet 5.5 with a 400. Both reject
+  `thinking: {"type": "disabled"}`. Opus 5.5 now gets no `thinking` field, as
+  Fable and Mythos already did, and Sonnet 5.5 gets
+  `thinking: {"type": "between_tools"}`, its way to turn thinking off. (#1326)
+- Fixed the Anthropic provider rejecting any response that carried a
+  `thinking` or `redacted_thinking` block as an unknown variant. Claude
+  Opus 5, Sonnet 5, Haiku 5.5 and the later Opus, Sonnet, Fable and Mythos
+  models think when a request leaves `thinking` out, and Claude models from
+  4.6 on are sent adaptive thinking once `AI_MEMORY_LLM_REASONING_EFFORT` is
+  set, so `memory_explore` and `ai-memory llm-test` failed as soon as the
+  model thought. The provider now skips the blocks it does not read. (#1325)
 
 ## [3.0.1] - 2026-10-15
 
