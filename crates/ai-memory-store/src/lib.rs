@@ -63,13 +63,14 @@ pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalUpsert,
     DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
-    HookSessionAdmission, IdentityResolution, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
-    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary,
-    PagesMode, ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary, RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate,
-    SessionTimesSkipReason, SkippedSessionTimes, StaleAfterRepair, backfill_entity_index,
-    backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
+    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
+    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
@@ -86,18 +87,19 @@ pub use reader::{
     AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
-    GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
-    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter, PageHit, PageHitWithMeta,
-    PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
-    ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
-    ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
-    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, SESSION_LINE_TITLE_CHARS,
-    SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain, SessionConsolidationQueue,
-    SessionConsolidationSummary, SessionDependentRows, SessionEndDisposition, SessionKindSummary,
-    SessionLine, SessionObservationSnapshot, SessionSummary, SessionToolTitles, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery,
-    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    GraphVia, HealthDetail, HealthPage, HybridSearch, IdleOpenSession, InboxCount, InboxEntry,
+    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
+    OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter, PageHit,
+    PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
+    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
+    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
+    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
+    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
+    SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
+    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
+    SessionSummary, SessionToolTitles, SettledPage, StatusCounts, StorageStatus, StoredEmbedding,
+    StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -108,7 +110,9 @@ pub use scope::{
     lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
     resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
-pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
+pub use session_consolidation::{
+    SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, enqueue_in_tx,
+};
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{

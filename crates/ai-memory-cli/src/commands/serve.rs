@@ -1413,10 +1413,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         embedder.clone(),
         admin_llm.clone(),
         config.decay,
+        config.sessions,
         config.dream,
         activity_clock,
         config.contradiction_band_min,
         config.contradiction_band_max,
+        config.consolidate_on_session_end,
+        consolidator.is_some(),
     )
     .await;
 
@@ -2081,10 +2084,13 @@ async fn start_maintenance_scheduler(
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
     decay: crate::config::DecaySettings,
+    sessions: crate::config::SessionsSettings,
     dream: crate::config::DreamSettings,
     activity_clock: ai_memory_consolidate::ActivityClock,
     contradiction_band_min: f32,
     contradiction_band_max: f32,
+    consolidate_on_session_end: bool,
+    has_session_consolidator: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -2447,6 +2453,92 @@ async fn start_maintenance_scheduler(
                 "dream pass enabled but no embedder is configured; job not started (nothing to cluster)"
             ),
         }
+    }
+
+    // Idle session auto-end: end the open sessions that never received a
+    // `SessionEnd` (crashed harness, closed terminal, timed-out hook) with
+    // the effects the hook path would have given them — summary page and
+    // consolidation job, never a handoff. Bounded batch every fixed
+    // interval; the scan is stateless and idempotent (the writer-side
+    // `ended_at IS NULL` CAS plus the conditional page write make a double
+    // end impossible), so it needs no persisted cadence state.
+    let idle_end_after_hours = sessions.idle_end_after_hours;
+    if maintenance_enabled && idle_end_after_hours > 0 {
+        let writer = writer.clone();
+        let reader = reader.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                ai_memory_hooks::IDLE_END_INTERVAL_SECS,
+            ));
+            // The first tick fires immediately; let the server come up and
+            // the writer settle before the first scan.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now_us = jiff::Timestamp::now().as_microsecond();
+                // The config load bounds the value to a microsecond-safe
+                // range; the checked arithmetic is the runtime belt (an
+                // overflow would flip the cutoff and mass-end sessions).
+                let Some(cutoff_us) = i64::from(idle_end_after_hours)
+                    .checked_mul(3_600_000_000)
+                    .and_then(|window_us| now_us.checked_sub(window_us))
+                else {
+                    tracing::warn!(
+                        idle_end_after_hours,
+                        "idle session auto-end tick: cutoff arithmetic overflowed; skipping this pass"
+                    );
+                    continue;
+                };
+                // Over-fetch the selection past the active-run sessions:
+                // the tick excludes them (their lifecycle belongs to the
+                // run), and the exclusion must not starve the batch bound
+                // behind a backlog of persistently excluded sessions.
+                let active_runs = match reader
+                    .active_managed_run_native_session_ids()
+                    .await
+                {
+                    Ok(active_runs) => active_runs,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "idle session auto-end run check failed");
+                        continue;
+                    }
+                };
+                let idle = match reader
+                    .idle_open_sessions(
+                        cutoff_us,
+                        ai_memory_hooks::IDLE_END_BATCH
+                            .saturating_add(active_runs.len()),
+                    )
+                    .await
+                {
+                    Ok(idle) => idle,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "idle session auto-end selection failed");
+                        continue;
+                    }
+                };
+                if idle.is_empty() {
+                    continue;
+                }
+                match ai_memory_hooks::run_idle_end_tick(&ai_memory_hooks::IdleEndTickInput {
+                    writer: &writer,
+                    reader: &reader,
+                    wiki: &wiki,
+                    sessions: idle,
+                    now_us: jiff::Timestamp::now().as_microsecond(),
+                    consolidate_on_session_end,
+                    has_consolidator: has_session_consolidator,
+                })
+                .await
+                {
+                    // Success is the tick's own log (idle_end.rs); the
+                    // scheduler only surfaces failures.
+                    Ok(_outcome) => {}
+                    Err(error) => tracing::warn!(error = %error, "idle session auto-end tick failed"),
+                }
+            }
+        }));
     }
 
     if tasks.is_empty() {
@@ -4268,10 +4360,13 @@ mod tests {
             None,
             None,
             crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
             crate::config::DreamSettings::default(),
             ai_memory_consolidate::ActivityClock::default(),
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4318,10 +4413,13 @@ mod tests {
                 None,
                 None,
                 crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings::default(),
                 crate::config::DreamSettings::default(),
                 ai_memory_consolidate::ActivityClock::default(),
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -4329,6 +4427,235 @@ mod tests {
             for task in tasks {
                 task.abort();
             }
+        }
+    }
+
+    /// The idle auto-end task starts only with maintenance enabled AND
+    /// `idle_end_after_hours > 0`; either switch off leaves the task count
+    /// unchanged.
+    #[tokio::test]
+    async fn idle_end_tick_does_not_start_when_disabled_or_maintenance_off() {
+        let baseline = MaintenanceSettings {
+            enabled: true,
+            forget_sweep_interval_secs: 0,
+            lint_interval_secs: 60,
+            embedding_backfill_interval_secs: 0,
+            reconcile_tombstones_deleted_pages: false,
+        };
+        // Key at 0: the baseline task count (one lint job + hollow-project job).
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            baseline.clone(),
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(tasks.len(), 2);
+        for task in tasks {
+            task.abort();
+        }
+
+        // Key on: exactly one extra task — the idle auto-end loop.
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            baseline.clone(),
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(tasks.len(), 3);
+        for task in tasks {
+            task.abort();
+        }
+
+        // Maintenance disabled with the key on: nothing starts.
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: false,
+                ..baseline
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            true,
+            true,
+        )
+        .await;
+        assert!(tasks.is_empty());
+    }
+
+    /// With the key on, the first real pass (one fixed interval after start,
+    /// fast-forwarded with paused `tokio::time`) ends an idle session with
+    /// the page, the watermark, the audit row and the consolidation job —
+    /// no real sleeping.
+    #[tokio::test]
+    async fn idle_end_tick_ends_an_idle_session_on_the_first_pass() {
+        let (_tmp, store, wiki, ws, proj, _second) = two_project_wiki().await;
+        tokio::time::pause();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let last_activity = now - 2 * 3_600_000_000; // two hours ago.
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+                occurred_at: Some(last_activity),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "idle scheduler test".into(),
+                    body: "prompt two hours ago".into(),
+                    importance: 5,
+                    occurred_at: Some(last_activity),
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: true,
+                forget_sweep_interval_secs: 0,
+                lint_interval_secs: 0,
+                embedding_backfill_interval_secs: 0,
+                reconcile_tombstones_deleted_pages: false,
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            true,
+            true,
+        )
+        .await;
+
+        // The settle tick already fired; let the spawned task register its
+        // first real interval timer, then fast-forward one fixed interval so
+        // the first real pass runs.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(
+            ai_memory_hooks::IDLE_END_INTERVAL_SECS,
+        ))
+        .await;
+        let mut ended = false;
+        for _ in 0..500 {
+            let disp = store
+                .reader
+                .session_end_disposition(sid, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap();
+            if matches!(disp, ai_memory_store::SessionEndDisposition::AlreadyEnded) {
+                ended = true;
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ended, "the first pass must end the idle session");
+
+        // Page written, tick-clock ended_at (last activity in the audit
+        // detail), audit row, consolidation job.
+        let page = store
+            .reader
+            .latest_page_id_by_ids(ws, proj, format!("sessions/{sid}.md"))
+            .await
+            .unwrap();
+        assert!(page.is_some());
+        let audit = store
+            .reader
+            .list_audit_events(ai_memory_store::AuditLogFilter {
+                op: Some("idle_session_end".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert!(
+            audit[0].at >= now && audit[0].at < now + 60_000_000_000,
+            "ended_at is the tick's clock (the discovery is ordered by ended_at): {}",
+            audit[0].at
+        );
+        assert!(
+            audit[0].detail.contains(&last_activity.to_string()),
+            "the last activity survives in the audit detail: {}",
+            audit[0].detail
+        );
+        // Claim with a fresh clock: the enqueue's `requested_at` is the
+        // tick's wall time, after this test's `now`.
+        let now_after = jiff::Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now_after + 1_000, now_after - 1_000)
+            .await
+            .unwrap();
+        assert_eq!(job.map(|j| j.session_id()), Some(sid));
+        for task in tasks {
+            task.abort();
         }
     }
 

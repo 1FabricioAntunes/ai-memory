@@ -116,7 +116,19 @@ from hook paths.
    canonical SessionEnd path as a native hook. Generated session-page
    frontmatter records `session_id` plus the immutable `sessions.agent_kind`
    as `agent`; it describes the page's harness origin, not the later writer.
-   Manual page writes do not receive inferred agent metadata.
+   Manual page writes do not receive inferred agent metadata. A session that
+   never delivered a `SessionEnd` (crashed harness, closed terminal) is ended
+   by the maintenance tick when `[sessions] idle_end_after_hours` is set, with
+   the tick's own page write, the consolidation job and the lifecycle-only
+   handoff release — no additional handoff from the tick. The page write is
+   conditional on the page version the selection captured in its own
+   statement, and the end stamp is a CAS on `ended_at IS NULL` that also
+   re-verifies the session's observation count (the digest's population) and
+   the latest page version — so a late real `SessionEnd` (or a checkpoint)
+   wins that race and converges through `AlreadyEnded`/`ReEnd`. `ended_at` is
+   the tick's clock (the session's last activity is preserved in the audit
+   detail), and the consolidation job is enqueued inside the stamp's
+   transaction.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
@@ -1061,6 +1073,24 @@ reconcile_tombstones_deleted_pages = false
                                    # session pages excluded. OFF = byte-identical to pre-2.5
                                    # behavior (deletions still need `ai-memory delete-page`).
                                    # Docs: docs/okf.md, docs/install.md.
+
+[sessions]                         # server-side session lifecycle
+idle_end_after_hours = 0           # 0 (default) = off. N > 0 (capped at 8760):
+                                   # the [maintenance] tick ends open sessions whose
+                                   # last activity is older than N hours with the tick's
+                                   # own effects (summary page attributed to the
+                                   # session owner + consolidation job, and the
+                                   # lifecycle-only handoff release), never an
+                                   # additional handoff from the tick. Bounded batch
+                                   # of 25 every 15 minutes; the page write is
+                                   # conditional on the version the selection
+                                   # captured, the end stamp is an `ended_at IS NULL`
+                                   # CAS that also re-verifies the session's
+                                   # observation count and the latest page version,
+                                   # so a real SessionEnd landing around the tick
+                                   # wins that race. `ended_at`
+                                   # is the tick's clock; the last activity is kept
+                                   # in the audit detail.
 
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively (fallback λ)

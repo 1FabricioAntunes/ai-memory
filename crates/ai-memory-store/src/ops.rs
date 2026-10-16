@@ -4,7 +4,7 @@
 //! the writer thread would violate the single-writer invariant (see
 //! [`crate::writer`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
@@ -3247,6 +3247,326 @@ pub fn end_admitted_session_with_handoff(
     let id = insert_handoff_row(&tx, handoff)?;
     tx.commit()?;
     Ok(id)
+}
+
+/// An idle auto-end candidate as selected by the server-side tick
+/// ([`crate::reader::ReaderPool::idle_open_sessions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleEndAction {
+    /// A substantive session: end it with its summary page and, when the
+    /// caller asks for it, its consolidation job.
+    Substantive {
+        /// The latest `sessions/<id>.md` version the tick WROTE OR KEPT.
+        /// The stamp re-verifies it is still the latest: a checkpoint or a
+        /// real `SessionEnd` page landing after the tick's write would
+        /// otherwise leave the stamp pointing at a page that no longer
+        /// represents the session's work.
+        expected_page_id: PageId,
+        /// The session's observation count at the moment the digest was
+        /// built (read in the digest's own snapshot: EVERY observation of
+        /// the session, whatever project each row landed in — the same
+        /// population `session_observation_count` counts). The stamp
+        /// re-verifies the live count still equals it: a non-end observation
+        /// landing after the digest would otherwise reach the watermark
+        /// without reaching the page.
+        observation_count: i64,
+        /// The tick's clock, in Unix microseconds. `ended_at` is stamped
+        /// with it — not with the session's last activity — so the
+        /// auto-improvement discovery, which is ordered by `ended_at`, finds
+        /// auto-ended sessions in the order they were ended.
+        now_us: i64,
+        /// The session's last activity, in Unix microseconds. Recorded in
+        /// the audit detail next to the tick's clock.
+        last_activity_us: i64,
+    },
+    /// A boundary-only session: end it without a page or a consolidation
+    /// job; a handoff accepted for it reopens for its owner.
+    LifecycleOnly {
+        /// The tick's clock, as in [`Self::Substantive::now_us`].
+        now_us: i64,
+        /// The session's last activity, as in
+        /// [`Self::Substantive::last_activity_us`].
+        last_activity_us: i64,
+    },
+}
+
+/// Outcome of one candidate in a batched idle end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleEndResult {
+    /// The substantive session ended with its summary page and watermark.
+    EndedSubstantive,
+    /// The lifecycle-only session ended (releasing its accepted handoff
+    /// when one existed).
+    EndedLifecycleOnly,
+    /// The session could no longer be ended: a real `SessionEnd` won the
+    /// race (the CAS saw `ended_at` set), the candidate no longer matches
+    /// its row's scope, the observation count or the latest page version
+    /// moved after the tick read it, or substantive work arrived before the
+    /// lifecycle-only atomic re-check. The row is untouched.
+    Lost,
+}
+
+/// One session for [`idle_end_sessions`], fully scoped so the guarded write
+/// never trusts a caller-provided id alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleEndCandidate {
+    /// Session to end.
+    pub session_id: SessionId,
+    /// Workspace the session row must belong to.
+    pub workspace_id: WorkspaceId,
+    /// Project the session row must belong to.
+    pub project_id: ProjectId,
+    /// Harness recorded on the session row.
+    pub agent_kind: AgentKind,
+    /// What the end does.
+    pub action: IdleEndAction,
+}
+
+/// End a batch of idle sessions in one writer command.
+///
+/// Each candidate is stamped by its own guarded write. The substantive end
+/// is an `UPDATE … WHERE ended_at IS NULL` CAS that ALSO re-verifies what the
+/// summary page saw: the session's observation count (every row of the
+/// session, the digest's population) must still equal the
+/// count the digest was built from, and the latest page version must still
+/// be the one the tick wrote or kept. Any mismatch — a non-end observation,
+/// a checkpoint page, or a real `SessionEnd` landing after the tick's read —
+/// reports [`IdleEndResult::Lost`] and rolls the candidate's transaction
+/// back: no stamp, no audit, no enqueue; the page the tick wrote stays an
+/// ordinary version. The lifecycle-only end applies the same scope/open
+/// guards before any mutation and re-checks substantiveness atomically,
+/// reporting `Lost` instead of downgrading substantive work to a boundary-
+/// only end. Immediately before the batch, the writer actor also snapshots
+/// active managed-run session links. Since every managed-run link and idle
+/// stamp is serialized through that actor, no link can land between this
+/// decisive snapshot and the guarded writes.
+///
+/// `ended_at` is the tick's clock (`now_us`), and
+/// `ended_observation_count` is counted in the same transaction as the
+/// stamp, so a later real `SessionEnd` is `AlreadyEnded` (no new
+/// observations) or `ReEnd` (new work arrived) against that watermark —
+/// never a double end of the same work. The session's last activity is
+/// preserved in the audit detail (`last_activity_us`). No handoff is
+/// created here: the baton is the hook path's decision.
+///
+/// `enqueue_consolidation` is the server's resolved
+/// `consolidate_on_session_end` flag, the same effect the hook path applies
+/// to a substantive end, computed once per tick. The enqueue runs INSIDE the
+/// stamp's transaction: a failed enqueue rolls back the stamp and the audit,
+/// leaving the session open for the next tick. A lost candidate is never
+/// enqueued.
+///
+/// # Errors
+/// Returns a [`StoreError`] on any SQL or commit failure. A CAS miss is not
+/// an error: it is reported per candidate as [`IdleEndResult::Lost`].
+pub fn idle_end_sessions(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+) -> StoreResult<Vec<IdleEndResult>> {
+    idle_end_sessions_inner(conn, candidates, enqueue_consolidation, None)
+}
+
+/// Test-only: [`idle_end_sessions`] with a `pre_stamp` hook that runs on
+/// the writer connection BEFORE each candidate's stamp transaction opens
+/// (after the previous candidate finished, before the `transaction()`
+/// below) — not inside it. Lets a test race a real effect (a non-end
+/// observation, a checkpoint page, a real `SessionEnd` stamp)
+/// deterministically into the window between the tick's page write and the
+/// stamp, without sleeps. The hook simulates a concurrent writer's effect
+/// landing in that window; it is not a participant in the stamp
+/// transaction.
+#[cfg(test)]
+pub fn idle_end_sessions_pre_stamp(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+    pre_stamp: &mut dyn FnMut(&mut Connection),
+) -> StoreResult<Vec<IdleEndResult>> {
+    idle_end_sessions_inner(conn, candidates, enqueue_consolidation, Some(pre_stamp))
+}
+
+fn idle_end_sessions_inner(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+    mut pre_stamp: Option<&mut dyn FnMut(&mut Connection)>,
+) -> StoreResult<Vec<IdleEndResult>> {
+    let mut results = Vec::with_capacity(candidates.len());
+    // The production command holds the sole writer actor for the entire
+    // batch, so one snapshot is decisive and avoids one query per candidate.
+    // The test seam deliberately mutates between candidates and therefore
+    // refreshes after each injected effect.
+    let active_sessions = if pre_stamp.is_none() {
+        Some(active_managed_run_sessions(conn)?)
+    } else {
+        None
+    };
+    for candidate in candidates {
+        if let Some(hook) = pre_stamp.as_mut() {
+            hook(conn);
+        }
+        let managed_run_active = match &active_sessions {
+            Some(active) => active.contains(&candidate.session_id),
+            None => active_managed_run_sessions(conn)?.contains(&candidate.session_id),
+        };
+        if managed_run_active {
+            results.push(IdleEndResult::Lost);
+            continue;
+        }
+        let result = match &candidate.action {
+            IdleEndAction::Substantive {
+                expected_page_id,
+                observation_count,
+                now_us,
+                last_activity_us,
+            } => {
+                let tx = conn.transaction()?;
+                let page_blob: &[u8] = expected_page_id.as_bytes();
+                let changed = tx.execute(
+                    "UPDATE sessions \
+                     SET ended_at = ?1, summary_page_id = ?2, \
+                         ended_observation_count = ( \
+                             SELECT COUNT(*) FROM observations \
+                             WHERE session_id = ?3 \
+                         ) \
+                     WHERE id = ?3 AND workspace_id = ?4 AND project_id = ?5 \
+                       AND ended_at IS NULL \
+                       AND ( \
+                             SELECT COUNT(*) FROM observations \
+                             WHERE session_id = ?3 \
+                         ) = ?6 \
+                       AND ( \
+                             SELECT id FROM pages \
+                             WHERE workspace_id = ?4 AND project_id = ?5 \
+                               AND path = ?7 AND is_latest = 1 \
+                         ) = ?2",
+                    params![
+                        *now_us,
+                        page_blob,
+                        candidate.session_id.as_bytes(),
+                        candidate.workspace_id.as_bytes(),
+                        candidate.project_id.as_bytes(),
+                        *observation_count,
+                        format!("sessions/{}.md", candidate.session_id)
+                    ],
+                )?;
+                if changed == 0 {
+                    // A real SessionEnd (or another writer) ended the
+                    // session after the tick selected it, the session's
+                    // work or its page moved after the tick's read, or the
+                    // candidate no longer matches its row: the newer effect
+                    // owns the row. Drop the transaction to roll back.
+                    results.push(IdleEndResult::Lost);
+                    continue;
+                }
+                audit_with_detail(
+                    &tx,
+                    "idle_session_end",
+                    Some(candidate.workspace_id.as_bytes()),
+                    Some(candidate.project_id.as_bytes()),
+                    Some(expected_page_id.as_bytes()),
+                    None,
+                    *now_us,
+                    &serde_json::json!({
+                        "session_id": candidate.session_id.to_string(),
+                        "action": "substantive",
+                        "last_activity_us": *last_activity_us,
+                    })
+                    .to_string(),
+                )?;
+                // The enqueue runs inside the stamp's transaction: a failed
+                // enqueue propagates, the transaction rolls back, and the
+                // session stays open for the next tick.
+                if enqueue_consolidation {
+                    crate::session_consolidation::enqueue_in_tx(
+                        &tx,
+                        candidate.workspace_id,
+                        candidate.project_id,
+                        candidate.session_id,
+                    )?;
+                }
+                tx.commit()?;
+                IdleEndResult::EndedSubstantive
+            }
+            IdleEndAction::LifecycleOnly {
+                now_us,
+                last_activity_us,
+            } => {
+                let tx = conn.transaction()?;
+                // The same guards as the substantive arm, before any
+                // mutation or handoff release: the candidate's scope must
+                // match the row and the row must still be open. Anything
+                // else is a stale or foreign candidate: `Lost`, nothing
+                // written.
+                let open: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM sessions \
+                     WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                       AND ended_at IS NULL",
+                    params![
+                        candidate.session_id.as_bytes(),
+                        candidate.workspace_id.as_bytes(),
+                        candidate.project_id.as_bytes()
+                    ],
+                    |row| row.get(0),
+                )?;
+                if open == 0 {
+                    results.push(IdleEndResult::Lost);
+                    continue;
+                }
+                let outcome =
+                    end_lifecycle_only_session_in_tx(&tx, &candidate.session_id, Some(*now_us))?;
+                match outcome {
+                    LifecycleOnlyEndOutcome::Ended { .. } => {
+                        // The auto-end audit is its own row in the stamp's
+                        // transaction, distinct from the
+                        // `release_lifecycle_only_handoff` row the handoff
+                        // release writes when a handoff was released.
+                        audit_with_detail(
+                            &tx,
+                            "idle_session_end",
+                            Some(candidate.workspace_id.as_bytes()),
+                            Some(candidate.project_id.as_bytes()),
+                            None,
+                            None,
+                            *now_us,
+                            &serde_json::json!({
+                                "session_id": candidate.session_id.to_string(),
+                                "action": "lifecycle_only",
+                                "last_activity_us": *last_activity_us,
+                            })
+                            .to_string(),
+                        )?;
+                        tx.commit()?;
+                        IdleEndResult::EndedLifecycleOnly
+                    }
+                    // Substantive work raced the tick's classification: leave
+                    // the session open (the transaction rolls back) and let
+                    // the real end — or the next tick — handle it.
+                    LifecycleOnlyEndOutcome::Substantive => {
+                        results.push(IdleEndResult::Lost);
+                        continue;
+                    }
+                }
+            }
+        };
+        results.push(result);
+    }
+    Ok(results)
+}
+
+fn active_managed_run_sessions(conn: &Connection) -> StoreResult<HashSet<SessionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT native_session_id FROM managed_runs \
+         WHERE state = 'active' AND native_session_id IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut sessions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let native_session_id: String = row.get(0)?;
+        sessions.insert(SessionId::from_native(&native_session_id));
+    }
+    Ok(sessions)
 }
 
 /// Mark a keyed hook event complete after its downstream effects finish.
