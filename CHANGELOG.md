@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
   --agent cline --apply` writes Cline's nine supported event files globally or
   per project, refuses user-owned and symlinked targets, and keeps embedded
   bearer credentials owner-only. `install-mcp --client cline --apply` writes
-  Cline's nested transport schema and explicitly selects Streamable HTTP.
+  Cline's top-level transport fields and explicitly selects Streamable HTTP.
   Detached start hooks recover handoffs through MCP; yolo mode disables hooks.
   Also added `install-mcp --client freebuff --apply`, which registers the
   sessionless stdio bridge in `~/.agents/mcp.json` without starting another
