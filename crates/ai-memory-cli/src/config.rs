@@ -1294,8 +1294,9 @@ pub struct RoutingSettings {
 }
 
 /// `[ingest]`: tool events the server drops whatever the client sends
-/// (#1241). Both lists are empty by default and apply to every project on the
-/// server. Validated once by [`Config::load`] into [`Self::drop_list`].
+/// (#1241). The tool lists and the event-kind list are all empty by default
+/// and apply to every project on the server. Validated once by
+/// [`Config::load`] into [`Self::drop_list`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IngestSettings {
@@ -1303,6 +1304,17 @@ pub struct IngestSettings {
     pub drop_tool_use_id_prefixes: Vec<String>,
     /// Drop a tool event whose tool name equals one of these exactly.
     pub drop_tool_names: Vec<String>,
+    /// Drop whole hook event kinds, whatever the client sends. Each value is a
+    /// hook event kind (e.g. `pre-tool-use`); a matching event is acknowledged
+    /// and discarded before it is stored. Empty by default (nothing dropped).
+    ///
+    /// `session-start` and `session-end` are rejected at load: the router uses
+    /// them to open and close a session, so dropping them would strand the
+    /// session state machine. Accepts either a TOML/JSON sequence
+    /// (`["pre-tool-use"]`) or a comma-separated env string
+    /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub drop_events: Vec<String>,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file.
     #[serde(skip)]
@@ -2453,6 +2465,7 @@ impl Config {
         config.ingest.drop_list = ai_memory_hooks::IngestDropList::new(
             config.ingest.drop_tool_use_id_prefixes.clone(),
             config.ingest.drop_tool_names.clone(),
+            &config.ingest.drop_events,
         )
         .map_err(|message| anyhow::anyhow!(message))?;
         // A4 entropy filter thresholds: reject an unusable threshold at startup
@@ -4997,7 +5010,8 @@ input_token_safety_margin = {margin}
             config.ingest.drop_list,
             ai_memory_hooks::IngestDropList::new(
                 vec!["toolu_plugin_".into()],
-                vec!["mcp__noisy__poll".into()]
+                vec!["mcp__noisy__poll".into()],
+                &[]
             )
             .unwrap()
         );
@@ -5013,6 +5027,106 @@ input_token_safety_margin = {margin}
         assert_eq!(
             Config::default().ingest.drop_list,
             ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    /// `[ingest] drop_events` names whole hook event kinds to drop (#1241
+    /// sibling). It loads into the same validated list the hook router checks,
+    /// defaults to empty (nothing dropped), and rejects a session-state kind
+    /// and an unknown kind at load.
+    #[test]
+    fn ingest_drop_events_load_into_the_router_list_and_reject_bad_kinds() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"pre-tool-use\"]\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        // The raw value survives, and the validated list is built from it.
+        assert_eq!(config.ingest.drop_events, vec!["pre-tool-use".to_string()]);
+        assert_eq!(
+            config.ingest.drop_list,
+            ai_memory_hooks::IngestDropList::new(Vec::new(), Vec::new(), &["pre-tool-use".into()])
+                .unwrap()
+        );
+
+        // A session-state kind fails startup with a clear error (session start…)
+        std::fs::write(
+            &config_path,
+            "[ingest]\ndrop_events = [\"session-start\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("session-start")
+                && format!("{error:#}").contains("session state"),
+            "{error:#}"
+        );
+
+        // …and session end.
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"session-end\"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("session-end")
+                && format!("{error:#}").contains("session state"),
+            "{error:#}"
+        );
+
+        // An unknown kind fails startup naming the value.
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"pre-tool-us\"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("pre-tool-us")
+                && format!("{error:#}").contains("not a known hook event kind"),
+            "{error:#}"
+        );
+
+        // Default: empty, so nothing is dropped.
+        assert_eq!(Config::default().ingest.drop_events, Vec::<String>::new());
+        assert_eq!(
+            Config::default().ingest.drop_list,
+            ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    /// The env form of `[ingest] drop_events` (`AI_MEMORY_INGEST__DROP_EVENTS`,
+    /// a comma-separated string) loads into the same validated list. Uses the
+    /// child-process marker pattern because `std::env::set_var` is unsafe and
+    /// forbidden in this crate's multi-threaded test binary.
+    #[test]
+    fn ingest_drop_events_env_overrides_default() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_DROP_EVENTS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            // No drop_events in the file; the env var supplies it.
+            std::fs::write(&config_path, "[ingest]\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert_eq!(
+                config.ingest.drop_events,
+                vec!["pre-tool-use".to_string(), "stop".to_string()]
+            );
+            println!("drop-events-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::ingest_drop_events_env_overrides_default")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_INGEST__DROP_EVENTS", "pre-tool-use,stop")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("drop-events-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 

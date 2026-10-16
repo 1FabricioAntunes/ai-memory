@@ -552,7 +552,10 @@ pub struct HookState {
     pub profile: ai_memory_core::profile::ProfileSettings,
     /// `[ingest]` drop list: tool events matching a listed tool-use id prefix
     /// or tool name are acknowledged and dropped before any capacity is spent
-    /// (#1241). Empty by default.
+    /// (#1241), checked right after the client capture protocol; events whose
+    /// whole kind is listed (`drop_events`, e.g. `pre-tool-use`) are dropped
+    /// the same way, checked right after the subagent exclusion so a marked
+    /// subagent event still seeds its tail tracking. Empty by default.
     pub ingest_drop_list: crate::drop_list::IngestDropList,
 }
 
@@ -695,8 +698,9 @@ async fn admit_hook(
         HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "cursor draft placeholder dropped");
     }
-    // The operator's server-side drop list (#1241): acknowledged as a policy
-    // drop before the rate limiter or the semaphore, so it costs nothing.
+    // The operator's server-side tool drop list (#1241): acknowledged as a
+    // policy drop before the rate limiter or the semaphore, so it costs
+    // nothing.
     if state.ingest_drop_list.matches(&env) {
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "ingest drop list");
@@ -723,6 +727,14 @@ async fn admit_hook(
     if should_drop_subagent(&state, &env, viewer).await {
         HookProcessingOutcome::DroppedSubagent.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "subagent capture dropped");
+    }
+    // Whole-kind drops (`[ingest] drop_events`): after the subagent exclusion,
+    // so a marked subagent event still seeds the tracking set its unmarked
+    // tail is dropped against, but before the rate limiter and the semaphore,
+    // so a dropped event still costs nothing.
+    if state.ingest_drop_list.matches_event_kind(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return (StatusCode::ACCEPTED, "ingest drop list");
     }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
         state.ingest_metrics.record_shed_saturated();
@@ -978,7 +990,7 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         }
-        // Server-side drop list (#1241), acknowledged like a policy drop.
+        // Server-side tool drop list (#1241), acknowledged like a policy drop.
         if state.ingest_drop_list.matches(&env) {
             HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
             results.push(HookBatchResult {
@@ -996,6 +1008,18 @@ async fn handle_hook_batch(
             results.push(HookBatchResult {
                 index: idx,
                 outcome: HookProcessingOutcome::DroppedSubagent,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
+        // Whole-kind drops (`[ingest] drop_events`): after the subagent
+        // exclusion (a marked event still seeds its tail tracking), before the
+        // semaphore, the rate limiter and storage.
+        if state.ingest_drop_list.matches_event_kind(&env) {
+            HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedPolicy,
             });
             accepted_indices.push(idx);
             continue;
@@ -8730,6 +8754,7 @@ pub(crate) mod tests {
         state.ingest_drop_list = crate::drop_list::IngestDropList::new(
             vec!["toolu_plugin_".into()],
             vec!["mcp__noisy__poll".into()],
+            &[],
         )
         .unwrap();
     }
@@ -8826,6 +8851,440 @@ pub(crate) mod tests {
             "both listed items are policy drops"
         );
         assert_eq!(snap.accepted, 1, "control: the unlisted item is ingested");
+    }
+
+    /// Install a `[ingest] drop_events` list dropping one whole event kind.
+    fn with_drop_events(state: &mut HookState, kinds: &[&str]) {
+        state.ingest_drop_list = crate::drop_list::IngestDropList::new(
+            Vec::new(),
+            Vec::new(),
+            &kinds.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+
+    /// Poll a session's stored observations until every kind in `expected` is
+    /// present (the hook path stores through a spawned task), or give up after
+    /// a generous deadline and return what landed. A session-end event also
+    /// creates a handoff (a wiki write + git checkpoint), which is slower than
+    /// a plain observation store, so the deadline is generous and the poll
+    /// waits for the specific kinds rather than a bare count.
+    async fn wait_for_kinds(
+        state: &HookState,
+        sid: &str,
+        expected: &[ObservationKind],
+    ) -> Vec<ai_memory_core::Observation> {
+        // The store keys observations on the native id resolved the way the
+        // hook path does (`from_native`: a UUID as-is, anything else hashed to
+        // a deterministic v5), so the lookup must use the same rule rather
+        // than a bare UUID parse.
+        let sid = SessionId::from_native(sid);
+        for _ in 0..300 {
+            let obs = state.reader.observations_for_session(sid).await.unwrap();
+            let kinds: Vec<ObservationKind> = obs.iter().map(|o| o.kind).collect();
+            if expected.iter().all(|kind| kinds.contains(kind)) {
+                return obs;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        state.reader.observations_for_session(sid).await.unwrap()
+    }
+
+    /// #1241 sibling: naming a whole event kind in `[ingest] drop_events`
+    /// drops every event of that kind (any agent, any payload) while the rest
+    /// are acknowledged and stored. `pre-tool-use` is the motivating case: its
+    /// 1:1 `post-tool-use` pair carries the content; only a call that never
+    /// finished leaves no trace.
+    #[tokio::test]
+    async fn the_ingest_drop_events_drops_the_named_kind_and_keeps_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["pre-tool-use"]);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let session = "drop-events-1";
+        let cwd = tmp.path().to_path_buf();
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let body = |extra: serde_json::Value| {
+            let mut b = serde_json::json!({ "session_id": session, "cwd": cwd.to_string_lossy().into_owned() });
+            b.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().cloned().unwrap());
+            b
+        };
+
+        // The named kind is dropped before any capacity is spent.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("pre-tool-use"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            body(serde_json::json!({ "tool_name": "Read", "tool_use_id": "toolu_1" })),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "ingest drop list"),
+            "pre-tool-use is dropped by its kind"
+        );
+
+        // Its 1:1 pair, the prompt, and a lifecycle event are all kept.
+        for (event, extra) in [
+            (
+                "post-tool-use",
+                serde_json::json!({ "tool_name": "Read", "tool_use_id": "toolu_1" }),
+            ),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "do the thing" }),
+            ),
+            ("session-end", serde_json::json!({})),
+        ] {
+            let (status, reason) = admit_hook(
+                state.clone(),
+                query(event),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                body(extra),
+            )
+            .await;
+            assert_eq!(
+                (status, reason),
+                (StatusCode::ACCEPTED, "queued"),
+                "{event} must not be dropped by the pre-tool-use drop"
+            );
+        }
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.dropped_by_policy, 1,
+            "only the named kind is a policy drop"
+        );
+        assert_eq!(
+            snap.accepted, 3,
+            "the pair, the prompt and session-end are ingested"
+        );
+
+        // What actually landed in the store: the kept tool pair and the
+        // prompt, and no pre-tool-use. We assert storage only for these: the
+        // session-end event is handled concurrently and, if its task runs
+        // before the substantive stores, treats the session as lifecycle-only,
+        // so its own observation is not a reliable assertion. It is proven
+        // *not dropped* by the "queued" response above.
+        let obs = wait_for_kinds(
+            &state,
+            session,
+            &[ObservationKind::PostToolUse, ObservationKind::UserPrompt],
+        )
+        .await;
+        let kinds: Vec<_> = obs.iter().map(|o| o.kind).collect();
+        assert!(
+            !kinds.contains(&ObservationKind::PreToolUse),
+            "the dropped kind must not be stored: {kinds:?}"
+        );
+        assert!(kinds.contains(&ObservationKind::PostToolUse), "{kinds:?}");
+        assert!(kinds.contains(&ObservationKind::UserPrompt), "{kinds:?}");
+    }
+
+    /// The batch route drops the named kind as committed (so the client clears
+    /// it from its spool) and stores the rest — same treatment as the tool drop
+    /// list.
+    #[tokio::test]
+    async fn the_ingest_drop_events_applies_to_hook_batches() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["pre-tool-use"]);
+        let metrics = state.ingest_metrics.clone();
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=pre-tool-use&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "drop-ev-b", "tool_name": "Read", "tool_use_id": "toolu_9" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=post-tool-use&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "drop-ev-b", "tool_name": "Read", "tool_use_id": "toolu_9" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "drop-ev-b", "prompt": "hi" }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 1, "the named kind is a policy drop");
+        assert_eq!(snap.accepted, 2, "the pair and the prompt are ingested");
+    }
+
+    /// Sibling of the #1241 tool-list capacity test: with the semaphore
+    /// exhausted, a whole-kind drop still answers 202 while an ordinary event
+    /// of a kept kind gets the 429 (control).
+    #[tokio::test]
+    async fn the_ingest_drop_events_drops_before_any_capacity_is_spent() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["pre-tool-use"]);
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        // The named kind is dropped before any capacity is spent.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("pre-tool-use"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-ev-sat", "tool_name": "Read", "tool_use_id": "toolu_1" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "ingest drop list"),
+            "the named kind is dropped before any capacity is spent"
+        );
+
+        // Control: a kept kind needs capacity and gets the 429.
+        let (status, _) = admit_hook(
+            state.clone(),
+            query("post-tool-use"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-ev-sat", "tool_name": "Read", "tool_use_id": "toolu_1" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "control: a kept kind needs capacity"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 1);
+        assert_eq!(snap.accepted, 0, "the kind drop spends no ingress capacity");
+    }
+
+    /// Whole-kind drops spend no per-source rate token: with burst 1 and no
+    /// refill, dropped events of the named kind never exhaust the budget, so
+    /// the source's first kept event is still admitted (control: its next
+    /// kept event is over budget).
+    #[tokio::test]
+    async fn the_ingest_drop_events_consumes_no_rate_budget() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["pre-tool-use"]);
+        // burst=1, ~no refill within the test window (same pattern as
+        // `handle_hook_rate_limits_a_flooding_source_but_not_others`).
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::new(0.001, 1.0)));
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        // Two events of the named kind: both dropped, neither spends a token.
+        for _ in 0..2 {
+            let (status, reason) = admit_hook(
+                state.clone(),
+                query("pre-tool-use"),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                serde_json::json!({ "session_id": "drop-ev-rl", "tool_name": "Read", "tool_use_id": "toolu_1" }),
+            )
+            .await;
+            assert_eq!(
+                (status, reason),
+                (StatusCode::ACCEPTED, "ingest drop list"),
+                "the named kind is dropped without spending a rate token"
+            );
+        }
+
+        // The source's first kept event still gets its single token.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("post-tool-use"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-ev-rl", "tool_name": "Read", "tool_use_id": "toolu_1" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "queued"),
+            "kind drops spend no rate token"
+        );
+
+        // Control: the source's next kept event is over budget.
+        let (status, _) = admit_hook(
+            state.clone(),
+            query("user-prompt-submit"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-ev-rl", "prompt": "over budget" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 2);
+        assert_eq!(snap.accepted, 1);
+        assert_eq!(snap.shed_rate_limited, 1);
+    }
+
+    /// The batch ack contract for whole-kind drops: a mixed batch reports the
+    /// per-index outcomes (`dropped_policy` for the named kind, `stored` for
+    /// the kept ones), persists only the kept events, and counts the drop.
+    #[tokio::test]
+    async fn the_ingest_drop_events_batch_reports_per_index_outcomes_and_only_stores_the_kept() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["pre-tool-use"]);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=pre-tool-use&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "drop-ev-ack", "tool_name": "Read", "tool_use_id": "toolu_9" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=post-tool-use&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "drop-ev-ack", "tool_name": "Read", "tool_use_id": "toolu_9" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "drop-ev-ack", "prompt": "hi" }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], 3,
+            "every item is acknowledged (dropped ones too)"
+        );
+        let results = ack["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "one result per acknowledged index");
+        assert_eq!(results[0]["index"], 0);
+        assert_eq!(
+            results[0]["outcome"], "dropped_policy",
+            "the named kind is a policy drop: {ack}"
+        );
+        assert_eq!(results[1]["index"], 1);
+        assert_eq!(results[1]["outcome"], "stored");
+        assert_eq!(results[2]["index"], 2);
+        assert_eq!(results[2]["outcome"], "stored");
+
+        // The batch processes inline, so the kept events are persisted by the
+        // time the response returns — and the dropped one is not.
+        let sid = SessionId::from_native("drop-ev-ack");
+        let obs = state.reader.observations_for_session(sid).await.unwrap();
+        let kinds: Vec<_> = obs.iter().map(|o| o.kind).collect();
+        assert!(
+            !kinds.contains(&ObservationKind::PreToolUse),
+            "the dropped kind must not be stored: {kinds:?}"
+        );
+        assert!(kinds.contains(&ObservationKind::PostToolUse), "{kinds:?}");
+        assert!(kinds.contains(&ObservationKind::UserPrompt), "{kinds:?}");
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 1);
+        assert_eq!(snap.accepted, 2);
+    }
+
+    /// The drop is specific to the named kind: with `stop` dropped, tool events
+    /// and prompts are untouched (control for a too-broad drop).
+    #[tokio::test]
+    async fn the_ingest_drop_events_leaves_other_kinds_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["stop"]);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        // Tool events and the prompt are not named, so they are ingested.
+        for event in ["pre-tool-use", "post-tool-use", "user-prompt-submit"] {
+            let (status, reason) = admit_hook(
+                state.clone(),
+                query(event),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                serde_json::json!({ "session_id": "drop-ev-c", "tool_name": "Read" }),
+            )
+            .await;
+            assert_eq!(
+                (status, reason),
+                (StatusCode::ACCEPTED, "queued"),
+                "{event} is not named and must be ingested"
+            );
+        }
+        // The named kind is dropped.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("stop"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "session_id": "drop-ev-c" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "ingest drop list"),
+            "the named kind is dropped"
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 1);
+        assert_eq!(snap.accepted, 3);
     }
 
     /// Both accept-but-drop branches, in one batch: a client-protocol Drop and
@@ -9721,6 +10180,281 @@ pub(crate) mod tests {
                 .is_empty(),
             "SubagentStart seeds the session so the leading unmarked event drops too"
         );
+    }
+
+    /// `[ingest] drop_events` and the subagent exclusion compose (single
+    /// path): with `subagent-start` itself named in the drop list, the marked
+    /// start still seeds the tracking set — the exclusion runs first — so the
+    /// unmarked tail of the subagent session is dropped too. Control: a
+    /// non-subagent session's prompt is stored.
+    #[tokio::test]
+    async fn the_ingest_drop_events_keeps_dropping_the_unmarked_subagent_tail() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["subagent-start"]);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("grok".into()),
+            drop_subagent: Some("1".into()),
+            ..Default::default()
+        };
+
+        // The marked start is dropped (as a subagent capture) and seeds
+        // "sub-drop-ev" — it is never stored, whatever the drop list says.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("subagent-start"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "sessionId": "sub-drop-ev" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "subagent capture dropped"),
+            "the marked start seeds the tracking before it can be dropped by kind"
+        );
+
+        // The unmarked tail of the same session is dropped via tracking.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("user-prompt-submit"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "sessionId": "sub-drop-ev", "prompt": "go" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "subagent capture dropped"),
+            "the unmarked tail of a tracked subagent session is dropped"
+        );
+
+        // Control: a non-subagent session's prompt is kept.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("user-prompt-submit"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "sessionId": "top-drop-ev", "prompt": "top" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "queued"),
+            "a non-subagent session is unaffected"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 2);
+        assert_eq!(snap.accepted, 1);
+
+        // The tail never reached the store; the control prompt did.
+        let sub_sid = SessionId::from_native("sub-drop-ev");
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the unmarked tail of a tracked subagent session is not stored"
+        );
+        let obs = wait_for_kinds(&state, "top-drop-ev", &[ObservationKind::UserPrompt]).await;
+        let kinds: Vec<_> = obs.iter().map(|o| o.kind).collect();
+        assert!(kinds.contains(&ObservationKind::UserPrompt), "{kinds:?}");
+    }
+
+    /// `[ingest] drop_events` and the subagent exclusion compose (batch
+    /// path): same scenario as the single-path sibling, with the per-index
+    /// outcomes asserted from the ack.
+    #[tokio::test]
+    async fn the_ingest_drop_events_keeps_dropping_the_unmarked_subagent_tail_in_batches() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["subagent-start"]);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let items = vec![
+            // (1) the marked start seeds the session and is dropped;
+            // (2) the unmarked tail of that session is dropped via tracking;
+            // (3) an unmarked prompt of a non-subagent session is kept.
+            HookBatchItem {
+                url: "http://h/hook?event=subagent-start&agent=grok&drop_subagent=1".into(),
+                body: serde_json::json!({ "sessionId": "sub-b-drop-ev" }),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=grok&drop_subagent=1".into(),
+                body: serde_json::json!({ "sessionId": "sub-b-drop-ev", "prompt": "go" }),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=grok&drop_subagent=1".into(),
+                body: serde_json::json!({ "sessionId": "top-b-drop-ev", "prompt": "top" }),
+            },
+        ];
+
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], 3,
+            "all three items are acknowledged: {ack}"
+        );
+        let results = ack["results"].as_array().unwrap();
+        assert_eq!(
+            results[0]["outcome"], "dropped_subagent",
+            "the marked start seeds the tracking and is dropped: {ack}"
+        );
+        assert_eq!(
+            results[1]["outcome"], "dropped_subagent",
+            "the unmarked tail of the tracked session still drops: {ack}"
+        );
+        assert_eq!(
+            results[2]["outcome"], "stored",
+            "a non-subagent prompt is kept: {ack}"
+        );
+
+        let sub_sid = SessionId::from_native("sub-b-drop-ev");
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the unmarked tail of a tracked subagent session is not stored"
+        );
+        let top_envelope = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("grok".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionId": "top-b-drop-ev", "prompt": "top" }),
+        );
+        let top_sid = resolve_session_id(&top_envelope).unwrap();
+        let obs = state
+            .reader
+            .observations_for_session(top_sid)
+            .await
+            .unwrap();
+        let kinds: Vec<_> = obs.iter().map(|o| o.kind).collect();
+        assert!(kinds.contains(&ObservationKind::UserPrompt), "{kinds:?}");
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 2);
+        assert_eq!(snap.accepted, 1);
+    }
+
+    /// A marked subagent event whose kind is listed in `[ingest] drop_events`
+    /// still seeds the tracking set: the subagent exclusion runs before the
+    /// whole-kind drop, so the unmarked tail of its session is dropped even
+    /// though the marking event itself was a named kind. Control: an unmarked
+    /// prompt of a never-seeded session is kept.
+    #[tokio::test]
+    async fn a_marked_event_of_a_dropped_kind_still_seeds_subagent_tracking() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_events(&mut state, &["pre-tool-use"]);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("grok".into()),
+            drop_subagent: Some("1".into()),
+            ..Default::default()
+        };
+
+        // The marked pre-tool-use: its kind is dropped, but the exclusion
+        // (which runs first) seeds the session.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("pre-tool-use"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "sessionId": "seed-drop-ev", "subagentType": "general-purpose", "toolName": "x" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "subagent capture dropped"),
+            "the marked event seeds the tracking before it is dropped"
+        );
+
+        // The unmarked tail of the same session is dropped via tracking —
+        // not by the kind list (user-prompt-submit is not named).
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("user-prompt-submit"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "sessionId": "seed-drop-ev", "prompt": "go" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "subagent capture dropped"),
+            "the tail drops via the tracking seeded by the marked event"
+        );
+
+        // Control: an unmarked prompt of a never-seeded session is kept.
+        let (status, reason) = admit_hook(
+            state.clone(),
+            query("user-prompt-submit"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "sessionId": "top-seed-drop-ev", "prompt": "top" }),
+        )
+        .await;
+        assert_eq!(
+            (status, reason),
+            (StatusCode::ACCEPTED, "queued"),
+            "a non-subagent session is unaffected"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 2);
+        assert_eq!(snap.accepted, 1);
+
+        let sub_sid = SessionId::from_native("seed-drop-ev");
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the tail of the seeded session is not stored"
+        );
+        let obs = wait_for_kinds(&state, "top-seed-drop-ev", &[ObservationKind::UserPrompt]).await;
+        let kinds: Vec<_> = obs.iter().map(|o| o.kind).collect();
+        assert!(kinds.contains(&ObservationKind::UserPrompt), "{kinds:?}");
     }
 
     #[tokio::test]
@@ -19705,6 +20439,65 @@ pub(crate) mod tests {
         assert!(
             !is_ephemeral_session(&observations),
             "tool-only work with no user prompt still counts as substantive"
+        );
+    }
+
+    /// Dropping `pre-tool-use` (via `[ingest] drop_events`) must not change
+    /// the ephemeral verdict for a session whose tool activity also produced a
+    /// `post-tool-use` (or any other substantive event): the positive
+    /// predicate still sees a substantive observation, so the session stays
+    /// substantive exactly as it would with the pre-tool-use present.
+    #[test]
+    fn dropping_pre_tool_use_keeps_a_tool_session_substantive() {
+        // The session as stored WITH the pre-tool-use present (baseline).
+        let with_pre = vec![
+            mk_obs(ObservationKind::SessionStart, "start", ""),
+            mk_obs(ObservationKind::PreToolUse, "Read", "README.md"),
+            mk_obs(ObservationKind::PostToolUse, "Read", "README.md"),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        // The same session after the operator dropped pre-tool-use: that
+        // observation is absent, but the post-tool-use remains.
+        let dropped_pre = vec![
+            mk_obs(ObservationKind::SessionStart, "start", ""),
+            mk_obs(ObservationKind::PostToolUse, "Read", "README.md"),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        assert_eq!(
+            is_ephemeral_session(&with_pre),
+            is_ephemeral_session(&dropped_pre),
+            "the verdict is unchanged by the drop"
+        );
+        assert!(
+            !is_ephemeral_session(&dropped_pre),
+            "dropping pre-tool-use must not turn a tool session ephemeral"
+        );
+    }
+
+    /// The one case where dropping pre-tool-use DOES change the verdict: a
+    /// session whose only substantive event was the pre-tool-use — a tool call
+    /// that started but never produced a post-tool-use, with no user prompt.
+    /// With the drop on, such a session looks ephemeral (lifecycle-only); the
+    /// server intentionally never stored the pre-tool-use, so it cannot count
+    /// it as work. Documented in `docs/ARCHITECTURE.md` next to the key.
+    #[test]
+    fn dropping_pre_tool_use_makes_an_unfinished_tool_call_look_ephemeral() {
+        let tool_started_never_finished = vec![
+            mk_obs(ObservationKind::SessionStart, "start", ""),
+            mk_obs(ObservationKind::PreToolUse, "Read", "README.md"),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        assert!(
+            !is_ephemeral_session(&tool_started_never_finished),
+            "control: a started tool call is substantive while stored"
+        );
+        let after_drop = vec![
+            mk_obs(ObservationKind::SessionStart, "start", ""),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        assert!(
+            is_ephemeral_session(&after_drop),
+            "once the only pre-tool-use is dropped, the session is lifecycle-only"
         );
     }
 

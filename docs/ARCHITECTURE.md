@@ -1286,6 +1286,33 @@ drop_tool_use_id_prefixes = []    # e.g. ["toolu_plugin_"]: drop a tool event wh
 drop_tool_names = []              # exact tool names to drop; both lists apply to every project,
                                   # at most 64 entries of 128 characters, checked before the
                                   # sanitizer, rate limiter and ingest semaphore
+drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-tool-use"]); a
+                                  # matching event is acknowledged and discarded before storage,
+                                  # checked right after the subagent exclusion (a marked
+                                  # subagent event still seeds its tail tracking) and before the
+                                  # rate limiter, the ingest semaphore and the sanitizer.
+                                  # session-start/session-end are rejected (they open/close the
+                                  # session state machine); unknown kinds are rejected. Dropping
+                                  # a kind also turns off everything that kind's processing
+                                  # does: user-prompt loses prompts (summaries, baton open
+                                  # questions, profile learning); pre-tool-use loses the
+                                  # pre-call evidence, so a session whose only work was a tool
+                                  # call that never finished ends lifecycle-only; post-tool-use
+                                  # loses results and the completed-call count; stop loses the
+                                  # opt-in assistant reply,
+                                  # the normal-completion signal and OpenCode's turn checkpoint;
+                                  # pre-compact/post-compaction lose the compaction checkpoint
+                                  # and its rewrite job (the session is not ended);
+                                  # notification loses the observation;
+                                  # subagent-start/subagent-stop lose subagent metadata (stored
+                                  # as `other`). user-prompt and pre-tool-use (with
+                                  # session-start) advance the project fallback pointer; dropping
+                                  # them removes those updates. The portable workstream ledger
+                                  # (`ai-memory run`) is not filtered by this key. In production
+                                  # ~87% of pre-tool-use observations have an empty body and
+                                  # each pairs 1:1 with a post-tool-use that carries the
+                                  # content. Empty by default. Env:
+                                  # AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
 ```
 
 The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese

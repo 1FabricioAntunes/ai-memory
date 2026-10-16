@@ -64,6 +64,34 @@ log_level = "info"
 # [ingest]
 # drop_tool_use_id_prefixes = ["toolu_plugin_"]
 # drop_tool_names = ["mcp__noisy__poll"]
+#
+# Drop whole hook event kinds instead of individual tool calls. In production
+# ~87% of pre-tool-use observations have an empty body and pre-tool-use pairs
+# 1:1 with post-tool-use, which carries the content. Dropping a kind also
+# turns off everything that kind's processing does:
+#   user-prompt       loses prompts: session summaries, baton open questions
+#                     and profile learning; with pre-tool-use, it also stops
+#                     the project fallback pointer advancing (session-start
+#                     still advances it)
+#   pre-tool-use      loses the pre-call evidence; a call that never produced
+#                     a post-tool-use then leaves no trace, so the session may
+#                     end lifecycle-only
+#   post-tool-use     loses results, the completed-call count and file-work
+#                     evidence
+#   stop              loses the opt-in assistant reply and the
+#                     normal-completion signal; OpenCode loses its turn
+#                     checkpoint/baton
+#   pre-compact /     lose the compaction checkpoint and its rewrite job
+#   post-compaction   (the session is not ended)
+#   notification      loses the observation (search/consolidation context)
+#   subagent-start /  lose the subagent metadata (when stored, they become
+#   subagent-stop     `other` observations)
+# session-start and session-end are rejected at startup (they open/close the
+# session state machine); any other known kind may be named. The portable
+# workstream ledger (`ai-memory run`) is not filtered by this key. Empty by
+# default (nothing dropped).
+# Env equivalent: AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
+# drop_events = ["pre-tool-use"]
 
 # Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
 # tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.

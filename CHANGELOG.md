@@ -11,6 +11,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+- Added `[ingest] drop_events` (env `AI_MEMORY_INGEST__DROP_EVENTS`), an
+  opt-in list of hook event kinds the server drops before storing them, next
+  to the existing `drop_tool_use_id_prefixes` and `drop_tool_names`. A dropped
+  event gets the same 202, `dropped_by_policy` metric and log as the other
+  policy drops, before the rate limiter, the ingest semaphore and the
+  sanitizer. The default drops nothing. `Config::load` checks each value
+  against the typed event kind and rejects unknown kinds and `session-start`
+  and `session-end`, which open and close sessions. The motivating case is
+  `pre-tool-use`: in one production store about 87% of those observations had
+  an empty body, and each pairs with a `post-tool-use` that carries the
+  content. With `pre-tool-use` dropped, a session whose only work was a tool
+  call that never finished now ends as lifecycle-only. (#PRNUM)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
