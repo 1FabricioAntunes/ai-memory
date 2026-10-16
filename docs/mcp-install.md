@@ -191,7 +191,7 @@ ai-memory install-hooks --agent cline --apply
 
 The MCP writer targets
 `${CLINE_MCP_SETTINGS_PATH:-~/.cline/data/settings/cline_mcp_settings.json}`
-and writes Cline's nested `transport` schema with
+and writes Cline's top-level `type`, `url`, and optional `headers` fields with
 `type: "streamableHttp"`; omitting that type makes Cline try legacy SSE. The
 hook writer creates Cline CLI's supported event files under `~/.cline/hooks`.
 Use `--scope project` for `.cline/hooks` in the current checkout. Existing

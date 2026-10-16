@@ -2336,9 +2336,9 @@ ai-memory install-hooks --agent cline --apply
 ```
 
 The MCP writer reads `CLINE_MCP_SETTINGS_PATH` or defaults to
-`~/.cline/data/settings/cline_mcp_settings.json`; it writes the nested
-`transport` object and explicitly selects `streamableHttp` rather than Cline's
-legacy SSE default. The hook writer targets the CLI's `~/.cline/hooks` files;
+`~/.cline/data/settings/cline_mcp_settings.json`; it writes top-level `type`,
+`url`, and optional `headers` fields and explicitly selects `streamableHttp`
+rather than Cline's legacy SSE default. The hook writer targets the CLI's `~/.cline/hooks` files;
 use `--scope project` for `.cline/hooks` in one checkout. Restart Cline after
 installation. Yolo mode disables Cline hooks, and task-start hooks are
 detached, so recover pending handoffs through MCP. The VS Code extension's

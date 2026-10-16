@@ -372,7 +372,8 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::Openclaw
-        | McpClient::IbmBob => plain(),
+        | McpClient::IbmBob
+        | McpClient::Cline => plain(),
         McpClient::GeminiCli | McpClient::AntigravityCli => json!({
             "command": BRIDGE_COMMAND,
             "args": bridge,
@@ -381,15 +382,6 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         McpClient::Cursor | McpClient::VsCodeCopilot | McpClient::Swival | McpClient::Zero => {
             typed("stdio")
         }
-        McpClient::Cline => json!({
-            "transport": {
-                "type": "stdio",
-                "command": BRIDGE_COMMAND,
-                "args": bridge,
-            },
-            "disabled": false,
-            "autoApprove": [],
-        }),
         McpClient::Freebuff => {
             let env = args
                 .auth_token
@@ -1786,22 +1778,20 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     Ok(serde_json::Value::Object(entry))
 }
 
-/// Cline's CLI writer uses a nested transport object. Keeping the explicit
+/// Cline's MCP entry uses top-level transport fields. Keeping the explicit
 /// `streamableHttp` discriminator is load-bearing: a bare `url` is parsed as
 /// legacy SSE and sends GET requests to ai-memory's POST-only MCP endpoint.
 fn build_mcp_entry_cline(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
-    let mut transport = serde_json::Map::new();
-    transport.insert("type".into(), json!("streamableHttp"));
-    transport.insert("url".into(), json!(flavored_url_for(args, base_url)));
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("streamableHttp"));
+    entry.insert("url".into(), json!(flavored_url_for(args, base_url)));
     if let Some(bearer) = bearer_header_value(args.auth_token.as_deref()) {
-        transport.insert("headers".into(), json!({"Authorization": bearer}));
+        entry.insert("headers".into(), json!({"Authorization": bearer}));
     }
-    Ok(json!({
-        "transport": transport,
-        "disabled": false,
-        "autoApprove": [],
-    }))
+    entry.insert("disabled".into(), json!(false));
+    entry.insert("autoApprove".into(), json!([]));
+    Ok(serde_json::Value::Object(entry))
 }
 
 /// OpenCode 2.0 beta MCP entry: `type: "remote"` + `url` + optional
@@ -2704,14 +2694,62 @@ mod tests {
     #[test]
     fn cline_entry_explicitly_selects_streamable_http() {
         let entry = build_json_mcp_entry(&args_with_token(McpClient::Cline)).unwrap();
-        assert_eq!(entry["transport"]["type"], "streamableHttp");
-        assert_eq!(entry["transport"]["url"], "http://127.0.0.1:49374/mcp");
+        assert_eq!(entry["type"], "streamableHttp");
+        assert_eq!(entry["url"], "http://127.0.0.1:49374/mcp");
         assert_eq!(
-            entry["transport"]["headers"]["Authorization"],
+            entry["headers"]["Authorization"],
             "Bearer test-token-deadbeef"
         );
+        assert!(entry.get("transport").is_none(), "{entry:#}");
         assert_eq!(entry["disabled"], false);
         assert_eq!(entry["autoApprove"], json!([]));
+    }
+
+    #[test]
+    fn cline_apply_replaces_the_old_nested_entry_and_preserves_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("cline_mcp_settings.json");
+        fs::write(
+            &file,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "transport": {
+                            "type": "streamableHttp",
+                            "url": "https://old.example/mcp"
+                        },
+                        "disabled": false,
+                        "autoApprove": []
+                    },
+                    "other": {"command": "other"}
+                },
+                "keep": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::Cline);
+        args.apply = true;
+        args.config_file = Some(file.clone());
+        args.server_url = Some("https://memory.example/mcp".into());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(first, fs::read_to_string(&file).unwrap());
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], true);
+        assert_eq!(root["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({
+                "type": "streamableHttp",
+                "url": "https://memory.example/mcp",
+                "disabled": false,
+                "autoApprove": []
+            })
+        );
     }
 
     #[test]
@@ -4328,6 +4366,10 @@ mod tests {
         assert_eq!(entry(McpClient::CommandCode)["transport"], "stdio");
         assert_eq!(entry(McpClient::VsCodeCopilot)["type"], "stdio");
         assert!(entry(McpClient::Zed).get("type").is_none());
+        let cline = entry(McpClient::Cline);
+        assert_eq!(cline["command"], "ai-memory");
+        assert_eq!(cline["args"][0], "mcp-bridge");
+        assert!(cline.get("transport").is_none(), "{cline:#}");
         // Kimi Code's schema dialect rides the bridge's upstream URL.
         assert_eq!(
             entry(McpClient::KimiCode)["args"][3],
