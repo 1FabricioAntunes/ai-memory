@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- On Windows, `setup` now starts the logon host with a plain executable path,
+  and the host passes plain drive/UNC data-directory and config arguments to the
+  supervisor and server it launches, instead of the `\\?\` verbatim prefix a
+  canonical path carries. The `Run` value was already plain (3.1.0); this covers
+  the command lines built from `current_exe()` and the canonical data dir. (#1280)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
