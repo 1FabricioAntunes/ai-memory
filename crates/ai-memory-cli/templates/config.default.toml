@@ -150,6 +150,17 @@ log_level = "info"
 #   embedding_model    = "..."            # provider-specific override
 #   embedding_dim      = 384              # must match the model
 
+# --- Session lifecycle (server-side) --------------------------------------
+# [sessions] idle_end_after_hours = N (default 0 = off): the maintenance
+# tick ends open sessions whose last activity is older than N hours
+# (crashed harness, closed terminal, timed-out hook) with the summary page
+# and consolidation job a real SessionEnd would have given — never a
+# handoff. Bounded batch of 25 every 15 minutes; a late real SessionEnd
+# always wins (page write conditional on the selected version, end stamp a
+# CAS on ended_at IS NULL). Validated at load: 0 or 1..=8760.
+#   [sessions]
+#   idle_end_after_hours = 24
+
 [decay]
 lambda = 0.02
 sigma = 0.6

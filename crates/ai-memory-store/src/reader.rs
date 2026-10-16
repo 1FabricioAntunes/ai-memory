@@ -1199,6 +1199,39 @@ pub struct SessionConsolidationQueue {
     pub oldest_pending_requested_at_us: Option<i64>,
 }
 
+/// One open session selected by [`ReaderPool::idle_open_sessions`] for the
+/// server-side idle auto-end tick: its last activity
+/// (`MAX(observations.created_at)`, falling back to `started_at`) is older
+/// than the tick's cutoff, and it never received a `SessionEnd`.
+#[derive(Debug, Clone)]
+pub struct IdleOpenSession {
+    /// Session id.
+    pub session_id: SessionId,
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Harness that opened the session.
+    pub agent_kind: AgentKind,
+    /// Captured session cwd, if available.
+    pub cwd: Option<String>,
+    /// Operator owning the session (`IdentityKey::storage_key`), `None` when
+    /// the session is shared/actorless. The tick attributes its page to this
+    /// owner, not to the server process.
+    pub actor_user: Option<String>,
+    /// Session start, Unix microseconds.
+    pub started_at: i64,
+    /// `MAX(observations.created_at)`, or `started_at` when the session has
+    /// no observations. The end preserves it in the audit detail
+    /// (`last_activity_us`); `ended_at` is the tick's clock.
+    pub last_activity_us: i64,
+    /// Latest `sessions/<id>.md` version captured alongside the selection
+    /// (same read, before any write). The tick's conditional page write takes
+    /// it as its precondition, so it cannot supersede a page a real
+    /// `SessionEnd` delivered after the selection.
+    pub seen_page_id: Option<PageId>,
+}
+
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
 /// and [`ReaderPool::session_summary_scoped`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3788,6 +3821,42 @@ impl ReaderPool {
         .await
     }
 
+    /// Count one session's IN-SCOPE observations — every kind, not just the
+    /// substantive ones. A session's idle end stamps
+    /// `ended_observation_count` from the live count and re-verifies the
+    /// candidate's digest-time count against it: a non-end observation
+    /// (a `Stop`, a lifecycle marker) landing in the window between the
+    /// digest read and the stamp must still lose the CAS. Scoped the same
+    /// way as [`Self::session_has_substantive_observation`]; a missing or
+    /// foreign session counts as zero.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_observation_count(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<i64> {
+        self.with_conn(move |conn| {
+            const SQL: &str = "SELECT COUNT(*) \
+                 FROM observations AS o \
+                 JOIN sessions AS s ON s.id = o.session_id \
+                 WHERE o.session_id = ?1 \
+                   AND s.workspace_id = ?2 AND s.project_id = ?3";
+            Ok(conn.query_row(
+                SQL,
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes()
+                ],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
     /// Read one session's observations through bounded queries, all inside one
     /// read transaction so every answer describes the same set of rows. The
     /// session must belong to the given workspace and project; a foreign or
@@ -4946,6 +5015,151 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(owner.flatten())
+        })
+        .await
+    }
+
+    /// Open sessions whose last activity is older than `cutoff_us`, for the
+    /// server-side idle auto-end tick.
+    ///
+    /// "Last activity" is `MAX(observations.created_at)` — the same fact the
+    /// end's audit preserves (`last_activity_us` detail; `ended_at` itself is
+    /// the tick's clock) — falling back to `started_at` for a session that
+    /// began but never captured an observation. Sessions without the
+    /// `ended_at IS NULL` shape are never returned, so the result is a
+    /// re-check-free candidate list: the end itself still guards with its own
+    /// `ended_at IS NULL` CAS in the writer.
+    ///
+    /// `seen_page_id` captures the latest `sessions/<id>.md` version in the
+    /// SAME STATEMENT as the session row (a correlated subquery over `pages`,
+    /// so one atomic SELECT cannot observe a page a real `SessionEnd`
+    /// publishes after the session row was read): the tick's conditional page
+    /// write takes it as its precondition and cannot supersede a page the
+    /// hook delivered between the selection and the tick's write. The path is
+    /// rendered in SQL from the id blob (see the query below); the selection
+    /// test proves it byte-for-byte against the Rust-rendered path.
+    ///
+    /// Ordered by last activity (oldest first) and bounded by `limit`, so one
+    /// tick ends a bounded batch and the next picks up the rest.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn idle_open_sessions(
+        &self,
+        cutoff_us: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<IdleOpenSession>> {
+        self.with_conn(move |conn| {
+            // ONE statement: the correlated subquery reads each session page
+            // from the same atomic snapshot as the session row, so the tick's
+            // precondition can never be a page version it never saw.
+            //
+            // The page path is rendered in SQL because `sessions.id` is the
+            // 16-byte UUID blob while `pages.path` is text: `lower(hex(s.id))`
+            // is the UUID's canonical hyphenless hex in the same lowercase
+            // letters `SessionId`'s `Display` prints, and the substr pieces
+            // reinsert the 8-4-4-4-12 hyphens. The result is byte-for-byte the
+            // Rust `format!("sessions/{session_id}.md")` — the selection test
+            // proves it with a page present (captured) and absent (not), so a
+            // rendering drift would stall the session, never compare against a
+            // guessed path.
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.workspace_id, s.project_id, s.agent_kind, s.cwd, s.actor_user, \
+             s.started_at, COALESCE( \
+                 (SELECT MAX(o.created_at) FROM observations o \
+                  WHERE o.session_id = s.id), \
+                 s.started_at) AS last_activity, \
+                 (SELECT p.id FROM pages p \
+                  WHERE p.workspace_id = s.workspace_id \
+                    AND p.project_id = s.project_id \
+                    AND p.is_latest = 1 \
+                    AND p.path = 'sessions/' || substr(lower(hex(s.id)), 1, 8) || '-' || \
+                                       substr(lower(hex(s.id)), 9, 4) || '-' || \
+                                       substr(lower(hex(s.id)), 13, 4) || '-' || \
+                                       substr(lower(hex(s.id)), 17, 4) || '-' || \
+                                       substr(lower(hex(s.id)), 21, 12) || '.md') \
+             FROM sessions s \
+             WHERE s.ended_at IS NULL \
+               AND COALESCE( \
+                     (SELECT MAX(o.created_at) FROM observations o \
+                      WHERE o.session_id = s.id), \
+                     s.started_at) < ?1 \
+             ORDER BY last_activity ASC, s.id ASC \
+             LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff_us, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<Vec<u8>>>(8)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut out = Vec::with_capacity(rows.len());
+            for (
+                id,
+                workspace_id,
+                project_id,
+                agent_kind,
+                cwd,
+                actor_user,
+                started_at,
+                last_activity_us,
+                page_id,
+            ) in rows
+            {
+                let session_id = SessionId::from_slice(&id)?;
+                let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
+                let project_id = ProjectId::from_slice(&project_id)?;
+                let seen_page_id = page_id
+                    .as_ref()
+                    .map(|bytes| PageId::from_slice(bytes))
+                    .transpose()?;
+                out.push(IdleOpenSession {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::from_wire(&agent_kind),
+                    cwd,
+                    actor_user,
+                    started_at,
+                    last_activity_us,
+                    seen_page_id,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Native session ids bound to `managed_runs` rows still in state
+    /// `active`, for the idle auto-end tick's exclusion: a live managed run
+    /// (`ai-memory run`) owns its native session's lifecycle, so the tick
+    /// must not end it even when the session row looks idle.
+    ///
+    /// The join is done in Rust, not SQL: `managed_runs.native_session_id`
+    /// holds the harness's native id string while `sessions.id` is the
+    /// derived UUIDv7 blob, so the two columns never compare equal in SQL.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn active_managed_run_native_session_ids(&self) -> StoreResult<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT native_session_id FROM managed_runs \
+                 WHERE state = 'active' AND native_session_id IS NOT NULL",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
         })
         .await
     }

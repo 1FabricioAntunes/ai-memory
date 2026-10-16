@@ -40,6 +40,8 @@ git2.workspace = true
 ai-memory-llm.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
+# Drive the real `/hook` route in the idle-end race tests.
+tower.workspace = true
 
 [lints]
 workspace = true
