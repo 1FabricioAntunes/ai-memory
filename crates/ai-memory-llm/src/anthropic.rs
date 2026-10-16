@@ -179,6 +179,9 @@ struct AnthropicOutputConfig {
 enum AnthropicThinking {
     Adaptive,
     Disabled,
+    /// Sonnet 5.5's lowest setting, no extended thinking: the model's way to
+    /// turn thinking off, since it answers `disabled` with a 400.
+    BetweenTools,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,8 +214,19 @@ struct AnthropicResponse {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContent {
-    Text { text: String },
-    ToolUse { input: serde_json::Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        input: serde_json::Value,
+    },
+    /// A block this provider does not read, such as `thinking` or
+    /// `redacted_thinking`. Models that think by default (Opus 5 and later,
+    /// Sonnet 5 and later, Haiku 5.5, Fable, Mythos), and every model sent
+    /// adaptive thinking for a configured effort, can start a response with
+    /// such blocks. Without this variant one of them fails the whole parse.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,7 +262,7 @@ impl LlmProvider for AnthropicProvider {
             .iter()
             .filter_map(|c| match c {
                 AnthropicContent::Text { text } => Some(text.as_str()),
-                AnthropicContent::ToolUse { .. } => None,
+                AnthropicContent::ToolUse { .. } | AnthropicContent::Other => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -573,7 +587,8 @@ impl ClaudeId {
         self.meets(self.family().adaptive_since())
     }
 
-    /// Fable 5, Mythos 5, and Mythos Preview reject `thinking.type=disabled`.
+    /// Fable 5, Mythos 5, Mythos Preview, and Opus 5.5 reject
+    /// `thinking.type=disabled` at every effort.
     fn thinking_always_on(self) -> bool {
         match self {
             Self::MythosPreview => true,
@@ -582,8 +597,26 @@ impl ClaudeId {
                 major,
                 ..
             } => major >= 5,
+            Self::Released {
+                family: ClaudeFamily::Opus,
+                major,
+                minor,
+            } => (major, minor) >= (5, 5),
             _ => false,
         }
+    }
+
+    /// Sonnet 5.5 rejects `thinking.type=disabled` too, but turns thinking
+    /// off with `between_tools`.
+    fn turns_thinking_off_between_tools(self) -> bool {
+        matches!(
+            self,
+            Self::Released {
+                family: ClaudeFamily::Sonnet,
+                major,
+                minor,
+            } if (major, minor) >= (5, 5)
+        )
     }
 
     fn accepts_thinking_disabled(self) -> bool {
@@ -622,6 +655,9 @@ impl ClaudeId {
         effort: ReasoningEffort,
     ) -> (Option<AnthropicOutputConfig>, Option<AnthropicThinking>) {
         match effort {
+            ReasoningEffort::None if self.turns_thinking_off_between_tools() => {
+                (None, Some(AnthropicThinking::BetweenTools))
+            }
             ReasoningEffort::None => (
                 None,
                 self.accepts_thinking_disabled()
@@ -647,6 +683,8 @@ fn version_segment(s: &str) -> Option<u32> {
 mod tests {
     use secrecy::SecretString;
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::types::{ChatMessage, ReasoningEffort};
     use rstest::rstest;
@@ -791,6 +829,46 @@ mod tests {
         assert!(plain.get("thinking").is_none());
     }
 
+    /// A model that thinks opens its response with `thinking` blocks, empty
+    /// under the default `display: "omitted"`, and may return
+    /// `redacted_thinking`. Both completion paths must read past them.
+    #[tokio::test]
+    async fn thinking_blocks_do_not_fail_either_completion_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "claude-opus-5",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "OK"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "result",
+                        "input": {"answer": "OK"}
+                    }
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 5}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), "claude-opus-5")
+            .unwrap()
+            .with_base_url(server.uri());
+
+        let response = provider.complete(chat_request()).await.unwrap();
+        assert_eq!(response.text, "OK");
+
+        let value = provider
+            .complete_structured_raw(chat_request(), json!({"type": "object"}))
+            .await
+            .unwrap();
+        assert_eq!(value, json!({"answer": "OK"}));
+    }
+
     fn body_for_effort(model: &str, effort: ReasoningEffort) -> serde_json::Value {
         let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), model)
             .unwrap()
@@ -829,6 +907,26 @@ mod tests {
         None
     )]
     #[case::fable_5_none_omits_disabled("claude-fable-5", ReasoningEffort::None, None, None)]
+    #[case::opus_55_none_omits_disabled("claude-opus-5-5", ReasoningEffort::None, None, None)]
+    #[case::bedrock_opus_55_none_omits_disabled(
+        "anthropic.claude-opus-5-5",
+        ReasoningEffort::None,
+        None,
+        None
+    )]
+    #[case::sonnet_5_disabled("claude-sonnet-5", ReasoningEffort::None, None, Some("disabled"))]
+    #[case::sonnet_55_none_between_tools(
+        "claude-sonnet-5-5",
+        ReasoningEffort::None,
+        None,
+        Some("between_tools")
+    )]
+    #[case::sonnet_55_low_adaptive(
+        "claude-sonnet-5-5",
+        ReasoningEffort::Low,
+        Some("low"),
+        Some("adaptive")
+    )]
     #[case::sonnet_46_xhigh_clamps_max(
         "claude-sonnet-4-6",
         ReasoningEffort::XHigh,

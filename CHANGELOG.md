@@ -12,6 +12,16 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the forget sweep's raw-observation prune deleting the raw capture of
+  a session that still has a queued consolidation. A session resumed after its
+  first summary gets a new `session_consolidation_jobs` row (`pending` or
+  `running`) while its old summary page is still live, so the prune could
+  delete the session's raw observations before the queued job read them, and
+  the job would consolidate a truncated session. The prune and its dry-run
+  count now share one exclusion: a session with a `pending` or `running`
+  consolidation job, or resumed capture newer than its last SessionEnd
+  generation, keeps every observation, however old; `completed`, `failed` and
+  `superseded` jobs do not block after the session is fully ended. (#1324)
 - Fixed SessionEnd loading every observation of the session into memory, up to
   three times, on the hook path. One production claude-code session held
   948,136 observations, so ending it deserialized close to a million rows
@@ -35,6 +45,18 @@ version in [`docs/changelog/`](docs/changelog/):
   default `auto`, with a tool description that asks for the call, and a reply
   that carries the JSON as text is read as the result. Other Claude models keep
   the forced call. (#1328)
+- Fixed `AI_MEMORY_LLM_REASONING_EFFORT=none` failing every Anthropic request
+  to Claude Opus 5.5 and Sonnet 5.5 with a 400. Both reject
+  `thinking: {"type": "disabled"}`. Opus 5.5 now gets no `thinking` field, as
+  Fable and Mythos already did, and Sonnet 5.5 gets
+  `thinking: {"type": "between_tools"}`, its way to turn thinking off. (#1326)
+- Fixed the Anthropic provider rejecting any response that carried a
+  `thinking` or `redacted_thinking` block as an unknown variant. Claude
+  Opus 5, Sonnet 5, Haiku 5.5 and the later Opus, Sonnet, Fable and Mythos
+  models think when a request leaves `thinking` out, and Claude models from
+  4.6 on are sent adaptive thinking once `AI_MEMORY_LLM_REASONING_EFFORT` is
+  set, so `memory_explore` and `ai-memory llm-test` failed as soon as the
+  model thought. The provider now skips the blocks it does not read. (#1325)
 
 ## [3.0.1] - 2026-10-15
 
