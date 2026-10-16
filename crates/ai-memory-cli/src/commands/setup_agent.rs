@@ -42,8 +42,8 @@ use crate::cli::{
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
-    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_grok_payload,
-    build_pool_settings_yaml, hook_script_for_current_platform,
+    KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_dsh_hooks_payload,
+    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform,
 };
 use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -220,6 +220,7 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
         AgentChoice::Pool => emit_pool(&emit_root, &args),
+        AgentChoice::Dsh => emit_dsh(&emit_root, &args),
         AgentChoice::CopilotCli => {
             emit_other(&emit_root, agent_sub, &args, &[COPILOT_CLI_PROFILE.events]);
         }
@@ -621,6 +622,41 @@ fn emit_pool(emit_root: &Path, args: &SetupAgentArgs) {
     println!("#       `ai-memory finalize-session --agent pool` (no true session-end event).");
     println!();
     print!("{snippet}");
+}
+
+/// Print DSH's generated Claude Code `hooks.json` plus the Cordis patch
+/// fragment that points the `@deepseek-ai/dsh-hooks-claude-code` bridge at
+/// it. The staged `.sh`/`.ps1` scripts are the artifact; the bridge reads the
+/// hooks.json via `configPath` after the operator merges the patch into
+/// `$DSH_HOME/profiles/<profile>/cordis.patch.yml`.
+fn emit_dsh(emit_root: &Path, args: &SetupAgentArgs) {
+    let payload = build_dsh_hooks_payload(
+        emit_root,
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    println!("# DeepSeek Harness (DSH) — DSH has no fixed agent config file.");
+    println!("# Hook scripts (must be reachable from the host that runs DSH):");
+    println!("#   {}", emit_root.display());
+    println!("# AI-memory server: {}", args.server_url);
+    if args.auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat the hook config as sensitive (chmod 600).");
+    }
+    println!("# NOTE: the bridge delivers exactly seven events — no PreCompact or");
+    println!("#       SessionEnd, and SessionStart runs detached, so capture works");
+    println!("#       but handoff injection does not. Recover handoffs via the MCP");
+    println!("#       memory_handoff_accept tool, and close finished sessions with");
+    println!("#       `ai-memory finalize-session --agent dsh`.");
+    println!();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).expect("static hook payload serializes")
+    );
+    println!();
+    print!("{}", install_hooks::dsh_bridge_patch_fragment(emit_root));
 }
 
 fn emit_devin(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
