@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed `ai-memory auth login oidc-device` sending the device code and the
+  issued tokens in clear text when the discovery document advertised a
+  plain-`http` device or token endpoint, or when the issuer itself was
+  plain `http`. The issuer and both endpoints must now use `https`; plain
+  `http` is still accepted on `localhost`, `127.0.0.1` and `::1` (#1354).
+
 ## [3.1.0] - 2026-10-16
 
 ### Added

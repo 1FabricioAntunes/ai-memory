@@ -1359,7 +1359,9 @@ pub struct AuthLoginArgs {
     pub client_id: Option<String>,
     /// OIDC issuer URL for `oidc-device` login, e.g. a Keycloak realm
     /// (`https://keycloak.example.com/realms/ai-memory`). Endpoints are
-    /// discovered from `<issuer>/.well-known/openid-configuration`.
+    /// discovered from `<issuer>/.well-known/openid-configuration`. The issuer
+    /// and both endpoints must use `https`; plain `http` is accepted only on
+    /// loopback.
     #[arg(long)]
     pub issuer: Option<String>,
 }
