@@ -66,7 +66,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `.agents/skills` with `--scope project`. `ai-memory setup` now uses it for
   Antigravity, which until now got its skills only in `~/.agents/skills`, a
   directory Antigravity does not read globally, and `uninstall --only skills`
-  sweeps both roots.
+  sweeps both roots. (#1357)
 
 ## [3.1.0] - 2026-10-16
 
