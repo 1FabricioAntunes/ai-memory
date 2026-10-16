@@ -206,9 +206,15 @@ from hook paths.
    is positive, then deletes raw `observations` older than that age, but only
    for sessions already consolidated into a summary page that is still live, so
    raw capture is never removed while it is the last copy of that session's
-   work. It runs last so this run's own evictions and hard-deletes already
-   exclude their sessions, deletes in `observation_prune_batch` transactions so
-   a multi-million row prune cannot hold the write lock, and repairs
+   work, and never for a session that still has a `session_consolidation_jobs`
+   row in `pending` or `running` — a queued (or lease-stale) consolidation
+   still reads the raw capture — and never while the live observation count is
+   newer than `sessions.ended_observation_count`, which closes the interval
+   between resumed capture and its next queue insertion. The dry-run count
+   applies the same guard for the same snapshot. It runs last so this run's own
+   evictions and hard-deletes already exclude their sessions, deletes in
+   `observation_prune_batch` transactions so a multi-million row prune cannot
+   hold the write lock, and repairs
    `sessions.ended_observation_count` downward in the same transaction. The
    prune is irreversible in a specific sense: observations are the input to
    consolidation, so a pruned session can never be re-consolidated (not with
