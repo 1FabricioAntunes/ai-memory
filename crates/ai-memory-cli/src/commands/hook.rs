@@ -575,13 +575,15 @@ fn write_success_response<W: std::io::Write>(
         // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
         Ok(())
-    } else if matches!(agent, AgentKind::Muse | AgentKind::CodeBuddy)
-        && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
+    } else if matches!(
+        agent,
+        AgentKind::Muse | AgentKind::CodeBuddy | AgentKind::IbmBob
+    ) && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
     {
-        // Muse adds SessionStart and UserPromptSubmit stdout to the turn as
-        // developer context, and CodeBuddy appends exit-0 stdout of both to
-        // the session, so a capture-only reply stays empty rather than put
-        // `{}` in front of the model on every prompt.
+        // Muse and IBM Bob add SessionStart and UserPromptSubmit stdout to the
+        // turn as context, and CodeBuddy appends exit-0 stdout of both to the
+        // session, so a capture-only reply stays empty rather than put `{}` in
+        // front of the model on every prompt.
         Ok(())
     } else if event == HookEvent::UserPrompt && agent.user_prompt_injects_handoff() {
         // Kimi Code injects any non-empty UserPromptSubmit stdout into the turn
@@ -1220,9 +1222,9 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
-                if agent_kind == AgentKind::KiroCli {
-                    // Kiro v2/v3 consume SessionStart stdout verbatim and define
-                    // no wrapper envelope.
+                if matches!(agent_kind, AgentKind::KiroCli | AgentKind::IbmBob) {
+                    // Kiro v2/v3 and IBM Bob consume SessionStart stdout
+                    // verbatim and define no wrapper envelope.
                     writeln!(stdout, "{handoff}")?;
                 } else {
                     let envelope = session_start_handoff_envelope(agent_kind, handoff);
@@ -2377,6 +2379,13 @@ mod tests {
                 HookEvent::PostToolUse,
                 b"{}\n".as_slice(),
             ),
+            (AgentKind::IbmBob, HookEvent::SessionStart, b"".as_slice()),
+            (AgentKind::IbmBob, HookEvent::UserPrompt, b"".as_slice()),
+            (
+                AgentKind::IbmBob,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
         ] {
             let mut output = Vec::new();
             write_success_response(&mut output, agent, event).unwrap();
@@ -2721,6 +2730,7 @@ mod tests {
     async fn a_handoff_is_never_claimed_without_a_project_directory() {
         let cases = [
             ("codebuddy", "session-start", serde_json::json!({})),
+            ("ibm-bob", "session-start", serde_json::json!({})),
             ("claude-code", "session-start", serde_json::json!({})),
             ("codex", "session-start", serde_json::json!({})),
             (
@@ -2780,6 +2790,12 @@ mod tests {
                         stdout.contains("OTHER-PROJECT-HANDOFF"),
                         "{agent}: {stdout}"
                     );
+                    if agent == "ibm-bob" {
+                        assert_eq!(
+                            stdout, "OTHER-PROJECT-HANDOFF\n",
+                            "Bob consumes plain SessionStart context, not a JSON envelope"
+                        );
+                    }
                 } else {
                     assert!(claims.is_empty(), "{agent}: unscoped claim: {recorded:?}");
                     assert!(

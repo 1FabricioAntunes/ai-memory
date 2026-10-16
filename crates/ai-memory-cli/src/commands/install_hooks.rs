@@ -448,6 +448,16 @@ pub(crate) fn codebuddy_settings_path() -> anyhow::Result<std::path::PathBuf> {
         .join("settings.json"))
 }
 
+/// `~/.bob/settings/settings.json` — IBM Bob's global settings shared by the
+/// IDE and Bob Shell. The root `hooks` block uses nested event groups.
+pub(crate) fn ibm_bob_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.bob/settings/settings.json")?
+        .join(".bob")
+        .join("settings")
+        .join("settings.json"))
+}
+
 /// `~/.config/zero/hooks.json` — Zero's user-level lifecycle hook config
 /// (issue #156). Zero resolves it under `$XDG_CONFIG_HOME` falling back to
 /// `~/.config`; like the OpenCode plugin path below we target the default
@@ -998,6 +1008,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 };
                 apply_to_codebuddy_settings(&path, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::IbmBob => {
+                let path = match &args.config_file {
+                    Some(path) => path.clone(),
+                    None => ibm_bob_settings_path()?,
+                };
+                apply_to_ibm_bob_settings(&path, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -1155,6 +1172,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         AgentChoice::Droid => render_droid(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Muse => render_muse(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::CodeBuddy => render_codebuddy(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::IbmBob => render_ibm_bob(&server_url, auth, &config.data_dir, strategy),
     }
 }
 
@@ -1350,6 +1368,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             // `run` resolves it into `args.config_file` before any caller.
             AgentChoice::Muse => return None,
             AgentChoice::CodeBuddy => codebuddy_settings_path().ok()?,
+            AgentChoice::IbmBob => ibm_bob_settings_path().ok()?,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -1612,11 +1631,9 @@ fn infer_installed_mcp_config(
         // Codex uses `http_headers`; Grok uses `headers`. The shared TOML
         // inferencer accepts both.
         McpClient::Codex => Ok(infer_toml_mcp_config(&content)),
-        McpClient::CommandCode | McpClient::CopilotCli => Ok(infer_json_mcp_config(
-            &content,
-            &["mcpServers", "ai-memory"],
-            "url",
-        )),
+        McpClient::CommandCode | McpClient::CopilotCli | McpClient::IbmBob => Ok(
+            infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
+        ),
         // `install-mcp --client droid` writes the bearer as the
         // `${AI_MEMORY_AUTH_TOKEN}` reference Droid expands, not the token,
         // so only the URL is inferred from it.
@@ -1779,6 +1796,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Muse => Some(McpClient::Muse),
         // No first-party CodeBuddy MCP installer in this change.
         AgentChoice::CodeBuddy => None,
+        AgentChoice::IbmBob => Some(McpClient::IbmBob),
     }
 }
 
@@ -7256,6 +7274,91 @@ fn render_codebuddy(
     Ok(())
 }
 
+/// Merge ai-memory's entries into IBM Bob's global settings, preserving every
+/// unrelated setting and hook. Bob IDE and Bob Shell both read this file.
+fn apply_to_ibm_bob_settings(
+    path: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = super::render_shared::build_ibm_bob_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: IBM Bob payload did not return a hooks object")?;
+    let outcome = apply_atomic(path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in IBM Bob settings.json but not an object")?;
+            for (event, value) in our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    print!("{IBM_BOB_INSTALL_NOTES}");
+    Ok(())
+}
+
+const IBM_BOB_INSTALL_NOTES: &str = "\
+# NOTE: IBM Bob injects plain SessionStart stdout into the model context, so
+#       the prior session's handoff is delivered automatically.
+# NOTE: Bob exposes Stop but no SessionEnd; close a finished session with
+#       `ai-memory finalize-session --agent ibm-bob`.
+# NOTE: start a new Bob session for it to load the new hooks.
+";
+
+/// Print the `hooks` block for IBM Bob's global settings (dry-run counterpart
+/// of [`apply_to_ibm_bob_settings`]).
+fn render_ibm_bob(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_ibm_bob_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing IBM Bob hook config")?;
+    println!("# IBM Bob hook config — merge under the `hooks` key of");
+    println!("# ~/.bob/settings/settings.json, or re-run with --apply to merge it in place.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
+    }
+    print!("{IBM_BOB_INSTALL_NOTES}");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 /// Merge ai-memory's entries into the `hooks` key of Muse's `settings.json`,
 /// keeping `schema_version`, every unknown key and every other hook in it,
 /// idempotently, with a backup next to the file on change. Muse fails every
@@ -8295,6 +8398,71 @@ mod tests {
         }
         assert!(root["hooks"].get("SubagentStart").is_none());
         assert!(root["hooks"].get("PostToolUseFailure").is_none());
+        let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+    }
+
+    /// IBM Bob shares one global settings file between the IDE and Shell.
+    /// Install only their common event vocabulary, preserve unrelated content,
+    /// omit unsupported matchers, and make repeated installation a no-op.
+    #[test]
+    fn ibm_bob_apply_merges_common_native_hooks_and_is_idempotent() {
+        let home = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let settings = home.path().join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({
+                "theme": "dark",
+                "hooks": {
+                    "PreToolUse": [{
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh"}]
+                    }],
+                    "PreCompact": [{
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/archive.sh"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::IbmBob,
+            config_file: Some(settings.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_ibm_bob_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        let first = fs::read_to_string(&settings).unwrap();
+        apply_to_ibm_bob_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        assert_eq!(first, fs::read_to_string(&settings).unwrap());
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["theme"], "dark");
+        for (event, script) in super::super::render_shared::IBM_BOB_EVENTS {
+            let entries = root["hooks"][event].as_array().unwrap();
+            let ours: Vec<_> = entries
+                .iter()
+                .filter(|entry| is_ai_memory_hook_entry(entry))
+                .collect();
+            assert_eq!(ours.len(), 1, "{event}");
+            assert!(ours[0].get("matcher").is_none(), "{event}");
+            let command = ours[0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                command.contains(&format!(
+                    " hook --event {} --agent ibm-bob --server-url ",
+                    script.trim_end_matches(".sh")
+                )),
+                "{event}: {command}"
+            );
+        }
+        assert_eq!(
+            root["hooks"]["PreCompact"][0]["hooks"][0]["command"],
+            "/usr/local/bin/archive.sh"
+        );
         let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");

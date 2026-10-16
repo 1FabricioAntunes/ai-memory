@@ -165,6 +165,19 @@ pub(crate) const CODEBUDDY_EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// IBM Bob IDE's common lifecycle vocabulary. Bob Shell also supports these
+/// five events; its additional compaction events are intentionally omitted so
+/// one global settings file remains valid in both products. Bob has no
+/// `SessionEnd`, and `Stop` is an agent-turn boundary rather than a reliable
+/// process-exit boundary.
+pub(crate) const IBM_BOB_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+];
+
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
 /// seconds, like the Claude Code plugins it loads. The capture POST is
 /// fire-and-forget; `SessionStart` also fetches a handoff.
@@ -1180,6 +1193,33 @@ pub(crate) fn build_codebuddy_hooks_payload(
         HookCommandContext::new(
             HookCommandPlatform::native(),
             "codebuddy",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for IBM Bob's
+/// `~/.bob/settings/settings.json`. Bob's outer event groups have the same
+/// nested shape as Claude Code, but `matcher` is valid only on tool events;
+/// omitting it matches every tool and keeps lifecycle entries schema-valid.
+/// Bob runs the command through the platform shell with the event JSON on
+/// stdin, so each entry invokes ai-memory's native hook command directly.
+pub(crate) fn build_ibm_bob_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &IBM_BOB_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::NestedWithoutMatcher,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "ibm-bob",
             data_dir,
             project_strategy,
         ),
@@ -4229,6 +4269,35 @@ if (inheritOnly) {
             let command = definition["hooks"][0]["command"].as_str().unwrap();
             assert!(command.contains("--agent command-code"), "{command}");
         }
+    }
+
+    #[test]
+    fn ibm_bob_profile_uses_common_events_without_matchers() {
+        let value = build_ibm_bob_hooks_payload(
+            "http://memory:49374",
+            None,
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 5);
+        for (event, script) in IBM_BOB_EVENTS {
+            let definition = &value["hooks"][event][0];
+            assert!(definition.get("matcher").is_none(), "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            let event_name = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!("hook --event {event_name} --agent ibm-bob")),
+                "{event}: {command}"
+            );
+            assert!(
+                command.contains("--project-strategy repo-root"),
+                "{command}"
+            );
+            assert!(!command.contains(".sh"), "{command}");
+        }
+        assert!(value["hooks"].get("SessionEnd").is_none());
+        assert!(value["hooks"].get("PreCompact").is_none());
     }
 
     #[test]

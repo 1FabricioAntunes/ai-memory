@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -1517,6 +1517,34 @@ checkpoint/prompt sidecars, hidden reasoning, images, and provider metadata,
 and preserves `parentId` on visible events for branch provenance. An unknown
 future transcript version fails closed until its schema is audited. Direct
 `cmd`, `cmdc`, or `command-code` launches remain unchanged.
+
+### IBM Bob
+
+IBM Bob IDE and Bob Shell share their global settings below `~/.bob/settings`.
+Install MCP and lifecycle capture together:
+
+```bash
+ai-memory install-mcp --client ibm-bob --apply \
+    --server-url "https://memory.example/mcp" \
+    --auth-token "$TOKEN"
+ai-memory install-hooks --agent ibm-bob --apply \
+    --server-url "https://memory.example" \
+    --auth-token "$TOKEN"
+```
+
+The `bob` alias is accepted. MCP is merged into `mcp.json` as Bob's native
+`streamable-http` entry with `protocolNegotiation: "legacy"`; this skips Bob's
+non-standard discovery probe and uses the standard MCP handshake. Hooks are
+merged into the root `hooks` object of `settings.json`, preserving other
+settings and handlers. The installer uses only the five events common to the
+IDE and Shell, delivers the pending handoff as plain `SessionStart` context,
+and enforces capture exclusions for tool events.
+
+Bob has no true session-end event. Use `ai-memory finalize-session --agent
+ibm-bob` after the final turn when you need the summary and handoff immediately.
+Managed `ai-memory run ibm-bob` resume is not supported because Bob does not
+document a stable native transcript store. See [the IBM Bob MCP and hook
+details](mcp-install.md#ibm-bob).
 
 ### Kiro CLI
 

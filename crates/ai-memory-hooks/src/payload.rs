@@ -845,6 +845,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // (#1299). Unknown values stay `Other` and keep the capture-only
             // path.
             | AgentKind::CodeBuddy
+            | AgentKind::IbmBob
     )
 }
 
@@ -2294,6 +2295,48 @@ mod tests {
             HookQuery {
                 event: "post-tool-use".into(),
                 agent: Some("codebuddy-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
+    }
+
+    /// IBM Bob documents the same snake_case tool fields as Claude Code. A
+    /// recognized Bob payload becomes a closed tool observation while an
+    /// unknown agent carrying identical JSON stays on the capture-only path.
+    #[test]
+    fn ibm_bob_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_bob",
+            "tool_input": {"file_path": "src/lib.rs"},
+            "tool_response": "file contents"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("ibm-bob".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::IbmBob);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_bob"), "{body}");
+        assert!(body.contains("\n---\nfile contents"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("ibm-bob-2".into()),
                 ..Default::default()
             },
             raw,

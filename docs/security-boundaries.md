@@ -126,6 +126,17 @@ means the boundary is not built yet.
 
 | 26 | Cross-harness native-history continuation stays checkout-scoped and client-local | `ai-memory-store/src/workstream.rs` `prepare_run` selects the newest current native session only when its harness differs from the destination and pins that typed identity on the run before destination linking can change recency; `ai-memory-cli/src/commands/run.rs` validates the returned `NativeSessionIdentity`, resolves only known adapter flavors, requires `native_session_in_checkout`, exports through the bounded read-only adapter, and writes an untrusted-history dossier to a private temporary directory exposed only to the child as `AI_MEMORY_PREVIOUS_SESSION_HISTORY`; the server wire type deliberately has no path/content field and same-harness launches select no source | Core `prepare_response_carries_only_previous_native_identity` and `older_prepare_response_defaults_to_no_adoption`; store `managed_adoption_stops_after_any_harness_links_the_workstream` (switch control, destination-link recency cannot replace the pinned source, same-harness refusal); hooks `managed_context_points_at_local_history_on_a_harness_switch` (no session id rendered, untrusted instruction present); CLI `previous_session_history_is_private_local_and_checkout_scoped` (legitimate control, foreign checkout refused, private local file removed with its owner) | STRONG for checkout isolation and server path/content privacy. The dossier is a bounded visible-history projection, not raw hidden reasoning; if the source store is absent, remote, unreadable, or over bounds, the child receives only the portable ledger and handoff |
 
+### IBM Bob evidence
+
+IBM Bob extends boundary **4j** through `hook.rs`
+`a_handoff_is_never_claimed_without_a_project_directory`: an unscoped Bob
+`SessionStart` cannot send `GET /handoff`, while the same payload with a `cwd`
+claims once and names that directory. It extends boundary **11b** through
+`capture_policy.rs` `ibm_bob_tool_calls_honor_capture_exclusions`: an ignored
+Claude-shaped `Read` path is dropped, a public-path control is kept, and the
+same body under an unknown agent stays unclassified. Removing Bob from either
+guard makes the corresponding adversarial test fail. Coverage: **STRONG**.
+
 ## Keeping this current (the standing protocol)
 
 1. **Touch a guard, add/extend its adversarial test.** Any change to code in the

@@ -851,7 +851,7 @@ OMP currently needs no added flag. ai-memory does not add a duplicate when the
 translated native flag is already present.
 
 Managed support is intentionally narrower than the general integration matrix.
-Gemini CLI, Devin CLI, Cursor, and other agents may
+IBM Bob, Gemini CLI, Devin CLI, Cursor, and other agents may
 have MCP or lifecycle-hook support without native managed resume. Contributors
 adding another managed harness must follow the [managed-harness contribution
 protocol](managed-harness-contributions.md), including read-only extraction,

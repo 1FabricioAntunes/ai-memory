@@ -130,6 +130,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         emit_codebuddy(&args)?;
         return Ok(());
     }
+    // IBM Bob's settings run the native hook command directly too.
+    if matches!(args.agent, AgentChoice::IbmBob) {
+        emit_ibm_bob(&args)?;
+        return Ok(());
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -228,7 +233,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Hermes
         | AgentChoice::Droid
         | AgentChoice::Muse
-        | AgentChoice::CodeBuddy => {
+        | AgentChoice::CodeBuddy
+        | AgentChoice::IbmBob => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -394,6 +400,29 @@ fn emit_codebuddy(args: &SetupAgentArgs) -> Result<()> {
     println!("# ~/.codebuddy/settings.json. The `command` must be an ai-memory");
     println!("# binary reachable on the host that runs CodeBuddy; prefer");
     println!("# `ai-memory install-hooks --agent codebuddy --apply` from that host.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print the `hooks` block for IBM Bob's shared global settings. No scripts
+/// are staged: each entry runs the native `hook` command.
+fn emit_ibm_bob(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_ibm_bob_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing IBM Bob hook config")?;
+    println!("# IBM Bob — merge under the `hooks` key of");
+    println!("# ~/.bob/settings/settings.json. The `command` must be an ai-memory");
+    println!("# binary reachable on the host that runs Bob; prefer");
+    println!("# `ai-memory install-hooks --agent ibm-bob --apply` from that host.");
     if args.auth_token.is_some() {
         println!("#       Treat settings.json as sensitive (chmod 600).");
     }

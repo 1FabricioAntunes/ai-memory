@@ -297,6 +297,10 @@ pub enum AgentKind {
     /// is appended to the session (#1299).
     #[serde(rename = "codebuddy", alias = "code-buddy")]
     CodeBuddy,
+    /// IBM Bob IDE, whose lifecycle hooks send Claude Code-shaped payloads
+    /// but consume `SessionStart` stdout as plain context text.
+    #[serde(rename = "ibm-bob", alias = "bob")]
+    IbmBob,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -307,7 +311,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -333,6 +337,7 @@ impl AgentKind {
         Self::Droid,
         Self::Muse,
         Self::CodeBuddy,
+        Self::IbmBob,
         Self::Other,
     ];
 
@@ -365,6 +370,7 @@ impl AgentKind {
             Self::Droid => "droid",
             Self::Muse => "muse",
             Self::CodeBuddy => "codebuddy",
+            Self::IbmBob => "ibm-bob",
             Self::Other => "other",
         }
     }
@@ -400,6 +406,7 @@ impl AgentKind {
             "droid" | "factory-droid" | "factory_droid" => Self::Droid,
             "muse" | "muse-code" | "musecode" => Self::Muse,
             "codebuddy" | "code-buddy" => Self::CodeBuddy,
+            "ibm-bob" | "bob" => Self::IbmBob,
             _ => Self::Other,
         }
     }
@@ -789,6 +796,27 @@ mod tests {
         assert!(!AgentKind::CodeBuddy.user_prompt_injects_handoff());
         assert!(!AgentKind::CodeBuddy.post_tool_injects_handoff());
         assert!(!AgentKind::CodeBuddy.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_ibm_bob_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::IbmBob.as_str(), "ibm-bob");
+        for alias in ["ibm-bob", "bob"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::IbmBob, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::IbmBob).unwrap(),
+            "\"ibm-bob\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"bob\"").unwrap(),
+            AgentKind::IbmBob
+        );
+        assert_eq!(AgentKind::from_wire("bob-shell-2"), AgentKind::Other);
+        assert!(AgentKind::IbmBob.session_start_injects_handoff());
+        assert!(!AgentKind::IbmBob.user_prompt_injects_handoff());
+        assert!(!AgentKind::IbmBob.post_tool_injects_handoff());
+        assert!(!AgentKind::IbmBob.reuses_session_id_after_end());
     }
 
     #[test]

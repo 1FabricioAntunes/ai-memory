@@ -158,6 +158,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Factory Droid | Supported |
 | Meta Muse Code | Supported |
 | CodeBuddy Code | Hooks-only |
+| IBM Bob | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | DeepSeek Harness (DSH) | MCP-only |

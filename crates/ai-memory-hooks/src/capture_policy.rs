@@ -191,7 +191,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::Zcode
         | AgentKind::CopilotCli
         | AgentKind::Muse
-        | AgentKind::CodeBuddy => (
+        | AgentKind::CodeBuddy
+        | AgentKind::IbmBob => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -264,6 +265,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Droid
                             | AgentKind::Muse
                             | AgentKind::CodeBuddy
+                            | AgentKind::IbmBob
                     ) {
                         "tool_input"
                     } else {
@@ -1109,7 +1111,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // CodeBuddy Code uses Claude Code's names and the same two fields
         // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
         | AgentKind::Muse
-        | AgentKind::CodeBuddy => object
+        | AgentKind::CodeBuddy
+        | AgentKind::IbmBob => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -4796,6 +4799,53 @@ mod tests {
                 "{name}: control"
             );
         }
+    }
+
+    /// Bob's Claude-shaped file and shell calls must pass through the same
+    /// capture exclusions. The legitimate control proves the mapping does not
+    /// discard every Bob tool call.
+    #[test]
+    fn ibm_bob_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |path: &str| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "bob-session",
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_input": {"file_path": path},
+                "tool_use_id": "toolu_1",
+            })
+        };
+
+        assert_eq!(
+            policy
+                .inspect(AgentKind::IbmBob, &call("secret/token"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::IbmBob, &call("src/lib.rs"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            policy
+                .inspect(AgentKind::Other, &call("secret/token"), "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "without the Bob mapping the call is not recognized"
+        );
     }
 
     #[test]
