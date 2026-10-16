@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -2326,6 +2326,37 @@ handoff injection at session start or the client's closest equivalent, except
 for Zero's no-stdout SessionStart behavior. Grok delivers on the first
 `PostToolUse` instead (Antigravity CLI uses `PreInvocation`).
 
+#### Cline CLI and FreeBuff
+
+Cline CLI is a first-party hooks + MCP integration:
+
+```bash
+ai-memory install-mcp --client cline --apply
+ai-memory install-hooks --agent cline --apply
+```
+
+The MCP writer reads `CLINE_MCP_SETTINGS_PATH` or defaults to
+`~/.cline/data/settings/cline_mcp_settings.json`; it writes the nested
+`transport` object and explicitly selects `streamableHttp` rather than Cline's
+legacy SSE default. The hook writer targets the CLI's `~/.cline/hooks` files;
+use `--scope project` for `.cline/hooks` in one checkout. Restart Cline after
+installation. Yolo mode disables Cline hooks, and task-start hooks are
+detached, so recover pending handoffs through MCP. The VS Code extension's
+separate `~/Documents/Cline/Hooks` convention is not modified.
+
+FreeBuff is MCP-only:
+
+```bash
+ai-memory install-mcp --client freebuff --apply
+```
+
+This merges a sessionless stdio bridge under `mcpServers` in
+`~/.agents/mcp.json`. FreeBuff finds that file while walking from the current
+directory to the home directory and already reads `AGENTS.md`. A file-backed
+server bearer stays in ai-memory's data directory; an explicit `--auth-token`
+is stored in the stdio entry's environment map. No lifecycle hooks or managed
+workstream are claimed.
+
 #### Clients without an `install-mcp` writer
 
 The clients below can reach ai-memory over streamable HTTP, but `install-mcp`
@@ -2350,8 +2381,8 @@ expands environment variables in its config, the example reads the token
 from `AI_MEMORY_AUTH_TOKEN`; export it in the shell that starts the client.
 Where the client documents no expansion, the example shows `<token>`, and the
 token has to be written into that file, so keep the file private. All of
-these clients speak HTTP MCP natively; `ai-memory mcp-bridge` is a Claude
-Code-only adapter and is not needed.
+these clients speak HTTP MCP natively, so `ai-memory mcp-bridge` is not needed
+for these hand-written recipes.
 
 ##### Warp
 
@@ -2378,34 +2409,6 @@ on macOS; the docs give no Linux path). Documented for Warp
 v0.2026.10.07.08.29.
 Sources: <https://docs.warp.dev/agents/capabilities/mcp>,
 <https://docs.warp.dev/agents/cli/configuration/>.
-
-##### Cline
-
-The Cline CLI reads `~/.cline/data/settings/cline_mcp_settings.json`
-(override the path with `CLINE_MCP_SETTINGS_PATH`). In the VS Code extension,
-open the **MCP Servers** icon, then **Configure > Configure MCP Servers**, and
-edit the same `mcpServers` map. Set `type` to `streamableHttp`: without it,
-Cline falls back to the legacy SSE transport.
-
-```json
-{
-  "mcpServers": {
-    "ai-memory": {
-      "type": "streamableHttp",
-      "url": "http://127.0.0.1:49374/mcp",
-      "headers": { "Authorization": "Bearer <token>" },
-      "disabled": false
-    }
-  }
-}
-```
-
-Cline does not document environment-variable expansion in `headers`. Leave
-out `headers` when the server has no bearer token; in that case the CLI can
-write the entry with
-`cline mcp add ai-memory http://127.0.0.1:49374/mcp --transport http`.
-Documented for the Cline extension 4.1.23 and CLI 3.0.70.
-Source: <https://docs.cline.bot/mcp/mcp-overview>.
 
 ##### Kilo Code
 

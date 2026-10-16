@@ -126,7 +126,9 @@ pub(crate) fn run_with_opencode_dialect(
     // install's config and token only through an explicit `--data-dir`, as
     // the Muse hooks do. Not from inside the Docker helper, whose data dir is
     // a container path the host-side bridge cannot open.
-    if args.client == McpClient::Muse && config.runtime_env.host_cwd().is_none() {
+    if matches!(args.client, McpClient::Muse | McpClient::Freebuff)
+        && config.runtime_env.host_cwd().is_none()
+    {
         args.bridge_data_dir = Some(config.data_dir.clone());
     }
     if args.auth_token.is_none()
@@ -166,6 +168,8 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::Muse => render_muse(&args)?,
         McpClient::Dsh => render_dsh(&args)?,
         McpClient::PrimeAgent => render_prime_agent(&args)?,
+        McpClient::Cline => render_json_mcp_fragment(&args)?,
+        McpClient::Freebuff => render_json_mcp_fragment(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -216,18 +220,29 @@ const BRIDGE_COMMAND: &str = "ai-memory";
 /// to it verbatim and the client is the one that needs the dialect.
 fn session_less_bridge_args(args: &InstallMcpArgs) -> Vec<String> {
     let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
-    vec![
+    let mut argv = vec![
         "mcp-bridge".to_owned(),
         "--no-session-id".to_owned(),
         "--server-url".to_owned(),
         flavored_url_for(args, base_url),
-    ]
+    ];
+    if let Some(data_dir) = &args.bridge_data_dir {
+        argv.extend([
+            "--data-dir".to_owned(),
+            data_dir.to_string_lossy().into_owned(),
+        ]);
+    }
+    argv
 }
 
 /// The upstream URL of an ai-memory bridge entry: `command: "ai-memory"` with
 /// `args`, or OpenCode's single `command` array, running `mcp-bridge` with a
 /// `--server-url`. `None` for any other entry.
 pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
+    let entry = entry
+        .get("transport")
+        .filter(|transport| transport.is_object())
+        .unwrap_or(entry);
     let argv: Vec<&str> = match entry.get("command")? {
         serde_json::Value::String(command) if command == BRIDGE_COMMAND => entry
             .get("args")?
@@ -319,6 +334,11 @@ pub(crate) fn existing_entry_endpoint(
     if let Some(url) = ["url", "httpUrl", "serverUrl"]
         .iter()
         .find_map(|key| entry.get(*key).and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            entry
+                .pointer("/transport/url")
+                .and_then(serde_json::Value::as_str)
+        })
         .or_else(|| bridge_entry_url(entry))
     {
         return Ok(Some(url.to_owned()));
@@ -360,6 +380,26 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         }),
         McpClient::Cursor | McpClient::VsCodeCopilot | McpClient::Swival | McpClient::Zero => {
             typed("stdio")
+        }
+        McpClient::Cline => json!({
+            "transport": {
+                "type": "stdio",
+                "command": BRIDGE_COMMAND,
+                "args": bridge,
+            },
+            "disabled": false,
+            "autoApprove": [],
+        }),
+        McpClient::Freebuff => {
+            let env = args
+                .auth_token
+                .as_ref()
+                .map_or_else(|| json!({}), |token| json!({"AI_MEMORY_AUTH_TOKEN": token}));
+            json!({
+                "command": BRIDGE_COMMAND,
+                "args": bridge,
+                "env": env,
+            })
         }
         McpClient::Omp => json!({
             "type": "stdio",
@@ -511,7 +551,7 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
 
 /// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
 /// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`,
-/// `PRIME_AGENT_CODING_AGENT_DIR`, and OMP's
+/// `PRIME_AGENT_CODING_AGENT_DIR`, `CLINE_MCP_SETTINGS_PATH`, and OMP's
 /// `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR`) read
 /// through `env`,
 /// so `ai-memory run --env` can point auto-wire at the same config home
@@ -521,7 +561,13 @@ pub(crate) fn mcp_config_path_with(
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<PathBuf> {
     use crate::cli::McpClient;
-    let home = || home_dir().context("could not locate $HOME for config-file auto-detect");
+    let home = || {
+        env("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(home_dir)
+            .context("could not locate $HOME for config-file auto-detect")
+    };
     Ok(match client {
         McpClient::ClaudeCode => claude_code_config_path_in(env("CLAUDE_CONFIG_DIR"))?,
         McpClient::Codex => codex_config_path_in(env("CODEX_HOME"))?,
@@ -652,6 +698,11 @@ pub(crate) fn mcp_config_path_with(
         McpClient::PrimeAgent => {
             prime_agent_dir_in(env("PRIME_AGENT_CODING_AGENT_DIR"))?.join("settings.json")
         }
+        McpClient::Cline => env("CLINE_MCP_SETTINGS_PATH")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(home()?.join(".cline/data/settings/cline_mcp_settings.json")),
+        McpClient::Freebuff => home()?.join(".agents").join("mcp.json"),
     })
 }
 
@@ -1059,6 +1110,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Droid
         | McpClient::Swival
         | McpClient::PrimeAgent => Some(JsonMcpLocation::RootMcpServers),
+        McpClient::Cline | McpClient::Freebuff => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
         // Zero, and ZCode use.
@@ -1077,7 +1129,12 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
 
 fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     validate_args(args)?;
-    if args.stdio_bridge
+    // FreeBuff supports local stdio MCP servers, not remote HTTP entries.
+    // Always bridge to the configured ai-memory HTTP server; starting another
+    // `serve` process would contend for the data-dir lock. Keep this at the
+    // typed builder boundary so auth-enable and other internal callers cannot
+    // accidentally request an unsupported direct entry.
+    if (args.stdio_bridge || args.client == McpClient::Freebuff)
         && let Some(entry) = stdio_bridge_entry(args)
     {
         return Ok(entry);
@@ -1089,6 +1146,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::Zero => build_mcp_entry_zero(args),
         McpClient::Zcode => build_mcp_entry_zcode(args),
         McpClient::Muse => build_mcp_entry_muse(args),
+        McpClient::Cline => build_mcp_entry_cline(args),
         McpClient::Codex | McpClient::Grok => {
             bail!("internal: Codex/Grok MCP config is TOML, not JSON")
         }
@@ -1346,6 +1404,11 @@ fn entry_endpoint(entry: &serde_json::Value) -> Option<&str> {
     entry
         .get("url")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            entry
+                .pointer("/transport/url")
+                .and_then(serde_json::Value::as_str)
+        })
         .or_else(|| bridge_entry_url(entry))
 }
 
@@ -1702,6 +1765,9 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
                 entry.insert("bearerTokenEnvVar".into(), json!(PRIME_AGENT_TOKEN_ENV));
             }
         }
+        McpClient::Cline | McpClient::Freebuff => {
+            bail!("internal: client has a dedicated MCP entry builder")
+        }
         _ => bail!("internal: build_mcp_entry called for unsupported client"),
     }
     Ok(serde_json::Value::Object(entry))
@@ -1718,6 +1784,24 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
         entry.insert("headers".into(), json!({"Authorization": b}));
     }
     Ok(serde_json::Value::Object(entry))
+}
+
+/// Cline's CLI writer uses a nested transport object. Keeping the explicit
+/// `streamableHttp` discriminator is load-bearing: a bare `url` is parsed as
+/// legacy SSE and sends GET requests to ai-memory's POST-only MCP endpoint.
+fn build_mcp_entry_cline(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut transport = serde_json::Map::new();
+    transport.insert("type".into(), json!("streamableHttp"));
+    transport.insert("url".into(), json!(flavored_url_for(args, base_url)));
+    if let Some(bearer) = bearer_header_value(args.auth_token.as_deref()) {
+        transport.insert("headers".into(), json!({"Authorization": bearer}));
+    }
+    Ok(json!({
+        "transport": transport,
+        "disabled": false,
+        "autoApprove": [],
+    }))
 }
 
 /// OpenCode 2.0 beta MCP entry: `type: "remote"` + `url` + optional
@@ -2617,6 +2701,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cline_entry_explicitly_selects_streamable_http() {
+        let entry = build_json_mcp_entry(&args_with_token(McpClient::Cline)).unwrap();
+        assert_eq!(entry["transport"]["type"], "streamableHttp");
+        assert_eq!(entry["transport"]["url"], "http://127.0.0.1:49374/mcp");
+        assert_eq!(
+            entry["transport"]["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert_eq!(entry["disabled"], false);
+        assert_eq!(entry["autoApprove"], json!([]));
+    }
+
+    #[test]
+    fn freebuff_entry_uses_sessionless_bridge_not_a_second_server() {
+        let mut args = args_for(McpClient::Freebuff);
+        args.server_url = Some("https://memory.example/mcp".into());
+        let entry = build_json_mcp_entry(&args).unwrap();
+        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(
+            entry["args"],
+            json!([
+                "mcp-bridge",
+                "--no-session-id",
+                "--server-url",
+                "https://memory.example/mcp"
+            ])
+        );
+        assert_eq!(entry["env"], json!({}));
+        assert!(
+            !entry["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str() == Some("serve"))
+        );
+
+        let mut authenticated = args_for(McpClient::Freebuff);
+        authenticated.server_url = Some("https://memory.example/mcp".into());
+        authenticated.auth_token = Some("explicit-token".into());
+        authenticated.bridge_data_dir = Some(PathBuf::from("/srv/ai-memory"));
+        let entry = build_json_mcp_entry(&authenticated).unwrap();
+        assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "explicit-token");
+        assert_eq!(
+            entry["args"],
+            json!([
+                "mcp-bridge",
+                "--no-session-id",
+                "--server-url",
+                "https://memory.example/mcp",
+                "--data-dir",
+                "/srv/ai-memory"
+            ])
+        );
+    }
+
     /// Droid's `mcp.json` HTTP entry (#1240): the URL is literal (Droid
     /// never expands variables there), and a configured bearer becomes the
     /// `${AI_MEMORY_AUTH_TOKEN}` reference Droid expands in headers, never
@@ -3428,6 +3568,25 @@ mod tests {
                 "{client:?} must follow {var}"
             );
         }
+
+        let cline_file = root.join("cline-mcp.json");
+        let env = |name: &str| {
+            (name == "CLINE_MCP_SETTINGS_PATH").then(|| cline_file.clone().into_os_string())
+        };
+        assert_eq!(
+            mcp_config_path_with(McpClient::Cline, &env).unwrap(),
+            cline_file
+        );
+
+        let env = |name: &str| (name == "HOME").then(|| root.as_os_str().to_owned());
+        assert_eq!(
+            mcp_config_path_with(McpClient::Cline, &env).unwrap(),
+            root.join(".cline/data/settings/cline_mcp_settings.json")
+        );
+        assert_eq!(
+            mcp_config_path_with(McpClient::Freebuff, &env).unwrap(),
+            root.join(".agents/mcp.json")
+        );
     }
 
     #[test]
@@ -3917,6 +4076,12 @@ mod tests {
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
             McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
+            McpClient::Cline => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::Freebuff => {
+                let mut args = args;
+                args.stdio_bridge = true;
+                render_json_mcp_fragment(&args).unwrap()
+            }
         }
     }
 
@@ -3948,6 +4113,7 @@ mod tests {
             McpClient::VsCodeCopilot,
             McpClient::Zed,
             McpClient::Dsh,
+            McpClient::Cline,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -3996,6 +4162,8 @@ mod tests {
             McpClient::Muse,
             McpClient::Dsh,
             McpClient::PrimeAgent,
+            McpClient::Cline,
+            McpClient::Freebuff,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -4037,6 +4205,12 @@ mod tests {
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
             McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
+            McpClient::Cline => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::Freebuff => {
+                let mut args = args;
+                args.stdio_bridge = true;
+                render_json_mcp_fragment(&args).unwrap()
+            }
         }
     }
 

@@ -231,6 +231,16 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // reaches a hook payload (verified against the 0.240.0 tool schemas,
         // #1240).
         AgentKind::Droid => (object.get("tool_name")?.as_str()?, None),
+        AgentKind::Cline => {
+            let tool = object
+                .get("tool_call")
+                .or_else(|| object.get("tool_result"))?
+                .as_object()?;
+            (
+                tool.get("name")?.as_str()?,
+                tool.get("id").and_then(Value::as_str),
+            )
+        }
         _ => return None,
     };
     Some((name, id))
@@ -250,6 +260,11 @@ pub(crate) fn tool_observation_metadata(
     let has_args = !require_input
         || match agent {
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
+            AgentKind::Cline => object
+                .get("tool_call")
+                .and_then(Value::as_object)
+                .and_then(|tool| tool.get("input"))
+                .is_some(),
             _ => object
                 .get(
                     if matches!(
@@ -291,6 +306,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(true) => ToolOutcome::Error,
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,
+        },
+        AgentKind::Cline => match raw
+            .get("tool_result")
+            .and_then(Value::as_object)
+            .and_then(|tool| tool.get("error"))
+        {
+            Some(Value::Null) | None => ToolOutcome::Success,
+            Some(Value::String(error)) if error.is_empty() => ToolOutcome::Success,
+            Some(_) => ToolOutcome::Error,
         },
         AgentKind::KiroCli => match raw
             .get("tool_response")
@@ -1077,6 +1101,11 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             .get("toolCall")
             .and_then(Value::as_object)
             .and_then(|call| Some((call.get("name")?.as_str()?, call.get("args")))),
+        AgentKind::Cline => object
+            .get("tool_call")
+            .or_else(|| object.get("tool_result"))
+            .and_then(Value::as_object)
+            .and_then(|call| Some((call.get("name")?.as_str()?, call.get("input")))),
         AgentKind::Grok => object
             .get("tool_name")
             .or_else(|| object.get("toolName"))
@@ -5055,6 +5084,40 @@ mod tests {
             agent_family(AgentKind::ClaudeCode, "Create"),
             ToolFamily::Unknown
         );
+    }
+
+    #[test]
+    fn cline_nested_tool_payloads_are_closed_and_classified() {
+        let pre = json!({
+            "tool_call": {
+                "id": "call-1",
+                "name": "read_file",
+                "input": {"path": "src/lib.rs"}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &pre),
+            Some(("read_file", Some("call-1")))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Cline, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-1"));
+
+        let success = json!({
+            "tool_result": {"id": "call-1", "name": "read_file", "output": "ok"}
+        });
+        let failure = json!({
+            "tool_result": {"id": "call-1", "name": "read_file", "error": "denied"}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &success),
+            ToolOutcome::Success
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &failure),
+            ToolOutcome::Error
+        );
+        assert_eq!(tool_payload_fields(AgentKind::Other, &pre), None);
     }
 
     /// Meta Muse Code's tool calls, in the shapes captured offline from Muse

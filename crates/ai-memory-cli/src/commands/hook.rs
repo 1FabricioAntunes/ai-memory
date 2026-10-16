@@ -298,6 +298,7 @@ fn payload_has_session_id(raw: &serde_json::Value) -> bool {
         "sessionID",
         "session",
         "conversationId",
+        "taskId",
     ]
     .iter()
     .any(|key| {

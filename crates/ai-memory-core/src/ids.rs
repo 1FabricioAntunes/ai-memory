@@ -305,6 +305,9 @@ pub enum AgentKind {
     /// (`@deepseek-ai/dsh-hooks-claude-code`) fires Claude Code-shaped
     /// payloads for seven events (no `SessionEnd` or `PreCompact`).
     Dsh,
+    /// Cline CLI, whose file hooks use `taskId` plus nested `tool_call` /
+    /// `tool_result` payloads. Run-start hooks are detached by default.
+    Cline,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -315,7 +318,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -343,6 +346,7 @@ impl AgentKind {
         Self::CodeBuddy,
         Self::IbmBob,
         Self::Dsh,
+        Self::Cline,
         Self::Other,
     ];
 
@@ -377,6 +381,7 @@ impl AgentKind {
             Self::CodeBuddy => "codebuddy",
             Self::IbmBob => "ibm-bob",
             Self::Dsh => "dsh",
+            Self::Cline => "cline",
             Self::Other => "other",
         }
     }
@@ -414,6 +419,7 @@ impl AgentKind {
             "codebuddy" | "code-buddy" => Self::CodeBuddy,
             "ibm-bob" | "bob" => Self::IbmBob,
             "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
+            "cline" | "cline-cli" => Self::Cline,
             _ => Self::Other,
         }
     }
@@ -484,6 +490,9 @@ impl AgentKind {
                 // DSH's bridge runs SessionStart detached, so its stdout
                 // cannot be relied on to deliver a fetched handoff.
                 | Self::Dsh
+                // Cline CLI runs TaskStart/TaskResume detached by default,
+                // so accepting a single-use handoff there would discard it.
+                | Self::Cline
                 | Self::Other
         )
     }
@@ -1295,5 +1304,19 @@ mod portable_page_path_tests {
         ] {
             assert_ne!(portable_page_key(a), portable_page_key(b));
         }
+    }
+
+    #[test]
+    fn cline_wire_identity_fails_safe_for_detached_start_hooks() {
+        assert_eq!(
+            super::AgentKind::from_wire("cline"),
+            super::AgentKind::Cline
+        );
+        assert_eq!(
+            super::AgentKind::from_wire("cline-cli"),
+            super::AgentKind::Cline
+        );
+        assert_eq!(super::AgentKind::Cline.as_str(), "cline");
+        assert!(!super::AgentKind::Cline.session_start_injects_handoff());
     }
 }

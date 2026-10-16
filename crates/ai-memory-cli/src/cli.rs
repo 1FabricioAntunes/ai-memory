@@ -1750,14 +1750,15 @@ pub enum InstallSkillsScope {
     Global,
 }
 
-/// Where `install-hooks` writes Claude Code's hook configuration.
+/// Where `install-hooks` writes a hook configuration with user/project scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookInstallScope {
-    /// The user-level settings file (`~/.claude/settings.json`, or
-    /// `$CLAUDE_CONFIG_DIR/settings.json`): hooks fire in every project.
+    /// The user-level hook location: Claude Code's settings file or Cline
+    /// CLI's `~/.cline/hooks` directory. Hooks fire in every project.
     Global,
-    /// This repository's gitignored `.claude/settings.local.json`: hooks fire
-    /// only for sessions started in this checkout.
+    /// This repository's hook location: Claude Code's gitignored
+    /// `.claude/settings.local.json` or Cline CLI's `.cline/hooks` directory.
+    /// Hooks fire only for sessions started in this checkout.
     Project,
 }
 
@@ -2490,6 +2491,11 @@ pub enum AgentChoice {
     /// `memory_handoff_accept` tool.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
+    /// Cline CLI — lifecycle files under `~/.cline/hooks`. Cline runs
+    /// TaskStart/TaskResume detached by default, so capture works but automatic
+    /// handoff injection does not; accept the handoff through MCP instead.
+    #[value(alias = "cline-cli")]
+    Cline,
 }
 
 impl AgentChoice {
@@ -2526,6 +2532,7 @@ impl AgentChoice {
             Self::CodeBuddy => AgentKind::CodeBuddy,
             Self::IbmBob => AgentKind::IbmBob,
             Self::Dsh => AgentKind::Dsh,
+            Self::Cline => AgentKind::Cline,
         }
     }
 
@@ -2548,7 +2555,8 @@ impl AgentChoice {
             | Self::Droid
             | Self::Muse
             | Self::CodeBuddy
-            | Self::IbmBob => None,
+            | Self::IbmBob
+            | Self::Cline => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2801,14 +2809,21 @@ pub enum McpClient {
     /// Pair with `install-hooks --agent muse` for lifecycle capture.
     #[value(alias = "muse-code", alias = "musecode")]
     Muse,
-    /// DeepSeek Harness (DSH) - MCP-only. DSH has no fixed JSON/TOML MCP
+    /// DeepSeek Harness (DSH) MCP writer. DSH has no fixed JSON/TOML MCP
     /// config: the client is a Cordis plugin entry
     /// (@deepseek-ai/dsh-mcp-client) inside a profile's cordis.patch.yml.
     /// This integration is print-only (--apply is refused); merge the
-    /// rendered insert list into the profile patch. No lifecycle capture is
-    /// claimed.
+    /// rendered insert list into the profile patch. Lifecycle capture is
+    /// installed separately with `install-hooks --agent dsh`.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
+    /// Cline CLI — `~/.cline/data/settings/cline_mcp_settings.json` (or
+    /// `CLINE_MCP_SETTINGS_PATH`) with an explicit Streamable HTTP transport.
+    #[value(alias = "cline-cli")]
+    Cline,
+    /// FreeBuff CLI — `~/.agents/mcp.json`; MCP-only through ai-memory's
+    /// sessionless stdio-to-HTTP bridge.
+    Freebuff,
     /// Prime Agent (PrimeIntellect-ai/prime-agent) - the `mcpServers` map of
     /// `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default
     /// `~/.prime/agent/settings.json`) with `type: "http"` + `url`. A token is
@@ -3228,18 +3243,16 @@ pub struct InstallHooksArgs {
     /// written next to the original before each modifying write.
     #[arg(long)]
     pub apply: bool,
-    /// Override the settings/plugin/extension file path for the selected agent.
-    /// For OpenClaw, this is the generated plugin package directory.
+    /// Override the settings/plugin/extension path for the selected agent.
+    /// For OpenClaw this is the generated plugin package directory; for Cline
+    /// CLI it is the hook directory.
     #[arg(long)]
     pub config_file: Option<PathBuf>,
-    /// Where to write the hook configuration. `project` targets the
-    /// repository's `.claude/settings.local.json` (at the git root; in the
-    /// current directory outside a repository, on Windows, or when the
-    /// repository root is the home directory) so capture is opted in per
-    /// checkout instead of for every session; Claude Code reads it alongside
-    /// the user-level hooks.
-    /// Claude Code only; ignores `CLAUDE_CONFIG_DIR`. Cannot be combined
-    /// with `--config-file`, which names the target file directly.
+    /// Where to write the hook configuration. For Claude Code, `project`
+    /// targets the repository's `.claude/settings.local.json` (at the git
+    /// root when available) and ignores `CLAUDE_CONFIG_DIR`. For Cline CLI,
+    /// it targets `.cline/hooks` in the current checkout. Cannot be combined
+    /// with `--config-file`, which names the target path directly.
     #[arg(
         long,
         value_enum,

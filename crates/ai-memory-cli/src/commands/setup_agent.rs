@@ -135,6 +135,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         emit_ibm_bob(&args)?;
         return Ok(());
     }
+    if matches!(args.agent, AgentChoice::Cline) {
+        bail!(
+            "Cline discovers generated hook files in the host user's hook directory; run `ai-memory install-hooks --agent cline --apply` on that host"
+        );
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -235,7 +240,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Droid
         | AgentChoice::Muse
         | AgentChoice::CodeBuddy
-        | AgentChoice::IbmBob => {
+        | AgentChoice::IbmBob
+        | AgentChoice::Cline => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
