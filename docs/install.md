@@ -2311,9 +2311,14 @@ first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
 `[briefing]`). The model sees it after that tool result. A session with no
 tool call and without that rule leaves the handoff for
-`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed, ZCode,
-DeepSeek Harness (DSH), and Prime Agent are MCP-only here, so you'll need to
+`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed, ZCode, and
+Prime Agent are MCP-only here, so you'll need to
 nudge the model to call `memory_query` / `memory_handoff_accept` itself.
+DeepSeek Harness (DSH) also has no hook stdout to carry the baton: its
+`@deepseek-ai/dsh-hooks-claude-code` bridge runs `SessionStart` detached, so
+`install-hooks --agent dsh` captures lifecycle events but handoff recovery
+goes through `memory_handoff_list` then `memory_handoff_accept`, and finished
+sessions close with `ai-memory finalize-session --agent dsh`.
 Prime Agent's snippet names `$AI_MEMORY_AUTH_TOKEN` rather than embedding the
 token, so export that variable where you launch `prime-agent`.
 For clients with `install-hooks` support, the capture path handles

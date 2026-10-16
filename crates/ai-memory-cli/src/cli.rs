@@ -2478,6 +2478,18 @@ pub enum AgentChoice {
     /// and injects plain `SessionStart` stdout into the model context.
     #[value(name = "ibm-bob", alias = "bob")]
     IbmBob,
+    /// DeepSeek Harness (DSH) — lifecycle capture through the official
+    /// `@deepseek-ai/dsh-hooks-claude-code` bridge, which consumes a Claude
+    /// Code `hooks.json`. `install-hooks --agent dsh` stages the hook
+    /// scripts, writes that generated `hooks.json`, and prints the Cordis
+    /// patch fragment to merge into `$DSH_HOME/profiles/<profile>/
+    /// cordis.patch.yml` (no fixed config file is written). The bridge
+    /// delivers exactly seven events and no `SessionEnd`, so close sessions
+    /// with `ai-memory finalize-session --agent dsh`; its detached
+    /// `SessionStart` means handoff recovery goes through the MCP
+    /// `memory_handoff_accept` tool.
+    #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
+    Dsh,
 }
 
 impl AgentChoice {
@@ -2513,6 +2525,7 @@ impl AgentChoice {
             Self::Muse => AgentKind::Muse,
             Self::CodeBuddy => AgentKind::CodeBuddy,
             Self::IbmBob => AgentKind::IbmBob,
+            Self::Dsh => AgentKind::Dsh,
         }
     }
 
@@ -4783,6 +4796,29 @@ mod tests {
                 panic!("expected install-mcp");
             };
             assert_eq!(args.client, McpClient::IbmBob);
+        }
+    }
+
+    #[test]
+    fn dsh_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["dsh", "deepseek-harness", "deepseek_harness"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::Dsh);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Dsh);
+            // DSH runs a staged script bundle through the Claude Code hooks
+            // bridge, so it owns a `hooks/dsh` directory.
+            assert_eq!(args.agent.script_hook_subdir(), Some("dsh"));
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::Dsh);
         }
     }
 

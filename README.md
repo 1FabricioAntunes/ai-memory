@@ -161,7 +161,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | IBM Bob | Supported |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
-| DeepSeek Harness (DSH) | MCP-only |
+| DeepSeek Harness (DSH) | Hooks + MCP |
 | Prime Agent | MCP-only |
 | Hermes Agent | Supported |
 | GrizzyBot | Supported |
