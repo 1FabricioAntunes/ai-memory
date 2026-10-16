@@ -1318,9 +1318,11 @@ pub struct IngestSettings {
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub drop_events: Vec<String>,
     /// The validated list the hook router checks. Set by [`Config::load`];
-    /// never read from or written to a config file.
+    /// never read from or written to a config file. Kept off the `Config`
+    /// stack frame because that value is constructed in short-stack CLI
+    /// entry points on Windows.
     #[serde(skip)]
-    pub drop_list: ai_memory_hooks::IngestDropList,
+    pub drop_list: Box<ai_memory_hooks::IngestDropList>,
 }
 
 /// Client-side hook spool retry policy.
@@ -2493,12 +2495,14 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
-        config.ingest.drop_list = ai_memory_hooks::IngestDropList::new(
-            config.ingest.drop_tool_use_id_prefixes.clone(),
-            config.ingest.drop_tool_names.clone(),
-            &config.ingest.drop_events,
-        )
-        .map_err(|message| anyhow::anyhow!(message))?;
+        config.ingest.drop_list = Box::new(
+            ai_memory_hooks::IngestDropList::new(
+                config.ingest.drop_tool_use_id_prefixes.clone(),
+                config.ingest.drop_tool_names.clone(),
+                &config.ingest.drop_events,
+            )
+            .map_err(|message| anyhow::anyhow!(message))?,
+        );
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -5038,8 +5042,8 @@ input_token_safety_margin = {margin}
         .unwrap();
         let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(
-            config.ingest.drop_list,
-            ai_memory_hooks::IngestDropList::new(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::new(
                 vec!["toolu_plugin_".into()],
                 vec!["mcp__noisy__poll".into()],
                 &[]
@@ -5056,8 +5060,8 @@ input_token_safety_margin = {margin}
 
         // Default: empty, so nothing is dropped.
         assert_eq!(
-            Config::default().ingest.drop_list,
-            ai_memory_hooks::IngestDropList::default()
+            Config::default().ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
         );
     }
 
@@ -5074,8 +5078,8 @@ input_token_safety_margin = {margin}
         // The raw value survives, and the validated list is built from it.
         assert_eq!(config.ingest.drop_events, vec!["pre-tool-use".to_string()]);
         assert_eq!(
-            config.ingest.drop_list,
-            ai_memory_hooks::IngestDropList::new(Vec::new(), Vec::new(), &["pre-tool-use".into()])
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::new(Vec::new(), Vec::new(), &["pre-tool-use".into()])
                 .unwrap()
         );
 
@@ -5113,8 +5117,8 @@ input_token_safety_margin = {margin}
         // Default: empty, so nothing is dropped.
         assert_eq!(Config::default().ingest.drop_events, Vec::<String>::new());
         assert_eq!(
-            Config::default().ingest.drop_list,
-            ai_memory_hooks::IngestDropList::default()
+            Config::default().ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
         );
     }
 

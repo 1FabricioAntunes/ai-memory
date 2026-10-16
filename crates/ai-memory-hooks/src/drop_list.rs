@@ -4,11 +4,11 @@
 //! client sends: tool calls by tool-use id prefix (Claude Code marks plugin
 //! tool calls with their own id prefix) and tool names exactly, plus whole
 //! hook event kinds (`drop_events`). A matching event is acknowledged like
-//! any other policy drop — the tool lists right after the client capture
-//! protocol, the whole kinds right after the subagent exclusion, in both the
-//! single and the batch ingress — before it reaches the rate limiter, the
-//! ingest semaphore, the sanitizer or storage. The lists are read once at
-//! startup and bounded, so the checks stay cheap on the hook path.
+//! any other policy drop. All lists run right after the subagent exclusion in
+//! both the single and the batch ingress, so a marked event always seeds tail
+//! tracking before a policy matcher can drop it, and before it reaches the rate
+//! limiter, the ingest semaphore, the sanitizer or storage. The lists are read
+//! once at startup and bounded, so the checks stay cheap on the hook path.
 
 use crate::payload::{HookEnvelope, HookEvent};
 
@@ -24,11 +24,9 @@ pub const MAX_DROP_ENTRY_CHARS: usize = 128;
 /// are read once at startup and bounded, so the checks stay cheap on the hook
 /// path.
 ///
-/// The two checks run at different router positions, on purpose: [`matches`]
-/// (the tool id/name lists) runs right after the client capture protocol, and
-/// [`matches_event_kind`] runs right after the subagent exclusion, so a
-/// marked subagent event still seeds the tracking set its unmarked tail is
-/// dropped against even when its kind is listed.
+/// Both checks run after the subagent exclusion, so a marked subagent event
+/// still seeds the tracking set its unmarked tail is dropped against even when
+/// its tool id, tool name, or event kind is listed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IngestDropList {
     tool_use_id_prefixes: Vec<String>,

@@ -1314,11 +1314,10 @@ max_attempts = 8                  # failed drain passes before dropping an event
 [ingest]                          # server-side drop list for tool events (#1241)
 drop_tool_use_id_prefixes = []    # e.g. ["toolu_plugin_"]: drop a tool event whose id starts so
 drop_tool_names = []              # exact tool names to drop; both lists apply to every project,
-                                  # at most 64 entries of 128 characters, checked before the
-                                  # sanitizer, rate limiter and ingest semaphore
+                                  # at most 64 entries of 128 characters
 drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-tool-use"]); a
                                   # matching event is acknowledged and discarded before storage,
-                                  # checked right after the subagent exclusion (a marked
+                                  # all three lists are checked right after the subagent exclusion (a marked
                                   # subagent event still seeds its tail tracking) and before the
                                   # rate limiter, the ingest semaphore and the sanitizer.
                                   # session-start/session-end are rejected (they open/close the

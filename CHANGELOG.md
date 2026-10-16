@@ -17,7 +17,9 @@ version in [`docs/changelog/`](docs/changelog/):
   to the existing `drop_tool_use_id_prefixes` and `drop_tool_names`. A dropped
   event gets the same 202, `dropped_by_policy` metric and log as the other
   policy drops, before the rate limiter, the ingest semaphore and the
-  sanitizer. The default drops nothing. `Config::load` checks each value
+  sanitizer. Subagent classification precedes every id, name, and kind matcher,
+  so a matching marked event still seeds tracking for its unmarked tail. The
+  default drops nothing. `Config::load` checks each value
   against the typed event kind and rejects unknown kinds and `session-start`
   and `session-end`, which open and close sessions. The motivating case is
   `pre-tool-use`: in one production store about 87% of those observations had

@@ -552,10 +552,10 @@ pub struct HookState {
     pub profile: ai_memory_core::profile::ProfileSettings,
     /// `[ingest]` drop list: tool events matching a listed tool-use id prefix
     /// or tool name are acknowledged and dropped before any capacity is spent
-    /// (#1241), checked right after the client capture protocol; events whose
-    /// whole kind is listed (`drop_events`, e.g. `pre-tool-use`) are dropped
-    /// the same way, checked right after the subagent exclusion so a marked
-    /// subagent event still seeds its tail tracking. Empty by default.
+    /// (#1241); events whose whole kind is listed (`drop_events`, e.g.
+    /// `pre-tool-use`) are dropped the same way. All matchers run after the
+    /// subagent exclusion so a marked event still seeds its tail tracking.
+    /// Empty by default.
     pub ingest_drop_list: crate::drop_list::IngestDropList,
 }
 
@@ -698,44 +698,29 @@ async fn admit_hook(
         HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "cursor draft placeholder dropped");
     }
-    // The operator's server-side tool drop list (#1241): acknowledged as a
-    // policy drop before the rate limiter or the semaphore, so it costs
-    // nothing.
-    if state.ingest_drop_list.matches(&env) {
-        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
-        return (StatusCode::ACCEPTED, "ingest drop list");
-    }
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
     // subagent sessions) when the operator opts in. Returning 202 (not an error)
     // means the client treats the event as delivered and never retries/spools
     // it. Runs before the semaphore so a dropped event consumes no capacity.
-    // The auth middleware in front of `/hook` injects the request's
-    // [`ActorContext`] (rung 1 root, rung 2 DB user, or anonymous). We
-    // capture the identity it names NOW — before the spawn drops the request
-    // extensions — so `process()` can key the `ActiveProject` map by the
-    // authenticated identity when `[auto_scope] mode = per_actor` is on.
-    let actor = actor_identity(actor_ext);
-    // Captured here for the same reason as the actor: the request extensions
-    // are gone by the time the spawned task runs. `AuthorizedViewer` is the
-    // gated marker, so this is `None` whenever per-repository authorization is
-    // off, and captures behave exactly as they always have.
+    // `AuthorizedViewer` is the gated marker, so this is `None` whenever
+    // per-repository authorization is off.
     let viewer = viewer_ext.map(|axum::Extension(v)| v.user());
-    // Same reason: the skip-list header is read here, while the request
-    // extensions still exist, and travels with the event into `process()`.
-    let skip_webhooks = admission_skips(level_ext, &headers);
-    let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     if should_drop_subagent(&state, &env, viewer).await {
         HookProcessingOutcome::DroppedSubagent.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "subagent capture dropped");
     }
-    // Whole-kind drops (`[ingest] drop_events`): after the subagent exclusion,
-    // so a marked subagent event still seeds the tracking set its unmarked
-    // tail is dropped against, but before the rate limiter and the semaphore,
-    // so a dropped event still costs nothing.
-    if state.ingest_drop_list.matches_event_kind(&env) {
+    // All server-side ingest matchers run after subagent classification. A
+    // matching marked tool event must still seed the tracking set used to
+    // suppress that subagent session's unmarked tail. Policy drops remain
+    // ahead of the rate limiter and semaphore, so they cost no capacity.
+    if state.ingest_drop_list.matches(&env) || state.ingest_drop_list.matches_event_kind(&env) {
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "ingest drop list");
     }
+    // Capture request extensions before the spawned processor owns the event.
+    let actor = actor_identity(actor_ext);
+    let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
+    let skip_webhooks = admission_skips(level_ext, &headers);
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
         state.ingest_metrics.record_shed_saturated();
         warn!("hook ingest saturated; dropping event with 429");
@@ -990,16 +975,6 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         }
-        // Server-side tool drop list (#1241), acknowledged like a policy drop.
-        if state.ingest_drop_list.matches(&env) {
-            HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
-            results.push(HookBatchResult {
-                index: idx,
-                outcome: HookProcessingOutcome::DroppedPolicy,
-            });
-            accepted_indices.push(idx);
-            continue;
-        }
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
@@ -1012,10 +987,10 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         }
-        // Whole-kind drops (`[ingest] drop_events`): after the subagent
-        // exclusion (a marked event still seeds its tail tracking), before the
-        // semaphore, the rate limiter and storage.
-        if state.ingest_drop_list.matches_event_kind(&env) {
+        // All ingest matchers run after subagent classification, so a marked
+        // tool event still seeds tracking even when its id, name, or kind is
+        // configured for policy drop.
+        if state.ingest_drop_list.matches(&env) || state.ingest_drop_list.matches_event_kind(&env) {
             HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
             results.push(HookBatchResult {
                 index: idx,
@@ -10479,6 +10454,209 @@ pub(crate) mod tests {
         let obs = wait_for_kinds(&state, "top-seed-drop-ev", &[ObservationKind::UserPrompt]).await;
         let kinds: Vec<_> = obs.iter().map(|o| o.kind).collect();
         assert!(kinds.contains(&ObservationKind::UserPrompt), "{kinds:?}");
+    }
+
+    /// The older tool-id and tool-name lists must follow the same ordering as
+    /// `drop_events`: a matching marked event seeds subagent tracking before
+    /// policy matching. This covers both matchers on the single-event ingress,
+    /// with an unrelated top-level session as the legitimate control.
+    #[tokio::test]
+    async fn marked_tool_policy_drops_seed_subagent_tracking_before_single_ingress_matching() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_list(&mut state);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("grok".into()),
+            drop_subagent: Some("1".into()),
+            ..Default::default()
+        };
+
+        for (session_id, tool) in [
+            (
+                "tool-prefix-subagent",
+                serde_json::json!({
+                    "tool_name": "Read",
+                    "tool_use_id": "toolu_plugin_marked"
+                }),
+            ),
+            (
+                "tool-name-subagent",
+                serde_json::json!({ "tool_name": "mcp__noisy__poll" }),
+            ),
+        ] {
+            let mut marked = tool;
+            marked["sessionId"] = session_id.into();
+            marked["subagentType"] = "general-purpose".into();
+            let result = admit_hook(
+                state.clone(),
+                query("post-tool-use"),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                marked,
+            )
+            .await;
+            assert_eq!(
+                result,
+                (StatusCode::ACCEPTED, "subagent capture dropped"),
+                "{session_id}: classification must seed before its tool matcher"
+            );
+
+            let result = admit_hook(
+                state.clone(),
+                query("user-prompt-submit"),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                serde_json::json!({ "sessionId": session_id, "prompt": "tail" }),
+            )
+            .await;
+            assert_eq!(
+                result,
+                (StatusCode::ACCEPTED, "subagent capture dropped"),
+                "{session_id}: the unmarked tail must remain suppressed"
+            );
+            assert!(
+                state
+                    .reader
+                    .observations_for_session(SessionId::from_native(session_id))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{session_id}: neither event may reach storage"
+            );
+        }
+
+        let result = admit_hook(
+            state.clone(),
+            query("user-prompt-submit"),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            serde_json::json!({ "sessionId": "tool-list-top-level", "prompt": "keep" }),
+        )
+        .await;
+        assert_eq!(result, (StatusCode::ACCEPTED, "queued"));
+        let observations = wait_for_kinds(
+            &state,
+            "tool-list-top-level",
+            &[ObservationKind::UserPrompt],
+        )
+        .await;
+        assert_eq!(observations.len(), 1, "the top-level control is stored");
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.dropped_by_policy, 4);
+        assert_eq!(snapshot.accepted, 1);
+    }
+
+    /// Batch-path sibling of the single-ingress ordering regression above.
+    #[tokio::test]
+    async fn marked_tool_policy_drops_seed_subagent_tracking_before_batch_matching() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        with_drop_list(&mut state);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let url = |event: &str| format!("http://h/hook?event={event}&agent=grok&drop_subagent=1");
+        let items = vec![
+            HookBatchItem {
+                url: url("post-tool-use"),
+                body: serde_json::json!({
+                    "sessionId": "batch-prefix-subagent",
+                    "subagentType": "general-purpose",
+                    "tool_name": "Read",
+                    "tool_use_id": "toolu_plugin_marked"
+                }),
+            },
+            HookBatchItem {
+                url: url("user-prompt-submit"),
+                body: serde_json::json!({
+                    "sessionId": "batch-prefix-subagent",
+                    "prompt": "tail"
+                }),
+            },
+            HookBatchItem {
+                url: url("post-tool-use"),
+                body: serde_json::json!({
+                    "sessionId": "batch-name-subagent",
+                    "subagentType": "general-purpose",
+                    "tool_name": "mcp__noisy__poll"
+                }),
+            },
+            HookBatchItem {
+                url: url("user-prompt-submit"),
+                body: serde_json::json!({
+                    "sessionId": "batch-name-subagent",
+                    "prompt": "tail"
+                }),
+            },
+            HookBatchItem {
+                url: url("user-prompt-submit"),
+                body: serde_json::json!({
+                    "sessionId": "batch-tool-list-top-level",
+                    "prompt": "keep"
+                }),
+            },
+        ];
+
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 5, "{ack}");
+        let outcomes: Vec<_> = ack["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                "dropped_subagent",
+                "dropped_subagent",
+                "dropped_subagent",
+                "dropped_subagent",
+                "stored"
+            ]
+        );
+        for session_id in ["batch-prefix-subagent", "batch-name-subagent"] {
+            assert!(
+                state
+                    .reader
+                    .observations_for_session(SessionId::from_native(session_id))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{session_id}: neither event may reach storage"
+            );
+        }
+        let observations = state
+            .reader
+            .observations_for_session(SessionId::from_native("batch-tool-list-top-level"))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 1, "the top-level control is stored");
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.dropped_by_policy, 4);
+        assert_eq!(snapshot.accepted, 1);
     }
 
     #[tokio::test]

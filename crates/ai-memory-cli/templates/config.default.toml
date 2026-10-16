@@ -60,7 +60,9 @@ log_level = "info"
 # discards a matching PreToolUse/PostToolUse event before it is sanitized or
 # stored, whatever the client sends. Applies to every project on this server.
 # At most 64 entries per list, 128 characters each. Example: Claude Code marks
-# plugin tool calls with their own tool-use id prefix.
+# plugin tool calls with their own tool-use id prefix. Subagent classification
+# runs first, so a matching marked event still seeds tracking that suppresses
+# the subagent session's unmarked tail.
 # [ingest]
 # drop_tool_use_id_prefixes = ["toolu_plugin_"]
 # drop_tool_names = ["mcp__noisy__poll"]

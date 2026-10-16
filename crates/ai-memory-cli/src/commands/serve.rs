@@ -1610,7 +1610,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 mid_session_routing: config.routing.mid_session,
                 profile: config.profile.clone(),
-                ingest_drop_list: config.ingest.drop_list.clone(),
+                ingest_drop_list: (*config.ingest.drop_list).clone(),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
