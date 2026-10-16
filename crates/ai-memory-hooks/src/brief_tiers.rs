@@ -119,10 +119,12 @@ pub(crate) fn assign_tiers(
     let mut spent = budget.prefix;
     let mut omitted_from = pages.len();
     for (idx, page) in pages.iter().enumerate() {
-        let tier = if page.tiers.is_some() {
-            BriefTier::L0
-        } else {
-            BriefTier::TitleOnly
+        let tier = match page.tiers {
+            // A body cheaper than its excerpt is covered whole, at its own
+            // cost, instead of crowding later pages out at the excerpt's.
+            Some([l0, _, l2]) if l2 < l0 => BriefTier::L2,
+            Some(_) => BriefTier::L0,
+            None => BriefTier::TitleOnly,
         };
         let cost = page.cost(tier);
         if spent + cost > coverage_ceiling {
@@ -159,10 +161,31 @@ pub(crate) fn assign_tiers(
             _ => None,
         }
     };
+    // A frontmatter excerpt can be longer than the body it describes
+    // (#1360). Showing that body whole then costs less than the excerpt, so
+    // the swap is free and returns the difference to the room.
+    let saving = |tiers: &[BriefTier], idx: usize, target: BriefTier| {
+        let page = &pages[idx];
+        match (page.tiers, tiers[idx]) {
+            (Some(_), current)
+                if target == BriefTier::L2
+                    && current != BriefTier::TitleOnly
+                    && current < target =>
+            {
+                page.cost(current)
+                    .checked_sub(page.cost(target))
+                    .filter(|s| *s > 0)
+            }
+            _ => None,
+        }
+    };
     let mut promote =
         |tiers: &mut [BriefTier], order: &[usize], target: BriefTier, max_delta: usize| {
             for &idx in order {
-                if let Some(d) = delta(tiers, idx, target)
+                if let Some(s) = saving(tiers, idx, target) {
+                    tiers[idx] = target;
+                    room += s;
+                } else if let Some(d) = delta(tiers, idx, target)
                     && d <= room.min(max_delta)
                 {
                     tiers[idx] = target;
@@ -300,6 +323,45 @@ mod tests {
     }
 
     #[test]
+    fn a_body_cheaper_than_its_excerpt_shows_whole() {
+        // A frontmatter `summary:` or `abstract:` can be longer than the body
+        // it describes (#1360). The body then costs less than the excerpt the
+        // page shows: less than its L0 (the first three), or only less than
+        // the L1 a short `abstract:` makes way for (the last two).
+        let pages = [
+            page(true, 256, 500, 120),
+            page(false, 256, 500, 120),
+            page(false, 300, 300, 200),
+            page(true, 100, 500, 200),
+            page(false, 100, 500, 200),
+        ];
+        let plan = assign(&pages, 4_000, 0);
+        assert_eq!(plan.tiers, vec![L2; 5]);
+    }
+
+    #[test]
+    fn the_bytes_a_cheaper_body_saves_go_to_other_pages() {
+        // After coverage, 400 bytes are left. The first page takes its
+        // 500-byte L1 (all 400), then swaps it for its 150-byte body, which
+        // frees 350. That pays for the second page's body (250 more than its
+        // excerpt), which no longer fits without the refund.
+        let pages = [page(true, 100, 500, 150), page(true, 100, 100, 350)];
+        let plan = assign(&pages, 100 + 200 + 400, 0);
+        assert_eq!(plan.tiers, vec![L2, L2]);
+        assert!(100 + spent(&pages, &plan) <= 700, "{plan:?}");
+    }
+
+    #[test]
+    fn a_body_cheaper_than_its_excerpt_is_covered_at_its_own_cost() {
+        // Ten 300-byte excerpts do not fit; ten 50-byte bodies do. Priced at
+        // the excerpt, most of these pages would be omitted.
+        let pages = vec![page(false, 300, 300, 50); 10];
+        let plan = assign(&pages, 100 + 1_000 + COUNT_ONLY, 0);
+        assert_eq!(plan.omitted_from, 10, "{plan:?}");
+        assert_eq!(plan.tiers, vec![L2; 10]);
+    }
+
+    #[test]
     fn zero_delta_and_title_only_pages_do_not_block_bodies() {
         let pages = [
             PageCosts {
@@ -396,11 +458,14 @@ mod tests {
         fn random_page(rng: &mut Rng) -> PageCosts {
             let l0 = 20 + rng.below(320);
             let l1 = l0 + [0, rng.below(300)][rng.below(2)];
+            // The last choice is a body shorter than its excerpt, which a long
+            // frontmatter `summary:` or `abstract:` produces (#1360).
             let l2 = [
                 l1,
                 l1 + rng.below(SHORT_BODY_SLACK * 2),
                 l1 + rng.below(20_000),
-            ][rng.below(3)];
+                1 + rng.below(l1),
+            ][rng.below(4)];
             PageCosts {
                 privileged: rng.below(4) == 0,
                 title_only: 10 + rng.below(60),
@@ -467,6 +532,15 @@ mod tests {
                             let [l0, l1, l2] = page.tiers.unwrap();
                             assert!(l2 <= l0.max(l1) + SHORT_BODY_SLACK, "{ctx}");
                         }
+                    }
+                }
+                // A covered page never shows an excerpt that costs more than
+                // its whole body.
+                for (page, tier) in pages.iter().zip(&p.tiers) {
+                    if let Some([_, _, l2]) = page.tiers
+                        && matches!(tier, L0 | L1)
+                    {
+                        assert!(page.cost(*tier) <= l2, "{ctx}");
                     }
                 }
                 // More budget never covers fewer pages.

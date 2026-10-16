@@ -2418,6 +2418,14 @@ impl<'a> BriefCandidate<'a> {
     fn costs(&self) -> brief_tiers::PageCosts {
         use brief_tiers::BriefTier::{L0, L1, TitleOnly};
         let with_heading = |text_len: usize| self.heading.len() + text_len + 1;
+        // An empty body has nothing to show whole. Priced like a body too
+        // long to keep, it can never replace the page's frontmatter excerpt
+        // with an empty section.
+        let l2 = if self.body_len == 0 {
+            usize::MAX
+        } else {
+            with_heading(self.body_len)
+        };
         brief_tiers::PageCosts {
             privileged: self.privileged(),
             title_only: self.section(TitleOnly).len(),
@@ -2425,7 +2433,7 @@ impl<'a> BriefCandidate<'a> {
                 [
                     with_heading(self.text(L0).len()),
                     with_heading(self.text(L1).len()),
-                    with_heading(self.body_len),
+                    l2,
                 ]
             }),
         }
@@ -16820,6 +16828,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// #1360: a frontmatter excerpt longer than the body it describes no
+    /// longer stands in for that body. The body costs less, so it shows
+    /// whole, pinned or not. A page with no body keeps its excerpt rather
+    /// than an empty section.
+    #[test]
+    fn render_session_brief_shows_a_body_shorter_than_its_excerpt() {
+        let summary = "Current focus of the team for this release cycle, kept as a \
+                       slot so every agent sees it at session start.";
+        let abstract_ = "Style rules for runtime code, the error types to use at \
+                         each layer, and where panics are still acceptable.";
+        let core = vec![
+            brief_core_page(
+                "_slots/focus.md",
+                "# Focus\n\nShipping the release. Keep main green.",
+                true,
+                serde_json::json!({"summary": summary}),
+            ),
+            brief_core_page(
+                "_rules/empty.md",
+                "",
+                false,
+                serde_json::json!({"summary": "An empty body keeps this summary."}),
+            ),
+            brief_core_page(
+                "_rules/style.md",
+                "No unwrap in runtime code.",
+                false,
+                serde_json::json!({"abstract": abstract_}),
+            ),
+        ];
+        let out = render_session_brief(&core, &[], BRIEF_BUDGET_DEFAULT).unwrap();
+        for page in [&core[0], &core[2]] {
+            assert!(
+                out.contains(&format!("(`{}`)\n{}\n", page.path, page.body.trim())),
+                "{} must render whole: {out}",
+                page.path
+            );
+        }
+        assert!(!out.contains(summary), "{out}");
+        assert!(!out.contains(abstract_), "{out}");
+        assert!(
+            out.contains("(`_rules/empty.md`)\nAn empty body keeps this summary.\n"),
+            "{out}"
+        );
+    }
+
     /// A crowded family of unprivileged pages left at their excerpt is
     /// listed under one heading; pinned or deepened siblings keep their own,
     /// and a small family is not worth an index.
@@ -16901,9 +16955,11 @@ pub(crate) mod tests {
     fn render_session_brief_reports_omitted_pages_under_max_size_excerpts() {
         let core: Vec<_> = (0..BRIEF_CORE_PAGES_LIMIT)
             .map(|i| {
+                // The body must outweigh the abstract: a cheaper body would
+                // be covered whole instead of as this max-size excerpt.
                 brief_core_page(
                     &format!("_rules/standing-rule-{i:02}.md"),
-                    "body",
+                    &"body ".repeat(200),
                     false,
                     serde_json::json!({"abstract": format!("{i:02} {}", "a".repeat(400))}),
                 )
@@ -16926,9 +16982,11 @@ pub(crate) mod tests {
     fn render_session_brief_keeps_the_omitted_count_under_escaped_excerpts() {
         let core: Vec<_> = (0..BRIEF_CORE_PAGES_LIMIT)
             .map(|i| {
+                // A body longer than the escaped excerpt, so the excerpt is
+                // what renders and gets priced.
                 brief_core_page(
                     &format!("_rules/hostile-{i:02}.md"),
-                    "body",
+                    &"body ".repeat(200),
                     false,
                     serde_json::json!({"abstract": UNTRUSTED_HISTORY_END.repeat(10)}),
                 )
