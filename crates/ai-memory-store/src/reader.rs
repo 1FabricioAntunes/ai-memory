@@ -5452,7 +5452,11 @@ impl ReaderPool {
     /// [`prune_consolidated_observations`](crate::ops::prune_consolidated_observations),
     /// read-only, so a dry run can report a number without any chance of a
     /// write. Kept beside the delete rather than derived from it because the
-    /// dry run must never open a write transaction at all.
+    /// dry run must never open a write transaction at all. The
+    /// active-work exclusion is the shared fragment
+    /// `OBSERVATION_PRUNE_SESSION_GUARD_SQL` (interpolated here and in the
+    /// delete), so a dry run can never report rows the real pass would keep,
+    /// or miss rows it would delete for the same snapshot.
     ///
     /// # Errors
     /// Propagates SQL errors.
@@ -5463,17 +5467,25 @@ impl ReaderPool {
         cutoff_us: i64,
     ) -> StoreResult<usize> {
         self.with_conn(move |conn| {
-            let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM observations o \
+            let guard = crate::ops::OBSERVATION_PRUNE_SESSION_GUARD_SQL;
+            let sql = format!(
+                "WITH candidate_sessions AS ( \
+                     SELECT DISTINCT session_id FROM observations \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND created_at < ?3 \
+                 ), eligible_sessions AS MATERIALIZED ( \
+                     SELECT s.id FROM candidate_sessions candidate \
+                     JOIN sessions s ON s.id = candidate.session_id \
+                     JOIN pages p ON p.id = s.summary_page_id \
+                     WHERE p.superseded_at IS NULL AND {guard} \
+                 ) \
+                 SELECT COUNT(*) FROM observations o \
+                 JOIN eligible_sessions eligible ON eligible.id = o.session_id \
                  WHERE o.workspace_id = ?1 \
                    AND o.project_id = ?2 \
-                   AND o.created_at < ?3 \
-                   AND EXISTS ( \
-                       SELECT 1 FROM sessions s \
-                       JOIN pages p ON p.id = s.summary_page_id \
-                       WHERE s.id = o.session_id \
-                         AND p.superseded_at IS NULL \
-                   )",
+                   AND o.created_at < ?3"
+            );
+            let n: i64 = conn.query_row(
+                &sql,
                 params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us],
                 |row| row.get(0),
             )?;

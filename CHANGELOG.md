@@ -194,6 +194,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Fixed the forget sweep's raw-observation prune deleting the raw capture of
+  a session that still has a queued consolidation. A session resumed after its
+  first summary gets a new `session_consolidation_jobs` row (`pending` or
+  `running`) while its old summary page is still live, so the prune could
+  delete the session's raw observations before the queued job read them, and
+  the job would consolidate a truncated session. The prune and its dry-run
+  count now share one exclusion: a session with a `pending` or `running`
+  consolidation job, or resumed capture newer than its last SessionEnd
+  generation, keeps every observation, however old; `completed`, `failed` and
+  `superseded` jobs do not block after the session is fully ended. (#1324)
 - Fixed SessionEnd loading every observation of the session into memory, up to
   three times, on the hook path. One production claude-code session held
   948,136 observations, so ending it deserialized close to a million rows
