@@ -38,6 +38,11 @@ version in [`docs/changelog/`](docs/changelog/):
   The PreCompact and PostCompaction checkpoint page uses the same bounded
   reads. The writer's lifecycle-only re-check and the reader now build their
   query from one shared predicate. (#1323)
+- Fixed `AI_MEMORY_LLM_REASONING_EFFORT=none` failing every Anthropic request
+  to Claude Opus 5.5 and Sonnet 5.5 with a 400. Both reject
+  `thinking: {"type": "disabled"}`. Opus 5.5 now gets no `thinking` field, as
+  Fable and Mythos already did, and Sonnet 5.5 gets
+  `thinking: {"type": "between_tools"}`, its way to turn thinking off. (#1326)
 - Fixed the Anthropic provider rejecting any response that carried a
   `thinking` or `redacted_thinking` block as an unknown variant. Claude
   Opus 5, Sonnet 5, Haiku 5.5 and the later Opus, Sonnet, Fable and Mythos
