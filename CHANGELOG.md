@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed auto-improve approvals that failed because a `reject`-policy admission
+  webhook was unreachable, timed out or answered 5xx being stored as
+  rejections. The proposal is still marked `failed`, but the outage no longer
+  enters the rejection buffer, so later reviews are not told to avoid a
+  proposal nobody refused and rejection telemetry counts only real
+  refusals. (#1358)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added

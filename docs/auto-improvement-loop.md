@@ -414,7 +414,9 @@ imply each other.
 rejection-buffer summary included in future reviewer prompts. The buffer is
 scoped by `workspace_id` + `project_id` and stores human rejects, approval
 conflicts/failures, and validator/model rejected candidates when they carry a
-reason.
+reason. An approval that fails because a `reject`-policy admission webhook was
+unreachable, timed out or answered 5xx still marks the proposal `failed`, but
+is not stored: an outage says nothing about the proposal.
 
 ## Proposal Format
 
