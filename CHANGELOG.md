@@ -12,6 +12,15 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added host-local native history continuation for managed harness switches.
+  When `ai-memory run` moves a workstream from one harness to another, it pins
+  the previous native session, validates it against the exact checkout, and
+  exposes a private temporary visible-history dossier to the receiving child
+  through `AI_MEMORY_PREVIOUS_SESSION_HISTORY`. The startup packet tells the
+  agent to consult it for details omitted by the bounded portable ledger. The
+  remote server receives no local path or transcript body; same-harness runs
+  create nothing, foreign/missing stores fail closed to the portable fallback,
+  and the dossier is deleted when the child exits. (#1327)
 - Added opt-in `[consolidation] verbatim_residue = true`, which recovers a
   bounded set of literal error lines, paths, URLs, status codes and versions
   from observations omitted or truncated by the consolidation projection.

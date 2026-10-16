@@ -1404,6 +1404,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v81_to_v82_preserves_managed_runs_and_adds_previous_session_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 81).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project =
+            crate::ops::get_or_create_project(&mut conn, &workspace, "project", None).unwrap();
+        let workstream = ai_memory_core::WorkstreamId::new();
+        let run_id = ai_memory_core::ManagedRunId::new();
+        conn.execute(
+            "INSERT INTO workstreams \
+             (id, workspace_id, project_id, repo_fingerprint, worktree_fingerprint, name, cwd, \
+              created_at, selected_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'repo', 'tree', 'default', '/repo', 1, 1, 1)",
+            params![
+                workstream.as_bytes(),
+                workspace.as_bytes(),
+                project.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO managed_runs \
+             (id, workstream_id, agent_kind, lease_owner, state, sync_after, sync_through, \
+              context_delivered, lease_expires_at, started_at) \
+             VALUES (?1, ?2, 'codex', 'host:1', 'finished', 3, 7, 1, 10, 1)",
+            params![run_id.as_bytes(), workstream.as_bytes()],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let preserved: (String, i64, i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, sync_after, sync_through, previous_agent_kind, \
+                        previous_native_session_id \
+                 FROM managed_runs WHERE id = ?1",
+                params![run_id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, ("codex".into(), 3, 7, None, None));
+        conn.execute(
+            "UPDATE managed_runs SET previous_agent_kind = 'claude-code', \
+             previous_native_session_id = 'native-1' WHERE id = ?1",
+            params![run_id.as_bytes()],
+        )
+        .unwrap();
+        let previous: (String, String) = conn
+            .query_row(
+                "SELECT previous_agent_kind, previous_native_session_id \
+                 FROM managed_runs WHERE id = ?1",
+                params![run_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(previous, ("claude-code".into(), "native-1".into()));
+    }
+
     /// V62 was reshaped in place (#776) from an in-migration backfill to
     /// DDL-only + a boot-path backfill, changing its checksum. A store that
     /// applied the ORIGINAL V62 recorded the old checksum; `run` must still

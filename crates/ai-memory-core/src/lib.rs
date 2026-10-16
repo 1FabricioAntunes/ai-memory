@@ -107,9 +107,9 @@ pub use user::{
 };
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse,
-    ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity, NewWorkstreamEvent,
-    PrepareManagedRunRequest, PrepareManagedRunResponse, RenameManagedWorkstreamRequest,
-    RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent,
-    WorkstreamEventKind, scrub_workstream_provenance,
+    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedNativeSessionReference,
+    ManagedRunContextResponse, ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
+    RenameManagedWorkstreamRequest, RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE,
+    WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind, scrub_workstream_provenance,
 };

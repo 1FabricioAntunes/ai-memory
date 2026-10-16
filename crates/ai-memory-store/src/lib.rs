@@ -5855,10 +5855,68 @@ mod tests {
             .await
             .unwrap();
         assert!(codex.native_session_id.is_none());
+        assert_eq!(
+            codex.previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            })
+        );
         assert!(
             !codex.may_adopt_existing_session,
             "an established Claude workstream must start a fresh Codex session"
         );
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(codex.run_id, AgentKind::Codex, "codex-native")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_context(codex.run_id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .previous_native_session,
+            Some(ai_memory_core::ManagedNativeSessionReference {
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "claude-native".into(),
+            }),
+            "linking the destination must not replace the pinned source"
+        );
+        store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: codex.run_id,
+                    native_session_id: Some("codex-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+        let same_harness = store
+            .writer
+            .prepare_workstream_run(prepare(AgentKind::Codex, "codex-again"))
+            .await
+            .unwrap();
+        assert!(same_harness.previous_native_session.is_none());
     }
 
     #[tokio::test]
