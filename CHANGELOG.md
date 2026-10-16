@@ -22,6 +22,7 @@ version in [`docs/changelog/`](docs/changelog/):
   now answers every other request with a JSON-RPC Method not found error,
   ignores notifications such as the client cancelling its probe, and still
   answers `ping`. A client that starts with `initialize` sees no change.
+  (#1355)
 
 ## [3.1.0] - 2026-10-16
 
