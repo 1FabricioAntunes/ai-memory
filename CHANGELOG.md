@@ -38,6 +38,13 @@ version in [`docs/changelog/`](docs/changelog/):
   The PreCompact and PostCompaction checkpoint page uses the same bounded
   reads. The writer's lifecycle-only re-check and the reader now build their
   query from one shared predicate. (#1323)
+- Fixed the Anthropic provider rejecting any response that carried a
+  `thinking` or `redacted_thinking` block as an unknown variant. Claude
+  Opus 5, Sonnet 5, Haiku 5.5 and the later Opus, Sonnet, Fable and Mythos
+  models think when a request leaves `thinking` out, and Claude models from
+  4.6 on are sent adaptive thinking once `AI_MEMORY_LLM_REASONING_EFFORT` is
+  set, so `memory_explore` and `ai-memory llm-test` failed as soon as the
+  model thought. The provider now skips the blocks it does not read. (#1325)
 
 ## [3.0.1] - 2026-10-15
 
