@@ -12,6 +12,13 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Stopped LLM provider and embedder requests from following a redirect to
+  another origin. reqwest drops `Authorization` on a cross-host hop but keeps
+  every other header, so `x-api-key`, `x-goog-api-key` and operator headers
+  from `llm_headers` reached whatever host a configured endpoint redirected
+  to. Redirects inside the same origin still work; one that changes scheme,
+  host or port now fails the request and names the origin it pointed at.
+  ([#1396](https://github.com/akitaonrails/ai-memory/pull/1396))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing

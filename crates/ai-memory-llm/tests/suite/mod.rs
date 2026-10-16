@@ -11,3 +11,4 @@ mod fallback_provider;
 mod openai_compat_embedder;
 mod openai_compat_guardrails;
 mod openai_compat_strict;
+mod redirect_credentials;
