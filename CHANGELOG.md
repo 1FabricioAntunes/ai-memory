@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed `ai-memory setup` wiring OpenCode 2 with OpenCode 1 artifacts. A
+  named `--agent opencode` (or `open-code`), or an OpenCode found by the
+  session store both majors share, always got the V1 function plugin
+  `plugins/ai-memory.ts` and a direct `mcp.ai-memory` entry, which OpenCode
+  2 does not load. `setup` now runs `opencode --version` once, as
+  `install-mcp` and `install-hooks` already did for the generic spelling, and
+  wires the V2 `{ id, setup }` plugin and nested `mcp.servers` entry when it
+  reports major 2. A failed probe writes no OpenCode wiring and is reported
+  as a setup problem; `--agent opencode2` still forces V2 without probing.
 ## [3.1.0] - 2026-10-16
 
 ### Added
