@@ -12,7 +12,8 @@ use ai_memory_core::{
     Tier, WorkspaceId,
 };
 use ai_memory_store::{
-    AuditLogFilter, IdleEndAction, IdleEndCandidate, IdleEndResult, SessionEndDisposition, Store,
+    AuditLogFilter, IdleEndAction, IdleEndCandidate, IdleEndResult, PrepareWorkstreamRun,
+    SessionEndDisposition, Store, WorkstreamSelection,
 };
 
 const HOUR_US: i64 = 3_600_000_000;
@@ -51,6 +52,18 @@ async fn begin(
     actor: Option<String>,
 ) -> SessionId {
     let id = SessionId::new();
+    begin_with_id(store, ws, proj, id, at_us, actor).await;
+    id
+}
+
+async fn begin_with_id(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    id: SessionId,
+    at_us: i64,
+    actor: Option<String>,
+) {
     store
         .writer
         .begin_session(NewSession {
@@ -61,7 +74,6 @@ async fn begin(
         })
         .await
         .unwrap();
-    id
 }
 
 fn observation(
@@ -1212,6 +1224,149 @@ async fn idle_end_pre_stamp_real_session_end_in_window_loses_the_cas() {
             .unwrap()
             .is_none(),
         "the lost candidate never enqueues; the hook path owns the job"
+    );
+}
+
+#[tokio::test]
+async fn idle_end_writer_recheck_refuses_runs_linked_after_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let now = jiff::Timestamp::now().as_microsecond();
+    let watermark = now - 5 * HOUR_US;
+
+    let substantive_native = "native-substantive-race";
+    let substantive_sid = SessionId::from_native(substantive_native);
+    begin_with_id(&store, ws, proj, substantive_sid, watermark - HOUR_US, None).await;
+    insert(
+        &store,
+        observation(
+            substantive_sid,
+            ws,
+            proj,
+            ObservationKind::UserPrompt,
+            watermark,
+            "idle prompt",
+        ),
+    )
+    .await;
+    let page = session_page(&store, ws, proj, substantive_sid).await;
+
+    let lifecycle_native = "native-lifecycle-race";
+    let lifecycle_sid = SessionId::from_native(lifecycle_native);
+    begin_with_id(&store, ws, proj, lifecycle_sid, watermark - HOUR_US, None).await;
+    insert(
+        &store,
+        observation(
+            lifecycle_sid,
+            ws,
+            proj,
+            ObservationKind::Stop,
+            watermark,
+            "turn finished",
+        ),
+    )
+    .await;
+
+    let prepare = |name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+    let substantive_run = store
+        .writer
+        .prepare_workstream_run(prepare("substantive-race"))
+        .await
+        .unwrap();
+    let lifecycle_run = store
+        .writer
+        .prepare_workstream_run(prepare("lifecycle-race"))
+        .await
+        .unwrap();
+
+    // Both runs are active but unlinked when the reader would select these
+    // sessions. Link each one in the last writer-side seam before its stamp.
+    // The decisive recheck must reject both action arms.
+    let mut links = std::collections::VecDeque::from([
+        (substantive_run.run_id, substantive_native),
+        (lifecycle_run.run_id, lifecycle_native),
+    ]);
+    let results = store
+        .writer
+        .end_idle_sessions_pre_stamp(
+            vec![
+                substantive(substantive_sid, ws, proj, page, 1, now, watermark),
+                lifecycle_only(lifecycle_sid, ws, proj, now, watermark),
+            ],
+            true,
+            Box::new(move |conn| {
+                let (run_id, native_session_id) = links.pop_front().unwrap();
+                conn.execute(
+                    "UPDATE managed_runs SET native_session_id = ?1 \
+                     WHERE id = ?2 AND state = 'active'",
+                    rusqlite::params![native_session_id, run_id.as_bytes()],
+                )
+                .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results, vec![IdleEndResult::Lost, IdleEndResult::Lost]);
+    for session_id in [substantive_sid, lifecycle_sid] {
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::Open,
+            "an active managed run keeps its session open"
+        );
+    }
+    assert!(
+        store
+            .reader
+            .list_audit_events(idle_audit_filter())
+            .await
+            .unwrap()
+            .is_empty(),
+        "the refused stamps write no audit rows"
+    );
+    let claim_at = now + 1;
+    assert!(
+        store
+            .writer
+            .claim_session_consolidation(claim_at, claim_at - 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "the refused substantive stamp enqueues no consolidation job"
+    );
+    assert!(
+        store
+            .reader
+            .page_versions(
+                ws,
+                proj,
+                PagePath::new(format!("sessions/{lifecycle_sid}.md"))
+                    .unwrap()
+                    .to_string(),
+                10,
+                0,
+            )
+            .await
+            .unwrap()
+            .versions
+            .is_empty(),
+        "the refused lifecycle-only stamp creates no page"
     );
 }
 

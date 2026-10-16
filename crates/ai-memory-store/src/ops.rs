@@ -4,7 +4,7 @@
 //! the writer thread would violate the single-writer invariant (see
 //! [`crate::writer`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
@@ -3336,7 +3336,10 @@ pub struct IdleEndCandidate {
 /// ordinary version. The lifecycle-only end applies the same scope/open
 /// guards before any mutation and re-checks substantiveness atomically,
 /// reporting `Lost` instead of downgrading substantive work to a boundary-
-/// only end.
+/// only end. Immediately before the batch, the writer actor also snapshots
+/// active managed-run session links. Since every managed-run link and idle
+/// stamp is serialized through that actor, no link can land between this
+/// decisive snapshot and the guarded writes.
 ///
 /// `ended_at` is the tick's clock (`now_us`), and
 /// `ended_observation_count` is counted in the same transaction as the
@@ -3390,9 +3393,26 @@ fn idle_end_sessions_inner(
     mut pre_stamp: Option<&mut dyn FnMut(&mut Connection)>,
 ) -> StoreResult<Vec<IdleEndResult>> {
     let mut results = Vec::with_capacity(candidates.len());
+    // The production command holds the sole writer actor for the entire
+    // batch, so one snapshot is decisive and avoids one query per candidate.
+    // The test seam deliberately mutates between candidates and therefore
+    // refreshes after each injected effect.
+    let active_sessions = if pre_stamp.is_none() {
+        Some(active_managed_run_sessions(conn)?)
+    } else {
+        None
+    };
     for candidate in candidates {
         if let Some(hook) = pre_stamp.as_mut() {
             hook(conn);
+        }
+        let managed_run_active = match &active_sessions {
+            Some(active) => active.contains(&candidate.session_id),
+            None => active_managed_run_sessions(conn)?.contains(&candidate.session_id),
+        };
+        if managed_run_active {
+            results.push(IdleEndResult::Lost);
+            continue;
         }
         let result = match &candidate.action {
             IdleEndAction::Substantive {
@@ -3533,6 +3553,20 @@ fn idle_end_sessions_inner(
         results.push(result);
     }
     Ok(results)
+}
+
+fn active_managed_run_sessions(conn: &Connection) -> StoreResult<HashSet<SessionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT native_session_id FROM managed_runs \
+         WHERE state = 'active' AND native_session_id IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut sessions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let native_session_id: String = row.get(0)?;
+        sessions.insert(SessionId::from_native(&native_session_id));
+    }
+    Ok(sessions)
 }
 
 /// Mark a keyed hook event complete after its downstream effects finish.

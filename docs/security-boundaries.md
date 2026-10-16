@@ -139,6 +139,19 @@ Claude-shaped `Read` path is dropped, a public-path control is kept, and the
 same body under an unknown agent stays unclassified. Removing Bob from either
 guard makes the corresponding adversarial test fail. Coverage: **STRONG**.
 
+Boundary **4k** also has a writer-side managed-run race guard. After the
+reader-side exclusion and immediately before the idle-end batch,
+`ops.rs` `active_managed_run_sessions` derives every active run's native
+session id in one batch snapshot and refuses a match. Managed-run
+links and idle stamps share the single writer actor, so no link can interleave
+after that decisive snapshot.
+`idle_session_end.rs`
+`idle_end_writer_recheck_refuses_runs_linked_after_selection` links active
+runs in the pre-stamp seam for both substantive and lifecycle-only candidates;
+both remain open, with no idle audit or consolidation job, while an unrelated
+session is not blanket-refused by the existing positive controls. Removing the
+writer-side recheck ends both sessions. Coverage: **STRONG**.
+
 ## Keeping this current (the standing protocol)
 
 1. **Touch a guard, add/extend its adversarial test.** Any change to code in the
