@@ -491,6 +491,16 @@ fn claude_file_above_temp_dir() -> Option<PathBuf> {
     })
 }
 
+/// The file named by the skip note (`note: <path> exists, so Claude Code ...`).
+fn noted_file(stderr: &str) -> Option<PathBuf> {
+    stderr.lines().find_map(|line| {
+        let (path, _) = line
+            .strip_prefix("note: ")?
+            .split_once(" exists, so Claude Code reads it")?;
+        Some(PathBuf::from(path))
+    })
+}
+
 /// #1297: with only `AGENTS.md` written, a `CLAUDE.local.md` or
 /// `.claude/CLAUDE.md` makes Claude Code read that instead, so the install
 /// says so. Controls: `AGENTS.md` alone, a `CLAUDE.md` target alongside, and a
@@ -498,7 +508,7 @@ fn claude_file_above_temp_dir() -> Option<PathBuf> {
 #[test]
 fn install_instructions_warns_when_claude_code_will_skip_agents_md() {
     let note = "so Claude Code reads it instead of AGENTS.md";
-    let run = |files: &[(&str, &str)]| {
+    let run_in = |files: &[(&str, &str)]| {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         fs::write(project.path().join("AGENTS.md"), "# Project\n").unwrap();
@@ -516,14 +526,16 @@ fn install_instructions_warns_when_claude_code_will_skip_agents_md() {
         assert_success(output);
         let agents = fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
         assert!(agents.contains(MARKER_START), "AGENTS.md gets the block");
-        stderr
+        (stderr, project)
     };
+    let run = |files: &[(&str, &str)]| run_in(files).0;
     for shadow in ["CLAUDE.local.md", ".claude/CLAUDE.md"] {
-        let stderr = run(&[(shadow, "# mine\n")]);
-        assert!(
-            stderr.contains(note) && stderr.contains(shadow),
-            "{shadow}: {stderr}"
-        );
+        let (stderr, project) = run_in(&[(shadow, "# mine\n")]);
+        // A Claude file above the temp dir also ends in `shadow`, so compare
+        // the file the note names, not a substring (#1346).
+        let named = noted_file(&stderr).and_then(|path| fs::canonicalize(path).ok());
+        let expected = fs::canonicalize(project.path().join(shadow)).unwrap();
+        assert_eq!(named, Some(expected), "{shadow}: {stderr}");
     }
     // #1346: the binary checks every ancestor of the cwd, so a Claude file
     // above the OS temp dir prints the note for any temp project. On Windows
