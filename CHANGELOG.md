@@ -12,6 +12,15 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added first-party Cline CLI lifecycle and MCP support. `install-hooks
+  --agent cline --apply` writes Cline's nine supported event files globally or
+  per project, refuses user-owned and symlinked targets, and keeps embedded
+  bearer credentials owner-only. `install-mcp --client cline --apply` writes
+  Cline's nested transport schema and explicitly selects Streamable HTTP.
+  Detached start hooks recover handoffs through MCP; yolo mode disables hooks.
+  Also added `install-mcp --client freebuff --apply`, which registers the
+  sessionless stdio bridge in `~/.agents/mcp.json` without starting another
+  ai-memory server. (#1335)
 - Added `[ingest] drop_events` (env `AI_MEMORY_INGEST__DROP_EVENTS`), an
   opt-in list of hook event kinds the server drops before storing them, next
   to the existing `drop_tool_use_id_prefixes` and `drop_tool_names`. A dropped

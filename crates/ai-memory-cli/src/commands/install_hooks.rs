@@ -1021,6 +1021,9 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_dsh(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::Cline => {
+                apply_to_cline_hooks(&server_url, auth, &config.data_dir, &args, &capture_mode)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -1184,6 +1187,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_dsh(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
+        AgentChoice::Cline => render_cline_hooks(
+            &server_url,
+            auth,
+            &config.data_dir,
+            &args,
+            &preview_capture_mode,
+        ),
     }
 }
 
@@ -1384,6 +1394,9 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             // data dir; it carries no baked strategy worth re-reading
             // (same reason Pool returns None).
             AgentChoice::Dsh => return None,
+            // Cline hook files are generated independently and carry no
+            // shared settings document from which to recover a strategy.
+            AgentChoice::Cline => return None,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -1742,6 +1755,12 @@ fn infer_installed_mcp_config(
             &["mcpServers", "ai-memory"],
             "url",
         )),
+        McpClient::Cline => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory", "transport"],
+            "url",
+        )),
+        McpClient::Freebuff => Ok(None),
     }
 }
 
@@ -1816,6 +1835,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // from (install-mcp --client dsh is print-only), so pass explicit
         // --server-url / --auth-token instead.
         AgentChoice::Dsh => None,
+        AgentChoice::Cline => Some(McpClient::Cline),
     }
 }
 
@@ -1847,6 +1867,7 @@ pub(crate) fn hook_config_target_with(
         AgentChoice::Grok => grok_hooks_path_in(env("GROK_HOME")),
         AgentChoice::AntigravityCli => antigravity_hooks_path(),
         AgentChoice::CopilotCli => copilot_cli_hooks_path_in(env("COPILOT_HOME")),
+        AgentChoice::Cline => cline_hooks_path_in(env("HOME")),
         other => anyhow::bail!(
             "{} is not auto-wired by `ai-memory run`",
             other.kind().as_str()
@@ -7768,6 +7789,209 @@ fn apply_to_pool(
     Ok(())
 }
 
+pub(crate) const CLINE_HOOK_EVENTS: [(&str, &str); 9] = [
+    ("TaskStart", "session-start"),
+    ("TaskResume", "session-start"),
+    ("UserPromptSubmit", "user-prompt"),
+    ("PreToolUse", "pre-tool-use"),
+    ("PostToolUse", "post-tool-use"),
+    ("TaskComplete", "stop"),
+    ("TaskCancel", "stop"),
+    ("TaskError", "stop"),
+    ("SessionShutdown", "session-end"),
+];
+
+pub(crate) fn cline_hooks_path_in(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    let home = home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(home_dir)
+        .context("could not locate $HOME for ~/.cline/hooks")?;
+    Ok(home.join(".cline").join("hooks"))
+}
+
+fn cline_hooks_target(args: &InstallHooksArgs) -> Result<PathBuf> {
+    if let Some(path) = &args.config_file {
+        return Ok(path.clone());
+    }
+    match args.scope {
+        HookInstallScope::Global => cline_hooks_path_in(std::env::var_os("HOME")),
+        HookInstallScope::Project => Ok(std::env::current_dir()
+            .context("could not resolve current dir for project Cline hooks")?
+            .join(".cline")
+            .join("hooks")),
+    }
+}
+
+fn posix_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn cline_hook_argv(
+    event: &str,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+    capture_mode: &str,
+) -> Vec<String> {
+    let mut argv = vec![
+        "ai-memory".to_string(),
+        "--data-dir".to_string(),
+        data_dir.to_string_lossy().into_owned(),
+        "hook".to_string(),
+        "--event".to_string(),
+        event.to_string(),
+        "--agent".to_string(),
+        "cline".to_string(),
+        "--server-url".to_string(),
+        server_url.to_string(),
+        "--capture-mode".to_string(),
+        capture_mode.to_string(),
+    ];
+    if let Some(token) = auth_token {
+        argv.extend(["--auth-token".to_string(), token.to_string()]);
+    }
+    if let Some(strategy) = args.project_strategy.and_then(ProjectStrategyArg::baked) {
+        argv.extend(["--project-strategy".to_string(), strategy.to_string()]);
+    }
+    argv
+}
+
+fn render_cline_hook_script(argv: &[String], windows: bool) -> String {
+    if windows {
+        let command = argv
+            .iter()
+            .map(|word| powershell_single_quote(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "# Generated by ai-memory install-hooks --agent cline.\n\
+             $ProgressPreference = 'SilentlyContinue'\n\
+             & {command}\n\
+             exit $LASTEXITCODE\n"
+        )
+    } else {
+        let command = argv
+            .iter()
+            .map(|word| posix_single_quote(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "#!/bin/sh\n# Generated by ai-memory install-hooks --agent cline.\nexec {command}\n"
+        )
+    }
+}
+
+fn render_cline_hooks(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+    capture_mode: &str,
+) -> Result<()> {
+    let target = cline_hooks_target(args)?;
+    let extension = if cfg!(windows) { "ps1" } else { "sh" };
+    println!("# Cline CLI hook files ({})", target.display());
+    println!("# Restart Cline after installing. Cline's yolo mode disables hooks.");
+    println!("# TaskStart/TaskResume run detached, so accept pending handoffs through MCP.");
+    if auth_token.is_some() {
+        println!(
+            "# The applied files contain the bearer token and are owner-only; preview redacts it."
+        );
+    }
+    for (name, event) in CLINE_HOOK_EVENTS {
+        let preview_token = auth_token.map(|_| "<redacted>");
+        let argv = cline_hook_argv(
+            event,
+            server_url,
+            preview_token,
+            data_dir,
+            args,
+            capture_mode,
+        );
+        println!(
+            "\n# {}.{}\n{}",
+            name,
+            extension,
+            render_cline_hook_script(&argv, cfg!(windows))
+        );
+    }
+    Ok(())
+}
+
+fn apply_to_cline_hooks(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+    capture_mode: &str,
+) -> Result<()> {
+    let target = cline_hooks_target(args)?;
+    fs::create_dir_all(&target)
+        .with_context(|| format!("creating Cline hooks directory {}", target.display()))?;
+    let extension = if cfg!(windows) { "ps1" } else { "sh" };
+    let mut rendered = Vec::with_capacity(CLINE_HOOK_EVENTS.len());
+    for (name, event) in CLINE_HOOK_EVENTS {
+        let path = target.join(format!("{name}.{extension}"));
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            anyhow::bail!(
+                "refusing to replace symlinked Cline hook {}",
+                path.display()
+            );
+        }
+        let argv = cline_hook_argv(event, server_url, auth_token, data_dir, args, capture_mode);
+        let content = render_cline_hook_script(&argv, cfg!(windows));
+        match fs::read_to_string(&path) {
+            Ok(existing)
+                if !existing.contains("Generated by ai-memory install-hooks --agent cline") =>
+            {
+                anyhow::bail!(
+                    "refusing to replace user-owned Cline hook {}; move it aside or combine it manually",
+                    path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        }
+        rendered.push((name, path, content));
+    }
+
+    for (name, path, content) in rendered {
+        let backup = PrivateBackup {
+            dir: data_dir.join("backups").join("cline-hooks"),
+            stem: format!("cline-{name}"),
+        };
+        let outcome = apply_atomic_with_backup(&path, Some(&backup), |existing| {
+            if !existing.is_empty()
+                && !existing.contains("Generated by ai-memory install-hooks --agent cline")
+            {
+                anyhow::bail!(
+                    "refusing to replace user-owned Cline hook {}; move it aside or combine it manually",
+                    path.display()
+                );
+            }
+            Ok(content.clone())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        }
+        eprintln!("✓ {} {}", outcome.verb(), path.display());
+    }
+    println!("Restart Cline so it reloads the hook directory.");
+    println!("Cline yolo mode disables hooks; lifecycle capture is unavailable in that mode.");
+    Ok(())
+}
+
 /// Print DSH's generated Claude Code `hooks.json` plus the Cordis patch
 /// fragment that points the official `@deepseek-ai/dsh-hooks-claude-code`
 /// bridge at it. DSH has no fixed agent config file, so merging the patch
@@ -9101,6 +9325,112 @@ mod tests {
             scope: HookInstallScope::Global,
             project_strategy: Some(ProjectStrategyArg::Basename),
         }
+    }
+
+    #[test]
+    fn cline_apply_writes_native_event_hooks_without_overwriting_user_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("cline-hooks");
+        let data = tmp.path().join("data");
+        let mut args = default_hook_args();
+        args.agent = AgentChoice::Cline;
+        args.config_file = Some(target.clone());
+        args.project_strategy = Some(ProjectStrategyArg::RepoRoot);
+
+        apply_to_cline_hooks(
+            "https://memory.example",
+            Some("tok'en"),
+            &data,
+            &args,
+            "allowlist",
+        )
+        .unwrap();
+
+        let extension = if cfg!(windows) { "ps1" } else { "sh" };
+        for (name, event) in CLINE_HOOK_EVENTS {
+            let path = target.join(format!("{name}.{extension}"));
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.contains("--agent"));
+            assert!(content.contains("cline"));
+            assert!(content.contains(event));
+            assert!(content.contains("https://memory.example"));
+            assert!(content.contains("allowlist"));
+            assert!(content.contains("repo-root"));
+            assert!(content.contains("--auth-token"));
+            assert!(!content.contains("<redacted>"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+
+        let first = target.join(format!("TaskStart.{extension}"));
+        fs::remove_file(&first).unwrap();
+        let owned = target.join(format!("TaskResume.{extension}"));
+        fs::write(&owned, "user-owned hook\n").unwrap();
+        let error = apply_to_cline_hooks("https://memory.example", None, &data, &args, "denylist")
+            .unwrap_err();
+        assert!(error.to_string().contains("refusing to replace user-owned"));
+        assert_eq!(fs::read_to_string(owned).unwrap(), "user-owned hook\n");
+        assert!(!first.exists(), "preflight must prevent a partial rewrite");
+    }
+
+    #[test]
+    fn cline_script_quoting_is_shell_specific_and_literal() {
+        let argv = vec!["ai-memory".to_string(), "a'b $HOME".to_string()];
+        let sh = render_cline_hook_script(&argv, false);
+        assert!(sh.contains("'a'\"'\"'b $HOME'"), "{sh}");
+        let ps = render_cline_hook_script(&argv, true);
+        assert!(ps.contains("'a''b $HOME'"), "{ps}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cline_apply_refuses_a_symlinked_hook_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("cline-hooks");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&target).unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+        symlink(&victim, target.join("TaskStart.sh")).unwrap();
+
+        let mut args = default_hook_args();
+        args.agent = AgentChoice::Cline;
+        args.config_file = Some(target);
+        let error = apply_to_cline_hooks(
+            "https://memory.example",
+            Some("secret"),
+            &data,
+            &args,
+            "denylist",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("refusing to replace symlinked"));
+        assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
+    }
+
+    #[test]
+    fn cline_hook_target_follows_supplied_home() {
+        let home = if cfg!(windows) {
+            std::ffi::OsString::from(r"C:\Users\alice")
+        } else {
+            std::ffi::OsString::from("/home/alice")
+        };
+        assert_eq!(
+            hook_config_target_with(AgentChoice::Cline, &|name| {
+                (name == "HOME").then(|| home.clone())
+            })
+            .unwrap(),
+            PathBuf::from(home).join(".cline").join("hooks")
+        );
     }
 
     // ── #issue project-strategy preservation on re-apply ─────────────

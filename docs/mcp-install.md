@@ -3,7 +3,7 @@
 For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
 It shows direct MCP writes, queries and handoffs without a native hook adapter.
 
-Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
+Warp, Kilo Code, Goose, Qwen Code and OpenHuman have no
 `install-mcp` client; their hand-written recipes are in
 [`install.md`](install.md#clients-without-an-install-mcp-writer).
 
@@ -177,8 +177,46 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh / prime-agent
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh / cline / freebuff / prime-agent
 > ```
+
+---
+
+## Cline CLI
+
+```bash
+ai-memory install-mcp --client cline --apply
+ai-memory install-hooks --agent cline --apply
+```
+
+The MCP writer targets
+`${CLINE_MCP_SETTINGS_PATH:-~/.cline/data/settings/cline_mcp_settings.json}`
+and writes Cline's nested `transport` schema with
+`type: "streamableHttp"`; omitting that type makes Cline try legacy SSE. The
+hook writer creates Cline CLI's supported event files under `~/.cline/hooks`.
+Use `--scope project` for `.cline/hooks` in the current checkout. Existing
+user-owned event files and symlinked targets are refused, and generated files
+that carry a bearer token are owner-only.
+
+Cline runs task-start hooks detached, so accept a pending handoff through MCP
+(`memory_handoff_list`, then `memory_handoff_accept`). Restart Cline after
+installing. Cline's yolo mode disables hooks. The VS Code extension has a
+separate hook directory and is not changed by this CLI integration.
+
+## FreeBuff
+
+```bash
+ai-memory install-mcp --client freebuff --apply
+```
+
+FreeBuff reads `mcpServers` from `.agents/mcp.json` while walking from the
+current directory toward the home directory. The installer writes the home
+file and registers a local `ai-memory mcp-bridge --no-session-id` stdio
+process, which forwards to the configured server and reads a file-backed token
+without copying it into FreeBuff's config. An explicit `--auth-token` is stored
+in the stdio entry's `AI_MEMORY_AUTH_TOKEN` environment map, like a bearer
+header in an HTTP-only client. FreeBuff has no lifecycle-hook or
+managed-workstream integration; it already reads `AGENTS.md`.
 
 ---
 

@@ -162,6 +162,8 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | DeepSeek Harness (DSH) | Hooks + MCP |
+| Cline CLI | Hooks + MCP |
+| FreeBuff | MCP-only |
 | Prime Agent | MCP-only |
 | Hermes Agent | Supported |
 | GrizzyBot | Supported |
@@ -390,9 +392,10 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
 #    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent opencode2`, `--agent gemini-cli`,
-#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent droid`, `--agent muse`, `--agent omp`,
+#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent copilot-cli`, `--agent droid`, `--agent muse`, `--agent cline`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
-#    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
+#    `--client gemini-cli`, `--client grok`, `--client kiro-cli`,
+#    `--client cline`, `--client freebuff`, etc.
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
