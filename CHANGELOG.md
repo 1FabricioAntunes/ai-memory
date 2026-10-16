@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- `ai-memory auth login openai-oauth` and `auth login copilot` no longer print
+  a failed endpoint's whole response body. The body is read up to 1 MiB,
+  scrubbed of secrets and terminal control sequences, and cut to 1 KiB, the
+  same handling provider errors already had for size. Provider error bodies
+  (`LlmError::Provider`, including `oidc-device` login and token refresh) are
+  now scrubbed too, before the cut, so a secret at the 1 KiB boundary is
+  still redacted. (#1359)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added

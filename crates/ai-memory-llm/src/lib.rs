@@ -151,6 +151,7 @@ pub use opencode::{
 };
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, RerankStage, Reranker};
+pub use response::provider_error_body;
 pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Role,
