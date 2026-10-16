@@ -2473,6 +2473,11 @@ pub enum AgentChoice {
     /// stdout (`hookSpecificOutput.additionalContext`) carries the handoff.
     #[value(name = "codebuddy", alias = "code-buddy")]
     CodeBuddy,
+    /// IBM Bob IDE — lifecycle hooks merged into the `hooks` key of
+    /// `~/.bob/settings/settings.json`. Bob sends Claude Code-shaped payloads
+    /// and injects plain `SessionStart` stdout into the model context.
+    #[value(name = "ibm-bob", alias = "bob")]
+    IbmBob,
 }
 
 impl AgentChoice {
@@ -2507,6 +2512,7 @@ impl AgentChoice {
             Self::Droid => AgentKind::Droid,
             Self::Muse => AgentKind::Muse,
             Self::CodeBuddy => AgentKind::CodeBuddy,
+            Self::IbmBob => AgentKind::IbmBob,
         }
     }
 
@@ -2528,7 +2534,8 @@ impl AgentChoice {
             | Self::Hermes
             | Self::Droid
             | Self::Muse
-            | Self::CodeBuddy => None,
+            | Self::CodeBuddy
+            | Self::IbmBob => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2718,6 +2725,11 @@ pub enum McpClient {
     /// Command Code CLI — `~/.commandcode/mcp.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// IBM Bob IDE — `~/.bob/settings/mcp.json`, using native Streamable HTTP.
+    /// Pair with `install-hooks --agent ibm-bob` for lifecycle capture and
+    /// plain-text `SessionStart` handoff delivery.
+    #[value(name = "ibm-bob", alias = "bob")]
+    IbmBob,
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
@@ -4750,6 +4762,27 @@ mod tests {
             assert_eq!(args.agent, AgentChoice::CodeBuddy);
             assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
             assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+    }
+
+    #[test]
+    fn ibm_bob_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["ibm-bob", "bob"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::IbmBob);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::IbmBob);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::IbmBob);
         }
     }
 

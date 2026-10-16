@@ -12,6 +12,17 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+- Added first-party IBM Bob support. `install-mcp --client ibm-bob --apply`
+  (alias `bob`) merges a native Streamable HTTP server into
+  `~/.bob/settings/mcp.json`, using Bob's documented `legacy` protocol
+  negotiation so it skips the non-standard `server/discover` probe.
+  `install-hooks --agent ibm-bob --apply` merges the five events common to
+  Bob IDE and Bob Shell into `~/.bob/settings/settings.json`, preserves other
+  settings and hooks, enforces capture exclusions over Claude-shaped tool
+  payloads, and delivers the pending handoff as plain `SessionStart` context.
+  Bob has no true `SessionEnd`, so finished sessions use
+  `finalize-session --agent ibm-bob`. Managed transcript resume is not claimed
+  without a documented stable native transcript store. (#1331)
 - Added host-local native history continuation for managed harness switches.
   When `ai-memory run` moves a workstream from one harness to another, it pins
   the previous native session, validates it against the exact checkout, and
@@ -203,6 +214,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Restored fresh source installs after crates.io yanked every `zip` release
+  compatible with Candle 0.11. Cargo now patches `zip` 8.6.0 to its immutable
+  upstream release commit, and `cargo-deny` permits only that repository with
+  an exact revision. Locked builds keep the same reviewed code, while
+  `cargo install --path crates/ai-memory-cli` can resolve from a clean graph
+  again. The patch can be removed when Candle publishes support for `zip` 9.
 - Fixed the forget sweep's raw-observation prune deleting the raw capture of
   a session that still has a queued consolidation. A session resumed after its
   first summary gets a new `session_consolidation_jobs` row (`pending` or

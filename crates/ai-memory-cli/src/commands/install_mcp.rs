@@ -157,6 +157,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::CommandCode => render_command_code(&args)?,
+        McpClient::IbmBob => render_ibm_bob(&args)?,
         McpClient::CopilotCli => render_copilot_cli(&args)?,
         McpClient::Droid => render_droid(&args)?,
         McpClient::Swival => render_swival(&args)?,
@@ -350,7 +351,8 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         | McpClient::Devin
         | McpClient::KimiCode
         | McpClient::KiroCli
-        | McpClient::Openclaw => plain(),
+        | McpClient::Openclaw
+        | McpClient::IbmBob => plain(),
         McpClient::GeminiCli | McpClient::AntigravityCli => json!({
             "command": BRIDGE_COMMAND,
             "args": bridge,
@@ -609,6 +611,7 @@ pub(crate) fn mcp_config_path_with(
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
+        McpClient::IbmBob => home()?.join(".bob").join("settings").join("mcp.json"),
         // Copilot CLI keeps its whole config dir at $COPILOT_HOME when set,
         // falling back to ~/.copilot; user-level MCP servers live in
         // mcp-config.json there (project `.mcp.json` / `.github/mcp.json`
@@ -1051,6 +1054,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::IbmBob
         | McpClient::CopilotCli
         | McpClient::Droid
         | McpClient::Swival
@@ -1619,6 +1623,17 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             entry.insert("transport".into(), json!("http"));
             entry.insert("enabled".into(), json!(true));
             entry.insert("url".into(), json!(server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::IbmBob => {
+            // Bob's HTTP client sends a non-standard `server/discover` probe
+            // in automatic mode. ai-memory implements the MCP initialize
+            // handshake, so pin Bob to its documented legacy negotiation path.
+            entry.insert("type".into(), json!("streamable-http"));
+            entry.insert("url".into(), json!(server_url));
+            entry.insert("protocolNegotiation".into(), json!("legacy"));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -2462,6 +2477,20 @@ fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_ibm_bob(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# IBM Bob IDE — merge into ~/.bob/settings/mcp.json, or re-run with\n\
+         # --apply to merge it in place preserving other servers. Bob also\n\
+         # supports project-level .bob/mcp.json via --config-file.\n\
+         # protocolNegotiation is set to legacy because Bob's automatic mode\n\
+         # probes server/discover before the standard MCP initialize handshake.\n\
+         # Pair with `ai-memory install-hooks --agent ibm-bob --apply` for\n\
+         # lifecycle capture and automatic handoff delivery.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_copilot_cli(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# GitHub Copilot CLI — merge into $COPILOT_HOME/mcp-config.json\n\
@@ -2661,6 +2690,70 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn ibm_bob_entry_uses_documented_legacy_streamable_http_shape() {
+        assert_eq!(
+            build_json_mcp_entry(&args_with_token(McpClient::IbmBob)).unwrap(),
+            json!({
+                "type": "streamable-http",
+                "url": "http://127.0.0.1:49374/mcp",
+                "protocolNegotiation": "legacy",
+                "headers": {"Authorization": "Bearer test-token-deadbeef"},
+            })
+        );
+        assert_eq!(
+            build_json_mcp_entry(&args_for(McpClient::IbmBob)).unwrap(),
+            json!({
+                "type": "streamable-http",
+                "url": "http://127.0.0.1:49374/mcp",
+                "protocolNegotiation": "legacy",
+            })
+        );
+        let path = mcp_config_path_with(McpClient::IbmBob, &|_| None).unwrap();
+        assert!(
+            path.ends_with(Path::new(".bob/settings/mcp.json")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn ibm_bob_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("mcp.json");
+        fs::write(
+            &file,
+            json!({
+                "mcpServers": {"other": {"type": "stdio", "command": "other"}},
+                "keep": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::IbmBob);
+        args.config_file = Some(file.clone());
+        args.server_url = Some("https://memory.example/mcp".into());
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(first, fs::read_to_string(&file).unwrap());
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], true);
+        assert_eq!(root["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({
+                "type": "streamable-http",
+                "url": "https://memory.example/mcp",
+                "protocolNegotiation": "legacy",
+            })
+        );
+        assert_eq!(
+            existing_entry_endpoint(McpClient::IbmBob, &file, "ai-memory").unwrap(),
+            Some("https://memory.example/mcp".into())
+        );
     }
 
     /// Muse's entry is the session-aware stdio bridge for `--agent muse`, so
@@ -3815,6 +3908,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::IbmBob => render_ibm_bob(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
@@ -3848,6 +3942,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::IbmBob,
             McpClient::CopilotCli,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
@@ -3890,6 +3985,7 @@ mod tests {
             McpClient::Zcode,
             McpClient::Devin,
             McpClient::KimiCode,
+            McpClient::IbmBob,
             McpClient::KiroCli,
             McpClient::CommandCode,
             McpClient::CopilotCli,
@@ -3932,6 +4028,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::IbmBob => render_ibm_bob(&args).unwrap(),
             McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Droid => render_droid(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),

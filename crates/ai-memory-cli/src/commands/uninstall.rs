@@ -276,6 +276,10 @@ fn build_plan(
                 install_hooks::codebuddy_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
+            (
+                install_hooks::ibm_bob_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {
@@ -438,6 +442,7 @@ fn build_plan(
             KimiCode,
             KiroCli,
             CommandCode,
+            IbmBob,
             CopilotCli,
             Droid,
             Swival,
@@ -1534,6 +1539,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::IbmBob
         | McpClient::CopilotCli
         | McpClient::Droid
         | McpClient::Swival

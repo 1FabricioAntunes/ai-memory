@@ -226,6 +226,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         if let Some(dir) = codebuddy_detected(&home) {
             found.push((AgentChoice::CodeBuddy, Found::ConfigDir(dir)));
         }
+        if let Some(dir) = ibm_bob_detected(&home) {
+            found.push((AgentChoice::IbmBob, Found::ConfigDir(dir)));
+        }
         found
             .into_iter()
             .map(|(agent, found)| (agent, Some(found)))
@@ -404,6 +407,11 @@ fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Option<
 /// by [`detect_agents`].
 fn codebuddy_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".codebuddy")).filter(|dir| dir.is_dir())
+}
+
+/// IBM Bob's shared configuration directory, `~/.bob`, when it exists.
+fn ibm_bob_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".bob")).filter(|dir| dir.is_dir())
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -1124,6 +1132,22 @@ mod tests {
             InstallSkillsAgent::Agents
         );
         assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy, None).mcp, None);
+    }
+
+    #[test]
+    fn ibm_bob_is_detected_and_wires_hooks_mcp_and_shared_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(ibm_bob_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".bob/settings")).unwrap();
+        assert_eq!(
+            ibm_bob_detected(home.path()),
+            Some(home.path().join(".bob"))
+        );
+        assert_eq!(skills_for(AgentChoice::IbmBob), InstallSkillsAgent::Agents);
+        assert_eq!(
+            AgentPlan::new(AgentChoice::IbmBob, None).mcp,
+            Some(McpClient::IbmBob)
+        );
     }
 
     /// A versioned Homebrew binary is recorded through the `opt/<formula>`

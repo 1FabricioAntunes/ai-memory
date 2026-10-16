@@ -1404,6 +1404,119 @@ mod tests {
         }
     }
 
+    /// V83 expands the sessions enum for IBM Bob. Existing sessions and
+    /// dependent observations survive the table rebuild, while the old V82
+    /// constraint rejects the new value and the migrated schema accepts it.
+    #[test]
+    fn v82_to_v83_preserves_sessions_and_observations_and_accepts_ibm_bob() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 82).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
+             VALUES (?1, ?2, ?3, 'codebuddy', '/repo', 1, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, started_at) \
+                 VALUES (?1, ?2, ?3, 'ibm-bob', 1)",
+                params![
+                    SessionId::new().as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+            )
+            .is_err(),
+            "the V82 CHECK must reject ibm-bob"
+        );
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'prompt', 'kept', 'kept body', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, actor_user FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "codebuddy".into(),
+                "/repo".into(),
+                Some("user:alice".into())
+            )
+        );
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 1, "the session's observations survive");
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::IbmBob,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
     #[test]
     fn v81_to_v82_preserves_managed_runs_and_adds_previous_session_identity() {
         let mut conn = Connection::open_in_memory().unwrap();
