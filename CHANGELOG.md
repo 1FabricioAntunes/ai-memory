@@ -34,7 +34,7 @@ version in [`docs/changelog/`](docs/changelog/):
   provider sent to make the model call its `result` tool. They now get the
   default `auto`, with a tool description that asks for the call, and a reply
   that carries the JSON as text is read as the result. Other Claude models keep
-  the forced call.
+  the forced call. (#1328)
 
 ## [3.0.1] - 2026-10-15
 
