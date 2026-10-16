@@ -470,6 +470,7 @@ ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
 ai-memory install-skills --scope global --agent copilot-cli
 ai-memory install-skills --scope global --agent hermes
+ai-memory install-skills --scope global --agent antigravity
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -484,7 +485,10 @@ handoff rule `$GROK_HOME/rules/ai-memory-handoff.md` (default
 `--target-dir` do not. For GitHub Copilot CLI, project-local skills go under the
 repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
 `~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
-`AGENTS.md` instruction target.
+`AGENTS.md` instruction target. Google Antigravity reads workspace skills from
+`.agents/skills` and has two global roots, `~/.gemini/config/skills` for the
+App and IDE and `~/.gemini/antigravity-cli/skills` for the CLI; a global
+`--agent antigravity` install writes both, and `uninstall` sweeps both.
 
 Project-local skill roots are `.claude/skills` for Claude-compatible installs,
 `.agents/skills` for cross-client installs, `.devin/skills` for Devin, and

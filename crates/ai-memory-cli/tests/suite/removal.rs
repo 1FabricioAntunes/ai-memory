@@ -1335,6 +1335,88 @@ fn install_skills_then_uninstall_only_skills_round_trips() {
     );
 }
 
+/// `install-skills --scope global --agent antigravity` writes the managed
+/// skills into both roots Antigravity reads, `~/.gemini/config/skills` (App
+/// and IDE) and `~/.gemini/antigravity-cli/skills` (CLI), and not into
+/// `~/.agents/skills`. A re-run changes nothing, and `uninstall --only skills`
+/// takes the skills back out of both roots while the user's own skill and
+/// Antigravity's MCP config beside them stay.
+#[test]
+fn antigravity_global_skills_install_idempotently_and_uninstall_from_both_roots() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let roots = [
+        home.path().join(".gemini/config/skills"),
+        home.path().join(".gemini/antigravity-cli/skills"),
+    ];
+    let user_skill = roots[0].join("user-skill/SKILL.md");
+    write_file(&user_skill, "---\nname: user-skill\n---\nkeep me\n");
+    let mcp_config = home.path().join(".gemini/config/mcp_config.json");
+    write_file(&mcp_config, "{}\n");
+
+    let install = || {
+        command_with_home(home.path())
+            .args([
+                "install-skills",
+                "--scope",
+                "global",
+                "--agent",
+                "antigravity",
+            ])
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    let first = install();
+    assert!(
+        first.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(
+                root.join(skill.relative_path).is_file(),
+                "{}",
+                root.join(skill.relative_path).display()
+            );
+        }
+    }
+    assert!(!home.path().join(".agents/skills").exists());
+
+    let second = install();
+    assert!(
+        second.status.success(),
+        "re-run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        stdout.matches("already up to date").count(),
+        roots.len() * MANAGED_SKILLS.len(),
+        "{stdout}"
+    );
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(!root.join(skill.relative_path).exists());
+        }
+    }
+    assert!(user_skill.exists(), "the user's own skill must survive");
+    assert!(mcp_config.exists(), "Antigravity's MCP config must survive");
+}
+
 #[test]
 fn uninstall_only_skills_leaves_custom_target_dir_for_manual_cleanup() {
     let _guard = cli_test_lock();

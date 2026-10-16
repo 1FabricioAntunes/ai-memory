@@ -58,6 +58,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `SessionStart` detached, so finished sessions close with
   `finalize-session --agent dsh` and pending handoffs are recovered via
   `memory_handoff_list` / `memory_handoff_accept`. (#1337)
+- Added an Antigravity skill root family. `install-skills --agent antigravity`
+  (aliases `antigravity-cli`, `agy`; also `install-instructions
+  --skills-agent antigravity`) writes the managed Agent Skills to both global
+  roots Antigravity reads, `~/.gemini/config/skills` (App and IDE) and
+  `~/.gemini/antigravity-cli/skills` (CLI), or to the workspace
+  `.agents/skills` with `--scope project`. `ai-memory setup` now uses it for
+  Antigravity, which until now got its skills only in `~/.agents/skills`, a
+  directory Antigravity does not read globally, and `uninstall --only skills`
+  sweeps both roots.
 
 ## [3.1.0] - 2026-10-16
 

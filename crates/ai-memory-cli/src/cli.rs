@@ -1778,6 +1778,11 @@ pub enum InstallSkillsAgent {
     CopilotCli,
     /// Hermes Agent's `.hermes/skills` directory.
     Hermes,
+    /// Google Antigravity: the workspace `.agents/skills` (project), or both
+    /// global directories, `~/.gemini/config/skills` (App and IDE) and
+    /// `~/.gemini/antigravity-cli/skills` (CLI).
+    #[value(alias = "antigravity-cli", alias = "agy")]
+    Antigravity,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }
@@ -4344,6 +4349,13 @@ mod tests {
                 panic!("expected install-hooks command for alias {alias}");
             };
             assert!(matches!(hook_args.agent, AgentChoice::AntigravityCli));
+
+            let skills_cli = Cli::try_parse_from(["ai-memory", "install-skills", "--agent", alias])
+                .unwrap_or_else(|e| panic!("failed to parse install-skills alias {alias}: {e}"));
+            let Command::InstallSkills(skills_args) = skills_cli.command else {
+                panic!("expected install-skills command for alias {alias}");
+            };
+            assert_eq!(skills_args.agent, InstallSkillsAgent::Antigravity);
         }
     }
 

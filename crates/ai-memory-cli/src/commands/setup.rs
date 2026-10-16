@@ -181,6 +181,7 @@ fn skills_for(agent: AgentChoice) -> InstallSkillsAgent {
         AgentChoice::CopilotCli => InstallSkillsAgent::CopilotCli,
         AgentChoice::Devin => InstallSkillsAgent::Devin,
         AgentChoice::Hermes => InstallSkillsAgent::Hermes,
+        AgentChoice::AntigravityCli => InstallSkillsAgent::Antigravity,
         _ => InstallSkillsAgent::Agents,
     }
 }
@@ -1547,6 +1548,11 @@ mod tests {
             InstallSkillsAgent::CopilotCli
         );
         assert_eq!(skills_for(AgentChoice::Codex), InstallSkillsAgent::Agents);
+        // Antigravity has no global `~/.agents/skills`; it reads its own roots.
+        assert_eq!(
+            skills_for(AgentChoice::AntigravityCli),
+            InstallSkillsAgent::Antigravity
+        );
         assert_eq!(
             skills_for(AgentChoice::KimiCode),
             InstallSkillsAgent::Agents
