@@ -28,6 +28,13 @@ version in [`docs/changelog/`](docs/changelog/):
   The PreCompact and PostCompaction checkpoint page uses the same bounded
   reads. The writer's lifecycle-only re-check and the reader now build their
   query from one shared predicate. (#1323)
+- Fixed every structured LLM call (consolidation, lint, auto-improve and the
+  rest) failing with a 400 on Claude Opus 5.5, Sonnet 5.5, Fable 5.1 and
+  Mythos 5.1. Those models reject a forced `tool_choice`, which the Anthropic
+  provider sent to make the model call its `result` tool. They now get the
+  default `auto`, with a tool description that asks for the call, and a reply
+  that carries the JSON as text is read as the result. Other Claude models keep
+  the forced call.
 
 ## [3.0.1] - 2026-10-15
 
