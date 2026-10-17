@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Prevented the Windows executable from overflowing its small default main
+  thread stack as the async CLI command tree grows. The top-level dispatch now
+  runs on an explicitly sized stack on Windows; the native Windows suite had
+  reached the point where every integration test that launched `ai-memory`
+  aborted before handling its command.
 - Fixed native hook events getting stranded forever when a harness killed the
   process after the spool file was synced but before its atomic rename. A later
   drain adopts complete, valid `*.json.tmp` entries after a five-minute grace
