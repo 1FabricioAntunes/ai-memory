@@ -53,7 +53,7 @@ It also publishes retrieval numbers, produced by the in-repo harness with full
 provenance and measured end to end through the shipped capture pipeline:
 LongMemEval-S hit@5 **0.666** zero-LLM and **0.815** with the default local
 embeddings in the published 2.6 line. The observation stream in 3.0
-(unreleased, on by default) raises zero-LLM to **0.951** and local embeddings
+(on by default) raises zero-LLM to **0.951** and local embeddings
 to **0.945** on all 470 questions, measured on one build with the stream off
 and on. With capture skipped and each raw session indexed whole (component
 mode, ranking only), zero-LLM FTS scores 0.972; the
@@ -253,10 +253,10 @@ ships something ai-memory does not, it is named.
   `/admin/metrics` instead), the coordination tools (leases, actions,
   routines, signals, sentinels), mesh sync (the nearest equivalent is the
   git-based `ai-memory-wikisync` companion), image memory, the two-way Claude
-  `MEMORY.md` bridge, PaaS deploy templates, an npm package (ai-memory 3.0
-  installs natively on Linux and macOS in two commands, `install.sh` and then
-  `ai-memory setup`, but has no `npx` route, and Windows gets no service
-  step), and the opt-in local cross-encoder reranker. The benchmark numbers are not
+  `MEMORY.md` bridge, PaaS deploy templates, an npm package (ai-memory installs
+  natively on Linux, macOS and Windows in two commands — `install.sh`/
+  `install.ps1` then `ai-memory setup` — but has no `npx` route), and the
+  opt-in local cross-encoder reranker. The benchmark numbers are not
   like-for-like (component vs pipeline, see above). To move your data, the
   `ai-memory-importer` companion (3.0) reads agentmemory's Obsidian vault
   (`agentmemory-vault`) or its `ExportData` JSON (`agentmemory-export`), and
@@ -389,9 +389,10 @@ ships something ai-memory does not, it is named.
   not from a plugin marketplace.
 - **An installer that detects and wires every agent.** `ai-memory setup`
   (3.0) wires MCP, hooks and Agent Skills for each detected agent on Linux and
-  macOS. Hindsight's coding-agent package covers 16+ agents, and memU's
-  `memu-agent detect` finds unknown agents' transcripts. Windows has no
-  service step yet.
+  macOS; 3.1 brought the same two-command install and a per-user service step to
+  Windows (`install.ps1` + a logon entry that starts `ai-memory service-host`).
+  Hindsight's coding-agent package covers 16+ agents, and memU's `memu-agent
+  detect` finds unknown agents' transcripts.
 - **No end-to-end QA number.** We publish retrieval hit@5; Mem0, Zep,
   Hindsight and EverOS publish end-to-end QA accuracy with a reader and a
   judge model. Our opt-in `answer=true` synthesis (2.4) has only an early,

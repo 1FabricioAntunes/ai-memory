@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Corrected stale claims in `docs/comparison.md` and `docs/competitive-parity.md`
+  that said Windows has no service step and the Windows install is experimental.
+  The 3.1 `install.ps1` + `setup` Windows service step is shipped production,
+  not experimental; the "3.0 (unreleased)" observation-stream note is corrected
+  to reflect the released 3.0 line. (#1271)
 - Made the executable auto-improvement eval policy server-owned. Manual CLI and
   HTTP reviews now use `[auto_improve.eval]` from the server process, and legacy
   requests that try to supply an `eval` object fail closed with an upgrade
