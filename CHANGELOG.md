@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed the `/web` page view showing a page whose `expires_at` TTL had passed
   exactly like a live one, although search and the project listings leave such
   a page out. The metadata row now carries an `expired` badge beside the tier
-  and kind; a live page renders as before.
+  and kind; a live page renders as before. (#1372)
 
 ## [3.1.0] - 2026-10-16
 
