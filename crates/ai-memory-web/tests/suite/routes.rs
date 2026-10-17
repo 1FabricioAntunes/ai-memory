@@ -367,6 +367,46 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
 }
 
 #[tokio::test]
+async fn web_page_view_marks_an_expired_page() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (path, expires_at) in [
+        ("notes/dated.md", "2000-01-01"),
+        ("notes/later.md", "2999-01-01"),
+    ] {
+        let mut request = wiki_req(ws, proj, path, "# Dated Note\n\nSame body.");
+        request.frontmatter = serde_json::json!({"kind": "fact", "expires_at": expires_at});
+        wiki.write_page(request).await.unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+
+    // The page still opens by its URL; the badge says what every listing
+    // already leaves out.
+    let (status, dated) = get_body(&app, "/w/default/scratch/p/notes/dated.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        dated.contains("Dated Note") && dated.contains("expired"),
+        "{dated}"
+    );
+    // A TTL still ahead shows no badge.
+    let (status, later) = get_body(&app, "/w/default/scratch/p/notes/later.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        later.contains("Dated Note") && !later.contains("expired"),
+        "{later}"
+    );
+}
+
+#[tokio::test]
 async fn web_page_view_created_is_the_first_versions_date() {
     let (tmp, store, wiki) = setup().await;
     let ws = store
