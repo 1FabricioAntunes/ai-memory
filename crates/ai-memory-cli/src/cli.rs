@@ -172,6 +172,8 @@ pub enum Command {
     AuditContamination(AuditContaminationArgs),
     /// Full-text search the wiki via FTS5.
     Search(SearchArgs),
+    /// List the most recently updated wiki pages.
+    Recent(RecentArgs),
     /// Fetch and display the full body of a wiki page.
     /// Accepts either `--path` (exact path) or a positional query that
     /// searches FTS5 and fetches the top matching page.
@@ -2134,6 +2136,28 @@ pub struct AuditContaminationArgs {
     pub json: bool,
 }
 
+/// Arguments for `recent`.
+#[derive(Debug, Args)]
+pub struct RecentArgs {
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. When omitted, auto-derived from the current project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// List the most recently updated pages of every project instead of the
+    /// current one. Each hit is labelled with its `workspace/project`.
+    #[arg(long, conflicts_with_all = ["workspace", "project"])]
+    pub global: bool,
+    /// Maximum number of pages to return.
+    #[arg(short = 'n', long, default_value_t = 10)]
+    pub limit: usize,
+    /// Emit results as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `search`.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
@@ -3638,6 +3662,37 @@ mod tests {
             let error =
                 Cli::try_parse_from(["ai-memory", "search", "wal", "--global", flag[0], flag[1]])
                     .expect_err("--global must conflict with an explicit scope");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag:?}"
+            );
+        }
+    }
+
+    /// `recent --global` drops the scope entirely, so naming one alongside it
+    /// is a contradiction clap rejects rather than one flag silently winning.
+    #[test]
+    fn recent_global_parses_and_conflicts_with_an_explicit_scope() {
+        let parsed = Cli::try_parse_from(["ai-memory", "recent", "--global", "-n", "20"])
+            .expect("recent --global parses");
+        let Command::Recent(args) = parsed.command else {
+            panic!("expected recent command");
+        };
+        assert!(args.global);
+        assert_eq!(args.limit, 20);
+        assert!(args.workspace.is_none() && args.project.is_none());
+
+        let default = Cli::try_parse_from(["ai-memory", "recent"]).expect("recent parses");
+        let Command::Recent(args) = default.command else {
+            panic!("expected recent command");
+        };
+        assert!(!args.global, "global recent stays opt-in");
+        assert_eq!(args.limit, 10);
+
+        for flag in [["--workspace", "acme"], ["--project", "api"]] {
+            let error = Cli::try_parse_from(["ai-memory", "recent", "--global", flag[0], flag[1]])
+                .expect_err("--global must conflict with an explicit scope");
             assert_eq!(
                 error.kind(),
                 clap::error::ErrorKind::ArgumentConflict,

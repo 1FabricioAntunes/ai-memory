@@ -275,6 +275,28 @@ operator can run it. A DB user searches across the projects they may read with
 `memory_query` reads; it does not change this command, which stays
 project-scoped unless you pass `--global`.
 
+## Recent pages from the terminal
+
+`ai-memory recent` lists the most recently updated wiki pages, newest first.
+It is the terminal counterpart of the agent's `memory_recent` tool: no query
+string, just recency.
+
+```bash
+ai-memory recent                                      # current project (cwd / marker)
+ai-memory recent --workspace acme --project api
+ai-memory recent --global                             # every project
+ai-memory recent --global --json -n 20
+```
+
+Each line shows the page path, an RFC 3339 `updated_at`, and a relative age,
+then the title and a short snippet. `--global` labels every hit with its
+`workspace/project`, and `--json` adds `workspace` and `project` fields to
+each hit. `--global` cannot be combined with `--workspace` or `--project`.
+
+The command calls `GET /admin/recent`, so on a multi-user server only the root
+operator can run it. `[recall] default_global` does not change this command;
+it stays project-scoped unless you pass `--global`.
+
 ## Historical memory and live code intelligence
 
 ai-memory can run beside CodeGraph, an LSP-backed service, a SCIP/LSIF index,

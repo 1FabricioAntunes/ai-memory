@@ -17,6 +17,7 @@
 //! - `GET  /admin/activity/by-client` — MCP tool-call counts per client (server-wide).
 //! - `GET  /admin/audit-log`      — paginated read of the append-only `audit_log`.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
+//! - `GET  /admin/recent`         — most recently updated wiki pages.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
 //! - `POST /admin/forget-sweep`   — run the M8 retention sweep.
@@ -598,6 +599,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `GET  /admin/activity/by-client`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
+/// - `GET  /admin/recent`
 /// - `GET  /admin/read-page`
 /// - `POST /admin/reorg`
 /// - `POST /admin/lint`
@@ -688,6 +690,7 @@ pub fn admin_router_with_sweep_tuning(
         )
         .route("/admin/audit-log", get(handle_audit_log))
         .route("/admin/search", get(handle_search))
+        .route("/admin/recent", get(handle_recent))
         .route("/admin/read-page", get(handle_read_page))
         .route("/admin/reorg", post(handle_reorg))
         .route("/admin/lint", post(handle_lint))
@@ -1785,6 +1788,132 @@ async fn handle_search(
             }),
     };
     match search_result {
+        Ok(hits) => (StatusCode::OK, Json(hits)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// recent
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/recent?limit=…`.
+#[derive(Debug, Deserialize)]
+struct RecentQuery {
+    /// Workspace name to list within. Must be provided together with `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Project name to list within. Must be provided together with `workspace`.
+    #[serde(default)]
+    project: Option<String>,
+    /// Max number of pages to return. Capped at 100 server-side.
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+/// One hit of `GET /admin/recent`.
+///
+/// Recency has no FTS rank, so `updated_at` is RFC 3339 instead of the
+/// store's reused `PageHit::rank` (updated_at microseconds as REAL). A
+/// global listing also names the workspace and project; a scoped listing
+/// omits those fields.
+#[derive(Debug, Serialize)]
+struct RecentHit {
+    id: ai_memory_core::PageId,
+    path: ai_memory_core::PagePath,
+    title: String,
+    snippet: String,
+    updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
+
+fn iso_from_rank_us(rank: f64) -> String {
+    // `recent_pages_*` store `updated_at` microseconds in `PageHit::rank`.
+    // Unix µs in 2026 sit well below the 53-bit integer mantissa.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let us = rank.round() as i64;
+    jiff::Timestamp::from_microsecond(us)
+        .map(|ts| ts.to_string())
+        .unwrap_or_default()
+}
+
+impl From<ai_memory_store::PageHit> for RecentHit {
+    fn from(hit: ai_memory_store::PageHit) -> Self {
+        Self {
+            id: hit.id,
+            path: hit.path,
+            title: hit.title,
+            snippet: hit.snippet,
+            updated_at: iso_from_rank_us(hit.rank),
+            workspace: None,
+            project: None,
+        }
+    }
+}
+
+impl From<ai_memory_store::PageHitWithMeta> for RecentHit {
+    fn from(hit: ai_memory_store::PageHitWithMeta) -> Self {
+        Self {
+            id: hit.id,
+            path: hit.path,
+            title: hit.title,
+            snippet: hit.snippet,
+            updated_at: iso_from_rank_us(hit.rank),
+            workspace: Some(hit.workspace_name),
+            project: Some(hit.project_name),
+        }
+    }
+}
+
+async fn handle_recent(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<RecentQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.clamp(1, 100);
+    let recent_result = match (
+        trimmed_opt(query.workspace.as_deref()),
+        trimmed_opt(query.project.as_deref()),
+    ) {
+        (Some(workspace), Some(project)) => {
+            match lookup_ws_proj_no_create(&state, workspace, project).await {
+                Ok((ws, proj)) => state
+                    .reader
+                    .recent_pages_for_project(ws, proj, limit)
+                    .await
+                    .and_then(|hits| {
+                        let hits: Vec<RecentHit> = hits.into_iter().map(Into::into).collect();
+                        Ok(serde_json::to_value(&hits)?)
+                    }),
+                Err(e) => return e,
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "workspace and project must be provided together"
+                })),
+            );
+        }
+        // Cross-project: every hit names its repository. `OPERATOR` reads
+        // every project because this route is root-only once the deployment
+        // distinguishes operators (`require_root_for_multiuser_admin`).
+        _ => state
+            .reader
+            .recent_pages_global(limit, OPERATOR)
+            .await
+            .and_then(|hits| {
+                let hits: Vec<RecentHit> = hits.into_iter().map(Into::into).collect();
+                Ok(serde_json::to_value(&hits)?)
+            }),
+    };
+    match recent_result {
         Ok(hits) => (StatusCode::OK, Json(hits)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -13862,6 +13991,7 @@ mod tests {
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/audit-log", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
+            ("GET", "/admin/recent", serde_json::Value::Null),
             (
                 "GET",
                 "/admin/read-page?workspace=default&project=scratch&path=notes/x.md",
