@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
+  now omits expired pages before evaluating episodic staleness, rule suggestions,
+  duplicate titles, and vector or LLM contradiction candidates, preventing
+  findings for expired pages that are pending forget-sweep deletion.
 - Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope. ([#1382](https://github.com/akitaonrails/ai-memory/pull/1382))
 - Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import. ([#1380](https://github.com/akitaonrails/ai-memory/pull/1380))
 - Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
