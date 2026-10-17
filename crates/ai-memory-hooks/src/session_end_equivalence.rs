@@ -871,7 +871,19 @@ impl Fixture {
             new_page.frontmatter_json, old_page.frontmatter_json,
             "{name}: page frontmatter"
         );
-        assert_eq!(new_page.body, old_page.body, "{name}: page body");
+        // The oracle predates the prompt-list cap: fold its full prompt list
+        // down to the capped form the new path prints before comparing, so a
+        // session over the cap still compares byte for byte everywhere else.
+        let prompt_titles: Vec<String> = rows
+            .iter()
+            .filter(|r| r.kind == ObservationKind::UserPrompt)
+            .map(|r| r.title.clone())
+            .collect();
+        assert_eq!(
+            new_page.body,
+            prompt_capped_body(&old_page.body, &prompt_titles),
+            "{name}: page body"
+        );
 
         for turn_checkpoint in [false, true] {
             let old_handoff = full_load::build_auto_handoff(
@@ -949,6 +961,59 @@ impl Fixture {
             "{name}: handoff facts"
         );
     }
+}
+
+/// The oracle page predates the prompt-list cap: it lists every prompt.
+/// Replace that section with the capped form the new path prints — the first
+/// and last slice, one omission line between them, each title numbered with
+/// its real position in the session — so the rest of the page still compares
+/// byte for byte. Sessions with at most `PROMPT_TITLES_MAX` prompts come
+/// back untouched, which is what keeps the small-session tests exact.
+fn prompt_capped_body(body: &str, titles: &[String]) -> String {
+    use crate::synth::{PROMPT_TITLES_HEAD, PROMPT_TITLES_MAX, PROMPT_TITLES_TAIL};
+    if titles.len() <= PROMPT_TITLES_MAX {
+        return body.to_string();
+    }
+    let heading = "## Prompts\n\n";
+    let start = body
+        .find(heading)
+        .expect("the oracle page lists its prompts");
+    // Rebuild the old section from `titles` instead of slicing the body, so
+    // a title that looks like a heading cannot move the boundary.
+    let old_section: String = titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!("{}. {t}\n", i + 1))
+        .collect();
+    let end = start + heading.len() + old_section.len();
+    debug_assert!(
+        body[end..].starts_with('\n'),
+        "the section runs to the next heading"
+    );
+    let (head, tail) = (
+        &titles[..PROMPT_TITLES_HEAD],
+        &titles[titles.len() - PROMPT_TITLES_TAIL..],
+    );
+    let mut capped = String::new();
+    for (i, t) in head.iter().enumerate() {
+        capped.push_str(&format!("{}. {t}\n", i + 1));
+    }
+    capped.push_str(&format!(
+        "\n_... {} prompts omitted from the middle (showing first {PROMPT_TITLES_HEAD} and last {PROMPT_TITLES_TAIL})._\n\n",
+        titles.len() - PROMPT_TITLES_MAX
+    ));
+    for (i, t) in tail.iter().enumerate() {
+        capped.push_str(&format!(
+            "{}. {t}\n",
+            titles.len() - PROMPT_TITLES_TAIL + i + 1
+        ));
+    }
+    let mut out = String::with_capacity(body.len());
+    out.push_str(&body[..start]);
+    out.push_str(heading);
+    out.push_str(&capped);
+    out.push_str(&body[end..]);
+    out
 }
 
 fn start(at: i64) -> Row {
@@ -1238,8 +1303,9 @@ async fn a_large_mixed_session_renders_identically() {
     }
 }
 
-/// The page lists every prompt title, so the digest keeps them all; nothing
-/// else about a session grows its digest.
+/// Nothing about a session's digest grows with the session: the raw lines
+/// and the prompt-title slice are capped, and the rest is counts and
+/// early-exit scans.
 #[tokio::test]
 async fn a_huge_session_reads_a_bounded_number_of_rows() {
     let fx = fixture().await;
@@ -1315,6 +1381,151 @@ async fn subagent_preamble_bodies_stop_at_the_first_usable_one() {
             "{name}: bodies read past the one that named the page"
         );
         fx.assert_equivalent(name, sid).await;
+    }
+}
+
+/// The `## Prompts` list is capped the way the raw-observation list is: a
+/// session with more prompts than the cap shows its first and last slice,
+/// numbered with the real positions, with one omission line between them,
+/// while the count and the stats keep the true total.
+#[tokio::test]
+async fn the_prompt_list_is_capped_like_the_raw_observations() {
+    use crate::synth::{PROMPT_TITLES_HEAD, PROMPT_TITLES_TAIL};
+
+    let fx = fixture().await;
+    let prompts = 2_000;
+    let mut rows = vec![start(0)];
+    for i in 1..=prompts {
+        rows.push(row(
+            ObservationKind::UserPrompt,
+            &format!("prompt {i}"),
+            "",
+            i as i64,
+        ));
+    }
+    rows.push(end(prompts as i64 + 1));
+    let sid = fx.seed(&rows).await;
+
+    // The store read itself: at most the bounded slice plus the true count.
+    let capped = fx
+        .store
+        .reader
+        .read_session_observations(fx.ws, fx.proj, sid, |s| {
+            s.prompt_titles(PROMPT_TITLES_HEAD, PROMPT_TITLES_TAIL)
+        })
+        .await
+        .unwrap();
+    assert_eq!(capped.total, prompts);
+    assert_eq!(capped.first.len(), PROMPT_TITLES_HEAD);
+    assert_eq!(capped.last.len(), PROMPT_TITLES_TAIL);
+    assert_eq!(capped.first[0], "prompt 1");
+    assert_eq!(
+        capped.first[PROMPT_TITLES_HEAD - 1],
+        format!("prompt {PROMPT_TITLES_HEAD}")
+    );
+    assert_eq!(
+        capped.last[0],
+        format!("prompt {}", prompts - PROMPT_TITLES_TAIL + 1)
+    );
+    assert_eq!(
+        capped.last[PROMPT_TITLES_TAIL - 1],
+        format!("prompt {prompts}")
+    );
+
+    // Through the real SessionEnd path: the stats keep the true total...
+    let (digest, stats) = SessionDigest::load_with_stats(&fx.store.reader, fx.ws, fx.proj, sid)
+        .await
+        .unwrap();
+    assert_eq!(stats.prompt_titles, prompts);
+
+    // ...and the page prints exactly the bounded slice, with the numbers and
+    // the omission line.
+    let page = crate::synthesize_session_page(fx.ws, fx.proj, sid, AgentKind::ClaudeCode, &digest);
+    let section = page
+        .body
+        .split("## Prompts\n\n")
+        .nth(1)
+        .expect("the page lists its prompts")
+        .split("\n## Raw observations")
+        .next()
+        .unwrap();
+    let numbered = section
+        .lines()
+        .filter(|l| l.split('.').next().unwrap_or("").parse::<usize>().is_ok())
+        .count();
+    assert_eq!(numbered, PROMPT_TITLES_HEAD + PROMPT_TITLES_TAIL);
+    assert!(section.contains("1. prompt 1\n"));
+    assert!(section.contains("250. prompt 250\n"));
+    assert!(section.contains("1751. prompt 1751\n"));
+    assert!(section.contains("2000. prompt 2000\n"));
+    assert!(
+        section.contains(
+            "_... 1500 prompts omitted from the middle (showing first 250 and last 250)._"
+        ),
+        "one omission line with the true gap: {section}"
+    );
+    // The count line keeps the true total.
+    let summary = page.frontmatter_json["summary"].as_str().unwrap();
+    assert!(summary.starts_with("2000 prompts"), "count line: {summary}");
+    // And the title, the handoff and the rest of the page are the oracle's.
+    assert_eq!(page.title, "prompt 1");
+    fx.assert_equivalent("2000 prompts (capped list)", sid)
+        .await;
+}
+
+/// Exactly at the cap the page still lists every prompt; one over it shows
+/// the head and tail slices and the omission line.
+#[tokio::test]
+async fn the_prompt_cap_boundary_keeps_five_hundred_and_cuts_five_hundred_one() {
+    for (n, capped) in [(500, false), (501, true)] {
+        let fx = fixture().await;
+        let mut rows = vec![start(0)];
+        for i in 1..=n {
+            rows.push(row(
+                ObservationKind::UserPrompt,
+                &format!("p{i}"),
+                "",
+                i as i64,
+            ));
+        }
+        rows.push(end(n as i64 + 1));
+        let sid = fx.seed(&rows).await;
+        let (digest, stats) = SessionDigest::load_with_stats(&fx.store.reader, fx.ws, fx.proj, sid)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.prompt_titles, n,
+            "n={n}: the stats keep the true total"
+        );
+        let page =
+            crate::synthesize_session_page(fx.ws, fx.proj, sid, AgentKind::ClaudeCode, &digest);
+        if capped {
+            assert!(page.body.contains("250. p250\n"), "n={n}");
+            assert!(
+                !page.body.contains("251. p251\n"),
+                "n={n}: the gap drops p251"
+            );
+            assert!(page.body.contains("252. p252\n"), "n={n}");
+            assert!(page.body.contains("501. p501\n"), "n={n}");
+            assert!(
+                page.body.contains(
+                    "_... 1 prompts omitted from the middle (showing first 250 and last 250)._"
+                ),
+                "n={n}: one omission line"
+            );
+        } else {
+            assert!(page.body.contains("500. p500\n"), "n={n}");
+            assert!(
+                !page.body.contains("prompts omitted"),
+                "n={n}: whole list, no marker"
+            );
+        }
+        let summary = page.frontmatter_json["summary"].as_str().unwrap();
+        assert!(
+            summary.starts_with(&format!("{n} prompts")),
+            "n={n}: count line: {summary}"
+        );
+        fx.assert_equivalent(&format!("prompts={n}"), sid).await;
     }
 }
 

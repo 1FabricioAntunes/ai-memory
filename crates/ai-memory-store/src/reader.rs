@@ -12236,6 +12236,20 @@ pub struct SessionToolTitles {
     pub titles: Vec<String>,
 }
 
+/// The prompt titles a session page lists, with the session's true prompt
+/// count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPromptTitles {
+    /// User prompts the session holds (the uncapped total).
+    pub total: usize,
+    /// The first titles in capture order: every one of them when the session
+    /// holds at most `head + tail` prompts, else the first `head`.
+    pub first: Vec<String>,
+    /// The last `tail` titles in capture order, only when the session holds
+    /// more than `head + tail` prompts.
+    pub last: Vec<String>,
+}
+
 /// What a page prints about one observation, without the body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLine {
@@ -12265,8 +12279,9 @@ pub const SUBSTANTIVE_OBSERVATION_KIND_SQL: &str =
 
 impl SessionObservationSnapshot<'_> {
     /// Rows this snapshot has deserialized into an [`Observation`] or a
-    /// [`SessionLine`] so far. Aggregates and the prompt-title projection are
-    /// not counted: they return counters and strings, not rows.
+    /// [`SessionLine`] so far. Aggregates and the prompt-title queries (the
+    /// bounded list and the one-row-at-a-time title walk) are not counted:
+    /// they return counters and short strings, not rows.
     #[must_use]
     pub fn rows_read(&self) -> usize {
         self.rows_read.get()
@@ -12373,46 +12388,106 @@ impl SessionObservationSnapshot<'_> {
         Ok(out)
     }
 
-    /// Every user prompt's title in capture order.
+    /// The prompt titles a page lists, with the session's true prompt count.
     ///
-    /// `visit` sees each prompt in that order, with its body only when the
-    /// title contains `body_for_titles_like` (a superset the caller filters
-    /// exactly), until it returns `false`; later prompts contribute their
-    /// title alone. At most one body is resident at a time, so a session full
-    /// of subagent preambles costs one body, not all of them.
-    ///
-    /// The titles are the one part of a SessionEnd that grows with the
-    /// session: the page it renders lists each of them, so the output cannot
-    /// be smaller than this. A title is short by construction (the router
-    /// truncates it for display); the bodies, which are not, stay in the
-    /// database.
+    /// A page prints at most the first `head` and the last `tail` titles, so
+    /// this reads at most `head + tail` titles plus one `COUNT(*)`, whatever
+    /// the session holds. Titles are short by construction (the router
+    /// truncates them for display).
     ///
     /// # Errors
     /// Propagates any SQL error.
-    pub fn prompt_titles(
+    pub fn prompt_titles(&self, head: usize, tail: usize) -> StoreResult<SessionPromptTitles> {
+        let total = self.conn.query_row(
+            "SELECT COUNT(*) FROM observations \
+             WHERE session_id = ?1 AND kind = ?2",
+            params![self.session_id, ObservationKind::UserPrompt.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let total = usize::try_from(total).unwrap_or(usize::MAX);
+        if total <= head + tail {
+            return Ok(SessionPromptTitles {
+                total,
+                first: self.prompt_title_window(total, ObservationOrder::Asc)?,
+                last: Vec::new(),
+            });
+        }
+        let mut last = self.prompt_title_window(tail, ObservationOrder::Desc)?;
+        last.reverse();
+        Ok(SessionPromptTitles {
+            total,
+            first: self.prompt_title_window(head, ObservationOrder::Asc)?,
+            last,
+        })
+    }
+
+    /// The first `limit` user-prompt titles of the session in `order`.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    fn prompt_title_window(
+        &self,
+        limit: usize,
+        order: ObservationOrder,
+    ) -> StoreResult<Vec<String>> {
+        let direction = match order {
+            ObservationOrder::Asc => "ASC",
+            ObservationOrder::Desc => "DESC",
+        };
+        let sql = format!(
+            "SELECT title FROM observations \
+             WHERE session_id = ?1 AND kind = ?2 \
+             ORDER BY created_at {direction}, rowid {direction} LIMIT ?3"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                self.session_id,
+                ObservationKind::UserPrompt.as_str(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| row.get(0),
+        )?;
+        let mut out = Vec::with_capacity(limit);
+        for title in rows {
+            out.push(title?);
+        }
+        Ok(out)
+    }
+
+    /// Walk the session's user prompts in capture order, one resident at a
+    /// time, feeding `visit` each title and, only when the title contains
+    /// `body_for_titles_like`, the prompt's body. The walk stops at the first
+    /// `false`, so a caller that settles the page title reads bodies no
+    /// further than the prompt that named it: a session full of subagent
+    /// preambles costs the bodies up to the first usable one, not all of
+    /// them, and one row is resident at a time no matter how long it is.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn scan_prompts(
         &self,
         body_for_titles_like: &str,
         mut visit: impl FnMut(&str, Option<&str>) -> bool,
-    ) -> StoreResult<Vec<String>> {
+    ) -> StoreResult<()> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END              FROM observations              WHERE session_id = ?1 AND kind = ?2              ORDER BY created_at ASC, rowid ASC",
+            "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END \
+             FROM observations WHERE session_id = ?1 AND kind = ?2 \
+             ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query(params![
             self.session_id,
             ObservationKind::UserPrompt.as_str(),
             body_for_titles_like,
         ])?;
-        let mut titles = Vec::new();
-        let mut visiting = true;
         while let Some(row) = rows.next()? {
             let title: String = row.get(0)?;
-            if visiting {
-                let body: Option<String> = row.get(1)?;
-                visiting = visit(&title, body.as_deref());
+            let body: Option<String> = row.get(1)?;
+            if !visit(&title, body.as_deref()) {
+                break;
             }
-            titles.push(title);
         }
-        Ok(titles)
+        Ok(())
     }
 
     /// The first `limit` rows of the session, oldest first, as page lines.

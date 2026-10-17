@@ -50,6 +50,11 @@ version in [`docs/changelog/`](docs/changelog/):
   byte-identical. Sessions with no observations in the consolidator's target
   scope (purged or foreign) are refused before any work, exactly as empty
   sessions were before. (#1363)
+- Fixed the session page's uncapped `## Prompts` list. Above 500 prompts the
+  page now lists the first 250 titles and the last 250, numbered by their real
+  position, with one line between them saying how many were left out. The
+  store reads at most 500 titles for it, and the page's prompt count and the
+  digest stats still report the true total. (#1349)
 
 ## [3.1.0] - 2026-10-16
 
