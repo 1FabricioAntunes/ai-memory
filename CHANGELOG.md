@@ -86,8 +86,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `GET /api/v1/workspaces/{workspace}/projects/{project}/graph` returns the
   in-project node and edge lists. A project graph keeps at most 120 pages,
   preferring those with the most same-project neighbours and then the most
-  recently updated. Expired pages stay hidden. An edge still requires both
-  ends to be readable.
+  recently updated; the store applies that cap before loading nodes or their
+  selected edges into the process. Expired pages stay hidden. An edge still
+  requires both ends to be readable.
 
 ### Fixed
 - Fixed native hook events getting stranded forever when a harness killed the

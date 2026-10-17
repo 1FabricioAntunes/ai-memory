@@ -6,7 +6,6 @@
 //! soft cap: a connection that comes back when the pool is already full
 //! is simply dropped.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9541,86 +9540,120 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let now = now_us();
             let ttl = not_expired("pg", "?3");
-            let mut page_stmt = conn.prepare(&format!(
-                "SELECT pg.id, pg.path, pg.title, pg.updated_at \
-                 FROM pages pg \
-                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 \
-                   AND pg.is_latest = 1{ttl}"
-            ))?;
-            let page_rows = page_stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
-                |row| {
-                    let id: Vec<u8> = row.get(0)?;
-                    Ok((id, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)?))
-                },
-            )?;
-            let mut pages: Vec<(PageId, String, String, i64)> = Vec::new();
-            for row in page_rows {
-                let (id, path, title, updated_at) = row?;
-                pages.push((PageId::from_slice(&id)?, path, title, updated_at));
-            }
-
             let from_ttl = not_expired("fp", "?3");
             let to_ttl = not_expired("tp", "?3");
-            let mut edge_stmt = conn.prepare(&format!(
-                "SELECT DISTINCT fp.id, tp.id, fp.path, tp.path \
-                 FROM links l \
-                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1{from_ttl} \
-                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
-                 WHERE fp.workspace_id = ?1 AND fp.project_id = ?2 \
-                   AND tp.workspace_id = ?1 AND tp.project_id = ?2 \
-                 ORDER BY fp.path, tp.path"
+            let mut page_stmt = conn.prepare(&format!(
+                "WITH live(id, path, title, updated_at) AS ( \
+                     SELECT pg.id, pg.path, pg.title, pg.updated_at \
+                     FROM pages pg \
+                     WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 \
+                       AND pg.is_latest = 1{ttl} \
+                 ), \
+                 live_edges(from_id, to_id) AS ( \
+                     SELECT DISTINCT fp.id, tp.id \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id \
+                       AND fp.is_latest = 1{from_ttl} \
+                     JOIN pages tp ON tp.id = l.to_page_id \
+                       AND tp.is_latest = 1{to_ttl} \
+                     WHERE fp.workspace_id = ?1 AND fp.project_id = ?2 \
+                       AND tp.workspace_id = ?1 AND tp.project_id = ?2 \
+                 ), \
+                 endpoints(page_id) AS ( \
+                     SELECT from_id FROM live_edges \
+                     UNION ALL \
+                     SELECT to_id FROM live_edges WHERE to_id != from_id \
+                 ), \
+                 ranked(id, path, title, updated_at, degree) AS ( \
+                     SELECT live.id, live.path, live.title, live.updated_at, \
+                            COUNT(endpoints.page_id) \
+                     FROM live \
+                     LEFT JOIN endpoints ON endpoints.page_id = live.id \
+                     GROUP BY live.id, live.path, live.title, live.updated_at \
+                 ) \
+                 SELECT id, path, title, degree, COUNT(*) OVER() \
+                 FROM ranked \
+                 ORDER BY degree DESC, updated_at DESC, path \
+                 LIMIT ?4"
             ))?;
-            let edge_rows = edge_stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
+            let page_rows = page_stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    now,
+                    PROJECT_LINK_GRAPH_MAX_NODES as i64
+                ],
                 |row| {
-                    let from_id: Vec<u8> = row.get(0)?;
-                    let to_id: Vec<u8> = row.get(1)?;
-                    Ok((from_id, to_id, row.get(2)?, row.get(3)?))
+                    let id: Vec<u8> = row.get(0)?;
+                    Ok((
+                        id,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
                 },
             )?;
-            let mut raw_edges: Vec<(PageId, PageId, String, String)> = Vec::new();
-            for row in edge_rows {
-                let (from_id, to_id, from_path, to_path) = row?;
-                raw_edges.push((
-                    PageId::from_slice(&from_id)?,
-                    PageId::from_slice(&to_id)?,
-                    from_path,
-                    to_path,
+            let mut pages: Vec<(PageId, LinkGraphNode)> = Vec::new();
+            let mut total_pages = 0_i64;
+            for row in page_rows {
+                let (id, path, title, degree, total) = row?;
+                total_pages = total;
+                pages.push((
+                    PageId::from_slice(&id)?,
+                    LinkGraphNode {
+                        path,
+                        title,
+                        degree: degree as u64,
+                    },
                 ));
             }
 
-            let mut degree: HashMap<PageId, u64> = HashMap::new();
-            for (from_id, to_id, _, _) in &raw_edges {
-                *degree.entry(*from_id).or_insert(0) += 1;
-                if from_id != to_id {
-                    *degree.entry(*to_id).or_insert(0) += 1;
+            let mut edges = Vec::new();
+            if !pages.is_empty() {
+                let mut placeholders = String::new();
+                for i in 0..pages.len() {
+                    if i > 0 {
+                        placeholders.push_str(", ");
+                    }
+                    let _ = write!(placeholders, "?{}", i + 4);
+                }
+                let edge_sql = format!(
+                    "SELECT DISTINCT fp.path, tp.path \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id \
+                       AND fp.is_latest = 1{from_ttl} \
+                     JOIN pages tp ON tp.id = l.to_page_id \
+                       AND tp.is_latest = 1{to_ttl} \
+                     WHERE fp.workspace_id = ?1 AND fp.project_id = ?2 \
+                       AND tp.workspace_id = ?1 AND tp.project_id = ?2 \
+                       AND fp.id IN ({placeholders}) \
+                       AND tp.id IN ({placeholders}) \
+                     ORDER BY fp.path, tp.path"
+                );
+                let mut bound = Vec::with_capacity(3 + pages.len());
+                bound.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                bound.push(Value::Blob(project_id.as_bytes().to_vec()));
+                bound.push(Value::Integer(now));
+                bound.extend(
+                    pages
+                        .iter()
+                        .map(|(id, _)| Value::Blob(id.as_bytes().to_vec())),
+                );
+                let mut edge_stmt = conn.prepare(&edge_sql)?;
+                let edge_rows = edge_stmt.query_map(params_from_iter(bound.iter()), |row| {
+                    Ok(LinkGraphEdge {
+                        from_path: row.get(0)?,
+                        to_path: row.get(1)?,
+                    })
+                })?;
+                for row in edge_rows {
+                    edges.push(row?);
                 }
             }
 
-            pages.sort_by(|a, b| {
-                let da = degree.get(&a.0).copied().unwrap_or(0);
-                let db = degree.get(&b.0).copied().unwrap_or(0);
-                db.cmp(&da)
-                    .then_with(|| b.3.cmp(&a.3))
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-            let truncated = pages.len() > PROJECT_LINK_GRAPH_MAX_NODES;
-            pages.truncate(PROJECT_LINK_GRAPH_MAX_NODES);
-            let keep: HashSet<PageId> = pages.iter().map(|page| page.0).collect();
-            let nodes = pages
-                .into_iter()
-                .map(|(id, path, title, _)| LinkGraphNode {
-                    degree: degree.get(&id).copied().unwrap_or(0),
-                    path,
-                    title,
-                })
-                .collect();
-            let edges = raw_edges
-                .into_iter()
-                .filter(|(from_id, to_id, _, _)| keep.contains(from_id) && keep.contains(to_id))
-                .map(|(_, _, from_path, to_path)| LinkGraphEdge { from_path, to_path })
-                .collect();
+            let truncated = total_pages > PROJECT_LINK_GRAPH_MAX_NODES as i64;
+            let nodes = pages.into_iter().map(|(_, node)| node).collect();
             Ok(LinkGraph {
                 nodes,
                 edges,
