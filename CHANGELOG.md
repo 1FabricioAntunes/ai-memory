@@ -103,6 +103,12 @@ version in [`docs/changelog/`](docs/changelog/):
   expired page, on both the markdown and the DB-fallback branch, and
   `read-page` prints an `expired: true` line (the field also appears in
   `--json`); a live page's output is unchanged. (#1373)
+- Fixed web wikilink rendering generating dead links for directory and stemless
+  targets. In markdown pages, wikilinks pointing to a directory (`[[notes/]]`) or
+  a stemless target (`[[notes/.md]]`, `[[.md]]`) were rewritten into invalid
+  page links that yielded 404 responses in the web browser. They now remain as
+  literal text, aligning web wikilink preprocessing with the wiki engine's link
+  extractor. (#1364)
 
 ## [3.1.0] - 2026-10-16
 
