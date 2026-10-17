@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Hardened OIDC credential transport after CodeQL alert #176: the shared
+  refresh-grant sink now requires a typed TLS-or-loopback endpoint, and device
+  authorization and token polling revalidate their endpoints immediately
+  before each request. A caller-mutated discovery object can no longer bypass
+  the login-time HTTPS check.
 - On Windows, `setup` now starts the logon host with a plain executable path,
   and the host passes plain drive/UNC data-directory and config arguments to the
   supervisor and server it launches, instead of the `\\?\` verbatim prefix a
