@@ -97,6 +97,12 @@ version in [`docs/changelog/`](docs/changelog/):
   exactly like a live one, although search and the project listings leave such
   a page out. The metadata row now carries an `expired` badge beside the tier
   and kind; a live page renders as before. (#1372)
+- Fixed `GET /admin/read-page` and `ai-memory read-page` returning a page whose
+  `expires_at` TTL had passed with nothing to say so, although `search` no
+  longer lists such a page. The response now carries `expired: true` for an
+  expired page, on both the markdown and the DB-fallback branch, and
+  `read-page` prints an `expired: true` line (the field also appears in
+  `--json`); a live page's output is unchanged. (#1373)
 
 ## [3.1.0] - 2026-10-16
 

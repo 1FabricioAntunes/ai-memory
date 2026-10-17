@@ -1828,6 +1828,10 @@ struct ReadPageResponse {
     frontmatter: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     served_from: Option<&'static str>,
+    /// Set when the page's `expires_at` TTL has passed: an exact-path read
+    /// still serves the page, which search no longer lists.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
 }
 
 async fn handle_read_page(
@@ -1888,6 +1892,18 @@ async fn handle_read_page(
         );
     };
 
+    // An expired page is still served (a read is not a search) but says so:
+    // search and the listings leave it out, so this flag is how the caller
+    // learns the page is only waiting for the forget sweep. Omitted while live.
+    let expired = match state
+        .reader
+        .page_expired_by_ids(ws, proj, page_path.as_str())
+        .await
+    {
+        Ok(expired) => expired.unwrap_or(false),
+        Err(e) => return internal_err(e.to_string()),
+    };
+
     match state.wiki.read_page(ws, proj, &page_path) {
         Ok(md) => {
             let title = md
@@ -1903,6 +1919,7 @@ async fn handle_read_page(
                 body: md.body,
                 frontmatter: md.frontmatter,
                 served_from: None,
+                expired,
             };
             (
                 StatusCode::OK,
@@ -1932,6 +1949,7 @@ async fn handle_read_page(
                     body: stored.body,
                     frontmatter,
                     served_from: Some("db-fallback"),
+                    expired,
                 };
                 (
                     StatusCode::OK,
