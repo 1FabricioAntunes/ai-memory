@@ -10098,8 +10098,8 @@ impl ReaderPool {
         .await
     }
 
-    /// Return the subset of `paths` that name a latest page in this scope, in
-    /// a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
+    /// Return the subset of `paths` that name a latest unexpired page in this
+    /// scope, in a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
     /// for callers that need to know *which* paths resolve — the consolidation
     /// link guard validates proposed cross-scope wikilinks against it (#1218).
     ///
@@ -10128,11 +10128,12 @@ impl ReaderPool {
             let placeholders = std::iter::repeat_n("?", distinct.len())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let ttl = not_expired("pg", "?3");
             let sql = format!(
                 "SELECT pg.path FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = p.workspace_id \
-                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1 \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1{ttl} \
                    AND (p.access_mode <> 'restricted' \
                         OR (w.name = '{global_ws}' AND p.name = '{global_proj}')) \
                    AND pg.path IN ({placeholders})",
@@ -10142,9 +10143,11 @@ impl ReaderPool {
             let mut stmt = conn.prepare(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
-            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 2);
+            let now = now_us();
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 3);
             binds.push(ws_bytes as &dyn rusqlite::ToSql);
             binds.push(proj_bytes as &dyn rusqlite::ToSql);
+            binds.push(&now as &dyn rusqlite::ToSql);
             for p in &distinct {
                 binds.push(p as &dyn rusqlite::ToSql);
             }
