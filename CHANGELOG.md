@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed web wikilink rendering generating dead links for directory and stemless
+  targets. In markdown pages, wikilinks pointing to a directory (`[[notes/]]`) or
+  a stemless target (`[[notes/.md]]`, `[[.md]]`) were rewritten into invalid
+  page links that yielded 404 responses in the web browser. They now remain as
+  literal text, aligning web wikilink preprocessing with the wiki engine's link
+  extractor.
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
