@@ -198,7 +198,9 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/pages
 ]
 ```
 
-`404` if the workspace or project doesn't exist.
+`404` if the workspace or project doesn't exist. A page whose `expires_at`
+TTL has passed is left out, as search and `recent` leave it out; the
+single-page read below still returns it.
 
 ### 4.4 Page (read full)
 
@@ -308,8 +310,8 @@ Rules:
 GET /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=20
 ```
 
-`is_latest = 1` pages ordered by `updated_at` DESC. `limit` clamped
-`1..=100`, default `10`.
+`is_latest = 1` pages whose `expires_at` TTL has not passed, ordered by
+`updated_at` DESC. `limit` clamped `1..=100`, default `10`.
 
 Every reader surface uses the same `kind` contract. An explicit frontmatter
 `kind` wins; otherwise the path families `_rules/`, `_slots/`, `sessions/`,

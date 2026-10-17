@@ -9635,7 +9635,9 @@ impl ReaderPool {
     }
 
     /// All `is_latest = 1` pages under a given (workspace, project),
-    /// ordered by path ascending. Used by the web UI tree view.
+    /// ordered by path ascending, TTL-expired pages included: a project
+    /// move copies every current page, and the curator reports on every
+    /// one. A listing shown to a reader uses [`Self::list_unexpired_pages`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -9644,20 +9646,57 @@ impl ReaderPool {
         workspace: &str,
         project: &str,
     ) -> StoreResult<Vec<PageSummary>> {
+        self.list_latest_pages(workspace, project, false).await
+    }
+
+    /// [`Self::list_pages`] without the pages whose `expires_at` TTL has
+    /// passed. The web tree, the namespace listing and the `/api/v1` page
+    /// lists read this, so a listing hides an expired page the way search
+    /// and recent do; an exact-path read still returns it.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_unexpired_pages(
+        &self,
+        workspace: &str,
+        project: &str,
+    ) -> StoreResult<Vec<PageSummary>> {
+        self.list_latest_pages(workspace, project, true).await
+    }
+
+    /// The query behind both listings; `hide_expired` adds the TTL guard.
+    async fn list_latest_pages(
+        &self,
+        workspace: &str,
+        project: &str,
+        hide_expired: bool,
+    ) -> StoreResult<Vec<PageSummary>> {
         let workspace = workspace.to_owned();
         let project = project.to_owned();
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let ttl = if hide_expired {
+                not_expired("pg", "?3")
+            } else {
+                String::new()
+            };
             let mut stmt = conn.prepare(&format!(
                 "SELECT pg.path, pg.title, {kind_expr} AS kind, \
                         pg.tier, pg.updated_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
-                 WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1 \
+                 WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1{ttl} \
                  ORDER BY pg.path ASC"
             ))?;
-            let rows = stmt.query_map(params![workspace, project], |row| {
+            let now = now_us();
+            let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(3);
+            bound.push(&workspace);
+            bound.push(&project);
+            if hide_expired {
+                bound.push(&now);
+            }
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let path: String = row.get(0)?;
                 let title: String = row.get(1)?;
                 let kind: String = row.get(2)?;

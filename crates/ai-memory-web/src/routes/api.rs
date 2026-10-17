@@ -175,7 +175,7 @@ async fn pages_handler(
     let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let pages = state
         .reader
-        .list_pages(&workspace, &project)
+        .list_unexpired_pages(&workspace, &project)
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -584,7 +584,7 @@ async fn recent_handler(
     if query.updated_since.is_none() && query.cursor.is_none() {
         let mut pages = state
             .reader
-            .list_pages(&workspace, &project)
+            .list_unexpired_pages(&workspace, &project)
             .await
             .map_err(internal_error)?;
         pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));

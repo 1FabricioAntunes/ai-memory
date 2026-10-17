@@ -4914,6 +4914,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_list_unexpired_pages_hides_only_the_expired_ones() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        let at = |seconds: i64| Some(jiff::Timestamp::from_second(seconds).unwrap());
+        for (path, expires_at) in [
+            ("expired.md", at(now - 60)),
+            ("future.md", at(now + 3_600)),
+            ("live.md", None),
+        ] {
+            let mut page = sample_page(ws, proj, path, "body");
+            page.expires_at = expires_at;
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let paths = |pages: Vec<PageSummary>| -> Vec<String> {
+            pages.into_iter().map(|p| p.path).collect()
+        };
+        // The full listing keeps the expired page for the callers that
+        // copy or audit every current page.
+        assert_eq!(
+            paths(store.reader.list_pages("default", "scratch").await.unwrap()),
+            ["expired.md", "future.md", "live.md"]
+        );
+        // The reader-facing listing drops it, and only it: a TTL still
+        // ahead and no TTL at all both stay.
+        assert_eq!(
+            paths(
+                store
+                    .reader
+                    .list_unexpired_pages("default", "scratch")
+                    .await
+                    .unwrap()
+            ),
+            ["future.md", "live.md"]
+        );
+    }
+
+    #[tokio::test]
     async fn reader_page_kinds_follow_canonical_paths_across_surfaces() {
         const CASES: [(&str, &str); 9] = [
             ("_rules/rule.md", "rule"),

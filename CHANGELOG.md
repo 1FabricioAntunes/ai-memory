@@ -80,6 +80,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `ReaderPool::dangling_cross_project_links`, so cross-project links to
   tombstoned or expired pages are reported as dangling instead of resolved,
   and expired source pages do not emit dangling link findings. (#1368)
+- Fixed the `/web` project tree and its recent-activity list, the namespace
+  listing, and the `/api/v1` `pages` list and legacy `recent` array showing
+  pages whose `expires_at` TTL had passed, which search, `memory_recent`, the
+  incremental `recent` form and page history already hid. A project move and
+  the curator still see every current page, and an exact-path read of an
+  expired page still answers. (#1369)
 
 ## [3.1.0] - 2026-10-16
 
