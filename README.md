@@ -637,6 +637,10 @@ a reverse proxy. Capture is sanitized at a typed privacy boundary before
 anything is stored, and per-repository `[capture]` rules can exclude
 paths or invert to allowlist mode. A repository can also route its capture
 to a different server than the one the hooks were installed against.
+Human login beyond loopback requires an HTTPS posture by default. Operators
+who explicitly accept plaintext passwords, cookies, credentials, and memory
+traffic on a private LAN can opt in with `serve --allow-insecure-human-auth`;
+the server never enables that exception implicitly.
 
 The full model is in [`docs/security.md`](docs/security.md),
 [`docs/users.md`](docs/users.md), and

@@ -545,6 +545,9 @@ enum HttpExposure {
     /// Unauthenticated on a non-loopback address, allowed because the
     /// operator passed `--allow-insecure-no-auth`.
     InsecureByOverride,
+    /// Human passwords and cookies are crossing a non-loopback plain-HTTP
+    /// connection because the operator accepted that transport risk.
+    InsecureHumanAuthByOverride,
     /// Unauthenticated on a non-loopback address inside a container, where
     /// the bind address is not evidence either way. See
     /// [`validate_http_exposure`].
@@ -585,16 +588,21 @@ fn validate_http_exposure(
     human_mode: bool,
     secure_cookie: bool,
     allow_insecure_no_auth: bool,
+    allow_insecure_human_auth: bool,
     containerized: bool,
 ) -> Result<HttpExposure> {
     if local_addr.ip().is_loopback() {
         return Ok(HttpExposure::Safe);
     }
     if human_mode && !secure_cookie {
+        if auth_enabled && allow_insecure_human_auth {
+            return Ok(HttpExposure::InsecureHumanAuthByOverride);
+        }
         anyhow::bail!(
             "refusing human authentication on non-loopback plain HTTP address {local_addr}: \
              passwords and session cookies require [auth].secure_cookie=true behind a trusted \
-             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback."
+             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback unless \
+             --allow-insecure-human-auth explicitly accepts plaintext transport."
         );
     }
     if auth_enabled {
@@ -628,6 +636,12 @@ fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<Str
             "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION because \
              --allow-insecure-no-auth was supplied. Anyone who can reach this address can call \
              destructive MCP tools."
+        )),
+        HttpExposure::InsecureHumanAuthByOverride => Some(format!(
+            "WARNING: ai-memory is serving HUMAN AUTHENTICATION on plain HTTP at {local_addr} \
+             because --allow-insecure-human-auth was supplied. Passwords, API credentials, \
+             session cookies, and memory data are unencrypted; a network peer can steal or \
+             modify them. Use this only on a network whose plaintext risk you explicitly accept."
         )),
         HttpExposure::UndeterminedInContainer => Some(format!(
             "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION. Inside a \
@@ -1931,6 +1945,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 human_mode,
                 config.auth.secure_cookie,
                 args.allow_insecure_no_auth,
+                args.allow_insecure_human_auth,
                 running_in_container(),
             )?;
             info!(
@@ -1950,6 +1965,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     "starting unauthenticated plain HTTP on a non-loopback address because \
                      --allow-insecure-no-auth was supplied — anyone on the network can call \
                      destructive MCP tools"
+                );
+            } else if exposure == HttpExposure::InsecureHumanAuthByOverride {
+                tracing::warn!(
+                    %local_addr,
+                    "starting human authentication on non-loopback plain HTTP because \
+                     --allow-insecure-human-auth was supplied — passwords, API credentials, \
+                     session cookies, and memory data cross the network unencrypted"
                 );
             } else if exposure == HttpExposure::UndeterminedInContainer {
                 tracing::warn!(
@@ -3818,6 +3840,7 @@ mod tests {
                             false,
                             allow_override,
                             false,
+                            false,
                         )
                         .is_ok(),
                         allowed,
@@ -3831,16 +3854,25 @@ mod tests {
     #[test]
     fn human_auth_non_loopback_requires_secure_cookie_posture() {
         let remote: SocketAddr = "192.168.1.90:49374".parse().unwrap();
-        assert!(validate_http_exposure(remote, true, true, false, false, false).is_err());
-        assert!(validate_http_exposure(remote, true, true, false, true, true).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, false, false, false).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, true, false, true).is_err());
         assert_eq!(
-            validate_http_exposure(remote, true, true, true, false, false).unwrap(),
+            validate_http_exposure(remote, true, true, true, false, false, false).unwrap(),
             HttpExposure::Safe
         );
+        assert_eq!(
+            validate_http_exposure(remote, true, true, false, false, true, false).unwrap(),
+            HttpExposure::InsecureHumanAuthByOverride
+        );
+
+        // The human-auth override must not become a second way to expose a
+        // server with no authentication at all.
+        assert!(validate_http_exposure(remote, false, false, false, false, true, false).is_err());
+        assert!(validate_http_exposure(remote, false, true, false, false, true, false).is_err());
 
         let loopback: SocketAddr = "127.0.0.1:49374".parse().unwrap();
         assert_eq!(
-            validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
+            validate_http_exposure(loopback, true, true, false, false, true, false).unwrap(),
             HttpExposure::Safe
         );
     }
@@ -3861,6 +3893,12 @@ mod tests {
         assert!(override_banner.contains("0.0.0.0:49374"));
         assert!(override_banner.contains("--allow-insecure-no-auth"));
 
+        let human_banner = exposure_banner(HttpExposure::InsecureHumanAuthByOverride, addr)
+            .expect("an insecure human-auth override must be announced");
+        assert!(human_banner.contains("HUMAN AUTHENTICATION"));
+        assert!(human_banner.contains("--allow-insecure-human-auth"));
+        assert!(human_banner.contains("session cookies"));
+
         let container_banner = exposure_banner(HttpExposure::UndeterminedInContainer, addr)
             .expect("an unauthenticated container bind must be announced");
         assert!(container_banner.contains("NO AUTHENTICATION"));
@@ -3877,13 +3915,13 @@ mod tests {
     fn the_quick_start_container_bind_is_announced_not_refused() {
         let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
 
-        let exposure = validate_http_exposure(quick_start, false, false, false, false, true)
+        let exposure = validate_http_exposure(quick_start, false, false, false, false, false, true)
             .expect("must not refuse");
         assert_eq!(exposure, HttpExposure::UndeterminedInContainer);
         assert!(exposure_banner(exposure, quick_start).is_some());
 
         // With a token configured there is nothing to announce.
-        let authed = validate_http_exposure(quick_start, true, false, false, false, true)
+        let authed = validate_http_exposure(quick_start, true, false, false, false, false, true)
             .expect("auth is fine");
         assert_eq!(exposure_banner(authed, quick_start), None);
     }
@@ -3898,19 +3936,21 @@ mod tests {
 
         // The exact Quick Start shape: no token, no override, in a container.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, false, false, true)
+            validate_http_exposure(quick_start, false, false, false, false, false, true)
                 .expect("must not refuse"),
             HttpExposure::UndeterminedInContainer,
         );
 
         // Identical inputs on a host still refuse — the carve-out is scoped
         // to the container case and does not soften the host rule.
-        assert!(validate_http_exposure(quick_start, false, false, false, false, false).is_err());
+        assert!(
+            validate_http_exposure(quick_start, false, false, false, false, false, false).is_err()
+        );
 
         // A container is not a blanket downgrade: with machine auth configured
         // the verdict is Safe, so the operator gets no spurious warning.
         assert_eq!(
-            validate_http_exposure(quick_start, true, false, false, false, true)
+            validate_http_exposure(quick_start, true, false, false, false, false, true)
                 .expect("auth is fine"),
             HttpExposure::Safe,
         );
@@ -3918,7 +3958,7 @@ mod tests {
         // An explicit override still reports as an override, not as the
         // container case, so the startup log keeps naming the real reason.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, false, true, true)
+            validate_http_exposure(quick_start, false, false, false, true, false, true)
                 .expect("override is fine"),
             HttpExposure::InsecureByOverride,
         );
@@ -3926,7 +3966,7 @@ mod tests {
         // Loopback inside a container is plain Safe.
         let loopback: SocketAddr = "127.0.0.1:49374".parse().expect("valid test address");
         assert_eq!(
-            validate_http_exposure(loopback, false, false, false, false, true)
+            validate_http_exposure(loopback, false, false, false, false, false, true)
                 .expect("loopback is fine"),
             HttpExposure::Safe,
         );

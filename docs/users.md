@@ -137,10 +137,13 @@ root_subject = "<root-subject>"
   root bearer is absent.
 - Only set it when the server is reachable *only* through that proxy.
 - `secure_cookie` is independent of proxy identity. Human auth requires it on
-  every non-loopback listener; ai-memory treats it as the explicit signal that
-  a trusted reverse proxy terminates HTTPS for `/web` and never trusts
-  forwarded protocol headers to infer that fact. Direct HTTP browsers will not
-  send a Secure cookie.
+  every non-loopback listener by default; ai-memory treats it as the explicit
+  signal that a trusted reverse proxy terminates HTTPS for `/web` and never
+  trusts forwarded protocol headers to infer that fact. Direct HTTP browsers
+  will not send a Secure cookie. `serve --allow-insecure-human-auth` (or
+  `AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) is the explicit, dangerous
+  exception for a private LAN whose operator accepts that passwords,
+  credentials, cookies, and memory data travel unencrypted.
 - **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
   setting its own.** Use a directive that *replaces* the header rather than
   appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`).
