@@ -23,8 +23,9 @@ Warp, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > other client gets a local stdio entry, in its own format, that runs
 > `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
 > the token file at launch and forwards no session id, so the client passes
-> `workspace` and `project` like any static client. The client must find
-> `ai-memory` on its `PATH` (GUI apps may need the full path). ZCode keeps
+> `workspace` and `project` like any static client. Stdio entries name the
+> `ai-memory` binary by its absolute path, so the client does not need it on
+> its `PATH`; the Docker wrapper keeps the bare `ai-memory`. ZCode keeps
 > HTTP entries only and is refused. Passing `--auth-token` explicitly (or
 > `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
 
@@ -239,7 +240,8 @@ sessions through that entry. Opt into ai-memory's local stdio bridge instead:
 ai-memory install-mcp --client claude-code --session-aware --apply
 ```
 
-The generated entry runs `ai-memory mcp-bridge`, connects to the same configured
+The generated entry runs `ai-memory mcp-bridge`, naming the binary by its
+absolute path, connects to the same configured
 local or remote `/mcp` endpoint, preserves bearer authentication, and adds
 `X-Memory-Actor-Session-Id: <CLAUDE_CODE_SESSION_ID>` to every upstream request.
 It supports ai-memory's default stateless HTTP mode and opt-in stateful mode.
@@ -570,7 +572,7 @@ id as the actor session:
   "mcpServers": {
     "ai-memory": {
       "type": "stdio",
-      "command": "ai-memory",
+      "command": "/home/you/.local/bin/ai-memory",
       "args": ["mcp-bridge", "--agent", "muse",
                "--server-url", "http://127.0.0.1:49374/mcp",
                "--data-dir", "/home/you/.local/share/ai-memory"],

@@ -3909,6 +3909,57 @@ impl ReaderPool {
         .await
     }
 
+    /// [`Self::read_session_observations`] gated on the session holding at
+    /// least one observation in the given scope, instead of on its
+    /// `sessions` row.
+    ///
+    /// The consolidator resolves the repository a session consolidates into
+    /// from where its observations actually landed, not from the (possibly
+    /// stale) `sessions` row, so its bounded reads gate on the observations
+    /// themselves: a session with rows in the scope opens, and a session
+    /// with none there — including a purged one — is refused as
+    /// [`StoreError::SessionCollision`], like the `sessions`-row gate.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error, and whatever `read` returns.
+    pub async fn read_session_observations_in_scope<F, T>(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        read: F,
+    ) -> StoreResult<T>
+    where
+        F: FnOnce(&SessionObservationSnapshot<'_>) -> StoreResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let in_scope = tx.query_row(
+                "SELECT EXISTS(\
+                    SELECT 1 FROM observations \
+                    WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3\
+                )",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes()
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !in_scope {
+                return Err(StoreError::SessionCollision);
+            }
+            let snapshot = SessionObservationSnapshot {
+                conn: &tx,
+                session_id: session_id.as_bytes().to_vec(),
+                rows_read: std::cell::Cell::new(0),
+            };
+            read(&snapshot)
+        })
+        .await
+    }
+
     /// Page through one session's raw observations as seen from one scope.
     ///
     /// Only the rows that landed in `(workspace_id, project_id)` are returned:
@@ -9230,10 +9281,11 @@ impl ReaderPool {
         .await
     }
 
-    /// List unresolved cross-project links authored by pages in this project
-    /// — declared dependencies on another project's page that don't resolve.
-    /// Each row says whether the named target project exists, so the lint can
-    /// tell a typo'd project name from a missing / renamed target page.
+    /// List unresolved cross-project links authored by latest unexpired pages
+    /// in this project — declared dependencies on another project's page that
+    /// don't resolve to an existing, latest, unexpired page. Each row says
+    /// whether the named target project exists, so the lint can tell a
+    /// typo'd project name from a missing / renamed target page.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -9243,7 +9295,9 @@ impl ReaderPool {
         project_id: ProjectId,
     ) -> StoreResult<Vec<DanglingCrossLink>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
+            let from_ttl = not_expired("fp", "?3");
+            let to_ttl = not_expired("tp", "?3");
+            let sql = format!(
                 "SELECT fp.path, l.to_workspace, l.to_project, l.to_path, \
                         EXISTS ( \
                             SELECT 1 FROM projects pr \
@@ -9256,12 +9310,15 @@ impl ReaderPool {
                         ) AS project_exists \
                  FROM links l \
                  JOIN pages fp ON fp.id = l.from_page_id \
-                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1 \
-                 WHERE l.to_page_id IS NULL AND l.to_project IS NOT NULL \
-                 ORDER BY fp.path, l.to_project, l.to_path",
-            )?;
+                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1{from_ttl} \
+                 LEFT JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
+                 WHERE tp.id IS NULL AND l.to_project IS NOT NULL \
+                 ORDER BY fp.path, l.to_project, l.to_path"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let now = now_us();
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
                 |row| {
                     let exists: i64 = row.get(4)?;
                     Ok(DanglingCrossLink {
@@ -9298,9 +9355,10 @@ impl ReaderPool {
         .await
     }
 
-    /// Typed `contradicts` edges declared by latest pages of one project
-    /// (docs/okf.md relations vocabulary). Each row feeds one rule-based
-    /// lint finding.
+    /// Typed `contradicts` edges declared by latest unexpired pages of one
+    /// project (docs/okf.md relations vocabulary). Each row feeds one
+    /// rule-based lint finding; `resolved` is true when the target resolves
+    /// to a latest unexpired page.
     ///
     /// # Errors
     /// Propagates SQL errors from the read pool.
@@ -9310,11 +9368,22 @@ impl ReaderPool {
         project_id: ProjectId,
     ) -> StoreResult<Vec<ContradictionEdge>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT fp.path, l.to_path,                         l.to_page_id IS NOT NULL AS resolved                  FROM links l                  JOIN pages fp ON fp.id = l.from_page_id                      AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1                  WHERE l.link_type = 'contradicts'                  ORDER BY fp.path, l.to_path",
-            )?;
+            let from_ttl = not_expired("fp", "?3");
+            let to_ttl = not_expired("tp", "?3");
+            let sql = format!(
+                "SELECT fp.path, l.to_path, \
+                        tp.id IS NOT NULL AS resolved \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id \
+                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1{from_ttl} \
+                 LEFT JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
+                 WHERE l.link_type = 'contradicts' \
+                 ORDER BY fp.path, l.to_path"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let now = now_us();
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
                 |row| {
                     let resolved: i64 = row.get(2)?;
                     Ok(ContradictionEdge {
@@ -9780,7 +9849,9 @@ impl ReaderPool {
     }
 
     /// All `is_latest = 1` pages under a given (workspace, project),
-    /// ordered by path ascending. Used by the web UI tree view.
+    /// ordered by path ascending, TTL-expired pages included: a project
+    /// move copies every current page, and the curator reports on every
+    /// one. A listing shown to a reader uses [`Self::list_unexpired_pages`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -9789,20 +9860,57 @@ impl ReaderPool {
         workspace: &str,
         project: &str,
     ) -> StoreResult<Vec<PageSummary>> {
+        self.list_latest_pages(workspace, project, false).await
+    }
+
+    /// [`Self::list_pages`] without the pages whose `expires_at` TTL has
+    /// passed. The web tree, the namespace listing and the `/api/v1` page
+    /// lists read this, so a listing hides an expired page the way search
+    /// and recent do; an exact-path read still returns it.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_unexpired_pages(
+        &self,
+        workspace: &str,
+        project: &str,
+    ) -> StoreResult<Vec<PageSummary>> {
+        self.list_latest_pages(workspace, project, true).await
+    }
+
+    /// The query behind both listings; `hide_expired` adds the TTL guard.
+    async fn list_latest_pages(
+        &self,
+        workspace: &str,
+        project: &str,
+        hide_expired: bool,
+    ) -> StoreResult<Vec<PageSummary>> {
         let workspace = workspace.to_owned();
         let project = project.to_owned();
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let ttl = if hide_expired {
+                not_expired("pg", "?3")
+            } else {
+                String::new()
+            };
             let mut stmt = conn.prepare(&format!(
                 "SELECT pg.path, pg.title, {kind_expr} AS kind, \
                         pg.tier, pg.updated_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
-                 WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1 \
+                 WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1{ttl} \
                  ORDER BY pg.path ASC"
             ))?;
-            let rows = stmt.query_map(params![workspace, project], |row| {
+            let now = now_us();
+            let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(3);
+            bound.push(&workspace);
+            bound.push(&project);
+            if hide_expired {
+                bound.push(&now);
+            }
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let path: String = row.get(0)?;
                 let title: String = row.get(1)?;
                 let kind: String = row.get(2)?;
@@ -12374,6 +12482,21 @@ pub struct SessionKindSummary {
     pub last_prompt_at: Option<i64>,
 }
 
+/// Row count and `created_at` span of one session's observations, in one
+/// aggregate pass: what a bounded projection and a session duration need
+/// before a single row is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationProjectionTotals {
+    /// Rows the session holds — every observation of it, regardless of the
+    /// scope the consolidation target was resolved from.
+    pub total: usize,
+    /// Oldest `created_at` (microseconds since the epoch); `None` while the
+    /// session holds no rows.
+    pub first_created_at: Option<i64>,
+    /// Newest `created_at`; `None` while the session holds no rows.
+    pub last_created_at: Option<i64>,
+}
+
 /// Tool names a session used, grouped in SQL.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionToolTitles {
@@ -12382,6 +12505,20 @@ pub struct SessionToolTitles {
     /// Every distinct non-empty title carried by a `pre-tool-use` or
     /// `post-tool-use` row.
     pub titles: Vec<String>,
+}
+
+/// The prompt titles a session page lists, with the session's true prompt
+/// count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPromptTitles {
+    /// User prompts the session holds (the uncapped total).
+    pub total: usize,
+    /// The first titles in capture order: every one of them when the session
+    /// holds at most `head + tail` prompts, else the first `head`.
+    pub first: Vec<String>,
+    /// The last `tail` titles in capture order, only when the session holds
+    /// more than `head + tail` prompts.
+    pub last: Vec<String>,
 }
 
 /// What a page prints about one observation, without the body.
@@ -12413,8 +12550,9 @@ pub const SUBSTANTIVE_OBSERVATION_KIND_SQL: &str =
 
 impl SessionObservationSnapshot<'_> {
     /// Rows this snapshot has deserialized into an [`Observation`] or a
-    /// [`SessionLine`] so far. Aggregates and the prompt-title projection are
-    /// not counted: they return counters and strings, not rows.
+    /// [`SessionLine`] so far. Aggregates and the prompt-title queries (the
+    /// bounded list and the one-row-at-a-time title walk) are not counted:
+    /// they return counters and short strings, not rows.
     #[must_use]
     pub fn rows_read(&self) -> usize {
         self.rows_read.get()
@@ -12464,6 +12602,25 @@ impl SessionObservationSnapshot<'_> {
         Ok(summary)
     }
 
+    /// Row count and the session's first and last `created_at` in one
+    /// aggregate pass, without reading a row.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn projection_totals(&self) -> StoreResult<ObservationProjectionTotals> {
+        let (total, first, last): (i64, Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT COUNT(*), MIN(created_at), MAX(created_at) \
+             FROM observations WHERE session_id = ?1",
+            params![self.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(ObservationProjectionTotals {
+            total: usize::try_from(total).unwrap_or(usize::MAX),
+            first_created_at: first,
+            last_created_at: last,
+        })
+    }
+
     /// The tool names the session used, grouped in SQL.
     ///
     /// # Errors
@@ -12502,46 +12659,106 @@ impl SessionObservationSnapshot<'_> {
         Ok(out)
     }
 
-    /// Every user prompt's title in capture order.
+    /// The prompt titles a page lists, with the session's true prompt count.
     ///
-    /// `visit` sees each prompt in that order, with its body only when the
-    /// title contains `body_for_titles_like` (a superset the caller filters
-    /// exactly), until it returns `false`; later prompts contribute their
-    /// title alone. At most one body is resident at a time, so a session full
-    /// of subagent preambles costs one body, not all of them.
-    ///
-    /// The titles are the one part of a SessionEnd that grows with the
-    /// session: the page it renders lists each of them, so the output cannot
-    /// be smaller than this. A title is short by construction (the router
-    /// truncates it for display); the bodies, which are not, stay in the
-    /// database.
+    /// A page prints at most the first `head` and the last `tail` titles, so
+    /// this reads at most `head + tail` titles plus one `COUNT(*)`, whatever
+    /// the session holds. Titles are short by construction (the router
+    /// truncates them for display).
     ///
     /// # Errors
     /// Propagates any SQL error.
-    pub fn prompt_titles(
+    pub fn prompt_titles(&self, head: usize, tail: usize) -> StoreResult<SessionPromptTitles> {
+        let total = self.conn.query_row(
+            "SELECT COUNT(*) FROM observations \
+             WHERE session_id = ?1 AND kind = ?2",
+            params![self.session_id, ObservationKind::UserPrompt.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let total = usize::try_from(total).unwrap_or(usize::MAX);
+        if total <= head + tail {
+            return Ok(SessionPromptTitles {
+                total,
+                first: self.prompt_title_window(total, ObservationOrder::Asc)?,
+                last: Vec::new(),
+            });
+        }
+        let mut last = self.prompt_title_window(tail, ObservationOrder::Desc)?;
+        last.reverse();
+        Ok(SessionPromptTitles {
+            total,
+            first: self.prompt_title_window(head, ObservationOrder::Asc)?,
+            last,
+        })
+    }
+
+    /// The first `limit` user-prompt titles of the session in `order`.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    fn prompt_title_window(
+        &self,
+        limit: usize,
+        order: ObservationOrder,
+    ) -> StoreResult<Vec<String>> {
+        let direction = match order {
+            ObservationOrder::Asc => "ASC",
+            ObservationOrder::Desc => "DESC",
+        };
+        let sql = format!(
+            "SELECT title FROM observations \
+             WHERE session_id = ?1 AND kind = ?2 \
+             ORDER BY created_at {direction}, rowid {direction} LIMIT ?3"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                self.session_id,
+                ObservationKind::UserPrompt.as_str(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| row.get(0),
+        )?;
+        let mut out = Vec::with_capacity(limit);
+        for title in rows {
+            out.push(title?);
+        }
+        Ok(out)
+    }
+
+    /// Walk the session's user prompts in capture order, one resident at a
+    /// time, feeding `visit` each title and, only when the title contains
+    /// `body_for_titles_like`, the prompt's body. The walk stops at the first
+    /// `false`, so a caller that settles the page title reads bodies no
+    /// further than the prompt that named it: a session full of subagent
+    /// preambles costs the bodies up to the first usable one, not all of
+    /// them, and one row is resident at a time no matter how long it is.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn scan_prompts(
         &self,
         body_for_titles_like: &str,
         mut visit: impl FnMut(&str, Option<&str>) -> bool,
-    ) -> StoreResult<Vec<String>> {
+    ) -> StoreResult<()> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END              FROM observations              WHERE session_id = ?1 AND kind = ?2              ORDER BY created_at ASC, rowid ASC",
+            "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END \
+             FROM observations WHERE session_id = ?1 AND kind = ?2 \
+             ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query(params![
             self.session_id,
             ObservationKind::UserPrompt.as_str(),
             body_for_titles_like,
         ])?;
-        let mut titles = Vec::new();
-        let mut visiting = true;
         while let Some(row) = rows.next()? {
             let title: String = row.get(0)?;
-            if visiting {
-                let body: Option<String> = row.get(1)?;
-                visiting = visit(&title, body.as_deref());
+            let body: Option<String> = row.get(1)?;
+            if !visit(&title, body.as_deref()) {
+                break;
             }
-            titles.push(title);
         }
-        Ok(titles)
+        Ok(())
     }
 
     /// The first `limit` rows of the session, oldest first, as page lines.
@@ -12654,20 +12871,90 @@ impl SessionObservationSnapshot<'_> {
         }
         Ok(None)
     }
+
+    /// Walk the session's rows in capture order (`created_at`, then `rowid`),
+    /// one resident at a time, giving `visit` each row's `rowid` beside the
+    /// materialised [`Observation`].
+    ///
+    /// A caller that wants more than one row back from a streamed pass keeps
+    /// the `rowid`s it liked here and re-reads those rows with
+    /// [`Self::row_by_rowid`]: one indexed point fetch per kept row instead
+    /// of a second full walk.
+    ///
+    /// `visit` returning `false` stops the walk early, so a caller that
+    /// needs only the first matching row does not pay for the rest. Like
+    /// [`Self::scan`], this keeps a single row in memory whatever the
+    /// session holds.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn each_row_with_rowid(
+        &self,
+        mut visit: impl FnMut(i64, &Observation) -> bool,
+    ) -> StoreResult<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rowid, id, session_id, workspace_id, project_id, kind, extension, \
+                    source_event, title, body, importance, created_at \
+             FROM observations WHERE session_id = ?1 \
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let mut rows = stmt.query(params![self.session_id])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let observation = row_to_observation_at(row, 1)??;
+            self.rows_read.set(self.rows_read.get() + 1);
+            if !visit(rowid, &observation) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialise one row of the session by its `rowid` — the point fetch a
+    /// streamed pass uses to re-read a body it chose to keep. One row, or
+    /// none when the `rowid` belongs to another session or is gone.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn row_by_rowid(&self, rowid: i64) -> StoreResult<Option<Observation>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                    title, body, importance, created_at \
+             FROM observations WHERE session_id = ?1 AND rowid = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.session_id, rowid])?;
+        match rows.next()? {
+            Some(row) => {
+                let observation = row_to_observation(row)??;
+                self.rows_read.set(self.rows_read.get() + 1);
+                Ok(Some(observation))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Observation>> {
-    let id_bytes: Vec<u8> = row.get(0)?;
-    let session_bytes: Vec<u8> = row.get(1)?;
-    let workspace_bytes: Vec<u8> = row.get(2)?;
-    let project_bytes: Vec<u8> = row.get(3)?;
-    let kind_str: String = row.get(4)?;
-    let extension: Option<String> = row.get(5)?;
-    let source_event: Option<String> = row.get(6)?;
-    let title: String = row.get(7)?;
-    let body: String = row.get(8)?;
-    let importance: i64 = row.get(9)?;
-    let created_us: i64 = row.get(10)?;
+    row_to_observation_at(row, 0)
+}
+
+/// [`row_to_observation`] with its columns shifted by `base` — the snapshot
+/// streams whose `SELECT` leads with `rowid`.
+fn row_to_observation_at(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> rusqlite::Result<StoreResult<Observation>> {
+    let id_bytes: Vec<u8> = row.get(base)?;
+    let session_bytes: Vec<u8> = row.get(base + 1)?;
+    let workspace_bytes: Vec<u8> = row.get(base + 2)?;
+    let project_bytes: Vec<u8> = row.get(base + 3)?;
+    let kind_str: String = row.get(base + 4)?;
+    let extension: Option<String> = row.get(base + 5)?;
+    let source_event: Option<String> = row.get(base + 6)?;
+    let title: String = row.get(base + 7)?;
+    let body: String = row.get(base + 8)?;
+    let importance: i64 = row.get(base + 9)?;
+    let created_us: i64 = row.get(base + 10)?;
     Ok(materialise_observation(
         id_bytes,
         session_bytes,

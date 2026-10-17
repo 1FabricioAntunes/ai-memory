@@ -17,8 +17,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
 /// A temp root holding the operator's home and a directory of fake tools.
 struct Sandbox {
     _tmp: tempfile::TempDir,
-    // Only the Linux service test reads it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     root: PathBuf,
     home: PathBuf,
 }
@@ -171,6 +169,104 @@ fn setup_plan_json_prints_the_plan_and_changes_nothing() {
         assert!(!refused.status.success(), "{args:?}: {}", text(&refused));
     }
     assert_eq!(sandbox.snapshot(), before, "a refused setup wrote");
+}
+
+/// The generic `opencode` agent, named or found by the session store both
+/// majors share, is wired in the major `opencode --version` reports: OpenCode
+/// 2 gets the `{ id, setup }` plugin and the nested `mcp.servers` entry, not
+/// the V1 function plugin and direct `mcp` entry. No server answers here, so
+/// each run still exits non-zero on its self-check.
+#[test]
+fn setup_wires_the_opencode_major_the_version_probe_reports() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for (version, named, plugin, stale, v2) in [
+        (
+            "2.0.31",
+            true,
+            "ai-memory-opencode2.ts",
+            "ai-memory.ts",
+            true,
+        ),
+        (
+            "2.0.31",
+            false,
+            "ai-memory-opencode2.ts",
+            "ai-memory.ts",
+            true,
+        ),
+        (
+            "1.18.34",
+            true,
+            "ai-memory.ts",
+            "ai-memory-opencode2.ts",
+            false,
+        ),
+    ] {
+        let sandbox = Sandbox::new();
+        let bin = sandbox.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        std::fs::write(&opencode, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+        std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(sandbox.home.join(".local/share/opencode")).unwrap();
+        let mut cmd = sandbox.cmd(Some(crate::e2e_support::free_port()));
+        cmd.env("PATH", &bin)
+            .args(["setup", "--yes", "--no-service"]);
+        if named {
+            cmd.args(["--agent", "opencode"]);
+        }
+        let out = cmd.output().unwrap();
+        let case = format!("{version} named={named}\n{}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("== open-code"),
+            "{case}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("problem: open-code"),
+            "{case}"
+        );
+
+        let config = sandbox.home.join(".config/opencode");
+        assert!(config.join("plugins").join(plugin).is_file(), "{case}");
+        assert!(!config.join("plugins").join(stale).exists(), "{case}");
+        let mcp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.join("opencode.json")).unwrap()).unwrap();
+        assert_eq!(
+            mcp["mcp"]["servers"]["ai-memory"].is_object(),
+            v2,
+            "{case}\n{mcp}"
+        );
+        assert_eq!(mcp["mcp"]["ai-memory"].is_object(), !v2, "{case}\n{mcp}");
+    }
+}
+
+/// With no `opencode` to probe, setup does not guess a major: it writes no
+/// OpenCode plugin or MCP entry and names the problem.
+#[test]
+fn setup_without_an_opencode_to_probe_writes_no_opencode_wiring() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.root.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = sandbox
+        .cmd(Some(crate::e2e_support::free_port()))
+        .env("PATH", &empty)
+        .args(["setup", "--yes", "--no-service", "--agent", "opencode"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("problem: open-code: skipped install-mcp and install-hooks")
+            && stderr.contains("was not found"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !sandbox.home.join(".config/opencode").exists(),
+        "{}",
+        text(&out)
+    );
 }
 
 /// `setup --web` through the binary: the printed address serves the page and

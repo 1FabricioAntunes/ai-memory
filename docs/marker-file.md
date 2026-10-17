@@ -181,7 +181,7 @@ inject_on_session_start = "true"
 # frontmatter `abstract:` or `summary:`, else the prose it opens with); what is
 # left deepens pages to longer excerpts and then whole bodies, pinned and
 # `_slots/` pages first, then the cheapest bodies. A body is shown whole or
-# not at all.
+# not at all, and a body shorter than its excerpt is always shown whole.
 # Four or more unpinned excerpts from one folder (`_rules/`, `gotchas/`,
 # `decisions/`, `procedures/`) share a heading. Pages the budget cannot
 # cover are listed by path so the agent can `memory_read_page` them,

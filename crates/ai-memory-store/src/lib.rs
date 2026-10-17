@@ -88,18 +88,18 @@ pub use reader::{
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
     GraphVia, HealthDetail, HealthPage, HybridSearch, IdleOpenSession, InboxCount, InboxEntry,
-    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
-    OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter, PageHit,
-    PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
-    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
-    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
-    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
-    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
-    SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionSummary, SessionToolTitles, SettledPage, StatusCounts, StorageStatus, StoredEmbedding,
-    StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow, WorkspaceSummary,
-    f32_vec_to_bytes,
+    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult,
+    ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
+    PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter, PageHit, PageHitWithMeta, PageLinks,
+    PageLinksPreview, PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
+    ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
+    ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
+    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, SESSION_LINE_TITLE_CHARS,
+    SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain, SessionConsolidationQueue,
+    SessionConsolidationSummary, SessionDependentRows, SessionEndDisposition, SessionKindSummary,
+    SessionLine, SessionObservationSnapshot, SessionPromptTitles, SessionSummary,
+    SessionToolTitles, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    StreamTimings, VectorQuery, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -1043,6 +1043,7 @@ mod tests {
                 project_id: proj,
                 proposal_id: id,
                 reason: "admission denied".into(),
+                record_rejection: true,
                 actor: actor.clone(),
                 author_id: None,
             })
@@ -1072,12 +1073,70 @@ mod tests {
                     project_id: proj,
                     proposal_id: id,
                     reason: "again".into(),
+                    record_rejection: true,
                     actor,
                     author_id: None,
                 })
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_fail_without_rejection_leaves_rejections_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/outage.md",
+                    AutoImproveProposalOperation::Create,
+                    "outage",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        store
+            .writer
+            .fail_auto_improve_proposal(FailAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: id,
+                reason: "admission webhook policy request failed".into(),
+                record_rejection: false,
+                actor: ActorContext::default(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Failed);
+        assert_eq!(detail.events.last().unwrap().event, "failed");
+        let rejections = store
+            .reader
+            .recent_auto_improve_rejections(ws, proj, 10, None)
+            .await
+            .unwrap();
+        assert!(rejections.is_empty(), "{rejections:?}");
     }
 
     #[tokio::test]
@@ -1202,6 +1261,7 @@ mod tests {
                 project_id: proj,
                 proposal_id: failed_id,
                 reason: "admission denied".into(),
+                record_rejection: true,
                 actor: actor.clone(),
                 author_id: None,
             })
@@ -4854,6 +4914,55 @@ mod tests {
         let paths: Vec<&str> = pages.iter().map(|p| p.path.as_str()).collect();
         assert!(paths.contains(&"x.md"));
         assert!(paths.contains(&"y.md"));
+    }
+
+    #[tokio::test]
+    async fn reader_list_unexpired_pages_hides_only_the_expired_ones() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        let at = |seconds: i64| Some(jiff::Timestamp::from_second(seconds).unwrap());
+        for (path, expires_at) in [
+            ("expired.md", at(now - 60)),
+            ("future.md", at(now + 3_600)),
+            ("live.md", None),
+        ] {
+            let mut page = sample_page(ws, proj, path, "body");
+            page.expires_at = expires_at;
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let paths = |pages: Vec<PageSummary>| -> Vec<String> {
+            pages.into_iter().map(|p| p.path).collect()
+        };
+        // The full listing keeps the expired page for the callers that
+        // copy or audit every current page.
+        assert_eq!(
+            paths(store.reader.list_pages("default", "scratch").await.unwrap()),
+            ["expired.md", "future.md", "live.md"]
+        );
+        // The reader-facing listing drops it, and only it: a TTL still
+        // ahead and no TTL at all both stay.
+        assert_eq!(
+            paths(
+                store
+                    .reader
+                    .list_unexpired_pages("default", "scratch")
+                    .await
+                    .unwrap()
+            ),
+            ["future.md", "live.md"]
+        );
     }
 
     #[tokio::test]

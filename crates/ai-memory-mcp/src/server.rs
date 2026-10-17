@@ -4706,7 +4706,9 @@ impl AiMemoryServer {
         this when the user asks to read, open, or show a specific page by \
         name or topic — not just snippets. Returns `{ path, title, body, \
         frontmatter }` (plus `served_from` when a missing markdown file is \
-        served from the DB fallback). \
+        served from the DB fallback, and `expired: true` when the page's \
+        `expires_at` TTL has passed: an exact-path read still returns such a \
+        page, which `memory_query` and `memory_recent` no longer surface). \
         \
         Set `include_related: true` to also walk the link graph outward from \
         this page and get a `related` array of the reachable pages, each with \
@@ -4787,8 +4789,8 @@ impl AiMemoryServer {
         //
         // Opt-in related-pages walk. Computed once against the resolved scope so
         // both the disk and DB-fallback branches attach the same `related`
-        // block; default off → `attach_related` is a no-op and the response
-        // stays byte-identical to a plain single-page read.
+        // block; default off → `annotate` adds nothing and the response stays
+        // byte-identical to a plain single-page read.
         let related = if args.include_related {
             let depth = args.related_depth.unwrap_or(1);
             Some(
@@ -4806,12 +4808,27 @@ impl AiMemoryServer {
         } else {
             None
         };
-        let attach_related = |mut value: serde_json::Value| {
-            if let (Some(nodes), Some(map)) = (&related, value.as_object_mut()) {
-                map.insert(
-                    "related".into(),
-                    serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
-                );
+        // An expired page is still returned (an explicit read is not a search)
+        // but says so: `memory_query`, `memory_recent` and the briefing hide
+        // it, so this flag is how a caller learns the page is only waiting for
+        // the forget sweep. Omitted while the page is live.
+        let expired = self
+            .reader
+            .page_expired_by_ids(ws, proj, page_path.as_str())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .unwrap_or(false);
+        let annotate = |mut value: serde_json::Value| {
+            if let Some(map) = value.as_object_mut() {
+                if let Some(nodes) = &related {
+                    map.insert(
+                        "related".into(),
+                        serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                if expired {
+                    map.insert("expired".into(), serde_json::Value::Bool(true));
+                }
             }
             value
         };
@@ -4846,7 +4863,7 @@ impl AiMemoryServer {
                 // frontmatter title was never filled otherwise read back
                 // titleless despite a proper `# Heading` (#599).
                 let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
-                ok_json(&attach_related(serde_json::json!({
+                ok_json(&annotate(serde_json::json!({
                     "path": page_path.to_string(),
                     "page_id": page_id.map(|id| id.to_string()),
                     "title": title,
@@ -4870,7 +4887,7 @@ impl AiMemoryServer {
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .or(Some(stored.title));
-                        ok_json(&attach_related(serde_json::json!({
+                        ok_json(&annotate(serde_json::json!({
                             "path": page_path.to_string(),
                             "page_id": page_id.map(|id| id.to_string()),
                             "title": title,
@@ -12753,6 +12770,92 @@ mod tests {
             text.contains("db-fallback"),
             "expected fallback diagnostic; got {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_marks_an_expired_page() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        for (path, expires_at) in [
+            ("notes/expired.md", "2000-01-01"),
+            ("notes/future.md", "2999-01-01"),
+        ] {
+            wiki.write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(path).unwrap(),
+                frontmatter: serde_json::json!({"title": "Dated", "expires_at": expires_at}),
+                body: "dated body".to_string(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Dated".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+        // The DB-fallback branch annotates too: an expired row with no
+        // markdown file behind it.
+        let a_minute_ago = jiff::Timestamp::now().as_second() - 60;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/db-only-expired.md").unwrap(),
+                title: "DB Only Expired".into(),
+                body: "fallback body".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"title": "DB Only Expired"}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: Some(jiff::Timestamp::from_second(a_minute_ago).unwrap()),
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let server = server.with_wiki(wiki);
+        for (path, expired) in [
+            ("notes/expired.md", true),
+            ("notes/future.md", false),
+            ("notes/db-only-expired.md", true),
+        ] {
+            let result = server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some(path.into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            // The page is still returned, and the flag appears only once the
+            // TTL has passed: a live page's response keeps its exact shape.
+            assert_eq!(json["path"], path, "{text}");
+            assert_eq!(
+                json.get("expired").and_then(serde_json::Value::as_bool),
+                expired.then_some(true),
+                "{path}: {text}"
+            );
+        }
     }
 
     #[tokio::test]

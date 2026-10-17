@@ -562,7 +562,10 @@ first call" policy after coverage without eating the recent share.
 
 1. **L0 coverage.** Walk `core` in store order (`pinned DESC, path ASC`).
    For each page, compute L0 text. If `l0` is `None`, the candidate is
-   a TitleOnly path line. Greedy-fit against
+   a TitleOnly path line. A non-empty body that costs less than its L0
+   (a frontmatter `abstract:` or `summary:` can be longer than the body
+   it describes) is covered at L2 instead, at its own cost (#1360).
+   Greedy-fit against
    `l0_ceiling = content_ceiling - recent_cap - count_only_floor`
    (a candidate fits when `l0_spent + cost(candidate) <= l0_ceiling`).
    If the candidate does not fit, stop. Every later page is `Omitted`.
@@ -584,7 +587,9 @@ first call" policy after coverage without eating the recent share.
 3. **Privileged L2.** For included privileged pages, in order: upgrade
    to full `body.trim()` only when the *entire* L2 fits. Do not
    truncate an L2 in this pass. Truncation of one body is what starves
-   later pages today. If L2 does not fit, the page stays at L1.
+   later pages today. If L2 does not fit, the page stays at L1. A body
+   cheaper than the L1 the page shows always fits: the swap is free and
+   its saving returns to the remainder. This holds in (5) and (6) too.
 4. **Unprivileged L1.** Same as (2) for the remaining included pages.
 5. **Short bodies.** In store order, complete any unprivileged page whose
    whole body is at most `SHORT_BODY_SLACK` (128) bytes more than what it

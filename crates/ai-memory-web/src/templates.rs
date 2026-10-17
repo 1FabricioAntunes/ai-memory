@@ -360,6 +360,10 @@ pub(crate) struct PageView {
     pub tier: String,
     /// Whether the page is pinned.
     pub pinned: bool,
+    /// Whether the page's `expires_at` TTL has passed. Search and the
+    /// listings already leave such a page out; its own URL still opens it,
+    /// so the view says so.
+    pub expired: bool,
     /// Humanised updated timestamp.
     pub updated_relative: String,
     /// Humanised created timestamp.

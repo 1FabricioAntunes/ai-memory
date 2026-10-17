@@ -475,9 +475,18 @@ On a real harness switch, the receiving managed agent is told to consult
 portable packet lacks a detail. The variable names a private temporary
 Markdown projection created from the previous harness's checkout-validated,
 read-only adapter; the file disappears when the managed child exits. It is
-local to the launcher machine. A switch on another machine still gets the
-server's portable ledger and handoff, but cannot read a native transcript that
-exists only on the first machine.
+local to the launcher machine. This covers quota exhaustion and other abrupt
+exits where the old harness cannot write a handoff: refreshed ai-memory routing
+also tells the new agent that "continue", "resume", and "pick up where we left
+off" mean to read that file first when the three managed-run variables are
+present. A switch on another machine still gets the server's portable ledger
+and handoff, but cannot read a native transcript that exists only on the first
+machine.
+
+If that variable is absent on a real same-machine switch, run
+`type -a ai-memory` and `ai-memory --version` in the launching shell. This path
+requires the 3.1.0 or newer host client; a stale Cargo or package-manager binary
+earlier in `PATH` can shadow an updated wrapper.
 
 In `resume`, type to search, use Up/Down to select a workstream, and Left/Right
 to choose its harness. Enter launches the selection; Escape clears a search,

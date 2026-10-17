@@ -158,9 +158,14 @@ runs, in order, the commands a native install otherwise needs one by one:
    says what it was found by (its session store, its MCP config, or for Muse
    its directory), then lists the other agents `--agent` accepts. Cursor,
    Gemini CLI, Droid and the other agents with no store to look for are
-   wired by naming them. OpenCode 2 and the Kiro CLI v3 engine share a store
-   with OpenCode and Kiro CLI, so they are wired only when named, for example
-   `--agent opencode2`.
+   wired by naming them. OpenCode 1 and 2 share one session store, so a
+   detected or named `opencode` runs `opencode --version` once and wires the
+   plugin and MCP entry for the major it reports, as `install-mcp --client
+   opencode` and `install-hooks --agent opencode` do by hand. When that probe
+   fails (no `opencode` on `PATH`, a timeout, or unreadable output), `setup`
+   writes no OpenCode plugin or MCP entry and reports the problem; `--agent
+   opencode2` forces V2 without probing. The Kiro CLI v3 engine shares a
+   store with Kiro CLI, so it is wired only when named.
 4. A self-check that writes nothing: `GET /healthz`, a `memory_status` call
    over MCP with the install's credential, and `doctor`. When Codex was wired,
    `setup` also asks Codex whether it will run the ai-memory hooks. If Codex
@@ -816,6 +821,12 @@ ai-memory auth login oidc-device \
   --issuer "https://issuer.example.com/realms/team" \
   --client-id "ai-memory-cli"
 ```
+
+The issuer, and the device and token endpoints its discovery document lists,
+must use `https`. Plain `http` is accepted only on `localhost`, `127.0.0.1`
+and `::1`, for a local test issuer. Authentication requests do not follow
+redirects, and refresh revalidates the token endpoint stored by older releases
+before sending a refresh token.
 
 The stored OIDC access token is also used by thin-client HTTP commands
 (`status`, `search`, `read-page`, `write-page`, `backup`, `embed`, and

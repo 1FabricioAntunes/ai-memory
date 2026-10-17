@@ -75,6 +75,174 @@ version in [`docs/changelog/`](docs/changelog/):
   preserve the same roots, including the shared project `.agents/skills`.
   (#1357)
 
+### Fixed
+- Fixed native hook events getting stranded forever when a harness killed the
+  process after the spool file was synced but before its atomic rename. A later
+  drain adopts complete, valid `*.json.tmp` entries after a five-minute grace
+  period and removes malformed old remnants. Claude Code settings installs now
+  give `SessionEnd` a 15-second timeout instead of its 1.5-second default budget;
+  plugin hooks rely on recovery because Claude does not let plugin timeouts
+  raise that budget. (#1377)
+- Hardened OIDC credential transport after CodeQL alert #176: the shared
+  refresh-grant sink now requires a typed TLS-or-loopback endpoint, and device
+  authorization and token polling revalidate their endpoints immediately
+  before each request. A caller-mutated discovery object can no longer bypass
+  the login-time HTTPS check.
+- On Windows, `setup` now starts the logon host with a plain executable path,
+  and the host passes plain drive/UNC data-directory and config arguments to the
+  supervisor and server it launches, instead of the `\\?\` verbatim prefix a
+  canonical path carries. The `Run` value was already plain (3.1.0); this covers
+  the command lines built from `current_exe()` and the canonical data dir. This
+  path cleanup does not by itself resolve Bitdefender's behavioral detection.
+  (#1280)
+- Fixed an explicit `llm_base_url` (or `AI_MEMORY_LLM_BASE_URL`) being dropped
+  for the `anthropic` and `openai` providers. Config resolved the override for
+  every provider, as documented, but the provider factory never applied it to
+  those two, so requests and the API key went straight to api.anthropic.com or
+  api.openai.com with nothing in the log. A gateway or reverse proxy set in front
+  of either vendor now receives the traffic. The docs now name the backends that
+  take no override: the ChatGPT backend behind `openai-oauth` and `codex`, and
+  `cursor`'s CLI. (#1347)
+- Corrected the `ExtractionState::NotApplicable` documentation and aligned the
+  generated OpenCode capture policy with the native evaluator: only an active
+  policy dropping a search/list tool reports `not-applicable`; an invalid
+  policy reports `extracted`. `ai-memory hook --check-capture` also uses
+  `not-applicable` when no policy was evaluated. (#1352)
+- `ai-memory auth login openai-oauth` and `auth login copilot` no longer print
+  a failed endpoint's whole response body. Error bodies are bounded, scrubbed
+  of secrets and terminal control sequences, then capped for display; provider
+  errors, including OIDC login and refresh, use the same ordering so a secret
+  at the display boundary is still redacted. (#1359)
+- Fixed OIDC device login and refresh sending credential-bearing requests to
+  non-TLS endpoints. Issuers and advertised or persisted device/token endpoints
+  must now use `https` outside loopback, and authentication requests do not
+  follow redirects. Plain `http` remains available for local test issuers on
+  `localhost`, `127.0.0.1` and `::1`. (#1354)
+- Fixed `install-instructions` printing a false "Claude Code reads <file> instead
+  of AGENTS.md" note when `$HOME` is reached through a symlink. The home
+  `.claude/CLAUDE.md` skip now compares with the same canonicalising
+  `paths_match` helper the import check uses, so a symlinked home matches its
+  resolved path. (#1345)
+- Corrected stale claims in `docs/comparison.md` and `docs/competitive-parity.md`
+  that said Windows has no service step and the Windows install is experimental.
+  The 3.1 `install.ps1` + `setup` Windows service step is shipped production,
+  not experimental; the "3.0 (unreleased)" observation-stream note is corrected
+  to reflect the released 3.0 line. (#1271)
+- Made the executable auto-improvement eval policy server-owned. Manual CLI and
+  HTTP reviews now use `[auto_improve.eval]` from the server process, and legacy
+  requests that try to supply an `eval` object fail closed with an upgrade
+  message.
+- Made managed cross-harness continuation survive quota exhaustion without a
+  voluntary handoff. The startup packet now places its server-authored resume
+  directive outside the untrusted transcript fence, and refreshed
+  `CLAUDE.md` / `AGENTS.md` routing tells an incoming agent that "continue",
+  "resume", and "pick up where we left off" must consult the private
+  `AI_MEMORY_PREVIOUS_SESSION_HISTORY` dossier when the managed-run variables
+  are present. The dossier remains untrusted evidence and stays local to the
+  launcher machine.
+- Fixed unbounded memory use in consolidation and auto-improve for long
+  sessions: both paths now read a bounded projection of the session's
+  observations instead of loading every row, keeping the LLM input
+  byte-identical. Sessions with no observations in the consolidator's target
+  scope (purged or foreign) are refused before any work, exactly as empty
+  sessions were before. (#1363)
+- Fixed the session page's uncapped `## Prompts` list. Above 500 prompts the
+  page now lists the first 250 titles and the last 250, numbered by their real
+  position, with one line between them saying how many were left out. The
+  store reads at most 500 titles for it, and the page's prompt count and the
+  digest stats still report the true total. (#1349)
+- Fixed auto-improve approvals that failed because a `reject`-policy admission
+  webhook was unreachable, timed out, rate-limited or answered 5xx being
+  stored as rejections. The proposal is still marked `failed`, but the outage
+  no longer enters the rejection buffer, so later reviews are not told to
+  avoid a proposal nobody refused and rejection telemetry counts only real
+  refusals. (#1358)
+- Fixed consolidation persisting non-page `relations:` targets in YAML
+  frontmatter on disk. Raw titles containing dots, directory paths, or stemless
+  `.md` strings in `relations:` were previously written into frontmatter and
+  retained by `prune_relations` when `extract_relation_links` returned an empty
+  list, causing the wiki watcher to emit repeated warnings on every
+  reconciliation pass. Targets are now validated through `extract_relation_links`
+  before frontmatter assembly and during relation pruning. (#1353, #1366)
+- Consolidation now also drops well-shaped same-project `relations:` targets
+  that name no existing page. Relations among pages in the same atomic batch
+  remain valid, and ordinary same-project body wikilinks may still point to a
+  page that will be written later. (#1353)
+- Verified target latest status and expiration in
+  `ReaderPool::contradiction_edges`, so a contradiction pointing at a
+  tombstoned or expired page is reported as unresolved instead of active, and
+  expired source pages do not emit contradiction findings. (#1367)
+- Verified target latest status and expiration in
+  `ReaderPool::dangling_cross_project_links`, so cross-project links to
+  tombstoned or expired pages are reported as dangling instead of resolved,
+  and expired source pages do not emit dangling link findings. (#1368)
+- Fixed the `/web` project tree and its recent-activity list, the namespace
+  listing, and the `/api/v1` `pages` list and legacy `recent` array showing
+  pages whose `expires_at` TTL had passed, which search, `memory_recent`, the
+  incremental `recent` form and page history already hid. A project move and
+  the curator still see every current page, and an exact-path read of an
+  expired page still answers. (#1369)
+- Fixed `memory_read_page` returning a page whose `expires_at` TTL had passed
+  with nothing to say so. The TTL design keeps an exact-path read answering for
+  such a page while `memory_query`, `memory_recent` and the briefing hide it,
+  and promised the response would carry `expired: true`; the flag was never
+  written. The response now carries `expired: true` for an expired page, on
+  both the markdown and the DB-fallback branch, and is unchanged for a live
+  one. (#1371)
+- Fixed the `/web` page view showing a page whose `expires_at` TTL had passed
+  exactly like a live one, although search and the project listings leave such
+  a page out. The metadata row now carries an `expired` badge beside the tier
+  and kind; a live page renders as before. (#1372)
+- Fixed `GET /admin/read-page` and `ai-memory read-page` returning a page whose
+  `expires_at` TTL had passed with nothing to say so, although `search` no
+  longer lists such a page. The response now carries `expired: true` for an
+  expired page, on both the markdown and the DB-fallback branch, and
+  `read-page` prints an `expired: true` line (the field also appears in
+  `--json`); a live page's output is unchanged. (#1373)
+- Fixed web wikilink rendering generating dead links for directory and stemless
+  targets. In markdown pages, wikilinks pointing to a directory (`[[notes/]]`) or
+  a stemless target (`[[notes/.md]]`, `[[.md]]`) were rewritten into invalid
+  page links that yielded 404 responses in the web browser. They now remain as
+  literal text, aligning web wikilink preprocessing with the wiki engine's link
+  extractor. (#1364)
+- `install-mcp` now writes the absolute path of the `ai-memory` binary as the
+  `command` of every stdio bridge entry (Claude Code's session-aware entry,
+  Muse Code and the session-less bridge of the other clients), as hook
+  commands already did. A client started without `~/.local/bin` on its `PATH`
+  no longer fails to spawn the bridge. The Docker wrapper keeps the bare
+  `ai-memory`, and existing entries with either form are still recognized.
+  (#1362)
+
+- Fixed the session-start brief hiding a page's body behind a longer
+  frontmatter excerpt. When a pinned, `_rules/` or `_slots/` page had a
+  `summary:` or `abstract:` longer than its body, the brief printed that
+  excerpt instead of the body, however much of `[briefing] max_chars` was
+  left, so a small wiki whose pages fit did not get every body whole. Such a
+  body now shows whole: it is priced at its own size when the brief decides
+  which pages fit, and the bytes it saves over the excerpt go to other pages.
+  A page with an empty body keeps its excerpt. (#1360)
+- Fixed `ai-memory setup` wiring OpenCode 2 with OpenCode 1 artifacts. A
+  named `--agent opencode` (or `open-code`), or an OpenCode found by the
+  session store both majors share, always got the V1 function plugin
+  `plugins/ai-memory.ts` and a direct `mcp.ai-memory` entry, which OpenCode
+  2 does not load. `setup` now runs `opencode --version` once, as
+  `install-mcp` and `install-hooks` already did for the generic spelling, and
+  wires the V2 `{ id, setup }` plugin and nested `mcp.servers` entry when it
+  reports major 2. A failed probe writes no OpenCode wiring and is reported
+  as a setup problem; `--agent opencode2` still forces V2 without probing.
+  (#1356)
+- Fixed `ai-memory mcp-bridge` exiting when a client sent `server/discover`
+  before `initialize`. A client that supports both the 2026-07-28 MCP revision
+  and the older `initialize` handshake, such as Antigravity CLI 1.4 and the
+  Antigravity 2.24 app, sends that probe first and falls back to `initialize`
+  when the server answers with an error. The bridge ended the session instead,
+  so the fallback found a closed pipe (`calling initialize: client is closing:
+  EOF`) and the client never connected. Until `initialize` arrives, the bridge
+  now answers every other request with a JSON-RPC Method not found error,
+  ignores notifications such as the client cancelling its probe, and still
+  answers `ping`. A client that starts with `initialize` sees no change.
+  (#1355)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added

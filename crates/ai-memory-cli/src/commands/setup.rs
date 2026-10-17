@@ -68,7 +68,8 @@ const PLAN_FORMAT: u32 = 1;
 /// cannot tell them apart: OpenCode 2 shares OpenCode's, and the Kiro CLI v3
 /// engine's store contains the v2 engine's. Wiring both would write two
 /// dialects into one config, so only the stable one is detected; the other is
-/// wired when named with `--agent`.
+/// wired when named with `--agent`. A detected OpenCode still gets the major
+/// its version probe reports ([`opencode_dialect`]).
 const EXPLICIT_ONLY: &[ManagedHarness] = &[ManagedHarness::OpenCode2, ManagedHarness::KiroV3];
 
 /// What `setup` will do.
@@ -186,13 +187,21 @@ fn skills_for(agent: AgentChoice) -> InstallSkillsAgent {
     }
 }
 
-/// The OpenCode major version an agent names outright, so neither installer
-/// probes `opencode --version` and picks one dialect for both.
-fn opencode_dialect(agent: AgentChoice) -> Option<OpenCodeDialect> {
+/// The OpenCode major version to wire, resolved once so both installers use
+/// the same dialect. The `opencode2` alias names V2 outright; the generic
+/// `opencode` (named, or detected by the session store both majors share)
+/// probes `opencode --version` the way `install-mcp` and `install-hooks` do
+/// by hand, and a failed probe is an error rather than a guess.
+fn opencode_dialect(
+    agent: AgentChoice,
+    env: &super::run::EffectiveChildEnv,
+) -> Result<Option<OpenCodeDialect>> {
     match agent {
-        AgentChoice::OpenCode => Some(OpenCodeDialect::V1),
-        AgentChoice::OpenCode2 => Some(OpenCodeDialect::V2),
-        _ => None,
+        AgentChoice::OpenCode => {
+            super::opencode_dialect::resolve_generic(None, env).map(|found| Some(found.dialect))
+        }
+        AgentChoice::OpenCode2 => Ok(Some(OpenCodeDialect::V2)),
+        _ => Ok(None),
     }
 }
 
@@ -957,7 +966,36 @@ fn wire_agent(
         );
         return problems;
     }
-    let dialect = opencode_dialect(plan.agent);
+    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    match opencode_dialect(plan.agent, &child_env) {
+        Ok(dialect) => wire_mcp_and_hooks(config, plan, dialect, &mut problems),
+        // A guessed major writes a plugin and MCP shape the installed OpenCode
+        // ignores without an error, so nothing is written instead.
+        Err(error) => problems.push(format!("skipped install-mcp and install-hooks: {error:#}")),
+    }
+    let skills_key = format!("{:?}", plan.skills);
+    if skills_done.insert(skills_key) {
+        let args = InstallSkillsArgs {
+            scope: InstallSkillsScope::Global,
+            agent: plan.skills,
+            target_dir: None,
+            print: false,
+            force: false,
+        };
+        if let Err(error) = install_skills::run(config, args) {
+            problems.push(format!("install-skills: {error:#}"));
+        }
+    }
+    problems
+}
+
+/// `install-mcp` then `install-hooks` for one agent, in one OpenCode dialect.
+fn wire_mcp_and_hooks(
+    config: &Config,
+    plan: &AgentPlan,
+    dialect: Option<OpenCodeDialect>,
+    problems: &mut Vec<String>,
+) {
     if let Some(client) = plan.mcp {
         if install_mcp::existing_entry_is_session_aware(client, None, ENTRY_NAME) {
             println!("mcp: keeping the existing session-aware entry");
@@ -1001,20 +1039,6 @@ fn wire_agent(
     {
         problems.push(format!("install-hooks: {error:#}"));
     }
-    let skills_key = format!("{:?}", plan.skills);
-    if skills_done.insert(skills_key) {
-        let args = InstallSkillsArgs {
-            scope: InstallSkillsScope::Global,
-            agent: plan.skills,
-            target_dir: None,
-            print: false,
-            force: false,
-        };
-        if let Err(error) = install_skills::run(config, args) {
-            problems.push(format!("install-skills: {error:#}"));
-        }
-    }
-    problems
 }
 
 /// `/healthz`, `memory_status` over MCP, and `doctor`; none of them writes a
@@ -1557,6 +1581,42 @@ mod tests {
             skills_for(AgentChoice::KimiCode),
             InstallSkillsAgent::Agents
         );
+    }
+
+    /// Generic `opencode` takes the probed major; the `opencode2` alias and
+    /// other agents never run a probe, so an empty `PATH` cannot fail them.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_dialect_probes_only_the_generic_spelling() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let empty = super::super::run::EffectiveChildEnv::for_tests([("PATH", "")]);
+        assert_eq!(
+            opencode_dialect(AgentChoice::OpenCode2, &empty).unwrap(),
+            Some(OpenCodeDialect::V2)
+        );
+        assert_eq!(opencode_dialect(AgentChoice::Codex, &empty).unwrap(), None);
+        let error = format!(
+            "{:#}",
+            opencode_dialect(AgentChoice::OpenCode, &empty).unwrap_err()
+        );
+        assert!(error.contains("was not found"), "{error}");
+
+        for (version, expected) in [
+            ("2.0.31", OpenCodeDialect::V2),
+            ("1.18.34", OpenCodeDialect::V1),
+        ] {
+            let bin = tempfile::tempdir().unwrap();
+            let opencode = bin.path().join("opencode");
+            std::fs::write(&opencode, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+            std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let env = super::super::run::EffectiveChildEnv::for_tests([("PATH", bin.path())]);
+            assert_eq!(
+                opencode_dialect(AgentChoice::OpenCode, &env).unwrap(),
+                Some(expected),
+                "{version}"
+            );
+        }
     }
 
     #[test]

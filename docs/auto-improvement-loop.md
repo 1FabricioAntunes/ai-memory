@@ -235,7 +235,8 @@ timeouts, invalid JSON, `passed = false`, missing `passed`, or score deltas belo
 `min_delta` reject only that targeted proposal. Non-targeted proposals bypass the
 gate. If all proposals fail eval, the run is still staged with zero proposals and
 the rejected candidates so the rejection buffer can remember the failed attempt.
-Hooks never run the eval command. See
+The server owns this executable policy: neither the CLI nor a direct admin
+request can replace it. Hooks never run the eval command. See
 [`auto-improve-eval-gates.md`](auto-improve-eval-gates.md) for the full stdin /
 stdout contract and example scorer scripts.
 
@@ -414,7 +415,9 @@ imply each other.
 rejection-buffer summary included in future reviewer prompts. The buffer is
 scoped by `workspace_id` + `project_id` and stores human rejects, approval
 conflicts/failures, and validator/model rejected candidates when they carry a
-reason.
+reason. An approval that fails because a `reject`-policy admission webhook was
+unreachable, timed out, rate-limited or answered 5xx still marks the proposal
+`failed`, but is not stored: an outage says nothing about the proposal.
 
 ## Proposal Format
 
