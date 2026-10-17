@@ -817,6 +817,12 @@ ai-memory auth login oidc-device \
   --client-id "ai-memory-cli"
 ```
 
+The issuer, and the device and token endpoints its discovery document lists,
+must use `https`. Plain `http` is accepted only on `localhost`, `127.0.0.1`
+and `::1`, for a local test issuer. Authentication requests do not follow
+redirects, and refresh revalidates the token endpoint stored by older releases
+before sending a refresh token.
+
 The stored OIDC access token is also used by thin-client HTTP commands
 (`status`, `search`, `read-page`, `write-page`, `backup`, `embed`, and
 similar) when no static `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is

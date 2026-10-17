@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed OIDC device login and refresh sending credential-bearing requests to
+  non-TLS endpoints. Issuers and advertised or persisted device/token endpoints
+  must now use `https` outside loopback, and authentication requests do not
+  follow redirects. Plain `http` remains available for local test issuers on
+  `localhost`, `127.0.0.1` and `::1`. (#1354)
 - Fixed `install-instructions` printing a false "Claude Code reads <file> instead
   of AGENTS.md" note when `$HOME` is reached through a symlink. The home
   `.claude/CLAUDE.md` skip now compares with the same canonicalising

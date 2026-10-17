@@ -315,6 +315,10 @@ async fn run_copilot_device_flow(client_id: &str, timeout_secs: u64) -> Result<S
 
 fn auth_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        // Authentication requests can carry device codes, authorization codes,
+        // refresh tokens, or issued credentials. Do not let an IdP redirect
+        // those request bodies to a different URL or a TLS downgrade.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
         .user_agent(format!("ai-memory/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -556,5 +560,40 @@ mod tests {
     #[test]
     fn expiry_status_does_not_print_exact_token_time() {
         assert_eq!(format_duration_until(0), "expired");
+    }
+
+    #[tokio::test]
+    async fn auth_client_never_forwards_credentials_through_redirects() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/received", target.local_addr().unwrap());
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}/token", source.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let response = auth_http_client()
+            .unwrap()
+            .post(source_url)
+            .form(&[("device_code", "synthetic-secret")])
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "an authentication request body reached the redirect target"
+        );
     }
 }
