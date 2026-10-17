@@ -12,6 +12,14 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed an explicit `llm_base_url` (or `AI_MEMORY_LLM_BASE_URL`) being dropped
+  for the `anthropic` and `openai` providers. Config resolved the override for
+  every provider, as documented, but the provider factory never applied it to
+  those two, so requests and the API key went straight to api.anthropic.com or
+  api.openai.com with nothing in the log. A gateway or reverse proxy set in front
+  of either vendor now receives the traffic. The docs now name the backends that
+  take no override: the ChatGPT backend behind `openai-oauth` and `codex`, and
+  `cursor`'s CLI. (#1347)
 - Corrected the `ExtractionState::NotApplicable` documentation and aligned the
   generated OpenCode capture policy with the native evaluator: only an active
   policy dropping a search/list tool reports `not-applicable`; an invalid
