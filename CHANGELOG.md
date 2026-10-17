@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed `memory_read_page` returning a page whose `expires_at` TTL had passed
+  with nothing to say so. The TTL design keeps an exact-path read answering for
+  such a page while `memory_query`, `memory_recent` and the briefing hide it,
+  and promised the response would carry `expired: true`; the flag was never
+  written. The response now carries `expired: true` for an expired page, on
+  both the markdown and the DB-fallback branch, and is unchanged for a live
+  one.
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
