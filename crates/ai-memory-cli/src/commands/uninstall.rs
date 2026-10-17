@@ -607,7 +607,7 @@ fn skill_roots(
     copilot_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(12);
+    let mut roots = Vec::with_capacity(14);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
@@ -625,6 +625,9 @@ fn skill_roots(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
         push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
+        for root in super::install_skills::antigravity_global_skill_roots(home) {
+            push_unique_skill_root(&mut roots, root);
+        }
     }
     // Windows global Devin installs live under %APPDATA%\devin\skills, not
     // $HOME/.devin/skills — sweep it too or uninstall orphans those skills.
@@ -2106,8 +2109,9 @@ mod tests {
         let without = skill_roots(cwd, Some(home), None, None, None, None);
         assert_eq!(
             without.len(),
-            10,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × project+global)"
+            12,
+            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × \
+             project+global, plus Antigravity's two global roots)"
         );
         assert!(
             without.contains(&cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
@@ -2256,6 +2260,24 @@ mod tests {
             default_home.contains(&PathBuf::from("/home/alice/.copilot/skills")),
             "{default_home:?}"
         );
+    }
+
+    #[test]
+    fn skill_roots_sweep_both_antigravity_global_roots() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+        );
+        for root in [
+            "/home/alice/.gemini/config/skills",
+            "/home/alice/.gemini/antigravity-cli/skills",
+        ] {
+            assert!(roots.contains(&PathBuf::from(root)), "{root}: {roots:?}");
+        }
     }
 
     #[test]
