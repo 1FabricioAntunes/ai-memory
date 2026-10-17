@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed `existing_latest_paths` ignoring page TTL expiration. The query now
+  filters out expired pages against the current timestamp, preventing the
+  consolidation link guard from keeping wikilinks or typed relations targeting
+  expired pages that are pending forget-sweep deletion.
+
 ## [3.1.1] - 2026-10-17
 
 ### Fixed
