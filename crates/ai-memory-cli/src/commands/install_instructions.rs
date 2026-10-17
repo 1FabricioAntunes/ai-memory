@@ -194,7 +194,7 @@ fn claude_code_skips_agents_md(
     let mut found = Vec::new();
     for dir in cwd.ancestors() {
         for name in ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"] {
-            if name == ".claude/CLAUDE.md" && home == Some(dir) {
+            if name == ".claude/CLAUDE.md" && home.is_some_and(|h| paths_match(h, dir)) {
                 continue;
             }
             let candidate = dir.join(name);
