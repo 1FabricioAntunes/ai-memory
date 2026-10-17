@@ -12,6 +12,13 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed native hook events getting stranded forever when a harness killed the
+  process after the spool file was synced but before its atomic rename. A later
+  drain adopts complete, valid `*.json.tmp` entries after a five-minute grace
+  period and removes malformed old remnants. Claude Code settings installs now
+  give `SessionEnd` a 15-second timeout instead of its 1.5-second default budget;
+  plugin hooks rely on recovery because Claude does not let plugin timeouts
+  raise that budget. (#1377)
 - Hardened OIDC credential transport after CodeQL alert #176: the shared
   refresh-grant sink now requires a typed TLS-or-loopback endpoint, and device
   authorization and token polling revalidate their endpoints immediately
