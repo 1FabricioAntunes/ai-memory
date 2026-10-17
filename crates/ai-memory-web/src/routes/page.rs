@@ -142,6 +142,7 @@ pub(crate) async fn handler(
         kind: meta.kind,
         tier: meta.tier,
         pinned: meta.pinned,
+        expired: meta.expired,
         updated_relative: humanize(&meta.updated_at),
         created_relative: humanize(&meta.created_at),
         supersedes_path,
