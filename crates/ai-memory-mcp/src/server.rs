@@ -12747,6 +12747,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_read_page_marks_an_expired_page() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        for (path, expires_at) in [
+            ("notes/expired.md", "2000-01-01"),
+            ("notes/future.md", "2999-01-01"),
+        ] {
+            wiki.write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(path).unwrap(),
+                frontmatter: serde_json::json!({"title": "Dated", "expires_at": expires_at}),
+                body: "dated body".to_string(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Dated".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+        // The DB-fallback branch annotates too: an expired row with no
+        // markdown file behind it.
+        let a_minute_ago = jiff::Timestamp::now().as_second() - 60;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/db-only-expired.md").unwrap(),
+                title: "DB Only Expired".into(),
+                body: "fallback body".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"title": "DB Only Expired"}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: Some(jiff::Timestamp::from_second(a_minute_ago).unwrap()),
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let server = server.with_wiki(wiki);
+        for (path, expired) in [
+            ("notes/expired.md", true),
+            ("notes/future.md", false),
+            ("notes/db-only-expired.md", true),
+        ] {
+            let result = server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some(path.into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            // The page is still returned, and the flag appears only once the
+            // TTL has passed: a live page's response keeps its exact shape.
+            assert_eq!(json["path"], path, "{text}");
+            assert_eq!(
+                json.get("expired").and_then(serde_json::Value::as_bool),
+                expired.then_some(true),
+                "{path}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn memory_read_page_missing_error_names_the_scope() {
         let (tmp, store, server, _ws, _proj) = setup_server().await;
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
