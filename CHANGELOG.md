@@ -12,6 +12,14 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Added
+
+- Added `ai-memory recent` and `GET /admin/recent` to list the most recently
+  updated wiki pages, newest first. The listing is scoped to the current
+  project by default (cwd / marker, or `--workspace`/`--project`); `--global`
+  covers every project and labels each hit with its workspace and project.
+  Each hit carries an RFC 3339 `updated_at` instead of an FTS rank. The admin
+  route is root-only on a multi-user server, the same as `/admin/search`.
+  ([#1379](https://github.com/akitaonrails/ai-memory/pull/1379))
 - Added an explicit `serve --allow-insecure-human-auth` (or
   `AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) escape hatch for operators who
   knowingly run password login over plain HTTP on a private LAN.

@@ -3589,7 +3589,7 @@ update or downloads. If no client is installed yet, the wrapper says to run
 is not blocked. For local loopback
 servers, the wrapper automatically bridges
 that helper back to the host's `127.0.0.1:49374`, so `ai-memory status`,
-`ai-memory search`, and `ai-memory bootstrap` work with the same default
+`ai-memory search`, `ai-memory recent`, and `ai-memory bootstrap` work with the same default
 URL as the generated agent config.
 
 #### SELinux-enforcing hosts

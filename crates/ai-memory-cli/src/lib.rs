@@ -136,6 +136,7 @@ pub async fn run() -> Result<()> {
             commands::audit_contamination::run(&config, args).await
         }
         Command::Search(args) => commands::search::run(&config, args).await,
+        Command::Recent(args) => commands::recent::run(&config, args).await,
         Command::ReadPage(args) => commands::read_page::run(&config, args).await,
         Command::WritePage(args) => commands::write_page::run(&config, args).await,
         Command::DeletePage(args) => commands::delete_page::run(&config, args).await,

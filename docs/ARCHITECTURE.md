@@ -846,7 +846,7 @@ page content and scope names never reach it.
 init                        status               list-projects
 run                         show                 continue
 resume                      workstreams          rename-workstream
-workstream-search           audit-contamination  search
+workstream-search           audit-contamination  search recent
 read-page                   write-page           delete-page
 serve                       reset                backup
 restore                     reindex              install-hooks

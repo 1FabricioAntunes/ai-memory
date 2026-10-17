@@ -294,10 +294,11 @@ falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
 `[recall] default_global` applies to an agent's unscoped `memory_query` and
-`memory_recent` calls. The `ai-memory search` terminal command does not read
-it: that command stays scoped to the current project and searches every
-project only when you pass `--global` (see
-[usage.md](usage.md#search-from-the-terminal)).
+`memory_recent` calls. The `ai-memory search` and `ai-memory recent` terminal
+commands do not read it: those commands stay scoped to the current project
+and cover every project only when you pass `--global` (see
+[usage.md](usage.md#search-from-the-terminal) and
+[usage.md](usage.md#recent-pages-from-the-terminal)).
 
 `default_global` and `inject_on_session_start` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
