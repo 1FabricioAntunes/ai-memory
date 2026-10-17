@@ -28,6 +28,10 @@ struct PageContent {
     title: Option<String>,
     body: String,
     frontmatter: serde_json::Value,
+    /// Set by the server when the page's `expires_at` TTL has passed: the
+    /// exact-path read still answers, while `search` no longer lists the page.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
 }
 
 /// Run the `read-page` subcommand.
@@ -73,6 +77,9 @@ pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
             println!("# {title}");
         }
         println!("path: {}", page.path);
+        if page.expired {
+            println!("expired: true");
+        }
         println!();
         print!("{}", page.body);
         if !page.body.ends_with('\n') {
