@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Verified target latest status and expiration in
+  `ReaderPool::dangling_cross_project_links`, so cross-project links to
+  tombstoned or expired pages are reported as dangling instead of resolved,
+  and expired source pages do not emit dangling link findings.
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
