@@ -383,15 +383,17 @@ impl Consolidator {
         // so the write cannot mint a dangling cross-project edge the lint
         // pass would flag.
         let mut frontmatter = build_frontmatter(&page, session_id, agent_kind);
-        let unresolved = crate::link_guard::unresolved_cross_scope_links(
+        let unresolved = crate::link_guard::unresolved_generated_links(
             &self.reader,
             ws,
+            proj,
             &[(&path, page.body_markdown.as_str(), &frontmatter)],
         )
         .await?;
         page.body_markdown =
-            crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved).into_owned();
-        crate::link_guard::prune_relations(&mut frontmatter, &unresolved);
+            crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved.body)
+                .into_owned();
+        crate::link_guard::prune_relations(&mut frontmatter, &unresolved.relations);
         let id = self
             .wiki
             .write_page(WritePageRequest {
@@ -941,15 +943,16 @@ impl Consolidator {
                 .iter()
                 .map(|req| (&req.path, req.body.as_str(), &req.frontmatter))
                 .collect();
-            crate::link_guard::unresolved_cross_scope_links(&self.reader, ws, &pages).await?
+            crate::link_guard::unresolved_generated_links(&self.reader, ws, proj, &pages).await?
         };
         if !unresolved.is_empty() {
             for (req, outcome) in requests.iter_mut().zip(outcomes_preview.iter_mut()) {
                 let rewritten =
-                    crate::link_guard::delink_body(&req.body, &req.path, &unresolved).into_owned();
+                    crate::link_guard::delink_body(&req.body, &req.path, &unresolved.body)
+                        .into_owned();
                 req.body = rewritten.clone();
                 outcome.new_body_markdown = rewritten;
-                crate::link_guard::prune_relations(&mut req.frontmatter, &unresolved);
+                crate::link_guard::prune_relations(&mut req.frontmatter, &unresolved.relations);
             }
         }
 
@@ -6342,23 +6345,36 @@ mod tests {
         assert!(stored.body.contains("[[notes/pending.md]]"));
     }
 
-    /// #1218 covers typed `relations:` edges too: an unresolved cross-scope
-    /// relation target is dropped before the write (an emptied relation goes
-    /// with it), while a live cross-scope target and a same-project target
-    /// stay, so frontmatter cannot mint the dangling edge the body guard
-    /// prevents.
+    /// Typed `relations:` targets must resolve, whether local or cross-scope;
+    /// unlike ordinary body links, a local relation may not dangle.
     #[tokio::test]
     async fn single_page_drops_unresolved_cross_scope_relations() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
         seed_other_project_page(&store, &wiki, ws, "otherproj", "notes/exists.md").await;
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/local.md").unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "Existing local target.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
 
         let response = serde_json::json!({
             "title": "Relation cleanup",
-            "body_markdown": "No links in the body.",
+            "body_markdown": "A pending [[notes/missing.md]] body link remains.",
             "tags": [],
             "relations": {
-                "causes": ["otherproj:notes/missing.md", "otherproj:notes/exists.md", "notes/local.md"],
+                "causes": ["otherproj:notes/missing.md", "otherproj:notes/exists.md", "notes/local.md", "notes/missing.md"],
                 "fixes": ["ghostproj:x.md"],
             },
         });
@@ -6389,6 +6405,7 @@ mod tests {
             stored.frontmatter
         );
         assert!(stored.frontmatter["relations"].get("fixes").is_none());
+        assert!(stored.body.contains("[[notes/missing.md]]"));
     }
 }
 

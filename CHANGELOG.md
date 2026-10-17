@@ -68,6 +68,10 @@ version in [`docs/changelog/`](docs/changelog/):
   list, causing the wiki watcher to emit repeated warnings on every
   reconciliation pass. Targets are now validated through `extract_relation_links`
   before frontmatter assembly and during relation pruning. (#1353, #1366)
+- Consolidation now also drops well-shaped same-project `relations:` targets
+  that name no existing page. Relations among pages in the same atomic batch
+  remain valid, and ordinary same-project body wikilinks may still point to a
+  page that will be written later. (#1353)
 
 ## [3.1.0] - 2026-10-16
 
