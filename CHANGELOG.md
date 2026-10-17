@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Corrected the `ExtractionState::NotApplicable` documentation and aligned the
+  generated OpenCode capture policy with the native evaluator: only an active
+  policy dropping a search/list tool reports `not-applicable`; an invalid
+  policy reports `extracted`. `ai-memory hook --check-capture` also uses
+  `not-applicable` when no policy was evaluated. (#1352)
 - `ai-memory auth login openai-oauth` and `auth login copilot` no longer print
   a failed endpoint's whole response body. Error bodies are bounded, scrubbed
   of secrets and terminal control sequences, then capped for display; provider
