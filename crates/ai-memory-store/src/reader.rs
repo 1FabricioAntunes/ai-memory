@@ -5909,7 +5909,7 @@ impl ReaderPool {
         .await
     }
 
-    /// Return `stale` / `wrong` feedback still attached to a *current*
+    /// Return `stale` / `wrong` feedback still attached to a *current* unexpired
     /// page version in one project, grouped by (page, kind) — the input
     /// for the lint pass's `feedback_flagged` findings. Rewriting a
     /// flagged page supersedes the version the feedback points at, so
@@ -5924,21 +5924,24 @@ impl ReaderPool {
         project_id: ProjectId,
     ) -> StoreResult<Vec<FeedbackFinding>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let ttl = not_expired("pg", "?3");
+            let sql = format!(
                 "SELECT pg.path, f.kind, COUNT(*) AS signal_count, MAX(f.created_at) AS latest, \
                         (SELECT reason FROM page_feedback r \
                           WHERE r.page_id = f.page_id AND r.kind = f.kind \
                             AND r.reason IS NOT NULL \
                           ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reason \
                  FROM page_feedback f \
-                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1{ttl} \
                  WHERE f.workspace_id = ?1 AND f.project_id = ?2 \
                    AND f.kind IN ('stale', 'wrong') \
                  GROUP BY f.page_id, pg.path, f.kind \
                  ORDER BY latest DESC, pg.path ASC, f.kind ASC",
-            )?;
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let now = now_us();
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
                 |row| {
                     let path: String = row.get(0)?;
                     let kind: String = row.get(1)?;
