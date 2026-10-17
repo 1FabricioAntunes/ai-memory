@@ -14,14 +14,17 @@ use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
     complete_structured_with_operation_id,
 };
-use ai_memory_store::{ReaderPool, WriterHandle};
+use ai_memory_store::{ReaderPool, StoreError, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::path_sanitize::slugify_page_path;
-use crate::projection::{ObservationProjectionConfig, project_observations};
+use crate::projection::{
+    ObservationProjectionConfig, ProjectedObservations, project_observations,
+    project_session_observations,
+};
 use crate::types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, Relations, SlotKind,
 };
@@ -252,12 +255,30 @@ impl Consolidator {
         author_id: Option<ai_memory_core::UserId>,
         instructions: Option<&str>,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
-        let observations = self.reader.observations_for_session(session_id).await?;
-        if observations.is_empty() {
+        // Resolve the target from where the observations landed (see
+        // `resolve_target`): the bounded reads below gate on the session
+        // holding at least one observation in THAT scope — the (possibly
+        // stale) `sessions` row is not consulted.
+        let (ws, proj) = self.resolve_target(session_id).await?;
+
+        // Bounded gate: count and span only, no row is materialised. A
+        // session with no observations in its consolidation scope — a
+        // foreign id, a purged one, or an empty one — is refused exactly
+        // like the old full load's empty check.
+        let totals = self
+            .reader
+            .read_session_observations_in_scope(ws, proj, session_id, |snap| {
+                snap.projection_totals()
+            })
+            .await
+            .map_err(|e| match e {
+                StoreError::SessionCollision => ConsolidatorError::EmptySession(session_id),
+                other => other.into(),
+            })?;
+        if totals.total == 0 {
             return Err(ConsolidatorError::EmptySession(session_id));
         }
 
-        let (ws, proj) = self.resolve_target(session_id).await?;
         let agent_kind = self.resolve_agent_origin(session_id).await?;
         let path = PagePath::new(format!("sessions/{session_id}.md"))?;
 
@@ -294,20 +315,40 @@ impl Consolidator {
         let existing_titles = self
             .existing_page_titles(ws, proj, &actor, session_id)
             .await;
+        // The prefix and its budget are known now; only the observation
+        // dump is read from the store — bounded: a full read while the
+        // session fits the selection cap, otherwise one streaming scan
+        // plus point fetches for the selected rows (and the residue
+        // candidates the greedy passes actually consume).
+        let plan = single_request_plan(
+            session_id,
+            &current_body,
+            instructions.as_deref(),
+            self.budgets,
+            &existing_titles,
+        );
+        let cfg = single_projection_cfg(plan.observation_chars, self.verbatim_residue);
+        let projected = self
+            .reader
+            .read_session_observations_in_scope(ws, proj, session_id, move |snap| {
+                Ok(project_session_observations(snap, &cfg)?.map(|(projected, _stats)| projected))
+            })
+            .await
+            .map_err(|e| match e {
+                // The session's rows disappeared between the gate above and
+                // this read: fail closed, like the empty check.
+                StoreError::SessionCollision => ConsolidatorError::EmptySession(session_id),
+                other => other.into(),
+            })?;
+        let Some(projected) = projected else {
+            return Err(ConsolidatorError::EmptySession(session_id));
+        };
         // One LLM operation, one identity: this fresh id (never the agent's
         // session id) is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a NEW operation
         // with a new id.
         let operation_id = LlmOperationId::new();
-        let request = build_request_with_residue(
-            session_id,
-            &observations,
-            &current_body,
-            instructions.as_deref(),
-            self.budgets,
-            &existing_titles,
-            self.verbatim_residue,
-        );
+        let request = assemble_single_request(&plan, &projected, self.budgets);
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -670,13 +711,29 @@ impl Consolidator {
         author_id: Option<ai_memory_core::UserId>,
         instructions: Option<&str>,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
-        let observations = self.reader.observations_for_session(session_id).await?;
-        if observations.is_empty() {
+        // Resolve the target from where the observations landed — see
+        // `resolve_target` / `consolidate_session` for the rationale. The
+        // bounded reads gate on the session holding at least one
+        // observation in that scope.
+        let (ws, proj) = self.resolve_target(session_id).await?;
+
+        // Bounded gate (see `consolidate_session`): count only, no row is
+        // materialised; a session with no observations in its consolidation
+        // scope is refused exactly like the old full load's empty check.
+        let totals = self
+            .reader
+            .read_session_observations_in_scope(ws, proj, session_id, |snap| {
+                snap.projection_totals()
+            })
+            .await
+            .map_err(|e| match e {
+                StoreError::SessionCollision => ConsolidatorError::EmptySession(session_id),
+                other => other.into(),
+            })?;
+        if totals.total == 0 {
             return Err(ConsolidatorError::EmptySession(session_id));
         }
-        // Resolve the target from where the observations landed — see
-        // `resolve_target` / `consolidate_session` for the rationale.
-        let (ws, proj) = self.resolve_target(session_id).await?;
+
         let agent_kind = self.resolve_agent_origin(session_id).await?;
 
         // Preflight admission BEFORE the LLM (see `consolidate_session`). The
@@ -711,20 +768,39 @@ impl Consolidator {
         let existing_titles = self
             .existing_page_titles(ws, proj, &actor, session_id)
             .await;
+        // The prefix and its budget are known now; only the observation
+        // dump is read from the store — bounded (see `consolidate_session`):
+        // a full read while the session fits the selection cap, otherwise
+        // one streaming scan plus point fetches for the selected rows.
+        let plan = batch_request_plan(
+            session_id,
+            &slots,
+            instructions.as_deref(),
+            self.budgets,
+            &existing_titles,
+        );
+        let cfg = batch_projection_cfg(plan.observation_chars, self.verbatim_residue);
+        let projected = self
+            .reader
+            .read_session_observations_in_scope(ws, proj, session_id, move |snap| {
+                Ok(project_session_observations(snap, &cfg)?.map(|(projected, _stats)| projected))
+            })
+            .await
+            .map_err(|e| match e {
+                // The session's rows disappeared between the gate above and
+                // this read: fail closed, like the empty check.
+                StoreError::SessionCollision => ConsolidatorError::EmptySession(session_id),
+                other => other.into(),
+            })?;
+        let Some(projected) = projected else {
+            return Err(ConsolidatorError::EmptySession(session_id));
+        };
         // One LLM operation, one identity (see `consolidate_session`): the
         // fresh id is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a new operation
         // with a new id.
         let operation_id = LlmOperationId::new();
-        let request = build_batch_request_with_residue(
-            session_id,
-            &observations,
-            &slots,
-            instructions.as_deref(),
-            self.budgets,
-            &existing_titles,
-            self.verbatim_residue,
-        );
+        let request = assemble_batch_request(&plan, &projected, self.budgets);
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -1062,7 +1138,7 @@ fn slot_kind_from_frontmatter(frontmatter: &serde_json::Value) -> SlotKind {
 }
 
 #[derive(Debug, Clone)]
-struct SlotSnapshot {
+pub(crate) struct SlotSnapshot {
     path: String,
     title: String,
     slot_kind: SlotKind,
@@ -1185,15 +1261,28 @@ fn build_batch_request_with_slots(
     )
 }
 
-fn build_batch_request_with_residue(
+/// Everything the batch request needs before the observation dump: the
+/// fixed scaffolding blocks in their exact prompt order, and the character
+/// budget the dump may consume. The in-memory and the bounded-snapshot
+/// request builds share this, so block order and budget math cannot drift
+/// between them.
+struct BatchRequestPlan {
+    fixed_header: String,
+    mandatory_suffix: String,
+    observations_header: String,
+    titles_block: String,
+    instructions_block: String,
+    slots_block: String,
+    observation_chars: usize,
+}
+
+fn batch_request_plan(
     session_id: SessionId,
-    observations: &[Observation],
     slots: &[SlotSnapshot],
     instructions: Option<&str>,
     budgets: PromptBudgets,
     existing_titles: &[String],
-    verbatim_residue: bool,
-) -> ChatRequest {
+) -> BatchRequestPlan {
     // Stable prefix first so prefix-caching providers can reuse it across
     // sessions of the same project: the fixed batch scaffolding (header +
     // field schema) and the project instructions lead the message, then the
@@ -1303,23 +1392,44 @@ fn build_batch_request_with_residue(
             .saturating_add(count_chars(&instructions_block))
             .saturating_add(count_chars(&slots_block)),
     );
-    let projected = project_observations(
-        observations,
-        &ObservationProjectionConfig::new(
-            observation_chars,
-            MAX_PROJECTED_OBSERVATIONS,
-            MAX_PROJECTED_OBSERVATION_BODY_CHARS,
-        )
-        .with_context_label("batch consolidation")
-        .with_verbatim_residue(verbatim_residue),
-    );
+    BatchRequestPlan {
+        fixed_header,
+        mandatory_suffix,
+        observations_header,
+        titles_block,
+        instructions_block,
+        slots_block,
+        observation_chars,
+    }
+}
+
+fn batch_projection_cfg(
+    observation_chars: usize,
+    verbatim_residue: bool,
+) -> ObservationProjectionConfig {
+    ObservationProjectionConfig::new(
+        observation_chars,
+        MAX_PROJECTED_OBSERVATIONS,
+        MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+    )
+    .with_context_label("batch consolidation")
+    .with_verbatim_residue(verbatim_residue)
+}
+
+/// Join the shared batch prefix with a ready-made projection — the
+/// in-memory or the bounded-snapshot one — into the final request.
+fn assemble_batch_request(
+    plan: &BatchRequestPlan,
+    projected: &ProjectedObservations,
+    budgets: PromptBudgets,
+) -> ChatRequest {
     let mut buf = String::new();
-    buf.push_str(&fixed_header);
-    buf.push_str(&mandatory_suffix);
-    buf.push_str(&instructions_block);
-    buf.push_str(&slots_block);
-    buf.push_str(&titles_block);
-    buf.push_str(&observations_header);
+    buf.push_str(&plan.fixed_header);
+    buf.push_str(&plan.mandatory_suffix);
+    buf.push_str(&plan.instructions_block);
+    buf.push_str(&plan.slots_block);
+    buf.push_str(&plan.titles_block);
+    buf.push_str(&plan.observations_header);
     buf.push_str(&projected.text);
 
     ChatRequest {
@@ -1331,6 +1441,23 @@ fn build_batch_request_with_residue(
         max_tokens: budgets.max_output_tokens,
         temperature: Some(0.2),
     }
+}
+
+fn build_batch_request_with_residue(
+    session_id: SessionId,
+    observations: &[Observation],
+    slots: &[SlotSnapshot],
+    instructions: Option<&str>,
+    budgets: PromptBudgets,
+    existing_titles: &[String],
+    verbatim_residue: bool,
+) -> ChatRequest {
+    let plan = batch_request_plan(session_id, slots, instructions, budgets, existing_titles);
+    let projected = project_observations(
+        observations,
+        &batch_projection_cfg(plan.observation_chars, verbatim_residue),
+    );
+    assemble_batch_request(&plan, &projected, budgets)
 }
 
 fn render_slot_snapshots(slots: &[SlotSnapshot], max_chars: usize) -> String {
@@ -1366,35 +1493,26 @@ pub const BATCH_SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikili
     "the observations"
 );
 
-#[cfg(test)]
-fn build_request(
-    session_id: SessionId,
-    observations: &[Observation],
-    current_body: &str,
-    instructions: Option<&str>,
-    budgets: PromptBudgets,
-    existing_titles: &[String],
-) -> ChatRequest {
-    build_request_with_residue(
-        session_id,
-        observations,
-        current_body,
-        instructions,
-        budgets,
-        existing_titles,
-        false,
-    )
+/// Everything the single-page request needs before the observation dump:
+/// the stable prefix blocks in their exact prompt order, and the character
+/// budget the dump may consume. The in-memory and the bounded-snapshot
+/// request builds share this, so block order and budget math cannot drift
+/// between them.
+struct SingleRequestPlan {
+    observations_header: String,
+    instructions_block: String,
+    current_body_block: String,
+    titles_block: String,
+    observation_chars: usize,
 }
 
-fn build_request_with_residue(
+fn single_request_plan(
     session_id: SessionId,
-    observations: &[Observation],
     current_body: &str,
     instructions: Option<&str>,
     budgets: PromptBudgets,
     existing_titles: &[String],
-    verbatim_residue: bool,
-) -> ChatRequest {
+) -> SingleRequestPlan {
     // Stable prefix first so prefix-caching providers can reuse it across
     // sessions of the same project: the project instructions lead, then the
     // per-page current body and titles, then the per-session id and the
@@ -1424,21 +1542,40 @@ fn build_request_with_residue(
             .saturating_add(count_chars(&current_body_block))
             .saturating_add(count_chars(&titles_block)),
     );
-    let projected = project_observations(
-        observations,
-        &ObservationProjectionConfig::new(
-            observation_chars,
-            MAX_PROJECTED_OBSERVATIONS,
-            MAX_PROJECTED_OBSERVATION_BODY_CHARS,
-        )
-        .with_context_label("single-page consolidation")
-        .with_verbatim_residue(verbatim_residue),
-    );
+    SingleRequestPlan {
+        observations_header,
+        instructions_block,
+        current_body_block,
+        titles_block,
+        observation_chars,
+    }
+}
+
+fn single_projection_cfg(
+    observation_chars: usize,
+    verbatim_residue: bool,
+) -> ObservationProjectionConfig {
+    ObservationProjectionConfig::new(
+        observation_chars,
+        MAX_PROJECTED_OBSERVATIONS,
+        MAX_PROJECTED_OBSERVATION_BODY_CHARS,
+    )
+    .with_context_label("single-page consolidation")
+    .with_verbatim_residue(verbatim_residue)
+}
+
+/// Join the shared single-page prefix with a ready-made projection — the
+/// in-memory or the bounded-snapshot one — into the final request.
+fn assemble_single_request(
+    plan: &SingleRequestPlan,
+    projected: &ProjectedObservations,
+    budgets: PromptBudgets,
+) -> ChatRequest {
     let mut buf = String::new();
-    buf.push_str(&instructions_block);
-    buf.push_str(&current_body_block);
-    buf.push_str(&titles_block);
-    buf.push_str(&observations_header);
+    buf.push_str(&plan.instructions_block);
+    buf.push_str(&plan.current_body_block);
+    buf.push_str(&plan.titles_block);
+    buf.push_str(&plan.observations_header);
     buf.push_str(&projected.text);
 
     ChatRequest {
@@ -1450,6 +1587,32 @@ fn build_request_with_residue(
         max_tokens: budgets.max_output_tokens,
         temperature: Some(0.2),
     }
+}
+
+#[cfg(test)]
+fn build_request(
+    session_id: SessionId,
+    observations: &[Observation],
+    current_body: &str,
+    instructions: Option<&str>,
+    budgets: PromptBudgets,
+    existing_titles: &[String],
+) -> ChatRequest {
+    // The production single-page path is bounded-snapshot-only; this test
+    // entry point composes the same shared parts from an already-materialised
+    // slice (residue off), which is what the unit tests below pin.
+    let plan = single_request_plan(
+        session_id,
+        current_body,
+        instructions,
+        budgets,
+        existing_titles,
+    );
+    let projected = project_observations(
+        observations,
+        &single_projection_cfg(plan.observation_chars, false),
+    );
+    assemble_single_request(&plan, &projected, budgets)
 }
 
 /// Default approximate input-token budget for consolidation prompts, sized for
@@ -1550,7 +1713,7 @@ const CURRENT_BODY_BUDGET_CHARS: usize = 20_000;
 /// Prompt limits derived from the configured approximate input and output
 /// token allowances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PromptBudgets {
+pub(crate) struct PromptBudgets {
     max_input_chars: usize,
     max_output_tokens: u32,
 }
@@ -6192,3 +6355,20 @@ mod tests {
         assert!(stored.frontmatter["relations"].get("fixes").is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "consolidator_oracle.rs"]
+pub(crate) mod consolidator_oracle;
+
+/// The frozen base projection, verbatim `projection.rs` as of the
+/// pre-change commit `11ca7c5b`: an independent copy of the old full-load
+/// selection/scoring/residue, used by the equivalence tests to compare the
+/// new streaming projection against the old rule without sharing code with
+/// it. The file is byte-identical to the base module (reproduced with
+/// `git show 11ca7c5b:crates/ai-memory-consolidate/src/projection.rs`), so
+/// a drift of its constants — the even-sample bonus, the recency maximum —
+/// shows up as a prompt diff the oracles that share the current projection
+/// cannot see.
+#[cfg(test)]
+#[path = "consolidator_frozen_oracle.rs"]
+pub(crate) mod frozen_projection_oracle;

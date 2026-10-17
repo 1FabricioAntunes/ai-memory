@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed unbounded memory use in consolidation and auto-improve for long
+  sessions: both paths now read a bounded projection of the session's
+  observations instead of loading every row, keeping the LLM input
+  byte-identical. Sessions with no observations in the consolidator's target
+  scope (purged or foreign) are refused before any work, exactly as empty
+  sessions were before. (#PRNUM)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added

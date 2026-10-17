@@ -1,8 +1,9 @@
 //! Deterministic observation projection for bounded internal LLM prompts.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ai_memory_core::{Observation, ObservationKind};
+use ai_memory_store::{SessionObservationSnapshot, StoreError, StoreResult};
 
 use crate::{
     keep_tokens::{has_residue_error_line, mine_residue_tokens},
@@ -103,6 +104,67 @@ pub fn cap_text_with_marker(input: &str, max_chars: usize, label: &str) -> Strin
     out
 }
 
+/// The base projection's early returns, checked by both the in-memory and
+/// the streaming paths before a single row is read: an empty population and
+/// a zero observation or character budget.
+enum ProjectionEarlyReturn {
+    /// No rows at all. The in-memory path renders `(none)`; the snapshot
+    /// path reports `None` (the caller's fail-closed empty session).
+    Empty,
+    /// A zero budget: the old no-budget marker, whatever the row count.
+    NoBudget(ProjectedObservations),
+}
+
+impl ProjectionEarlyReturn {
+    /// The in-memory rendering of the early return (`None` for the snapshot
+    /// path's empty session, which reports `None` instead).
+    fn rendered(self) -> Option<ProjectedObservations> {
+        match self {
+            Self::Empty => Some(ProjectedObservations {
+                text: "(none)".into(),
+                total_count: 0,
+                selected_count: 0,
+                omitted_count: 0,
+                truncated_bodies: 0,
+                selected_indices: Vec::new(),
+                warnings: Vec::new(),
+            }),
+            Self::NoBudget(projected) => Some(projected),
+        }
+    }
+}
+
+/// The shared early-return rule of the base projection: both the in-memory
+/// and the streaming paths take these returns — and only these — before
+/// reading a row.
+fn projection_early_return(
+    total: usize,
+    cfg: &ObservationProjectionConfig,
+) -> Option<ProjectionEarlyReturn> {
+    if total == 0 {
+        return Some(ProjectionEarlyReturn::Empty);
+    }
+    if cfg.max_selected_observations == 0 || cfg.max_total_chars == 0 {
+        let text = format!(
+            "[{} observations omitted: no projection budget; full originals remain in SQLite by observation id]\n",
+            total
+        );
+        return Some(ProjectionEarlyReturn::NoBudget(ProjectedObservations {
+            text,
+            total_count: total,
+            selected_count: 0,
+            omitted_count: total,
+            truncated_bodies: 0,
+            selected_indices: Vec::new(),
+            warnings: vec![format!(
+                "{} observation projection omitted by input budget",
+                context_label(cfg)
+            )],
+        }));
+    }
+    None
+}
+
 /// Project raw observations into deterministic, budgeted prompt text without
 /// mutating or compressing the raw observations in SQLite.
 #[must_use]
@@ -110,78 +172,108 @@ pub fn project_observations(
     observations: &[Observation],
     cfg: &ObservationProjectionConfig,
 ) -> ProjectedObservations {
-    if observations.is_empty() {
-        return ProjectedObservations {
-            text: "(none)".into(),
-            total_count: 0,
-            selected_count: 0,
-            omitted_count: 0,
-            truncated_bodies: 0,
-            selected_indices: Vec::new(),
-            warnings: Vec::new(),
-        };
+    if let Some(early) =
+        projection_early_return(observations.len(), cfg).and_then(ProjectionEarlyReturn::rendered)
+    {
+        return early;
     }
 
-    if cfg.max_selected_observations == 0 || cfg.max_total_chars == 0 {
-        let text = format!(
-            "[{} observations omitted: no projection budget; full originals remain in SQLite by observation id]\n",
-            observations.len()
-        );
-        return ProjectedObservations {
-            text,
-            total_count: observations.len(),
-            selected_count: 0,
-            omitted_count: observations.len(),
-            truncated_bodies: 0,
-            selected_indices: Vec::new(),
-            warnings: vec![format!(
-                "{} observation projection omitted by input budget",
-                context_label(cfg)
-            )],
-        };
-    }
-
-    // Scores and rendered blocks depend only on an observation and its position
-    // in the full list, never on which other observations were selected, so
-    // both are computed once here. The prune loop below used to recompute
-    // every remaining score (each one scans the body) and re-render the whole
-    // text on every removal: quadratic, and 14s for 256 observations of 4k
-    // chars, in production consolidation as much as in the test.
+    // Scores depend only on an observation and its position in the full list,
+    // never on which other observations were selected, so they are computed
+    // once here.
     let scores: Vec<i32> = observations
         .iter()
         .enumerate()
         .map(|(idx, obs)| observation_score(obs, idx, observations.len()))
         .collect();
-    let mut selected =
-        select_observation_indices(observations, cfg.max_selected_observations, &scores);
+    let selected =
+        select_observation_indices(observations.len(), cfg.max_selected_observations, &scores);
+    let selected_pairs: Vec<(usize, i32)> =
+        selected.iter().map(|&idx| (idx, scores[idx])).collect();
+    project_from_rows(
+        observations.len(),
+        selected_pairs,
+        &|idx| observations.get(idx),
+        cfg,
+        ResidueSource::InMemory(observations),
+    )
+}
 
-    let block_chars: Vec<usize> = observations
+/// Project one session's observations from the parts both a full in-memory
+/// load and a streaming snapshot scan can supply: the row count, the
+/// selection with the base score of every selected row, access to the
+/// selected rows, and a residue candidate source.
+///
+/// This is the single assembly path — character-budget pruning, residue,
+/// rendering and the omission marker all happen here, so the in-memory and
+/// streaming projections can never drift apart. The selection itself has
+/// already been made by the caller with the shared rules ([`select_observation_indices`]
+/// in memory, the bounded top-k of [`project_session_observations`]
+/// streaming), which keeps its cost out of this function.
+///
+/// The selection arrives as `(index, base score)` pairs: pruning re-minimizes
+/// over the surviving pairs, so each score must travel with its index — a
+/// positional score slice would fall out of sync after the first removal and
+/// prune the wrong blocks.
+fn project_from_rows<'a>(
+    total: usize,
+    selected: Vec<(usize, i32)>,
+    row_at: &dyn Fn(usize) -> Option<&'a Observation>,
+    cfg: &ObservationProjectionConfig,
+    residue_source: ResidueSource<'_>,
+) -> ProjectedObservations {
+    let mut selected = selected;
+
+    // Render only the selected rows: a non-selected row's block length is
+    // never read, and on a streamed session it would mean re-reading the
+    // bodies we just chose not to keep. A row that vanished between the
+    // scan and the fetch renders nothing, so it counts zero characters.
+    let mut block_chars: BTreeMap<usize, usize> = BTreeMap::new();
+    for &(idx, _) in &selected {
+        if let Some(obs) = row_at(idx) {
+            block_chars.insert(
+                idx,
+                render_observation_block(total, idx, obs, cfg.per_body_excerpt_chars)
+                    .text
+                    .chars()
+                    .count(),
+            );
+        }
+    }
+    let mut total_chars: usize = selected
         .iter()
-        .enumerate()
-        .map(|(idx, obs)| {
-            render_observation_block(observations.len(), idx, obs, cfg.per_body_excerpt_chars)
-                .text
-                .chars()
-                .count()
-        })
-        .collect();
-    let mut total_chars: usize = selected.iter().map(|idx| block_chars[*idx]).sum();
+        .map(|(idx, _)| block_chars.get(idx).copied().unwrap_or(0))
+        .sum();
 
     while total_chars > cfg.max_total_chars && selected.len() > 1 {
-        let Some(remove_idx) = lowest_prunable_index(observations, &selected, &scores) else {
+        let Some(remove_idx) = lowest_prunable_pair(total, &selected) else {
             break;
         };
-        selected.retain(|idx| *idx != remove_idx);
-        total_chars = total_chars.saturating_sub(block_chars[remove_idx]);
+        selected.retain(|&(idx, _)| idx != remove_idx);
+        total_chars =
+            total_chars.saturating_sub(block_chars.get(&remove_idx).copied().unwrap_or(0));
     }
-    let mut residue = cfg.verbatim_residue.then(|| {
-        render_verbatim_residue(
+    let mut selected_indices: Vec<usize> = selected.iter().map(|(idx, _)| *idx).collect();
+    let mut residue = cfg.verbatim_residue.then(|| match &residue_source {
+        ResidueSource::InMemory(observations) => render_verbatim_residue(
             observations,
-            &selected,
-            &scores,
+            &selected_indices,
             cfg.per_body_excerpt_chars,
             cfg.max_total_chars.saturating_div(8).min(MAX_RESIDUE_CHARS),
-        )
+        ),
+        ResidueSource::Fetched {
+            pass_one,
+            pass_two,
+            fetch,
+        } => render_verbatim_residue_fetched(
+            pass_one,
+            pass_two,
+            fetch,
+            &selected_indices,
+            row_at,
+            total,
+            cfg,
+        ),
     });
     let mut residue_pruned_blocks = 0usize;
     if residue
@@ -189,10 +281,11 @@ pub fn project_observations(
         .is_some_and(|rendered| !rendered.is_empty())
     {
         while residue_pruned_blocks < MAX_RESIDUE_PRUNED_BLOCKS {
-            let rendered_chars: usize = selected.iter().map(|idx| block_chars[*idx]).sum();
-            let marker_chars = omission_marker(observations.len(), selected.len(), cfg)
-                .chars()
-                .count();
+            let rendered_chars: usize = selected
+                .iter()
+                .map(|(idx, _)| block_chars.get(idx).copied().unwrap_or(0))
+                .sum();
+            let marker_chars = omission_marker(total, selected.len(), cfg).chars().count();
             let residue_chars = residue.as_ref().map_or(0, ResidueRender::char_count);
             if rendered_chars
                 .saturating_add(marker_chars)
@@ -201,17 +294,20 @@ pub fn project_observations(
             {
                 break;
             }
-            let Some(remove_idx) = lowest_prunable_index(observations, &selected, &scores) else {
+            let Some(remove_idx) = lowest_prunable_pair(total, &selected) else {
                 break;
             };
-            selected.retain(|idx| *idx != remove_idx);
+            selected.retain(|&(idx, _)| idx != remove_idx);
             residue_pruned_blocks += 1;
         }
 
-        let rendered_chars: usize = selected.iter().map(|idx| block_chars[*idx]).sum();
-        let marker_chars = omission_marker(observations.len(), selected.len(), cfg)
-            .chars()
-            .count();
+        selected_indices = selected.iter().map(|(idx, _)| *idx).collect();
+
+        let rendered_chars: usize = selected
+            .iter()
+            .map(|(idx, _)| block_chars.get(idx).copied().unwrap_or(0))
+            .sum();
+        let marker_chars = omission_marker(total, selected.len(), cfg).chars().count();
         let room = cfg
             .max_total_chars
             .saturating_sub(rendered_chars.saturating_add(marker_chars));
@@ -220,17 +316,18 @@ pub fn project_observations(
         }
     }
 
-    let rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
-    let omitted_count = observations.len().saturating_sub(selected.len());
+    let rendered =
+        render_projection_rows(total, &selected_indices, row_at, cfg.per_body_excerpt_chars);
+    let omitted_count = total.saturating_sub(selected.len());
     let mut text = rendered.text;
     let mut warnings = Vec::new();
     if omitted_count > 0 {
-        text.push_str(&omission_marker(observations.len(), selected.len(), cfg));
+        text.push_str(&omission_marker(total, selected.len(), cfg));
         warnings.push(format!(
             "{} observation input sampled {} of {} observations",
             context_label(cfg),
             selected.len(),
-            observations.len()
+            total
         ));
     }
     if rendered.truncated_bodies > 0 {
@@ -274,13 +371,354 @@ pub fn project_observations(
 
     ProjectedObservations {
         text,
-        total_count: observations.len(),
+        total_count: total,
         selected_count: selected.len(),
         omitted_count,
         truncated_bodies: rendered.truncated_bodies,
-        selected_indices: selected,
+        selected_indices,
         warnings,
     }
+}
+
+/// Where the residue passes get their candidates and bodies.
+enum ResidueSource<'a> {
+    /// Every row is already materialised in memory.
+    InMemory(&'a [Observation]),
+    /// Candidate rows are re-read by `rowid` as the greedy passes consume
+    /// them; nothing about a candidate body is known before its `rowid` is
+    /// fetched.
+    Fetched {
+        pass_one: Vec<ResidueCandidate>,
+        pass_two: Vec<ResidueCandidate>,
+        fetch: &'a dyn Fn(i64) -> Option<(Observation, String)>,
+    },
+}
+
+/// One residue candidate, ranked before its body is read again: its
+/// selection score, its position, whether its body carries a residue error
+/// line (pass two ranks those first), and the `rowid` the body is re-read
+/// with. The in-memory path ranks candidates it already holds (`rowid`
+/// unused); the streaming path re-reads each consumed body by `rowid`.
+struct ResidueCandidate {
+    score: i32,
+    idx: usize,
+    error_line: bool,
+    rowid: i64,
+}
+
+/// Which residue pass a row's text belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResiduePass {
+    /// A high-signal kind that carries renderable text (a user-written
+    /// prompt, or the other kinds' residue slice), ranked by score.
+    One,
+    /// Any other row with residue text, ranked error-line first, then score.
+    Two,
+}
+
+/// The residue candidate eligibility, the single rule both residue renders
+/// apply to a row: a routing body is never a candidate; a high-signal kind
+/// with renderable text is pass one; any other row with residue text is
+/// pass two. Deciding it here — instead of in each render — is what keeps
+/// the in-memory and streaming residue from disagreeing about who is a
+/// candidate at all.
+fn residue_candidate_pass(obs: &Observation) -> Option<ResiduePass> {
+    if carries_routing_text(obs) {
+        return None;
+    }
+    let pass_one_kind = matches!(
+        obs.kind,
+        ObservationKind::UserPrompt
+            | ObservationKind::Stop
+            | ObservationKind::PreCompact
+            | ObservationKind::PostCompaction
+            | ObservationKind::SessionEnd
+    );
+    if pass_one_kind {
+        return residue_candidate_text(obs)
+            .is_some()
+            .then_some(ResiduePass::One);
+    }
+    residue_slice(&obs.body)
+        .is_some()
+        .then_some(ResiduePass::Two)
+}
+
+/// The residue text a candidate row contributes: pass one renders the
+/// user-written part of a prompt or the residue slice of the other
+/// high-signal kinds; pass two renders the residue slice. Normalized the
+/// same way in both paths.
+fn residue_candidate_text(obs: &Observation) -> Option<String> {
+    let text = if obs.kind == ObservationKind::UserPrompt {
+        user_written(&obs.body)?
+    } else {
+        residue_slice(&obs.body)?
+    };
+    Some(normalize_residue_text(&text))
+}
+
+/// Whether a pass-two row's residue carries an error line: the flag pass
+/// two ranks on, computed from the same normalized text both renders use.
+fn residue_error_line(body: &str) -> bool {
+    residue_slice(body).is_some_and(|text| has_residue_error_line(&normalize_residue_text(&text)))
+}
+
+/// The residue pass-one ranking: score descending, then position
+/// descending — the shared order for the pass-one candidates of both
+/// residue renders.
+fn rank_residue_pass_one(a: &ResidueCandidate, b: &ResidueCandidate) -> std::cmp::Ordering {
+    b.score.cmp(&a.score).then_with(|| b.idx.cmp(&a.idx))
+}
+
+/// The residue pass-two ranking: error-line rows first, then score and
+/// position descending — the shared order for the pass-two candidates of
+/// both residue renders.
+fn rank_residue_pass_two(a: &ResidueCandidate, b: &ResidueCandidate) -> std::cmp::Ordering {
+    b.error_line
+        .cmp(&a.error_line)
+        .then_with(|| b.score.cmp(&a.score))
+        .then_with(|| b.idx.cmp(&a.idx))
+}
+
+/// What a bounded projection spent, for the caller's log line and tests:
+/// how many rows the snapshot deserialized, the high water of full rows
+/// resident at once, and the high water of the candidate structures the
+/// scan keeps — the bounded top-k heap and, with residue on, the
+/// per-candidate tuples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundedProjectionStats {
+    /// Rows the snapshot deserialized (the streamed scan plus the point
+    /// fetches).
+    pub rows_read: usize,
+    /// The most full observation rows resident at one time.
+    pub resident_high_water: usize,
+    /// High-water length of the streaming top-k heap; 0 on the in-memory
+    /// path, which selects over the slice instead.
+    pub heap_high_water: usize,
+    /// High-water length of the residue candidate lists; 0 while residue is
+    /// off, where no candidate tuple is collected.
+    pub residue_candidates_high_water: usize,
+}
+
+/// The streaming top-k of the selection: at most `limit - 2` entries — the
+/// base's selection is the two anchors plus the best `limit - 2` of the
+/// rest — keyed exactly like [`select_observation_indices`]: the shared
+/// selection key, ties by index. Each entry keeps the base score (pruning
+/// needs it) and the `rowid` (the fetch needs it). The map's ascending
+/// `(key, idx)` order is a min-heap here: the weakest entry is the first,
+/// and a strictly stronger incoming row evicts it, so the state never
+/// grows with the session.
+struct BoundedTopK {
+    entries: BTreeMap<(i32, usize), (i32, i64)>,
+    capacity: usize,
+    high_water: usize,
+}
+
+impl BoundedTopK {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            capacity,
+            high_water: 0,
+        }
+    }
+
+    /// Admit one row. `key` is the row's [`selection_key`]; the row's own
+    /// index is part of the map key so the base's tie-break (higher index
+    /// wins) falls out of the `(key, idx)` order.
+    fn insert(&mut self, key: i32, idx: usize, score: i32, rowid: i64) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() < self.capacity {
+            self.entries.insert((key, idx), (score, rowid));
+            self.high_water = self.high_water.max(self.entries.len());
+            return;
+        }
+        let Some(&weakest) = self.entries.keys().next() else {
+            return;
+        };
+        if (key, idx) > weakest {
+            self.entries.remove(&weakest);
+            self.entries.insert((key, idx), (score, rowid));
+            self.high_water = self.high_water.max(self.entries.len());
+        }
+    }
+
+    /// The kept rows as `(index, base score, rowid)` triples.
+    fn finish(self) -> Vec<(usize, i32, i64)> {
+        self.entries
+            .into_iter()
+            .map(|((_, idx), (score, rowid))| (idx, score, rowid))
+            .collect()
+    }
+}
+
+/// Project one session's observations straight off a bounded snapshot, so a
+/// caller never holds more than the selection's rows in memory.
+///
+/// `totals.total <= cfg.max_selected_observations` reads every row (a
+/// handful, bounded by the selection cap) and projects them in memory;
+/// otherwise the base's early returns are taken straight off the totals and
+/// one streaming scan keeps one row resident, scoring every row with
+/// [`observation_score`] in Rust — no SQL scoring — and holding only the
+/// two anchors' `rowid`s and a bounded top-k heap of the best `limit - 2`
+/// rows seen so far. Only the selected rows and the residue candidates the
+/// greedy passes actually consume are re-read, by `rowid`.
+///
+/// Returns `None` when the session holds no rows.
+///
+/// # Errors
+/// Propagates any SQL error from the snapshot.
+pub(crate) fn project_session_observations(
+    snap: &SessionObservationSnapshot,
+    cfg: &ObservationProjectionConfig,
+) -> StoreResult<Option<(ProjectedObservations, BoundedProjectionStats)>> {
+    let totals = snap.projection_totals()?;
+    // The base's early returns, before any row is read beyond the totals:
+    // an empty session reports `None` (the caller's fail-closed empty
+    // session) and a zero budget renders the old no-budget marker.
+    if let Some(early) = projection_early_return(totals.total, cfg) {
+        return match early {
+            ProjectionEarlyReturn::Empty => Ok(None),
+            ProjectionEarlyReturn::NoBudget(projected) => Ok(Some((
+                projected,
+                BoundedProjectionStats {
+                    rows_read: snap.rows_read(),
+                    resident_high_water: 0,
+                    heap_high_water: 0,
+                    residue_candidates_high_water: 0,
+                },
+            ))),
+        };
+    }
+
+    if totals.total <= cfg.max_selected_observations {
+        let mut rows: Vec<Observation> = Vec::with_capacity(totals.total);
+        snap.each_row_with_rowid(|_, obs| {
+            rows.push(obs.clone());
+            true
+        })?;
+        let projected = project_observations(&rows, cfg);
+        let stats = BoundedProjectionStats {
+            rows_read: snap.rows_read(),
+            resident_high_water: rows.len().saturating_add(1),
+            heap_high_water: 0,
+            residue_candidates_high_water: 0,
+        };
+        return Ok(Some((projected, stats)));
+    }
+
+    let total = totals.total;
+    // The even-sample set derives from `total` — known from the totals
+    // aggregate — and is O(sample size), not O(total): the scan applies it
+    // row by row through the shared selection key.
+    let even = even_sample_indices(total);
+    let limit = cfg.max_selected_observations;
+    // The base's `limit == 1` rule keeps the last anchor only, so the heap
+    // is empty then.
+    let mut top_k = BoundedTopK::new(limit.saturating_sub(2));
+    let mut anchor0_rowid: Option<i64> = None;
+    let mut last_rowid: Option<i64> = None;
+    let mut pass_one: Vec<ResidueCandidate> = Vec::new();
+    let mut pass_two: Vec<ResidueCandidate> = Vec::new();
+    let mut idx = 0usize;
+    snap.each_row_with_rowid(|rowid, obs| {
+        let score = observation_score(obs, idx, total);
+        if cfg.verbatim_residue {
+            match residue_candidate_pass(obs) {
+                Some(ResiduePass::One) => pass_one.push(ResidueCandidate {
+                    score,
+                    idx,
+                    error_line: false,
+                    rowid,
+                }),
+                Some(ResiduePass::Two) => pass_two.push(ResidueCandidate {
+                    score,
+                    idx,
+                    error_line: residue_error_line(&obs.body),
+                    rowid,
+                }),
+                None => {}
+            }
+        }
+        if idx == 0 {
+            anchor0_rowid = Some(rowid);
+        } else {
+            last_rowid = Some(rowid);
+        }
+        // The anchors are selected outright; the heap holds the rest.
+        if !is_hard_anchor(total, idx) {
+            top_k.insert(selection_key(score, idx, &even), idx, score, rowid);
+        }
+        idx += 1;
+        true
+    })?;
+    debug_assert_eq!(idx, total, "the scan must cover exactly the totals' rows");
+
+    let heap_high_water = top_k.high_water;
+    let residue_candidates_high_water = if cfg.verbatim_residue {
+        pass_one.len().max(pass_two.len())
+    } else {
+        0
+    };
+    let heap = top_k.finish();
+    let mut selected_idx: Vec<usize> = heap.iter().map(|(i, _, _)| *i).collect();
+    if limit >= 2 {
+        selected_idx.push(0);
+    }
+    selected_idx.push(total - 1);
+    selected_idx.sort_unstable();
+    let mut selected: Vec<(usize, i32)> = Vec::with_capacity(selected_idx.len());
+    let mut selected_rows: Vec<Observation> = Vec::with_capacity(selected_idx.len());
+    for &i in &selected_idx {
+        let rowid = if i == 0 {
+            anchor0_rowid.ok_or(StoreError::SessionCollision)?
+        } else if i == total - 1 {
+            last_rowid.ok_or(StoreError::SessionCollision)?
+        } else {
+            heap.iter()
+                .find(|(idx, _, _)| *idx == i)
+                .map(|(_, _, rowid)| *rowid)
+                .ok_or(StoreError::SessionCollision)?
+        };
+        let observation = snap
+            .row_by_rowid(rowid)?
+            .ok_or(StoreError::SessionCollision)?;
+        selected.push((i, observation_score(&observation, i, total)));
+        selected_rows.push(observation);
+    }
+    let position: BTreeMap<usize, usize> = selected
+        .iter()
+        .enumerate()
+        .map(|(pos, &(idx, _))| (idx, pos))
+        .collect();
+    let row_at = |idx: usize| position.get(&idx).map(|&pos| &selected_rows[pos]);
+
+    let fetch = |rowid: i64| -> Option<(Observation, String)> {
+        let obs = snap.row_by_rowid(rowid).ok().flatten()?;
+        let text = residue_candidate_text(&obs)?;
+        Some((obs, text))
+    };
+
+    let projected = project_from_rows(
+        total,
+        selected,
+        &row_at,
+        cfg,
+        ResidueSource::Fetched {
+            pass_one,
+            pass_two,
+            fetch: &fetch,
+        },
+    );
+    let stats = BoundedProjectionStats {
+        rows_read: snap.rows_read(),
+        resident_high_water: selected_rows.len().saturating_add(1),
+        heap_high_water,
+        residue_candidates_high_water,
+    };
+    Ok(Some((projected, stats)))
 }
 
 fn omission_marker(total: usize, selected: usize, cfg: &ObservationProjectionConfig) -> String {
@@ -349,7 +787,6 @@ impl ResidueRender {
 fn render_verbatim_residue(
     observations: &[Observation],
     selected: &[usize],
-    scores: &[i32],
     per_body_excerpt_chars: usize,
     max_chars: usize,
 ) -> ResidueRender {
@@ -360,21 +797,92 @@ fn render_verbatim_residue(
         };
     }
 
+    let total = observations.len();
     let selected_set: HashSet<usize> = selected.iter().copied().collect();
-    let mut seen = HashSet::new();
-    for idx in selected {
-        let block = render_observation_block(
-            observations.len(),
-            *idx,
-            &observations[*idx],
-            per_body_excerpt_chars,
-        );
-        seen.extend(mine_residue_tokens(&block.text, usize::MAX));
-    }
+    let (mut seen, pass_zero) = residue_initial_state(
+        total,
+        selected,
+        |idx| observations.get(idx),
+        per_body_excerpt_chars,
+    );
 
+    // The shared candidate rule decides who is a candidate — and in which
+    // pass — and the shared rankers order it, exactly as the streaming
+    // residue does; only the text is extracted here, at render time, by
+    // the same helper the fetched path's eligibility and fetch use.
+    let mut pass_one: Vec<ResidueCandidate> = Vec::new();
+    let mut pass_two: Vec<ResidueCandidate> = Vec::new();
+    for (idx, observation) in observations.iter().enumerate() {
+        if selected_set.contains(&idx) {
+            continue;
+        }
+        match residue_candidate_pass(observation) {
+            Some(ResiduePass::One) => pass_one.push(ResidueCandidate {
+                score: observation_score(observation, idx, total),
+                idx,
+                error_line: false,
+                rowid: 0,
+            }),
+            Some(ResiduePass::Two) => pass_two.push(ResidueCandidate {
+                score: observation_score(observation, idx, total),
+                idx,
+                error_line: residue_error_line(&observation.body),
+                rowid: 0,
+            }),
+            None => {}
+        }
+    }
+    pass_one.sort_by(rank_residue_pass_one);
+    pass_two.sort_by(rank_residue_pass_two);
+
+    let mut rendered = ResidueRender {
+        groups: Vec::new(),
+        token_count: 0,
+    };
+    let early_limit = max_chars / 2;
+    append_residue_pass(
+        &mut rendered,
+        pass_zero
+            .into_iter()
+            .map(|(idx, text)| (observations[idx].clone(), text))
+            .chain(pass_one.into_iter().filter_map(|candidate| {
+                residue_candidate_text(&observations[candidate.idx])
+                    .map(|text| (observations[candidate.idx].clone(), text))
+            })),
+        &mut seen,
+        early_limit,
+    );
+    append_residue_pass(
+        &mut rendered,
+        pass_two.into_iter().filter_map(|candidate| {
+            residue_candidate_text(&observations[candidate.idx])
+                .map(|text| (observations[candidate.idx].clone(), text))
+        }),
+        &mut seen,
+        max_chars,
+    );
+    rendered
+}
+
+/// The residue state derived from the selected set alone: the tokens the
+/// projection already printed (`seen`) and the over-excerpt tails of the
+/// selected bodies (`pass_zero`, in selection order). Both residue renders
+/// start from this, so they can never disagree about what the projection
+/// already showed.
+fn residue_initial_state<'a>(
+    total: usize,
+    selected: &[usize],
+    row_at: impl Fn(usize) -> Option<&'a Observation>,
+    per_body_excerpt_chars: usize,
+) -> (HashSet<String>, Vec<(usize, String)>) {
+    let mut seen = HashSet::new();
     let mut pass_zero = Vec::new();
     for idx in selected {
-        let observation = &observations[*idx];
+        let Some(observation) = row_at(*idx) else {
+            continue;
+        };
+        let block = render_observation_block(total, *idx, observation, per_body_excerpt_chars);
+        seen.extend(mine_residue_tokens(&block.text, usize::MAX));
         if observation.body.chars().count() <= per_body_excerpt_chars
             || carries_routing_text(observation)
         {
@@ -387,61 +895,46 @@ fn render_verbatim_residue(
             .collect();
         pass_zero.push((*idx, normalize_residue_text(&tail)));
     }
+    (seen, pass_zero)
+}
 
-    let pass_one_indices: HashSet<usize> = observations
+/// The fetched counterpart of [`render_verbatim_residue`]: candidates arrive
+/// ranked — score, position, error-line flag and `rowid` all decided while
+/// the row was streamed — and bodies are re-read by `rowid` only as the
+/// greedy passes consume them. A pass stops at the first budget overflow, so
+/// the rows behind the never-visited candidates are never re-read.
+fn render_verbatim_residue_fetched<'a>(
+    pass_one: &[ResidueCandidate],
+    pass_two: &[ResidueCandidate],
+    fetch: &dyn Fn(i64) -> Option<(Observation, String)>,
+    selected: &[usize],
+    row_at: &dyn Fn(usize) -> Option<&'a Observation>,
+    total: usize,
+    cfg: &ObservationProjectionConfig,
+) -> ResidueRender {
+    let per_body_excerpt_chars = cfg.per_body_excerpt_chars;
+    let max_chars = cfg.max_total_chars.saturating_div(8).min(MAX_RESIDUE_CHARS);
+    if max_chars <= RESIDUE_HEADER.chars().count() {
+        return ResidueRender {
+            groups: Vec::new(),
+            token_count: 0,
+        };
+    }
+
+    let selected_set: HashSet<usize> = selected.iter().copied().collect();
+    let (mut seen, pass_zero) =
+        residue_initial_state(total, selected, row_at, per_body_excerpt_chars);
+
+    let mut pass_one_ranked: Vec<&ResidueCandidate> = pass_one
         .iter()
-        .enumerate()
-        .filter(|(idx, observation)| {
-            !selected_set.contains(idx)
-                && matches!(
-                    observation.kind,
-                    ObservationKind::UserPrompt
-                        | ObservationKind::Stop
-                        | ObservationKind::PreCompact
-                        | ObservationKind::PostCompaction
-                        | ObservationKind::SessionEnd
-                )
-        })
-        .map(|(idx, _)| idx)
+        .filter(|candidate| !selected_set.contains(&candidate.idx))
         .collect();
-    let mut pass_one: Vec<(usize, String)> = observations
+    pass_one_ranked.sort_by(|a, b| rank_residue_pass_one(a, b));
+    let mut pass_two_ranked: Vec<&ResidueCandidate> = pass_two
         .iter()
-        .enumerate()
-        .filter(|(idx, observation)| {
-            pass_one_indices.contains(idx) && !carries_routing_text(observation)
-        })
-        .filter_map(|(idx, observation)| {
-            let text = if observation.kind == ObservationKind::UserPrompt {
-                user_written(&observation.body)?
-            } else {
-                residue_slice(&observation.body)?
-            };
-            Some((idx, normalize_residue_text(&text)))
-        })
+        .filter(|candidate| !selected_set.contains(&candidate.idx))
         .collect();
-    pass_one.sort_by(|(left, _), (right, _)| {
-        scores[*right]
-            .cmp(&scores[*left])
-            .then_with(|| right.cmp(left))
-    });
-    let mut pass_two: Vec<(usize, String)> = observations
-        .iter()
-        .enumerate()
-        .filter(|(idx, observation)| {
-            !selected_set.contains(idx)
-                && !pass_one_indices.contains(idx)
-                && !carries_routing_text(observation)
-        })
-        .filter_map(|(idx, observation)| {
-            residue_slice(&observation.body).map(|text| (idx, normalize_residue_text(&text)))
-        })
-        .collect();
-    pass_two.sort_by(|(left, left_text), (right, right_text)| {
-        has_residue_error_line(right_text)
-            .cmp(&has_residue_error_line(left_text))
-            .then_with(|| scores[*right].cmp(&scores[*left]))
-            .then_with(|| right.cmp(left))
-    });
+    pass_two_ranked.sort_by(|a, b| rank_residue_pass_two(a, b));
 
     let mut rendered = ResidueRender {
         groups: Vec::new(),
@@ -450,24 +943,62 @@ fn render_verbatim_residue(
     let early_limit = max_chars / 2;
     append_residue_pass(
         &mut rendered,
-        observations,
-        pass_zero.into_iter().chain(pass_one),
+        pass_zero
+            .into_iter()
+            .filter_map(|(idx, text)| row_at(idx).map(|observation| (observation.clone(), text)))
+            .chain(FetchedCandidateIter {
+                pos: 0,
+                candidates: &pass_one_ranked,
+                fetch,
+            }),
         &mut seen,
         early_limit,
     );
-    append_residue_pass(&mut rendered, observations, pass_two, &mut seen, max_chars);
+    append_residue_pass(
+        &mut rendered,
+        FetchedCandidateIter {
+            pos: 0,
+            candidates: &pass_two_ranked,
+            fetch,
+        },
+        &mut seen,
+        max_chars,
+    );
     rendered
+}
+
+/// Candidates consumed in ranked order, their bodies fetched by `rowid` as
+/// they go: the pass never fetches a body it will not render, and a budget
+/// overflow stops both the groups and the fetches.
+struct FetchedCandidateIter<'a> {
+    pos: usize,
+    candidates: &'a [&'a ResidueCandidate],
+    fetch: &'a dyn Fn(i64) -> Option<(Observation, String)>,
+}
+
+impl Iterator for FetchedCandidateIter<'_> {
+    type Item = (Observation, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.pos < self.candidates.len() {
+            let candidate = &self.candidates[self.pos];
+            self.pos += 1;
+            if let Some(item) = (self.fetch)(candidate.rowid) {
+                return Some(item);
+            }
+        }
+        None
+    }
 }
 
 fn append_residue_pass(
     rendered: &mut ResidueRender,
-    observations: &[Observation],
-    candidates: impl IntoIterator<Item = (usize, String)>,
+    candidates: impl IntoIterator<Item = (Observation, String)>,
     seen: &mut HashSet<String>,
     max_chars: usize,
 ) {
-    for (idx, text) in candidates {
-        let Some(group) = residue_group(&observations[idx], &text, seen) else {
+    for (observation, text) in candidates {
+        let Some(group) = residue_group(&observation, &text, seen) else {
             continue;
         };
         let next_chars = rendered
@@ -575,18 +1106,19 @@ struct RenderedProjection {
     truncated_bodies: usize,
 }
 
-fn render_projection(
-    observations: &[Observation],
+fn render_projection_rows<'a>(
+    total: usize,
     selected: &[usize],
+    row_at: &dyn Fn(usize) -> Option<&'a Observation>,
     per_body_excerpt_chars: usize,
 ) -> RenderedProjection {
     let mut text = String::new();
     let mut truncated_bodies = 0usize;
     for idx in selected {
-        let Some(obs) = observations.get(*idx) else {
+        let Some(obs) = row_at(*idx) else {
             continue;
         };
-        let block = render_observation_block(observations.len(), *idx, obs, per_body_excerpt_chars);
+        let block = render_observation_block(total, *idx, obs, per_body_excerpt_chars);
         if block.truncated {
             truncated_bodies += 1;
         }
@@ -670,33 +1202,36 @@ fn fit_text_to_budget(text: &str, max_chars: usize, marker: &str) -> String {
     out
 }
 
-fn select_observation_indices(
-    observations: &[Observation],
-    limit: usize,
-    scores: &[i32],
-) -> Vec<usize> {
-    if observations.len() <= limit {
-        return (0..observations.len()).collect();
+/// The shared selection key both paths rank rows by: the base score plus
+/// the even-sample bonus. The in-memory path sorts `(key, idx)` and the
+/// streaming path feeds the same pair to its bounded heap, so a tie
+/// resolves by index exactly as the base's order `(score + bonus, idx)
+///` does — never re-derived per path.
+#[must_use]
+fn selection_key(score: i32, idx: usize, even: &BTreeSet<usize>) -> i32 {
+    score
+        + if even.contains(&idx) {
+            EVEN_SAMPLE_SCORE
+        } else {
+            0
+        }
+}
+
+fn select_observation_indices(total: usize, limit: usize, scores: &[i32]) -> Vec<usize> {
+    if total <= limit {
+        return (0..total).collect();
     }
     let mut selected: BTreeSet<usize> = BTreeSet::new();
     if limit == 1 {
-        selected.insert(observations.len() - 1);
+        selected.insert(total - 1);
         return selected.into_iter().collect();
     }
     selected.insert(0);
-    selected.insert(observations.len() - 1);
-    let even = even_sample_indices(observations.len());
-    let mut scored: Vec<(i32, usize)> = observations
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !selected.contains(idx))
-        .map(|(idx, _)| {
-            let mut score = scores[idx];
-            if even.contains(&idx) {
-                score += EVEN_SAMPLE_SCORE;
-            }
-            (score, idx)
-        })
+    selected.insert(total - 1);
+    let even = even_sample_indices(total);
+    let mut scored: Vec<(i32, usize)> = (0..total)
+        .filter(|idx| !selected.contains(idx))
+        .map(|idx| (selection_key(scores[idx], idx, &even), idx))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
@@ -726,22 +1261,22 @@ fn even_sample_indices(total: usize) -> BTreeSet<usize> {
     out
 }
 
-fn lowest_prunable_index(
-    observations: &[Observation],
-    selected: &[usize],
-    scores: &[i32],
-) -> Option<usize> {
+/// `scores` is positional to `selected` — `scores[pos]` is the base score
+/// of `selected[pos]` — so neither path keeps a per-row vector of the whole
+/// session. The hard anchors never prune, so their scores are never read.
+/// The weakest non-anchor selection pair — the base's `lowest_prunable_index`
+/// minimum over its full score vector, applied to the selected pairs: the
+/// lowest base score first, then the lowest index on a tie.
+fn lowest_prunable_pair(total: usize, selected: &[(usize, i32)]) -> Option<usize> {
     selected
         .iter()
-        .copied()
-        .filter(|idx| !is_hard_anchor(observations, *idx))
-        .map(|idx| (scores[idx], idx))
-        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
-        .map(|(_, idx)| idx)
+        .filter(|(idx, _)| !is_hard_anchor(total, *idx))
+        .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        .map(|(idx, _)| *idx)
 }
 
-fn is_hard_anchor(observations: &[Observation], idx: usize) -> bool {
-    idx == 0 || idx + 1 == observations.len()
+fn is_hard_anchor(total: usize, idx: usize) -> bool {
+    idx == 0 || idx + 1 == total
 }
 
 fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
@@ -973,8 +1508,95 @@ mod tests {
             projected
                 .selected_indices
                 .iter()
-                .any(|idx| !is_hard_anchor(&observations, *idx) && even.contains(idx))
+                .any(|idx| !is_hard_anchor(observations.len(), *idx) && even.contains(idx))
         );
+    }
+
+    /// The base values of the selection constants, pinned literally: the
+    /// frozen-projection oracle derives its expectation from its own copy
+    /// of the base code, so these literals are the independent pin that a
+    /// changed constant still changes the prompt with.
+    #[test]
+    fn selection_constants_match_the_base_values() {
+        assert_eq!(EVEN_SAMPLE_SCORE, 20);
+        assert_eq!(MAX_RECENCY_SCORE, 80);
+    }
+
+    /// At `limit = 16` the 14 heap slots are filled exactly by the 14
+    /// even-sample rows when the bonus outranks a one-point lead. Row 200
+    /// (not an even position) leads every other row by one point: at the
+    /// base bonus (20) every even row's key (120) still outranks the leader
+    /// (101) and the leader is cut; at a shrunken bonus (1) the even rows
+    /// drop to 101, tie the leader, and the higher-index tie-break admits
+    /// row 200 while evicting the lowest-index even row (19).
+    #[test]
+    fn even_sample_bonus_is_decisive_at_the_selection_boundary() {
+        let total = 300;
+        let mut scores = vec![100i32; total];
+        scores[200] = 101;
+        let selected = select_observation_indices(total, 16, &scores);
+        let even = even_sample_indices(total);
+        assert_eq!(even.len(), 16);
+        assert!(
+            even.iter().all(|idx| selected.contains(idx)),
+            "the base bonus must lift every even-sample row above the one-point leader"
+        );
+        assert!(
+            !selected.contains(&200),
+            "the base bonus keeps the one-point leader out; bonus 1 ties it with the even rows and the tie-break admits it"
+        );
+        assert_eq!(selected.len(), 16);
+    }
+
+    /// The recency maximum, pinned at a selection boundary: rows 33 (an
+    /// even-sample position, `30 + 26 + 20`) and 57 (`30 + 46`) tie on the
+    /// shared selection key while the recency span is `MAX_RECENCY_SCORE`
+    /// (80), and the tie breaks to the higher index — a maximum of 81 lifts
+    /// the even row by one point and the selection flips from 57 to 33. The
+    /// other rows from 34 on carry routing text so none can outrank either,
+    /// and `limit = 3` keeps the selection at the two anchors plus one heap
+    /// entry, the boundary itself.
+    #[test]
+    fn recency_maximum_is_decisive_at_the_selection_boundary() {
+        let total = 100;
+        let observations: Vec<Observation> = (0..total)
+            .map(|idx| {
+                if idx >= 34 && idx != 57 {
+                    obs(
+                        idx,
+                        ObservationKind::PostToolUse,
+                        "routing",
+                        "note about long-term memory (ai-memory) routing install",
+                        0,
+                    )
+                } else {
+                    obs(idx, ObservationKind::PostToolUse, "routine", "x", 0)
+                }
+            })
+            .collect();
+        let scores: Vec<i32> = observations
+            .iter()
+            .enumerate()
+            .map(|(idx, observation)| observation_score(observation, idx, total))
+            .collect();
+        let selected = select_observation_indices(total, 3, &scores);
+        assert_eq!(
+            selected,
+            vec![0, 57, 99],
+            "rows 33 and 57 tie at the base recency maximum; only a larger maximum flips the winner"
+        );
+    }
+
+    /// The recency score spans exactly `MAX_RECENCY_SCORE` over the session:
+    /// first row 0, last row the full maximum, divisor `total - 1`. A
+    /// mutant that changes the divisor (e.g. `total`) shifts the last row's
+    /// score and is caught here.
+    #[test]
+    fn recency_score_spans_the_full_maximum_over_the_session() {
+        assert_eq!(recency_score(0, 300), 0);
+        assert_eq!(recency_score(299, 300), MAX_RECENCY_SCORE);
+        assert_eq!(recency_score(150, 300), (150 * MAX_RECENCY_SCORE) / 299);
+        assert_eq!(recency_score(5, 1), 0);
     }
 
     #[test]
