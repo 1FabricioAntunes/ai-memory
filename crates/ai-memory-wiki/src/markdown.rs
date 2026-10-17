@@ -883,6 +883,48 @@ fn closing_paren_after_destination(tail: &str) -> Option<usize> {
     None
 }
 
+/// Decode the path portion of an ordinary Markdown URL destination once.
+///
+/// Split literal query and fragment delimiters before calling this helper:
+/// an encoded `%23` or `%3F` names a character in the filename. Wikilinks
+/// name literal page paths and must not go through URL decoding. Invalid
+/// escape spellings stay literal; invalid UTF-8 and encoded control bytes
+/// have no portable page-path representation and are refused.
+#[must_use]
+pub fn decode_markdown_destination_path(path: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !path.contains('%') {
+        return Some(std::borrow::Cow::Borrowed(path));
+    }
+    let mut decoded = Vec::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes
+                    .get(pos + 1)
+                    .copied()
+                    .and_then(|b| char::from(b).to_digit(16)),
+                bytes
+                    .get(pos + 2)
+                    .copied()
+                    .and_then(|b| char::from(b).to_digit(16)),
+            )
+        {
+            let byte = (hi * 16 + lo) as u8;
+            if byte.is_ascii_control() {
+                return None;
+            }
+            decoded.push(byte);
+            pos += 3;
+        } else {
+            decoded.push(bytes[pos]);
+            pos += 1;
+        }
+    }
+    String::from_utf8(decoded).ok().map(std::borrow::Cow::Owned)
+}
+
 fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
     let target = raw
         .split_once('|')
@@ -890,26 +932,27 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
         .trim()
         .trim_matches('<')
         .trim_matches('>');
-    if target.is_empty() || target.starts_with('#') || target.contains("://") {
+    if target.is_empty() || target.starts_with('#') {
         return None;
     }
+    let path = target.split(['#', '?']).next()?.trim();
+    let decoded = if wikilink {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        decode_markdown_destination_path(path)?
+    };
+    let target = decoded.as_ref();
     let lower = target.to_ascii_lowercase();
-    if lower.starts_with("mailto:")
+    if target.is_empty()
+        || target.contains("://")
+        || target.contains('\\')
+        || lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
         || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
         || lower.starts_with("file:")
     {
-        return None;
-    }
-
-    let target = target.split_once('#').map_or(target, |(path, _)| path);
-    let target = target
-        .split_once('?')
-        .map_or(target, |(path, _)| path)
-        .trim();
-    if target.is_empty() || target.contains('\\') {
         return None;
     }
 
@@ -2054,5 +2097,54 @@ mod tests {
         // Without whitespace or parens a bare destination holds them fine.
         let bare = rewrite_local_wikilinks("[[notes/a>b.md]]", &path, "proj");
         assert!(bare.ends_with("](../notes/a>b.md)"), "{bare}");
+    }
+
+    #[test]
+    fn markdown_url_paths_decode_once_before_link_resolution() {
+        for (destination, expected) in [
+            ("notes/my%20note.md", "notes/my note.md"),
+            ("notes/%E6%97%A5%E6%9C%AC.md", "notes/日本.md"),
+            ("notes/my%23note.md#section", "notes/my#note.md"),
+            ("notes/my%3Fnote.md?view=1", "notes/my?note.md"),
+            ("notes/my%2520note.md", "notes/my%20note.md"),
+            ("notes%2Fmy%20note.md", "notes/my note.md"),
+            ("notes/%zz.md", "notes/%zz.md"),
+            ("notes/%2.md", "notes/%2.md"),
+        ] {
+            let root = PagePath::new("source.md").unwrap();
+            let links = extract_links(&format!("[note](<{destination}>)"), &root);
+            assert_eq!(links.len(), 1, "{destination}");
+            assert_eq!(links[0].path.as_str(), expected, "{destination}");
+            assert_eq!(links[0].workspace, None);
+            assert_eq!(links[0].project, None);
+        }
+        assert_eq!(linked("[[notes/my%20note.md]]"), ["notes/my%20note.md"]);
+    }
+
+    #[test]
+    fn decoded_markdown_paths_cannot_escape_or_change_scope() {
+        let root = PagePath::new("source.md").unwrap();
+        for destination in [
+            "%2e%2e/secret.md",
+            "notes/%2e%2e/%2e%2e/secret.md",
+            "notes%5Csecret.md",
+            "%68ttps%3A%2F%2Fexample.com/secret.md",
+            "%66ile%3Asecret.md",
+            "notes/%FF.md",
+            "notes/%00.md",
+        ] {
+            assert!(
+                extract_links(&format!("[note](<{destination}>)"), &root).is_empty(),
+                "{destination} must not become a page target"
+            );
+        }
+        let links = extract_links("[note](other%3Anotes/secret.md)", &root);
+        assert!(
+            links
+                .iter()
+                .all(|link| link.workspace.is_none() && link.project.is_none())
+        );
+        let links = extract_links("[note](notes/%2e%2e/inside.md)", &root);
+        assert_eq!(links[0].path.as_str(), "inside.md");
     }
 }
