@@ -5603,8 +5603,8 @@ impl ReaderPool {
     /// `reconsolidation` kinds — the breadth signal — and `newest_evidence_us`
     /// is `MAX(created_at)`. The contradiction count is the number of
     /// `contradicts` edges the page declares whose target resolves to a *live*
-    /// (latest) page; a stale (dangling) contradiction does not weaken the
-    /// belief, matching the lint's resolved/stale split.
+    /// (latest unexpired) page; a stale (dangling or expired) contradiction does
+    /// not weaken the belief, matching the lint's resolved/stale split.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -5658,22 +5658,29 @@ impl ReaderPool {
             }
 
             // Live contradictions each page declares. Only edges whose target
-            // resolves to a latest page count — a dangling `contradicts` is
-            // stale, not an active disagreement (mirrors the lint split).
+            // resolves to a latest unexpired page count — a dangling or
+            // expired `contradicts` is stale, not an active disagreement
+            // (mirrors the lint split).
+            let now = now_us();
+            let to_ttl = not_expired("tp", "?");
             let contradiction_sql = format!(
                 "SELECT l.from_page_id, COUNT(*) \
                  FROM links l \
-                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
                  WHERE l.link_type = 'contradicts' \
                    AND l.from_page_id IN ({placeholders}) \
                  GROUP BY l.from_page_id"
             );
             let mut stmt = conn.prepare(&contradiction_sql)?;
-            let rows = stmt.query_map(params_from_iter(page_id_blobs.iter()), |row| {
-                let id: Vec<u8> = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((id, n))
-            })?;
+            let now_val = Value::Integer(now);
+            let rows = stmt.query_map(
+                params_from_iter(std::iter::once(&now_val).chain(page_id_blobs.iter())),
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((id, n))
+                },
+            )?;
             for r in rows {
                 let (id, n) = r?;
                 let entry = out.entry(PageId::from_slice(&id)?).or_default();
