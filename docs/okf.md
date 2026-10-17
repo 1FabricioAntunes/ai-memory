@@ -59,6 +59,11 @@ families. Summary of what conformance requires:
 
 ## Field mapping
 
+Ordinary Markdown links use URL path encoding: `notes/my%20note.md` points
+to `notes/my note.md`. Import and the web UI decode that path once before
+resolving it. A literal percent sequence in a filename uses `%25` in a
+Markdown URL, while `[[wikilinks]]` continue to name literal page paths.
+
 | OKF key | ai-memory source |
 |---|---|
 | `type` (required) | derived from path family + existing frontmatter: `sessions/` → `Session Summary`, `_rules/` → `Rule`, `gotchas/` → `Gotcha`, `decisions/` → `Decision`, `procedures/` → `Procedure`, `concepts/` → `Concept`, `notes/` → `Note`, `runbooks/` → `Runbook`, `_slots/` → `Invariant`/`State` (from `slot_kind`), `_lint/` → `Lint Report`, `_pending/` → `Pending Note`; `kind:` frontmatter (`fact`/`note`/`procedure`/`decision`) wins over the path default when present |
