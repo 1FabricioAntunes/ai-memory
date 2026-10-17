@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
+  pages. The store query now filters out expired page targets against the
+  current timestamp, preventing `memory_lint` from emitting `feedback_flagged`
+  findings for expired pages that are pending forget-sweep deletion.
+  ([#1388](https://github.com/akitaonrails/ai-memory/pull/1388))
 - Fixed `existing_latest_paths` ignoring page TTL expiration. The query now
   filters out expired pages against the current timestamp, preventing the
   consolidation link guard from keeping wikilinks or typed relations targeting
