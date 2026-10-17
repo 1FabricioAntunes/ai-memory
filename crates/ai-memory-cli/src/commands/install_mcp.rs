@@ -4440,7 +4440,7 @@ mod tests {
         assert_eq!(entry(McpClient::VsCodeCopilot)["type"], "stdio");
         assert!(entry(McpClient::Zed).get("type").is_none());
         let cline = entry(McpClient::Cline);
-        assert_eq!(cline["command"], "ai-memory");
+        assert_eq!(cline["command"], bridge_command());
         assert_eq!(cline["args"][0], "mcp-bridge");
         assert!(cline.get("transport").is_none(), "{cline:#}");
         // Kimi Code's schema dialect rides the bridge's upstream URL.
