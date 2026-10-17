@@ -1199,6 +1199,39 @@ pub struct SessionConsolidationQueue {
     pub oldest_pending_requested_at_us: Option<i64>,
 }
 
+/// One open session selected by [`ReaderPool::idle_open_sessions`] for the
+/// server-side idle auto-end tick: its last activity
+/// (`MAX(observations.created_at)`, falling back to `started_at`) is older
+/// than the tick's cutoff, and it never received a `SessionEnd`.
+#[derive(Debug, Clone)]
+pub struct IdleOpenSession {
+    /// Session id.
+    pub session_id: SessionId,
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Harness that opened the session.
+    pub agent_kind: AgentKind,
+    /// Captured session cwd, if available.
+    pub cwd: Option<String>,
+    /// Operator owning the session (`IdentityKey::storage_key`), `None` when
+    /// the session is shared/actorless. The tick attributes its page to this
+    /// owner, not to the server process.
+    pub actor_user: Option<String>,
+    /// Session start, Unix microseconds.
+    pub started_at: i64,
+    /// `MAX(observations.created_at)`, or `started_at` when the session has
+    /// no observations. The end preserves it in the audit detail
+    /// (`last_activity_us`); `ended_at` is the tick's clock.
+    pub last_activity_us: i64,
+    /// Latest `sessions/<id>.md` version captured alongside the selection
+    /// (same read, before any write). The tick's conditional page write takes
+    /// it as its precondition, so it cannot supersede a page a real
+    /// `SessionEnd` delivered after the selection.
+    pub seen_page_id: Option<PageId>,
+}
+
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
 /// and [`ReaderPool::session_summary_scoped`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2127,6 +2160,45 @@ pub struct PageMeta {
     /// is hidden from retrieval and awaiting the next forget sweep.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub expired: bool,
+}
+
+/// Soft cap on nodes in a project link graph. Pages with the fewest
+/// same-project neighbours drop first when a project is larger, then the
+/// oldest of those; the rest stay reachable from the page tree.
+pub const PROJECT_LINK_GRAPH_MAX_NODES: usize = 120;
+
+/// One latest page kept in a project link graph.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LinkGraphNode {
+    /// Relative wiki path.
+    pub path: String,
+    /// Page title.
+    pub title: String,
+    /// Number of resolved same-project neighbours (either direction).
+    pub degree: u64,
+}
+
+/// One resolved same-project edge in a project link graph.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LinkGraphEdge {
+    /// Source page path.
+    pub from_path: String,
+    /// Target page path.
+    pub to_path: String,
+}
+
+/// Latest unexpired pages in one project and the resolved wikilinks among
+/// them. Powers `/web/w/{workspace}/{project}/graph` and
+/// `GET /api/v1/workspaces/{workspace}/projects/{project}/graph`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LinkGraph {
+    /// Pages kept after the degree-then-recency cap.
+    pub nodes: Vec<LinkGraphNode>,
+    /// Resolved same-project edges whose both ends are in `nodes`.
+    pub edges: Vec<LinkGraphEdge>,
+    /// `true` when the project has more live pages than
+    /// [`PROJECT_LINK_GRAPH_MAX_NODES`].
+    pub truncated: bool,
 }
 
 /// One resolved cross-project edge (a link whose endpoints live in
@@ -3788,6 +3860,42 @@ impl ReaderPool {
         .await
     }
 
+    /// Count one session's IN-SCOPE observations — every kind, not just the
+    /// substantive ones. A session's idle end stamps
+    /// `ended_observation_count` from the live count and re-verifies the
+    /// candidate's digest-time count against it: a non-end observation
+    /// (a `Stop`, a lifecycle marker) landing in the window between the
+    /// digest read and the stamp must still lose the CAS. Scoped the same
+    /// way as [`Self::session_has_substantive_observation`]; a missing or
+    /// foreign session counts as zero.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_observation_count(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<i64> {
+        self.with_conn(move |conn| {
+            const SQL: &str = "SELECT COUNT(*) \
+                 FROM observations AS o \
+                 JOIN sessions AS s ON s.id = o.session_id \
+                 WHERE o.session_id = ?1 \
+                   AND s.workspace_id = ?2 AND s.project_id = ?3";
+            Ok(conn.query_row(
+                SQL,
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes()
+                ],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
     /// Read one session's observations through bounded queries, all inside one
     /// read transaction so every answer describes the same set of rows. The
     /// session must belong to the given workspace and project; a foreign or
@@ -5001,6 +5109,151 @@ impl ReaderPool {
         .await
     }
 
+    /// Open sessions whose last activity is older than `cutoff_us`, for the
+    /// server-side idle auto-end tick.
+    ///
+    /// "Last activity" is `MAX(observations.created_at)` — the same fact the
+    /// end's audit preserves (`last_activity_us` detail; `ended_at` itself is
+    /// the tick's clock) — falling back to `started_at` for a session that
+    /// began but never captured an observation. Sessions without the
+    /// `ended_at IS NULL` shape are never returned, so the result is a
+    /// re-check-free candidate list: the end itself still guards with its own
+    /// `ended_at IS NULL` CAS in the writer.
+    ///
+    /// `seen_page_id` captures the latest `sessions/<id>.md` version in the
+    /// SAME STATEMENT as the session row (a correlated subquery over `pages`,
+    /// so one atomic SELECT cannot observe a page a real `SessionEnd`
+    /// publishes after the session row was read): the tick's conditional page
+    /// write takes it as its precondition and cannot supersede a page the
+    /// hook delivered between the selection and the tick's write. The path is
+    /// rendered in SQL from the id blob (see the query below); the selection
+    /// test proves it byte-for-byte against the Rust-rendered path.
+    ///
+    /// Ordered by last activity (oldest first) and bounded by `limit`, so one
+    /// tick ends a bounded batch and the next picks up the rest.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn idle_open_sessions(
+        &self,
+        cutoff_us: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<IdleOpenSession>> {
+        self.with_conn(move |conn| {
+            // ONE statement: the correlated subquery reads each session page
+            // from the same atomic snapshot as the session row, so the tick's
+            // precondition can never be a page version it never saw.
+            //
+            // The page path is rendered in SQL because `sessions.id` is the
+            // 16-byte UUID blob while `pages.path` is text: `lower(hex(s.id))`
+            // is the UUID's canonical hyphenless hex in the same lowercase
+            // letters `SessionId`'s `Display` prints, and the substr pieces
+            // reinsert the 8-4-4-4-12 hyphens. The result is byte-for-byte the
+            // Rust `format!("sessions/{session_id}.md")` — the selection test
+            // proves it with a page present (captured) and absent (not), so a
+            // rendering drift would stall the session, never compare against a
+            // guessed path.
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.workspace_id, s.project_id, s.agent_kind, s.cwd, s.actor_user, \
+             s.started_at, COALESCE( \
+                 (SELECT MAX(o.created_at) FROM observations o \
+                  WHERE o.session_id = s.id), \
+                 s.started_at) AS last_activity, \
+                 (SELECT p.id FROM pages p \
+                  WHERE p.workspace_id = s.workspace_id \
+                    AND p.project_id = s.project_id \
+                    AND p.is_latest = 1 \
+                    AND p.path = 'sessions/' || substr(lower(hex(s.id)), 1, 8) || '-' || \
+                                       substr(lower(hex(s.id)), 9, 4) || '-' || \
+                                       substr(lower(hex(s.id)), 13, 4) || '-' || \
+                                       substr(lower(hex(s.id)), 17, 4) || '-' || \
+                                       substr(lower(hex(s.id)), 21, 12) || '.md') \
+             FROM sessions s \
+             WHERE s.ended_at IS NULL \
+               AND COALESCE( \
+                     (SELECT MAX(o.created_at) FROM observations o \
+                      WHERE o.session_id = s.id), \
+                     s.started_at) < ?1 \
+             ORDER BY last_activity ASC, s.id ASC \
+             LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff_us, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<Vec<u8>>>(8)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut out = Vec::with_capacity(rows.len());
+            for (
+                id,
+                workspace_id,
+                project_id,
+                agent_kind,
+                cwd,
+                actor_user,
+                started_at,
+                last_activity_us,
+                page_id,
+            ) in rows
+            {
+                let session_id = SessionId::from_slice(&id)?;
+                let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
+                let project_id = ProjectId::from_slice(&project_id)?;
+                let seen_page_id = page_id
+                    .as_ref()
+                    .map(|bytes| PageId::from_slice(bytes))
+                    .transpose()?;
+                out.push(IdleOpenSession {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::from_wire(&agent_kind),
+                    cwd,
+                    actor_user,
+                    started_at,
+                    last_activity_us,
+                    seen_page_id,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Native session ids bound to `managed_runs` rows still in state
+    /// `active`, for the idle auto-end tick's exclusion: a live managed run
+    /// (`ai-memory run`) owns its native session's lifecycle, so the tick
+    /// must not end it even when the session row looks idle.
+    ///
+    /// The join is done in Rust, not SQL: `managed_runs.native_session_id`
+    /// holds the harness's native id string while `sessions.id` is the
+    /// derived UUIDv7 blob, so the two columns never compare equal in SQL.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn active_managed_run_native_session_ids(&self) -> StoreResult<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT native_session_id FROM managed_runs \
+                 WHERE state = 'active' AND native_session_id IS NOT NULL",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })
+        .await
+    }
+
     /// Resolve the `(workspace, project)` where a session's observations
     /// actually landed, independent of the (possibly stale) `sessions` row.
     ///
@@ -5603,8 +5856,8 @@ impl ReaderPool {
     /// `reconsolidation` kinds — the breadth signal — and `newest_evidence_us`
     /// is `MAX(created_at)`. The contradiction count is the number of
     /// `contradicts` edges the page declares whose target resolves to a *live*
-    /// (latest) page; a stale (dangling) contradiction does not weaken the
-    /// belief, matching the lint's resolved/stale split.
+    /// (latest unexpired) page; a stale (dangling or expired) contradiction does
+    /// not weaken the belief, matching the lint's resolved/stale split.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -5658,22 +5911,29 @@ impl ReaderPool {
             }
 
             // Live contradictions each page declares. Only edges whose target
-            // resolves to a latest page count — a dangling `contradicts` is
-            // stale, not an active disagreement (mirrors the lint split).
+            // resolves to a latest unexpired page count — a dangling or
+            // expired `contradicts` is stale, not an active disagreement
+            // (mirrors the lint split).
+            let now = now_us();
+            let to_ttl = not_expired("tp", "?");
             let contradiction_sql = format!(
                 "SELECT l.from_page_id, COUNT(*) \
                  FROM links l \
-                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
                  WHERE l.link_type = 'contradicts' \
                    AND l.from_page_id IN ({placeholders}) \
                  GROUP BY l.from_page_id"
             );
             let mut stmt = conn.prepare(&contradiction_sql)?;
-            let rows = stmt.query_map(params_from_iter(page_id_blobs.iter()), |row| {
-                let id: Vec<u8> = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((id, n))
-            })?;
+            let now_val = Value::Integer(now);
+            let rows = stmt.query_map(
+                params_from_iter(std::iter::once(&now_val).chain(page_id_blobs.iter())),
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((id, n))
+                },
+            )?;
             for r in rows {
                 let (id, n) = r?;
                 let entry = out.entry(PageId::from_slice(&id)?).or_default();
@@ -5909,7 +6169,7 @@ impl ReaderPool {
         .await
     }
 
-    /// Return `stale` / `wrong` feedback still attached to a *current*
+    /// Return `stale` / `wrong` feedback still attached to a *current* unexpired
     /// page version in one project, grouped by (page, kind) — the input
     /// for the lint pass's `feedback_flagged` findings. Rewriting a
     /// flagged page supersedes the version the feedback points at, so
@@ -5924,21 +6184,24 @@ impl ReaderPool {
         project_id: ProjectId,
     ) -> StoreResult<Vec<FeedbackFinding>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let ttl = not_expired("pg", "?3");
+            let sql = format!(
                 "SELECT pg.path, f.kind, COUNT(*) AS signal_count, MAX(f.created_at) AS latest, \
                         (SELECT reason FROM page_feedback r \
                           WHERE r.page_id = f.page_id AND r.kind = f.kind \
                             AND r.reason IS NOT NULL \
                           ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reason \
                  FROM page_feedback f \
-                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1{ttl} \
                  WHERE f.workspace_id = ?1 AND f.project_id = ?2 \
                    AND f.kind IN ('stale', 'wrong') \
                  GROUP BY f.page_id, pg.path, f.kind \
                  ORDER BY latest DESC, pg.path ASC, f.kind ASC",
-            )?;
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let now = now_us();
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
                 |row| {
                     let path: String = row.get(0)?;
                     let kind: String = row.get(1)?;
@@ -9265,6 +9528,151 @@ impl ReaderPool {
         .await
     }
 
+    /// Latest unexpired pages in one project and the resolved wikilinks
+    /// among them.
+    ///
+    /// Cross-project and unresolved links are omitted: this is the in-project
+    /// map the project graph page draws. Expired pages are hidden the same way
+    /// other retrieval surfaces hide them. When the project has more live
+    /// pages than [`PROJECT_LINK_GRAPH_MAX_NODES`], pages with the fewest
+    /// same-project neighbours drop first, then the oldest of those.
+    ///
+    /// Personal slots are included, matching [`Self::list_pages`]: the caller
+    /// has already authorized the project.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn project_link_graph(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<LinkGraph> {
+        self.with_conn(move |conn| {
+            let now = now_us();
+            let ttl = not_expired("pg", "?3");
+            let from_ttl = not_expired("fp", "?3");
+            let to_ttl = not_expired("tp", "?3");
+            let mut page_stmt = conn.prepare(&format!(
+                "WITH live(id, path, title, updated_at) AS ( \
+                     SELECT pg.id, pg.path, pg.title, pg.updated_at \
+                     FROM pages pg \
+                     WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 \
+                       AND pg.is_latest = 1{ttl} \
+                 ), \
+                 live_edges(from_id, to_id) AS ( \
+                     SELECT DISTINCT fp.id, tp.id \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id \
+                       AND fp.is_latest = 1{from_ttl} \
+                     JOIN pages tp ON tp.id = l.to_page_id \
+                       AND tp.is_latest = 1{to_ttl} \
+                     WHERE fp.workspace_id = ?1 AND fp.project_id = ?2 \
+                       AND tp.workspace_id = ?1 AND tp.project_id = ?2 \
+                 ), \
+                 endpoints(page_id) AS ( \
+                     SELECT from_id FROM live_edges \
+                     UNION ALL \
+                     SELECT to_id FROM live_edges WHERE to_id != from_id \
+                 ), \
+                 ranked(id, path, title, updated_at, degree) AS ( \
+                     SELECT live.id, live.path, live.title, live.updated_at, \
+                            COUNT(endpoints.page_id) \
+                     FROM live \
+                     LEFT JOIN endpoints ON endpoints.page_id = live.id \
+                     GROUP BY live.id, live.path, live.title, live.updated_at \
+                 ) \
+                 SELECT id, path, title, degree, COUNT(*) OVER() \
+                 FROM ranked \
+                 ORDER BY degree DESC, updated_at DESC, path \
+                 LIMIT ?4"
+            ))?;
+            let page_rows = page_stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    now,
+                    PROJECT_LINK_GRAPH_MAX_NODES as i64
+                ],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    Ok((
+                        id,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+            let mut pages: Vec<(PageId, LinkGraphNode)> = Vec::new();
+            let mut total_pages = 0_i64;
+            for row in page_rows {
+                let (id, path, title, degree, total) = row?;
+                total_pages = total;
+                pages.push((
+                    PageId::from_slice(&id)?,
+                    LinkGraphNode {
+                        path,
+                        title,
+                        degree: degree as u64,
+                    },
+                ));
+            }
+
+            let mut edges = Vec::new();
+            if !pages.is_empty() {
+                let mut placeholders = String::new();
+                for i in 0..pages.len() {
+                    if i > 0 {
+                        placeholders.push_str(", ");
+                    }
+                    let _ = write!(placeholders, "?{}", i + 4);
+                }
+                let edge_sql = format!(
+                    "SELECT DISTINCT fp.path, tp.path \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id \
+                       AND fp.is_latest = 1{from_ttl} \
+                     JOIN pages tp ON tp.id = l.to_page_id \
+                       AND tp.is_latest = 1{to_ttl} \
+                     WHERE fp.workspace_id = ?1 AND fp.project_id = ?2 \
+                       AND tp.workspace_id = ?1 AND tp.project_id = ?2 \
+                       AND fp.id IN ({placeholders}) \
+                       AND tp.id IN ({placeholders}) \
+                     ORDER BY fp.path, tp.path"
+                );
+                let mut bound = Vec::with_capacity(3 + pages.len());
+                bound.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+                bound.push(Value::Blob(project_id.as_bytes().to_vec()));
+                bound.push(Value::Integer(now));
+                bound.extend(
+                    pages
+                        .iter()
+                        .map(|(id, _)| Value::Blob(id.as_bytes().to_vec())),
+                );
+                let mut edge_stmt = conn.prepare(&edge_sql)?;
+                let edge_rows = edge_stmt.query_map(params_from_iter(bound.iter()), |row| {
+                    Ok(LinkGraphEdge {
+                        from_path: row.get(0)?,
+                        to_path: row.get(1)?,
+                    })
+                })?;
+                for row in edge_rows {
+                    edges.push(row?);
+                }
+            }
+
+            let truncated = total_pages > PROJECT_LINK_GRAPH_MAX_NODES as i64;
+            let nodes = pages.into_iter().map(|(_, node)| node).collect();
+            Ok(LinkGraph {
+                nodes,
+                edges,
+                truncated,
+            })
+        })
+        .await
+    }
+
     /// Return one row per (workspace, project) with page-count and
     /// last-updated aggregates. Used by the web UI project-list view.
     ///
@@ -10091,8 +10499,8 @@ impl ReaderPool {
         .await
     }
 
-    /// Return the subset of `paths` that name a latest page in this scope, in
-    /// a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
+    /// Return the subset of `paths` that name a latest unexpired page in this
+    /// scope, in a single query. The batched counterpart of [`Self::latest_page_id_by_ids`]
     /// for callers that need to know *which* paths resolve — the consolidation
     /// link guard validates proposed cross-scope wikilinks against it (#1218).
     ///
@@ -10121,11 +10529,12 @@ impl ReaderPool {
             let placeholders = std::iter::repeat_n("?", distinct.len())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let ttl = not_expired("pg", "?3");
             let sql = format!(
                 "SELECT pg.path FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = p.workspace_id \
-                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1 \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1{ttl} \
                    AND (p.access_mode <> 'restricted' \
                         OR (w.name = '{global_ws}' AND p.name = '{global_proj}')) \
                    AND pg.path IN ({placeholders})",
@@ -10135,9 +10544,11 @@ impl ReaderPool {
             let mut stmt = conn.prepare(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
-            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 2);
+            let now = now_us();
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 3);
             binds.push(ws_bytes as &dyn rusqlite::ToSql);
             binds.push(proj_bytes as &dyn rusqlite::ToSql);
+            binds.push(&now as &dyn rusqlite::ToSql);
             for p in &distinct {
                 binds.push(p as &dyn rusqlite::ToSql);
             }

@@ -116,7 +116,19 @@ from hook paths.
    canonical SessionEnd path as a native hook. Generated session-page
    frontmatter records `session_id` plus the immutable `sessions.agent_kind`
    as `agent`; it describes the page's harness origin, not the later writer.
-   Manual page writes do not receive inferred agent metadata.
+   Manual page writes do not receive inferred agent metadata. A session that
+   never delivered a `SessionEnd` (crashed harness, closed terminal) is ended
+   by the maintenance tick when `[sessions] idle_end_after_hours` is set, with
+   the tick's own page write, the consolidation job and the lifecycle-only
+   handoff release — no additional handoff from the tick. The page write is
+   conditional on the page version the selection captured in its own
+   statement, and the end stamp is a CAS on `ended_at IS NULL` that also
+   re-verifies the session's observation count (the digest's population) and
+   the latest page version — so a late real `SessionEnd` (or a checkpoint)
+   wins that race and converges through `AlreadyEnded`/`ReEnd`. `ended_at` is
+   the tick's clock (the session's last activity is preserved in the audit
+   detail), and the consolidation job is enqueued inside the stamp's
+   transaction.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
@@ -1064,6 +1076,24 @@ reconcile_tombstones_deleted_pages = false
                                    # behavior (deletions still need `ai-memory delete-page`).
                                    # Docs: docs/okf.md, docs/install.md.
 
+[sessions]                         # server-side session lifecycle
+idle_end_after_hours = 0           # 0 (default) = off. N > 0 (capped at 8760):
+                                   # the [maintenance] tick ends open sessions whose
+                                   # last activity is older than N hours with the tick's
+                                   # own effects (summary page attributed to the
+                                   # session owner + consolidation job, and the
+                                   # lifecycle-only handoff release), never an
+                                   # additional handoff from the tick. Bounded batch
+                                   # of 25 every 15 minutes; the page write is
+                                   # conditional on the version the selection
+                                   # captured, the end stamp is an `ended_at IS NULL`
+                                   # CAS that also re-verifies the session's
+                                   # observation count and the latest page version,
+                                   # so a real SessionEnd landing around the tick
+                                   # wins that race. `ended_at`
+                                   # is the tick's clock; the last activity is kept
+                                   # in the audit detail.
+
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively (fallback λ)
 sigma = 0.6                        # ↑ to reward query-hits more
@@ -1286,8 +1316,34 @@ max_attempts = 8                  # failed drain passes before dropping an event
 [ingest]                          # server-side drop list for tool events (#1241)
 drop_tool_use_id_prefixes = []    # e.g. ["toolu_plugin_"]: drop a tool event whose id starts so
 drop_tool_names = []              # exact tool names to drop; both lists apply to every project,
-                                  # at most 64 entries of 128 characters, checked before the
-                                  # sanitizer, rate limiter and ingest semaphore
+                                  # at most 64 entries of 128 characters
+drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-tool-use"]); a
+                                  # matching event is acknowledged and discarded before storage,
+                                  # all three lists are checked right after the subagent exclusion (a marked
+                                  # subagent event still seeds its tail tracking) and before the
+                                  # rate limiter, the ingest semaphore and the sanitizer.
+                                  # session-start/session-end are rejected (they open/close the
+                                  # session state machine); unknown kinds are rejected. Dropping
+                                  # a kind also turns off everything that kind's processing
+                                  # does: user-prompt loses prompts (summaries, baton open
+                                  # questions, profile learning); pre-tool-use loses the
+                                  # pre-call evidence, so a session whose only work was a tool
+                                  # call that never finished ends lifecycle-only; post-tool-use
+                                  # loses results and the completed-call count; stop loses the
+                                  # opt-in assistant reply,
+                                  # the normal-completion signal and OpenCode's turn checkpoint;
+                                  # pre-compact/post-compaction lose the compaction checkpoint
+                                  # and its rewrite job (the session is not ended);
+                                  # notification loses the observation;
+                                  # subagent-start/subagent-stop lose subagent metadata (stored
+                                  # as `other`). user-prompt and pre-tool-use (with
+                                  # session-start) advance the project fallback pointer; dropping
+                                  # them removes those updates. The portable workstream ledger
+                                  # (`ai-memory run`) is not filtered by this key. In production
+                                  # ~87% of pre-tool-use observations have an empty body and
+                                  # each pairs 1:1 with a post-tool-use that carries the
+                                  # content. Empty by default. Env:
+                                  # AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
 ```
 
 The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese
@@ -1309,8 +1365,10 @@ ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
                            opencode (defaults to the Go endpoint, set
                            https://opencode.ai/zen/v1 for Zen's catalogue).
-                           Applies to any provider: naming ai-memory is how an
-                           operator says a vendor endpoint is proxied on purpose
+                           Applies to every HTTP API provider: naming ai-memory
+                           is how an operator says a vendor endpoint is proxied
+                           on purpose. The ChatGPT backend (openai-oauth, codex)
+                           and cursor's CLI have no override
 LLM_BASE_URL               the unprefixed cross-tool convention, accepted for
                            openai-compat and opencode only. Providers with a
                            fixed vendor endpoint (anthropic, openai, gemini,
@@ -1525,7 +1583,9 @@ the server URL is loopback and no `default` server profile is registered.
 * **Richer read surfaces for the web UI.** The multi-workspace read-only
   wiki browser shipped in `ai-memory-web` (`/web`: project list, page
   tree, page view, page history with a server-side unified diff, a paged
-  session timeline, project search through `memory_query`'s hybrid ranker
+  session timeline, a server-rendered link graph at `/web/graph` and
+  `/web/w/<workspace>/<project>/graph`, project search through
+  `memory_query`'s hybrid ranker
   with a recall trace, the root-only `/web/health` panel, and the root-only
   `/web/pending` triage page,
   whose approve and reject buttons post to the existing
@@ -1538,8 +1598,8 @@ the server URL is loopback and no `default` server profile is registered.
   a concurrent write replaced stays visible (invariant #16). TTL expiry still
   applies: an expired version is neither listed nor readable by id, and a page
   whose live version expired shows no history, since the forget sweep deletes
-  every row at its path. Better *reading*
-  (graph exploration) is open. See
+  every row at its path. The link graph is a circular SVG plus an edge table;
+  larger layouts and interactive clustering remain open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
 * **Retrieval measurement gaps.** The LongMemEval-S harness ships in
   `evals/` (pipeline, component and decomposition modes; results in

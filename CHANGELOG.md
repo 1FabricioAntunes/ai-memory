@@ -19,8 +19,153 @@ version in [`docs/changelog/`](docs/changelog/):
   covers every project and labels each hit with its workspace and project.
   Each hit carries an RFC 3339 `updated_at` instead of an FTS rank. The admin
   route is root-only on a multi-user server, the same as `/admin/search`.
+  ([#1379](https://github.com/akitaonrails/ai-memory/pull/1379))
+- Added an explicit `serve --allow-insecure-human-auth` (or
+  `AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) escape hatch for operators who
+  knowingly run password login over plain HTTP on a private LAN.
+  It is off by default, does not bypass the separate unauthenticated-exposure
+  guard, and prints an unconditional warning that passwords, API credentials,
+  session cookies, and memory data cross the network unencrypted. (#1383)
+- Added first-party Cline CLI lifecycle and MCP support. `install-hooks
+  --agent cline --apply` writes Cline's nine supported event files globally or
+  per project, refuses user-owned and symlinked targets, and keeps embedded
+  bearer credentials owner-only. `install-mcp --client cline --apply` writes
+  Cline's top-level transport fields and explicitly selects Streamable HTTP.
+  Detached start hooks recover handoffs through MCP; yolo mode disables hooks.
+  Also added `install-mcp --client freebuff --apply`, which registers the
+  sessionless stdio bridge in `~/.agents/mcp.json` without starting another
+  ai-memory server. (#1335)
+- Added `[ingest] drop_events` (env `AI_MEMORY_INGEST__DROP_EVENTS`), an
+  opt-in list of hook event kinds the server drops before storing them, next
+  to the existing `drop_tool_use_id_prefixes` and `drop_tool_names`. A dropped
+  event gets the same 202, `dropped_by_policy` metric and log as the other
+  policy drops, before the rate limiter, the ingest semaphore and the
+  sanitizer. Subagent classification precedes every id, name, and kind matcher,
+  so a matching marked event still seeds tracking for its unmarked tail. The
+  default drops nothing. `Config::load` checks each value
+  against the typed event kind and rejects unknown kinds and `session-start`
+  and `session-end`, which open and close sessions. The motivating case is
+  `pre-tool-use`: in one production store about 87% of those observations had
+  an empty body, and each pairs with a `post-tool-use` that carries the
+  content. With `pre-tool-use` dropped, a session whose only work was a tool
+  call that never finished now ends as lifecycle-only. (#1339)
+- Added opt-in `[sessions] idle_end_after_hours` (env
+  `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS`; default `0`, off; range
+  `1..=8760`). When it is set, the `serve` maintenance tick ends open sessions
+  with no activity for that many hours, such as a harness that crashed or a
+  terminal closed before `SessionEnd` fired. A substantive session gets its
+  `sessions/<id>.md` summary page, attributed to the session's owner, and its
+  consolidation job. A boundary-only session ends lifecycle-only and releases
+  the handoff it had accepted. The tick creates no handoff of its own and skips
+  sessions bound to an active managed run. A real `SessionEnd` or checkpoint
+  that lands while the tick runs wins, and the tick leaves that session alone.
+  `ended_at` is the time of the tick; the session's last activity goes in the
+  audit row. (#1338)
+- Added first-party DeepSeek Harness (DSH) lifecycle capture. `install-hooks
+  --agent dsh` (aliases `deepseek-harness`, `deepseek_harness`) stages the
+  new `hooks/dsh` bundle, writes a generated Claude Code `hooks.json`, and
+  prints a Cordis patch fragment that mounts DSH's official
+  `@deepseek-ai/dsh-hooks-claude-code` bridge on
+  `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (the patch file itself is
+  never auto-written). DSH sessions are stored as `agent=dsh`, and its bridge
+  forwards Claude Code-shaped tool payloads, so `[capture] ignore_paths`
+  exclusions apply to its file, search and shell calls (Windows `pwsh`, POSIX
+  `bash`) like any other Claude-shaped adapter; the reserved Code Mode
+  `run_code` transport that its `headless` profile calls is treated as inline
+  program source. The bridge
+  delivers exactly seven events (no `PreCompact` or `SessionEnd`) and runs
+  `SessionStart` detached, so finished sessions close with
+  `finalize-session --agent dsh` and pending handoffs are recovered via
+  `memory_handoff_list` / `memory_handoff_accept`. (#1337)
+- Added an Antigravity skill root family. `install-skills --agent antigravity`
+  (aliases `antigravity-cli`, `agy`; also `install-instructions
+  --skills-agent antigravity`) writes the managed Agent Skills to both global
+  roots Antigravity reads, `~/.gemini/config/skills` (App and IDE) and
+  `~/.gemini/antigravity-cli/skills` (CLI), or to the workspace
+  `.agents/skills` with `--scope project`. `ai-memory setup` now uses it for
+  Antigravity, which until now got its skills only in `~/.agents/skills`, a
+  directory Antigravity does not read globally, and `uninstall --only skills`
+  sweeps both roots. MCP-driven routing refresh and `backup-agents` expose and
+  preserve the same roots, including the shared project `.agents/skills`.
+  (#1357)
+
+- Added a read-only wiki link graph in `/web`. The header **Graph** link opens
+  `/web/graph`, a server-rendered map of resolved wikilinks whose endpoints sit
+  in different projects, plus a table of those edges. Each project page links
+  to `/web/w/<workspace>/<project>/graph`, which shows that project's latest
+  unexpired pages and the resolved same-project links between them as an SVG
+  and a table. Both pages are HTML with no JavaScript.
+  `GET /api/v1/graph` now accepts `workspace` and `project` together to return
+  only edges that touch that project (passing only one of them is `400`), and
+  `GET /api/v1/workspaces/{workspace}/projects/{project}/graph` returns the
+  in-project node and edge lists. A project graph keeps at most 120 pages,
+  preferring those with the most same-project neighbours and then the most
+  recently updated; the store applies that cap before loading nodes or their
+  selected edges into the process. Expired pages stay hidden. An edge still
+  requires both ends to be readable.
 
 ### Fixed
+- Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope. ([#1382](https://github.com/akitaonrails/ai-memory/pull/1382))
+- Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import. ([#1380](https://github.com/akitaonrails/ai-memory/pull/1380))
+- Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
+  pages. The store query now filters out expired page targets against the
+  current timestamp, preventing `memory_lint` from emitting `feedback_flagged`
+  findings for expired pages that are pending forget-sweep deletion.
+  ([#1388](https://github.com/akitaonrails/ai-memory/pull/1388))
+- Fixed `existing_latest_paths` ignoring page TTL expiration. The query now
+  filters out expired pages against the current timestamp, preventing the
+  consolidation link guard from keeping wikilinks or typed relations targeting
+  expired pages that are pending forget-sweep deletion.
+  ([#1387](https://github.com/akitaonrails/ai-memory/pull/1387))
+- Fixed `page_belief_inputs` counting contradictions against TTL-expired target
+  pages as active live contradictions. When a page declares a `contradicts`
+  relation to a target whose `expires_at` TTL has passed, the declaration is
+  stale and must not weaken belief strength or reduce confidence in retrieval
+  ranking. `contradiction_sql` now applies the `not_expired` guard on the target
+  page, aligning belief input aggregation with the lint's resolved/stale split.
+  ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
+- Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+
+## [3.1.1] - 2026-10-17
+
+### Fixed
+- Prevented the Windows executable from overflowing its small default main
+  thread stack as the async CLI command tree grows. The top-level dispatch now
+  runs on an explicitly sized stack on Windows; the native Windows suite had
+  reached the point where every integration test that launched `ai-memory`
+  aborted before handling its command.
+- Fixed native hook events getting stranded forever when a harness killed the
+  process after the spool file was synced but before its atomic rename. A later
+  drain adopts complete, valid `*.json.tmp` entries after a five-minute grace
+  period and removes malformed old remnants. Claude Code settings installs now
+  give `SessionEnd` a 15-second timeout instead of its 1.5-second default budget;
+  plugin hooks rely on recovery because Claude does not let plugin timeouts
+  raise that budget. (#1377)
+- Hardened OIDC credential transport after CodeQL alert #176: the shared
+  refresh-grant sink now requires a typed TLS-or-loopback endpoint, and device
+  authorization and token polling revalidate their endpoints immediately
+  before each request. A caller-mutated discovery object can no longer bypass
+  the login-time HTTPS check.
+- On Windows, `setup` now starts the logon host with a plain executable path,
+  and the host passes plain drive/UNC data-directory and config arguments to the
+  supervisor and server it launches, instead of the `\\?\` verbatim prefix a
+  canonical path carries. The `Run` value was already plain (3.1.0); this covers
+  the command lines built from `current_exe()` and the canonical data dir. This
+  path cleanup does not by itself resolve Bitdefender's behavioral detection.
+  (#1280)
+- Fixed an explicit `llm_base_url` (or `AI_MEMORY_LLM_BASE_URL`) being dropped
+  for the `anthropic` and `openai` providers. Config resolved the override for
+  every provider, as documented, but the provider factory never applied it to
+  those two, so requests and the API key went straight to api.anthropic.com or
+  api.openai.com with nothing in the log. A gateway or reverse proxy set in front
+  of either vendor now receives the traffic. The docs now name the backends that
+  take no override: the ChatGPT backend behind `openai-oauth` and `codex`, and
+  `cursor`'s CLI. (#1347)
+- Corrected the `ExtractionState::NotApplicable` documentation and aligned the
+  generated OpenCode capture policy with the native evaluator: only an active
+  policy dropping a search/list tool reports `not-applicable`; an invalid
+  policy reports `extracted`. `ai-memory hook --check-capture` also uses
+  `not-applicable` when no policy was evaluated. (#1352)
 - `ai-memory auth login openai-oauth` and `auth login copilot` no longer print
   a failed endpoint's whole response body. Error bodies are bounded, scrubbed
   of secrets and terminal control sequences, then capped for display; provider
@@ -134,6 +279,27 @@ version in [`docs/changelog/`](docs/changelog/):
   body now shows whole: it is priced at its own size when the brief decides
   which pages fit, and the bytes it saves over the excerpt go to other pages.
   A page with an empty body keeps its excerpt. (#1360)
+- Fixed `ai-memory setup` wiring OpenCode 2 with OpenCode 1 artifacts. A
+  named `--agent opencode` (or `open-code`), or an OpenCode found by the
+  session store both majors share, always got the V1 function plugin
+  `plugins/ai-memory.ts` and a direct `mcp.ai-memory` entry, which OpenCode
+  2 does not load. `setup` now runs `opencode --version` once, as
+  `install-mcp` and `install-hooks` already did for the generic spelling, and
+  wires the V2 `{ id, setup }` plugin and nested `mcp.servers` entry when it
+  reports major 2. A failed probe writes no OpenCode wiring and is reported
+  as a setup problem; `--agent opencode2` still forces V2 without probing.
+  (#1356)
+- Fixed `ai-memory mcp-bridge` exiting when a client sent `server/discover`
+  before `initialize`. A client that supports both the 2026-07-28 MCP revision
+  and the older `initialize` handshake, such as Antigravity CLI 1.4 and the
+  Antigravity 2.24 app, sends that probe first and falls back to `initialize`
+  when the server answers with an error. The bridge ended the session instead,
+  so the fallback found a closed pipe (`calling initialize: client is closing:
+  EOF`) and the client never connected. Until `initialize` arrives, the bridge
+  now answers every other request with a JSON-RPC Method not found error,
+  ignores notifications such as the client cancelling its probe, and still
+  answers `ping`. A client that starts with `initialize` sees no change.
+  (#1355)
 
 ## [3.1.0] - 2026-10-16
 
@@ -1227,7 +1393,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.1...HEAD
+[3.1.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.1
 [3.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.0
 [3.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.0.1
 [3.0.0]: https://github.com/akitaonrails/ai-memory/compare/v2.6.7...v3.0.0

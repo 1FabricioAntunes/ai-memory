@@ -494,6 +494,7 @@ ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
 ai-memory install-skills --scope global --agent copilot-cli
 ai-memory install-skills --scope global --agent hermes
+ai-memory install-skills --scope global --agent antigravity
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -508,7 +509,10 @@ handoff rule `$GROK_HOME/rules/ai-memory-handoff.md` (default
 `--target-dir` do not. For GitHub Copilot CLI, project-local skills go under the
 repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
 `~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
-`AGENTS.md` instruction target.
+`AGENTS.md` instruction target. Google Antigravity reads workspace skills from
+`.agents/skills` and has two global roots, `~/.gemini/config/skills` for the
+App and IDE and `~/.gemini/antigravity-cli/skills` for the CLI; a global
+`--agent antigravity` install writes both, and `uninstall` sweeps both.
 
 Project-local skill roots are `.claude/skills` for Claude-compatible installs,
 `.agents/skills` for cross-client installs, `.devin/skills` for Devin, and
@@ -651,7 +655,11 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and search. On a project, page,
+breadcrumbs, rendered markdown, metadata, search, and a link graph.
+The header **Graph** link opens `/web/graph` (cross-project wikilinks);
+each project page links to `/web/w/<ws>/<proj>/graph` (pages in that
+project and the resolved links between them). Both are a server-rendered
+SVG plus a table, with no JavaScript. On a project, page,
 namespace, history or session view the header search box searches that project;
 elsewhere it searches every project with FTS5, like
 `memory_query(global=true)`, and the search page's "Search in" selector picks

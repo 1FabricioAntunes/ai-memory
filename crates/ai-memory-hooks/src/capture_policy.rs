@@ -103,7 +103,17 @@ pub enum PolicyState {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExtractionState {
-    /// Tool does not require path extraction.
+    /// No path extraction applied to this event. Two cases produce it:
+    ///
+    /// - An active policy met a search/list tool ([`ToolFamily::SearchList`]).
+    ///   The policy drops it whatever its arguments say, so no path is
+    ///   extracted or counted. Under an inactive or invalid policy the same
+    ///   tool reports [`Self::Extracted`]: the state depends on the policy,
+    ///   not only on the tool.
+    /// - `ai-memory hook --check-capture` evaluated no policy at all, because
+    ///   the event is not a tool event or no working directory was found. The
+    ///   report then pairs it with `policy_state: inactive` and
+    ///   `tool_family: unknown`.
     NotApplicable,
     /// Direct fields were extracted successfully.
     Extracted,
@@ -182,6 +192,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // Meta Muse Code sends the same three fields, `tool_use_id` being the
         // provider's call id (`call_…`, captured offline on Muse Code 1.4.7).
         // CodeBuddy Code sends the same Claude Code fields (#1299).
+        // DSH's Claude Code hooks bridge forwards the same Claude Code
+        // snake_case fields for PreToolUse / PostToolUse.
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
@@ -192,7 +204,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::CopilotCli
         | AgentKind::Muse
         | AgentKind::CodeBuddy
-        | AgentKind::IbmBob => (
+        | AgentKind::IbmBob
+        | AgentKind::Dsh => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -228,6 +241,16 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // reaches a hook payload (verified against the 0.240.0 tool schemas,
         // #1240).
         AgentKind::Droid => (object.get("tool_name")?.as_str()?, None),
+        AgentKind::Cline => {
+            let tool = object
+                .get("tool_call")
+                .or_else(|| object.get("tool_result"))?
+                .as_object()?;
+            (
+                tool.get("name")?.as_str()?,
+                tool.get("id").and_then(Value::as_str),
+            )
+        }
         _ => return None,
     };
     Some((name, id))
@@ -247,6 +270,11 @@ pub(crate) fn tool_observation_metadata(
     let has_args = !require_input
         || match agent {
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
+            AgentKind::Cline => object
+                .get("tool_call")
+                .and_then(Value::as_object)
+                .and_then(|tool| tool.get("input"))
+                .is_some(),
             _ => object
                 .get(
                     if matches!(
@@ -266,6 +294,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Muse
                             | AgentKind::CodeBuddy
                             | AgentKind::IbmBob
+                            | AgentKind::Dsh
                     ) {
                         "tool_input"
                     } else {
@@ -287,6 +316,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(true) => ToolOutcome::Error,
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,
+        },
+        AgentKind::Cline => match raw
+            .get("tool_result")
+            .and_then(Value::as_object)
+            .and_then(|tool| tool.get("error"))
+        {
+            Some(Value::Null) | None => ToolOutcome::Success,
+            Some(Value::String(error)) if error.is_empty() => ToolOutcome::Success,
+            Some(_) => ToolOutcome::Error,
         },
         AgentKind::KiroCli => match raw
             .get("tool_response")
@@ -1073,6 +1111,11 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             .get("toolCall")
             .and_then(Value::as_object)
             .and_then(|call| Some((call.get("name")?.as_str()?, call.get("args")))),
+        AgentKind::Cline => object
+            .get("tool_call")
+            .or_else(|| object.get("tool_result"))
+            .and_then(Value::as_object)
+            .and_then(|call| Some((call.get("name")?.as_str()?, call.get("input")))),
         AgentKind::Grok => object
             .get("tool_name")
             .or_else(|| object.get("toolName"))
@@ -1112,7 +1155,11 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
         | AgentKind::Muse
         | AgentKind::CodeBuddy
-        | AgentKind::IbmBob => object
+        | AgentKind::IbmBob
+        // DSH's Claude Code hooks bridge forwards the same `tool_name` /
+        // `tool_input` pair, so its file and shell calls read the ignore
+        // paths exactly as Claude Code's do.
+        | AgentKind::Dsh => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -1212,7 +1259,9 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // started and returns what it printed, like Codex `write_stdin`.
         output_reader: reads_earlier_output(name)
             || (agent == AgentKind::Muse && name.eq_ignore_ascii_case("bash_input")),
-        powershell: name.eq_ignore_ascii_case("powershell"),
+        // Claude Code's `PowerShell` and DSH's Windows `pwsh` share the
+        // backquote escaping the command splitter has to model.
+        powershell: name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh"),
         inline_code: family == ToolFamily::NonFile
             && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
         call_id,
@@ -1461,8 +1510,12 @@ pub const SEARCH_LIST_TOOL_NAMES: &[&str] = &[
 /// Gemini CLI's `run_shell_command`, `{command, dir_path?}`) and the Hermes
 /// Agent tools that execute code, drive a browser, or fetch the web
 /// (agent/shell_hooks.py envelope; names from the model_tools registry,
-/// live-captured 2026-10-07). They are non-file rather than unknown because
-/// family `unknown` drops the tool output from observation bodies.
+/// live-captured 2026-10-07). DeepSeek Harness reaches the same shell through
+/// the win32 layer: its POSIX tool is `bash` and its Windows tool is `pwsh`
+/// (`@deepseek-ai/dsh-tool-pwsh`), so both names must classify or an active
+/// `ignore_paths` never reads the command's arguments. They are non-file
+/// rather than unknown because family `unknown` drops the tool output from
+/// observation bodies.
 pub const NON_FILE_TOOL_NAMES: &[&str] = &[
     "bash",
     "shell",
@@ -1478,8 +1531,10 @@ pub const NON_FILE_TOOL_NAMES: &[&str] = &[
     "execute_bash",
     "execute_cmd",
     "powershell",
+    "pwsh",
     "run_shell_command",
     "execute_code",
+    "run_code",
     "browser_exec",
     "browser_navigate",
     "web_extract",
@@ -1488,9 +1543,13 @@ pub const NON_FILE_TOOL_NAMES: &[&str] = &[
 ];
 
 /// Non-file tools whose input is program source (Hermes `execute_code`,
-/// `{"code": "..."}`): like `python3 -c`, it builds paths at run time, so
-/// nothing lexical proves it read no ignored file.
-pub const INLINE_CODE_TOOL_NAMES: &[&str] = &["execute_code"];
+/// `{"code": "..."}`, and DSH's reserved `run_code` Code Mode transport,
+/// which takes the same `code` field —
+/// <https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/core/tools>):
+/// like `python3 -c`, the program builds its paths at run time, so nothing
+/// lexical proves it read no ignored file. DSH's `headless` profile mounts
+/// Code Mode, so `run_code` is the tool its one-shot runs call.
+pub const INLINE_CODE_TOOL_NAMES: &[&str] = &["execute_code", "run_code"];
 
 /// Tools that return output of a command started by an earlier call: Claude
 /// Code `BashOutput`/`TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw
@@ -4848,6 +4907,113 @@ mod tests {
         );
     }
 
+    /// DSH's Claude Code hooks bridge forwards Claude Code-shaped tool
+    /// payloads, so a DSH file or shell call must pass through the same
+    /// capture exclusions as the harness it borrows its shape from. Without a
+    /// DSH mapping `extract` returns the default extraction, `inspect` sees
+    /// `ToolFamily::Unknown`, and an active `ignore_paths` keeps the call
+    /// instead of dropping it.
+    #[test]
+    fn dsh_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "dsh-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("Read", json!({"file_path": "secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("Read", json!({"file_path": "src/lib.rs"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        // DSH's Windows shell tool is `pwsh`; the POSIX one is `bash`.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("pwsh", json!({"command": "cat secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("bash", json!({"command": "cat secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        // DSH's `headless` profile mounts Code Mode, so its one-shot runs call
+        // the reserved `run_code` transport with program source that builds
+        // its paths at run time. Like any other inline-code tool it must fall
+        // back to metadata under an active policy instead of keeping the
+        // program and its output.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call(
+                        "run_code",
+                        json!({
+                            "code": "const r = await tools.read({file_path: 'secret/token'}); console.log(r)",
+                            "description": "read an ignored file",
+                        }),
+                    ),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Other,
+                    &call("Read", json!({"file_path": "secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "without the DSH mapping the call is not recognized"
+        );
+    }
+
     #[test]
     fn droid_tool_calls_honor_capture_exclusions() {
         let policy = CapturePolicy::resolve(
@@ -5051,6 +5217,40 @@ mod tests {
             agent_family(AgentKind::ClaudeCode, "Create"),
             ToolFamily::Unknown
         );
+    }
+
+    #[test]
+    fn cline_nested_tool_payloads_are_closed_and_classified() {
+        let pre = json!({
+            "tool_call": {
+                "id": "call-1",
+                "name": "read_file",
+                "input": {"path": "src/lib.rs"}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &pre),
+            Some(("read_file", Some("call-1")))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Cline, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-1"));
+
+        let success = json!({
+            "tool_result": {"id": "call-1", "name": "read_file", "output": "ok"}
+        });
+        let failure = json!({
+            "tool_result": {"id": "call-1", "name": "read_file", "error": "denied"}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &success),
+            ToolOutcome::Success
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &failure),
+            ToolOutcome::Error
+        );
+        assert_eq!(tool_payload_fields(AgentKind::Other, &pre), None);
     }
 
     /// Meta Muse Code's tool calls, in the shapes captured offline from Muse
@@ -6085,6 +6285,15 @@ mod tests {
             (
                 AgentKind::Devin,
                 json!({"tool_name": "exec", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            // DSH's Windows shell tool beside its POSIX `bash`.
+            (
+                AgentKind::Dsh,
+                json!({"tool_name": "pwsh", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            (
+                AgentKind::Dsh,
+                json!({"tool_name": "bash", "tool_input": {"command": "cat docs/adr/x.md"}}),
             ),
         ] {
             let decision = policy.inspect(agent, &raw, "/repo");

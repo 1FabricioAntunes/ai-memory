@@ -1754,14 +1754,15 @@ pub enum InstallSkillsScope {
     Global,
 }
 
-/// Where `install-hooks` writes Claude Code's hook configuration.
+/// Where `install-hooks` writes a hook configuration with user/project scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookInstallScope {
-    /// The user-level settings file (`~/.claude/settings.json`, or
-    /// `$CLAUDE_CONFIG_DIR/settings.json`): hooks fire in every project.
+    /// The user-level hook location: Claude Code's settings file or Cline
+    /// CLI's `~/.cline/hooks` directory. Hooks fire in every project.
     Global,
-    /// This repository's gitignored `.claude/settings.local.json`: hooks fire
-    /// only for sessions started in this checkout.
+    /// This repository's hook location: Claude Code's gitignored
+    /// `.claude/settings.local.json` or Cline CLI's `.cline/hooks` directory.
+    /// Hooks fire only for sessions started in this checkout.
     Project,
 }
 
@@ -1781,6 +1782,11 @@ pub enum InstallSkillsAgent {
     CopilotCli,
     /// Hermes Agent's `.hermes/skills` directory.
     Hermes,
+    /// Google Antigravity: the workspace `.agents/skills` (project), or both
+    /// global directories, `~/.gemini/config/skills` (App and IDE) and
+    /// `~/.gemini/antigravity-cli/skills` (CLI).
+    #[value(alias = "antigravity-cli", alias = "agy")]
+    Antigravity,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }
@@ -1976,8 +1982,9 @@ pub struct SetupArgs {
     pub yes: bool,
     /// Wire this agent instead of the detected ones. Repeat for several.
     /// Detection looks for each harness's session store or MCP config under
-    /// your home; OpenCode 2 and the Kiro CLI v3 engine are only wired when
-    /// named here.
+    /// your home. A detected or named `opencode` is wired for the major
+    /// `opencode --version` reports (`opencode2` forces V2 without probing);
+    /// the Kiro CLI v3 engine is only wired when named here.
     #[arg(long = "agent", value_enum)]
     pub agents: Vec<AgentChoice>,
     /// Do not install or start a user service; use this when the server
@@ -2504,6 +2511,23 @@ pub enum AgentChoice {
     /// and injects plain `SessionStart` stdout into the model context.
     #[value(name = "ibm-bob", alias = "bob")]
     IbmBob,
+    /// DeepSeek Harness (DSH) — lifecycle capture through the official
+    /// `@deepseek-ai/dsh-hooks-claude-code` bridge, which consumes a Claude
+    /// Code `hooks.json`. `install-hooks --agent dsh` stages the hook
+    /// scripts, writes that generated `hooks.json`, and prints the Cordis
+    /// patch fragment to merge into `$DSH_HOME/profiles/<profile>/
+    /// cordis.patch.yml` (no fixed config file is written). The bridge
+    /// delivers exactly seven events and no `SessionEnd`, so close sessions
+    /// with `ai-memory finalize-session --agent dsh`; its detached
+    /// `SessionStart` means handoff recovery goes through the MCP
+    /// `memory_handoff_accept` tool.
+    #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
+    Dsh,
+    /// Cline CLI — lifecycle files under `~/.cline/hooks`. Cline runs
+    /// TaskStart/TaskResume detached by default, so capture works but automatic
+    /// handoff injection does not; accept the handoff through MCP instead.
+    #[value(alias = "cline-cli")]
+    Cline,
 }
 
 impl AgentChoice {
@@ -2539,6 +2563,8 @@ impl AgentChoice {
             Self::Muse => AgentKind::Muse,
             Self::CodeBuddy => AgentKind::CodeBuddy,
             Self::IbmBob => AgentKind::IbmBob,
+            Self::Dsh => AgentKind::Dsh,
+            Self::Cline => AgentKind::Cline,
         }
     }
 
@@ -2561,7 +2587,8 @@ impl AgentChoice {
             | Self::Droid
             | Self::Muse
             | Self::CodeBuddy
-            | Self::IbmBob => None,
+            | Self::IbmBob
+            | Self::Cline => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2814,14 +2841,21 @@ pub enum McpClient {
     /// Pair with `install-hooks --agent muse` for lifecycle capture.
     #[value(alias = "muse-code", alias = "musecode")]
     Muse,
-    /// DeepSeek Harness (DSH) - MCP-only. DSH has no fixed JSON/TOML MCP
+    /// DeepSeek Harness (DSH) MCP writer. DSH has no fixed JSON/TOML MCP
     /// config: the client is a Cordis plugin entry
     /// (@deepseek-ai/dsh-mcp-client) inside a profile's cordis.patch.yml.
     /// This integration is print-only (--apply is refused); merge the
-    /// rendered insert list into the profile patch. No lifecycle capture is
-    /// claimed.
+    /// rendered insert list into the profile patch. Lifecycle capture is
+    /// installed separately with `install-hooks --agent dsh`.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
+    /// Cline CLI — `~/.cline/data/settings/cline_mcp_settings.json` (or
+    /// `CLINE_MCP_SETTINGS_PATH`) with an explicit Streamable HTTP transport.
+    #[value(alias = "cline-cli")]
+    Cline,
+    /// FreeBuff CLI — `~/.agents/mcp.json`; MCP-only through ai-memory's
+    /// sessionless stdio-to-HTTP bridge.
+    Freebuff,
     /// Prime Agent (PrimeIntellect-ai/prime-agent) - the `mcpServers` map of
     /// `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default
     /// `~/.prime/agent/settings.json`) with `type: "http"` + `url`. A token is
@@ -3241,18 +3275,16 @@ pub struct InstallHooksArgs {
     /// written next to the original before each modifying write.
     #[arg(long)]
     pub apply: bool,
-    /// Override the settings/plugin/extension file path for the selected agent.
-    /// For OpenClaw, this is the generated plugin package directory.
+    /// Override the settings/plugin/extension path for the selected agent.
+    /// For OpenClaw this is the generated plugin package directory; for Cline
+    /// CLI it is the hook directory.
     #[arg(long)]
     pub config_file: Option<PathBuf>,
-    /// Where to write the hook configuration. `project` targets the
-    /// repository's `.claude/settings.local.json` (at the git root; in the
-    /// current directory outside a repository, on Windows, or when the
-    /// repository root is the home directory) so capture is opted in per
-    /// checkout instead of for every session; Claude Code reads it alongside
-    /// the user-level hooks.
-    /// Claude Code only; ignores `CLAUDE_CONFIG_DIR`. Cannot be combined
-    /// with `--config-file`, which names the target file directly.
+    /// Where to write the hook configuration. For Claude Code, `project`
+    /// targets the repository's `.claude/settings.local.json` (at the git
+    /// root when available) and ignores `CLAUDE_CONFIG_DIR`. For Cline CLI,
+    /// it targets `.cline/hooks` in the current checkout. Cannot be combined
+    /// with `--config-file`, which names the target path directly.
     #[arg(
         long,
         value_enum,
@@ -3448,6 +3480,12 @@ pub struct ServeArgs {
     /// or a loopback bind instead.
     #[arg(long)]
     pub allow_insecure_no_auth: bool,
+    /// DANGEROUS: allow human login over plain HTTP on a non-loopback bind.
+    ///
+    /// HTTP-only. Passwords, session cookies, API credentials, and memory data
+    /// can be read or modified by anyone able to intercept the connection.
+    #[arg(long, env = "AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH")]
+    pub allow_insecure_human_auth: bool,
     /// Skip the filesystem watcher; useful for transient debugging.
     #[arg(long)]
     pub no_watcher: bool,
@@ -3820,19 +3858,35 @@ mod tests {
     }
 
     #[test]
-    fn serve_parses_insecure_no_auth_override() {
+    fn serve_parses_insecure_transport_overrides() {
         let parsed = Cli::try_parse_from([
             "ai-memory",
             "serve",
             "--transport",
             "http",
             "--allow-insecure-no-auth",
+            "--allow-insecure-human-auth",
         ])
         .expect("serve override parses");
         let Command::Serve(args) = parsed.command else {
             panic!("expected serve command");
         };
         assert!(args.allow_insecure_no_auth);
+        assert!(args.allow_insecure_human_auth);
+
+        let command = Cli::command();
+        let serve = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "serve")
+            .expect("serve subcommand exists");
+        let human_override = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "allow_insecure_human_auth")
+            .expect("human-auth override exists");
+        assert_eq!(
+            human_override.get_env(),
+            Some(std::ffi::OsStr::new("AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH"))
+        );
     }
 
     #[test]
@@ -4375,6 +4429,13 @@ mod tests {
                 panic!("expected install-hooks command for alias {alias}");
             };
             assert!(matches!(hook_args.agent, AgentChoice::AntigravityCli));
+
+            let skills_cli = Cli::try_parse_from(["ai-memory", "install-skills", "--agent", alias])
+                .unwrap_or_else(|e| panic!("failed to parse install-skills alias {alias}: {e}"));
+            let Command::InstallSkills(skills_args) = skills_cli.command else {
+                panic!("expected install-skills command for alias {alias}");
+            };
+            assert_eq!(skills_args.agent, InstallSkillsAgent::Antigravity);
         }
     }
 
@@ -4840,6 +4901,29 @@ mod tests {
                 panic!("expected install-mcp");
             };
             assert_eq!(args.client, McpClient::IbmBob);
+        }
+    }
+
+    #[test]
+    fn dsh_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["dsh", "deepseek-harness", "deepseek_harness"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::Dsh);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Dsh);
+            // DSH runs a staged script bundle through the Claude Code hooks
+            // bridge, so it owns a `hooks/dsh` directory.
+            assert_eq!(args.agent.script_hook_subdir(), Some("dsh"));
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::Dsh);
         }
     }
 

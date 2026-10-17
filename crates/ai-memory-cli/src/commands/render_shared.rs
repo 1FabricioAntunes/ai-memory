@@ -49,6 +49,11 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Claude Code otherwise gives SessionEnd hooks a 1.5-second shared budget.
+/// A settings-file timeout raises that budget (up to Claude's 60-second cap),
+/// leaving room for a slow local spool fsync without making other hooks wait.
+pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
+
 /// Kimi Code lifecycle events ai-memory hooks. Claude Code's 9-event
 /// vocabulary (`CLAUDE_CODE_EVENTS`) plus `PostToolUseFailure`: Kimi Code
 /// fires `PostToolUse` on successful calls only and reports failures
@@ -176,6 +181,27 @@ pub(crate) const IBM_BOB_EVENTS: [(&str, &str); 5] = [
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("Stop", "stop.sh"),
+];
+
+/// DeepSeek Harness (DSH) lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-the-Claude-Code-hooks.json, POSIX hook-script-filename)`.
+///
+/// DSH has no native hook protocol: capture runs through the official
+/// `@deepseek-ai/dsh-hooks-claude-code` bridge, which consumes a Claude Code
+/// `hooks.json` and delivers exactly these seven events — `PreCompact` and
+/// `SessionEnd` are not delivered, and `SessionStart` runs detached, so the
+/// bundle never fetches a handoff and finished sessions close with
+/// `ai-memory finalize-session --agent dsh`. Adding a hook event means
+/// updating this list AND adding the matching `.sh` and `.ps1` files under
+/// `hooks/dsh/`; the install-hooks parity test fails if the bundle drifts.
+pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
 ];
 
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
@@ -623,7 +649,7 @@ function captureDecide(tool: CaptureTool, config: CaptureConfig): CaptureDisposi
 const captureRank: Record<CaptureDisposition, number> = { keep: 0, "metadata-only": 1, drop: 2 };
 // Every other marker governing a path the call names (a file-tool target or the files an `apply_patch` names, a search/list directory, file or path-like glob argument, or a shell argument with a separator resolved from its workdir, plus that directory) inspects it too, so a checkout's `ignore_paths` hold for a call made from elsewhere. Lexical; each directory is looked up once and remembered for every lookup that passes it; a glob location is looked up from its literal root (before the walk, whose one listing may spend the time budget) and, when that root lies outside the event's own checkout, every directory it could pass through is checked for a marker of its own; a glob whose `..` follows a `**` is looked up in every reading. Locations outside the own checkout come first: there unreadable targets, glob syntax the walk cannot follow, and anything past the bounds are unprovable, while running out of budget inside the own checkout ends the lookup. Mirrors `capture_lookup_locations` and `foreign_capture_decision`.
 function captureForeignConfigs(tool: CaptureTool, config: CaptureConfig, cwd: string | undefined, own: string | undefined): CaptureConfig[] { const invalid: CaptureConfig[] = [{ state: "invalid", patterns: [], base: config.base, windowsHost: config.windowsHost }]; const locations = new Set<string>(); let overflow = false; const add = (path: string, base: string): string[] | undefined => { const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(path); if (!absolute && !base) return undefined; const readings = captureAllReadings(captureResolve(path, base, config.windowsHost), config.windowsHost); if (readings === false) { overflow = true; return undefined; } if (!readings) return undefined; return readings.map((candidate) => { const location = candidate.windows ? candidate.path.replace(/\//g, "\\") : candidate.path; locations.add(location); return location; }); }; if (tool.family === "file") { const paths = tool.paths ?? tool.patch; if (!paths) return invalid; for (const path of paths) if (add(path, config.base) === undefined) return invalid; } else if (tool.family === "search-list") { if (!tool.search) return invalid; const roots: string[] = []; for (const root of tool.search.roots) { const found = add(root, config.base); if (found === undefined) return invalid; roots.push(...found); } if (!roots.length) roots.push(config.base); for (const pattern of tool.search.patterns.filter((p) => /[\/\\]/.test(p))) for (const root of roots) if (add(pattern, root) === undefined) return invalid; } else if (tool.family === "non-file" && tool.command !== undefined) { if (captureCommandOversized(tool.command)) return invalid; const base = captureBase(config, tool.workdir); if (base) add(base, base); const home = homedir(); const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); for (const [word, tilde] of [...split.words, ...split.expanded]) for (const [argument] of captureShellArguments(word)) { const expanded = captureExpandTilde(argument, tilde, home, base); if (/[\/\\]/.test(expanded)) add(expanded, base); } } if (overflow || locations.size > CAPTURE_MAX_LOOKUP_LOCATIONS) return invalid; const markers: string[] = []; const memo: CaptureMarkerMemo = { governing: new Map(), checkouts: new Map() }; let checkout: string | undefined; if (cwd) { const root = captureMemoCheckout(resolve(cwd), memo, { dirs: 0, entries: 0, deadline: Infinity, now: Date.now, probes: -Infinity }); checkout = root && captureOwnCheckout(root) ? root : undefined; captureMemoRemember(cwd, own, memo); if (statSync(resolve(cwd), { throwIfNoEntry: false })?.isDirectory()) captureMemoNote(cwd, memo); } const budget: CaptureGlobBudget = { dirs: 0, entries: 0, deadline: captureNow() + CAPTURE_MAX_GLOB_MS, now: captureNow, probes: 0 }; const remember = (marker: string | undefined): boolean => { if (!marker || marker === own || markers.includes(marker)) return true; if (markers.length === CAPTURE_MAX_FOREIGN_MARKERS) return false; markers.push(marker); return true; }; const insideOwn = (location: string) => checkout !== undefined && (location === checkout || location.startsWith(join(checkout, "x").slice(0, -1))); const ordered = [...locations].filter((location) => !insideOwn(location)); const insideFrom = ordered.length; ordered.push(...[...locations].filter(insideOwn).sort((a, b) => a.split(/[\\/]/).length - b.split(/[\\/]/).length)); for (let index = 0; index < ordered.length; index++) { const location = ordered[index]; const walk = captureGlobWalk(location); if (walk === undefined) return invalid; const lookup = walk ? walk.root : location; const dir = captureExistingDirWithin(lookup, memo, budget); if (dir === undefined) { if (index >= insideFrom) break; return invalid; } const marker = dir === null ? null : captureMemoMarker(dir, memo, budget); if (marker === undefined) { if (index >= insideFrom) break; return invalid; } if (!remember(marker ?? undefined)) return invalid; if (walk) { const found = captureMarkersBelow(walk.root, walk.steps, checkout, budget); if (!found) return invalid; for (const marker of found) if (!remember(marker)) return invalid; } } return markers.map((marker) => captureConfigAt(marker, cwd)); }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } if (config.state === "inactive") return { disposition, payload }; const extraction = config.state === "active" && tool.family === "search-list" ? "not-applicable" : tool.extraction === "not-applicable" ? "extracted" : tool.extraction; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
 "##;
     let names = |names: &[&str]| {
         let quoted: Vec<String> = names.iter().map(|name| ts_string_literal(name)).collect();
@@ -680,7 +706,7 @@ pub(crate) fn build_claude_code_payload(
     server_url: &str,
     auth_token: Option<&str>,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -692,7 +718,7 @@ pub(crate) fn build_claude_code_payload(
             None,
             None,
         ),
-    )
+    ))
 }
 
 pub(crate) fn build_claude_code_payload_with_data_dir(
@@ -743,7 +769,7 @@ fn build_claude_code_payload_with_data_dir_for_platform(
     capture_assistant: bool,
     platform: HookCommandPlatform,
 ) -> serde_json::Value {
-    build_hook_payload_for_platform(
+    with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -752,7 +778,20 @@ fn build_claude_code_payload_with_data_dir_for_platform(
         HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
             .allow_claude_windows_exec()
             .with_capture_assistant(capture_assistant),
-    )
+    ))
+}
+
+fn with_claude_session_end_timeout(mut payload: Value) -> Value {
+    if let Some(handler) = payload
+        .pointer_mut("/hooks/SessionEnd/0/hooks/0")
+        .and_then(Value::as_object_mut)
+    {
+        handler.insert(
+            "timeout".into(),
+            Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS),
+        );
+    }
+    payload
 }
 
 /// Grok Build CLI hook payload for docker/setup-agent script snippets.
@@ -776,6 +815,36 @@ pub(crate) fn build_grok_payload(
             "grok",
             None,
             None,
+        ),
+    )
+}
+
+/// DeepSeek Harness (DSH) hook payload: a Claude Code `hooks.json` document
+/// the official `@deepseek-ai/dsh-hooks-claude-code` bridge consumes via its
+/// `configPath` setting. Commands are rendered for the current platform
+/// (native `ai-memory hook --event … --agent dsh` commands by default, so
+/// capture gets the local spool and capture-policy v1 enforcement; script
+/// commands under an `AI_MEMORY_HOOK_PLATFORM` override). The payload only
+/// covers [`DSH_EVENTS`] — no `PreCompact` or `SessionEnd`.
+#[must_use]
+pub(crate) fn build_dsh_hooks_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &DSH_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::current(),
+            "dsh",
+            data_dir,
+            project_strategy,
         ),
     )
 }
@@ -3249,6 +3318,8 @@ emit({{ tool: "edit", args: {{ path: privatePath, nested: {{ body: privateBody }
 const malformedRequest = requests.at(-1) ?? "";
 const malformedQueued = JSON.stringify(queue.at(-1));
 check(JSON.parse(malformedRequest)._ai_memory_capture?.policy_state === "invalid", "malformed-quote-invalid-protocol");
+const invalidSearch = capturePolicy({{ tool: "grep", args: {{ pattern: "x" }} }}, malformedQuoteCwd);
+check(invalidSearch.protocol?.policy_state === "invalid" && invalidSearch.protocol.extraction_state === "extracted", "invalid-search-extraction-parity");
 for (const forbidden of [privatePath, privateBody]) check(!malformedQueued.includes(forbidden) && !malformedRequest.includes(forbidden), "malformed-quote-redaction");
 emit({{ tool: "edit", args: {{ path: "C:relative", nested: {{ path: privatePath, body: privateBody }} }}, output: privateBody, error: privateBody, sessionID: "session-safe", cwd: "/cwd-safe", tool_call_id: "call-safe" }}, gatedCwd);
 const metadata = requests.at(-1) ?? "";
@@ -3263,6 +3334,8 @@ for (const forbidden of [privatePath, privatePattern, privateBody]) check(!metad
 const inactivePayload = {{ tool: "edit", args: {{ path: privatePath }}, output: privateBody }};
 const inactive = capturePolicy(inactivePayload, "/no-marker");
 check(inactive.disposition === "keep" && inactive.payload === inactivePayload && !inactive.protocol, "inactive-preserves-object");
+const activeSearch = capturePolicy({{ tool: "grep", args: {{ pattern: "x" }} }}, gatedCwd);
+check(activeSearch.protocol?.policy_state === "active" && activeSearch.protocol.extraction_state === "not-applicable", "active-search-not-applicable");
 const activeKeep = capturePolicy({{ tool: "bash", args: {{ command: privateBody }} }}, gatedCwd);
 check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 && activeKeep.protocol.policy_state === "active", "active-keep-adds-protocol");
 // Windows spellings of an ignored file, and the POSIX sessions they must not touch (shared vectors; mirrors `windows_spelling_fixture_vectors`).
@@ -3516,6 +3589,14 @@ if (inheritOnly) {
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }
+        assert_eq!(
+            v.pointer("/hooks/SessionEnd/0/hooks/0/timeout"),
+            Some(&Value::from(CLAUDE_SESSION_END_TIMEOUT_SECS))
+        );
+        assert!(
+            v.pointer("/hooks/PostToolUse/0/hooks/0/timeout").is_none(),
+            "only the cancellation-prone SessionEnd budget is raised"
+        );
     }
 
     #[test]

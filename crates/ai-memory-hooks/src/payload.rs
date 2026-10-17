@@ -555,6 +555,7 @@ pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
             "sessionID",
             "session",
             "conversationId",
+            "taskId",
         ],
     )
     .or_else(|| {
@@ -573,7 +574,12 @@ pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
         )
     });
     let cwd = extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"])
-        .or_else(|| extract_first_string_array_item(raw, &["workspacePaths", "workspace_roots"]))
+        .or_else(|| {
+            extract_first_string_array_item(
+                raw,
+                &["workspacePaths", "workspace_roots", "workspaceRoots"],
+            )
+        })
         .or_else(|| {
             extract_string_path(
                 raw,
@@ -846,6 +852,11 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // path.
             | AgentKind::CodeBuddy
             | AgentKind::IbmBob
+            // DSH's Claude Code hooks bridge (`@deepseek-ai/dsh-hooks-claude-code`)
+            // forwards Claude Code's snake_case tool fields for PreToolUse /
+            // PostToolUse.
+            | AgentKind::Dsh
+            | AgentKind::Cline
     )
 }
 
@@ -939,6 +950,10 @@ fn safe_tool_body(
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/extra/error_message").and_then(value_to_text))
                     .or_else(|| extract_content(raw, &["error"]))
+            } else if agent == AgentKind::Cline {
+                raw.pointer("/tool_result/output")
+                    .and_then(value_to_text)
+                    .or_else(|| raw.pointer("/tool_result/error").and_then(value_to_text))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -1089,7 +1104,12 @@ fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> 
             // Kimi Code sends `prompt` as content blocks
             // (`[{"type":"text","text":...}]`); `extract_content` flattens
             // them and returns identical values for plain-string agents.
-            extract_content(raw, &["prompt", "message", "text"]).and_then(first_line)
+            extract_content(raw, &["prompt", "message", "text"])
+                .or_else(|| {
+                    raw.pointer("/userPromptSubmit/prompt")
+                        .and_then(value_to_text)
+                })
+                .and_then(first_line)
         }
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             extract_string(raw, &["tool", "tool_name", "name"])
@@ -1176,7 +1196,12 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
 
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
+        HookEvent::UserPrompt => {
+            extract_content(raw, &["prompt", "message", "text"]).or_else(|| {
+                raw.pointer("/userPromptSubmit/prompt")
+                    .and_then(value_to_text)
+            })
+        }
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -1408,6 +1433,27 @@ mod tests {
         assert!(ProjectSource::RepoRoot.yields_to_session());
         assert!(!ProjectSource::Marker.yields_to_session());
         assert!(!ProjectSource::Unspecified.yields_to_session());
+    }
+
+    #[test]
+    fn cline_context_uses_task_id_and_first_workspace_root() {
+        let raw = serde_json::json!({
+            "taskId": "cline-task-1",
+            "workspaceRoots": ["/work/project", "/work/other"],
+            "userPromptSubmit": {"prompt": "continue the audit"}
+        });
+        let context = hook_payload_context(&raw);
+        assert_eq!(context.session_id.as_deref(), Some("cline-task-1"));
+        assert_eq!(context.cwd.as_deref(), Some("/work/project"));
+        let envelope = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(envelope.body_excerpt.as_deref(), Some("continue the audit"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
 It shows direct MCP writes, queries and handoffs without a native hook adapter.
 
-Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
+Warp, Kilo Code, Goose, Qwen Code and OpenHuman have no
 `install-mcp` client; their hand-written recipes are in
 [`install.md`](install.md#clients-without-an-install-mcp-writer).
 
@@ -178,8 +178,46 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh / prime-agent
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh / cline / freebuff / prime-agent
 > ```
+
+---
+
+## Cline CLI
+
+```bash
+ai-memory install-mcp --client cline --apply
+ai-memory install-hooks --agent cline --apply
+```
+
+The MCP writer targets
+`${CLINE_MCP_SETTINGS_PATH:-~/.cline/data/settings/cline_mcp_settings.json}`
+and writes Cline's top-level `type`, `url`, and optional `headers` fields with
+`type: "streamableHttp"`; omitting that type makes Cline try legacy SSE. The
+hook writer creates Cline CLI's supported event files under `~/.cline/hooks`.
+Use `--scope project` for `.cline/hooks` in the current checkout. Existing
+user-owned event files and symlinked targets are refused, and generated files
+that carry a bearer token are owner-only.
+
+Cline runs task-start hooks detached, so accept a pending handoff through MCP
+(`memory_handoff_list`, then `memory_handoff_accept`). Restart Cline after
+installing. Cline's yolo mode disables hooks. The VS Code extension has a
+separate hook directory and is not changed by this CLI integration.
+
+## FreeBuff
+
+```bash
+ai-memory install-mcp --client freebuff --apply
+```
+
+FreeBuff reads `mcpServers` from `.agents/mcp.json` while walking from the
+current directory toward the home directory. The installer writes the home
+file and registers a local `ai-memory mcp-bridge --no-session-id` stdio
+process, which forwards to the configured server and reads a file-backed token
+without copying it into FreeBuff's config. An explicit `--auth-token` is stored
+in the stdio entry's `AI_MEMORY_AUTH_TOKEN` environment map, like a bearer
+header in an HTTP-only client. FreeBuff has no lifecycle-hook or
+managed-workstream integration; it already reads `AGENTS.md`.
 
 ---
 
@@ -586,7 +624,8 @@ Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 
 ## DeepSeek Harness (DSH)
 
-**Status:** MCP supported (print-only). No lifecycle hooks or managed workstream claimed.
+**Status:** MCP supported (print-only) + lifecycle hooks via the official
+Claude Code hooks bridge. No managed workstream.
 
 DSH has no fixed JSON/TOML MCP config: the MCP client is a Cordis plugin entry
 (`@deepseek-ai/dsh-mcp-client`) inside a profile's `cordis.patch.yml`.
@@ -603,16 +642,49 @@ reloads its patch live), then reload or restart the profile. The fragment regist
 the default stateless HTTP endpoint and carries `Authorization: Bearer <token>`
 when `--auth-token` (or a configured server token) is present.
 
-DSH ships a bridge that runs an existing Claude Code `hooks.json` or settings
-file (`@deepseek-ai/dsh-hooks-claude-code`). Pointing it at ai-memory's Claude
-Code hooks is not a supported capture path: those hooks report every event as
-`agent=claude-code`, so DSH sessions would be stored as Claude Code sessions.
-ai-memory does not install or manage the bridge, and it delivers only seven Claude Code events
-(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-`Stop`, `SubagentStart`, `SubagentStop`). `PreCompact` and
-`SessionEnd` are not delivered, and its `SessionStart` injection runs
-detached. Treat DSH as MCP-only here and recover handoffs explicitly with
-`memory_handoff_list` then `memory_handoff_accept` when continuity matters.
+Lifecycle capture runs through DSH's official Claude Code hooks bridge
+(`@deepseek-ai/dsh-hooks-claude-code`), which consumes a Claude Code
+`hooks.json`. ai-memory ships a DSH hook bundle and a first-party installer:
+
+```bash
+ai-memory install-hooks --agent dsh --apply \
+    --server-url "$AI_MEMORY_SERVER" --auth-token "$TOKEN"
+```
+
+`--apply` stages the `hooks/dsh` scripts under the data dir and writes a
+generated Claude Code `hooks.json` next to them (native `ai-memory hook`
+commands by default, so capture enforces capture exclusions and keeps the
+local spool). It then prints the bridge patch fragment — a `- insert:` item
+mounted under the DSH profile patch — which you merge into
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` by hand, because that file is
+a hand-maintained YAML patch layer (the same reason `install-mcp --client
+dsh` refuses to write it):
+
+```yaml
+- insert:
+    - id: ai-memory-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: '<data-dir>/hooks/dsh/hooks.json'
+```
+
+Install the bridge package into the profile first (`dsh plugin --profile
+<profile> add @deepseek-ai/dsh-hooks-claude-code`), then reload or restart
+the profile. Without `--apply`, `install-hooks --agent dsh` prints the same
+`hooks.json` and patch fragment for a manual merge.
+
+Two bridge constraints shape DSH capture:
+
+- The bridge delivers only seven Claude Code events (`SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`,
+  `SubagentStop`). `PreCompact` and `SessionEnd` are not delivered, so a
+  finished session stays open until `ai-memory finalize-session --agent dsh`
+  closes it (the same close path as Command Code, Kiro CLI and Antigravity).
+- `SessionStart` runs detached, so its stdout cannot reliably deliver a
+  fetched handoff; the DSH hook bundle therefore never claims one. Recover a
+  pending handoff with `memory_handoff_list` then `memory_handoff_accept`, or
+  ask the model to. DSH sessions are stored as `agent=dsh`, never as
+  `claude-code`.
 
 ---
 

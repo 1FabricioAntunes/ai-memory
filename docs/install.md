@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed, and MCP-only recipes for Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose, Qwen Code and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -158,9 +158,14 @@ runs, in order, the commands a native install otherwise needs one by one:
    says what it was found by (its session store, its MCP config, or for Muse
    its directory), then lists the other agents `--agent` accepts. Cursor,
    Gemini CLI, Droid and the other agents with no store to look for are
-   wired by naming them. OpenCode 2 and the Kiro CLI v3 engine share a store
-   with OpenCode and Kiro CLI, so they are wired only when named, for example
-   `--agent opencode2`.
+   wired by naming them. OpenCode 1 and 2 share one session store, so a
+   detected or named `opencode` runs `opencode --version` once and wires the
+   plugin and MCP entry for the major it reports, as `install-mcp --client
+   opencode` and `install-hooks --agent opencode` do by hand. When that probe
+   fails (no `opencode` on `PATH`, a timeout, or unreadable output), `setup`
+   writes no OpenCode plugin or MCP entry and reports the problem; `--agent
+   opencode2` forces V2 without probing. The Kiro CLI v3 engine shares a
+   store with Kiro CLI, so it is wired only when named.
 4. A self-check that writes nothing: `GET /healthz`, a `memory_status` call
    over MCP with the install's credential, and `doctor`. When Codex was wired,
    `setup` also asks Codex whether it will run the ai-memory hooks. If Codex
@@ -2317,15 +2322,51 @@ first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
 `[briefing]`). The model sees it after that tool result. A session with no
 tool call and without that rule leaves the handoff for
-`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed, ZCode,
-DeepSeek Harness (DSH), and Prime Agent are MCP-only here, so you'll need to
+`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed, ZCode, and
+Prime Agent are MCP-only here, so you'll need to
 nudge the model to call `memory_query` / `memory_handoff_accept` itself.
+DeepSeek Harness (DSH) also has no hook stdout to carry the baton: its
+`@deepseek-ai/dsh-hooks-claude-code` bridge runs `SessionStart` detached, so
+`install-hooks --agent dsh` captures lifecycle events but handoff recovery
+goes through `memory_handoff_list` then `memory_handoff_accept`, and finished
+sessions close with `ai-memory finalize-session --agent dsh`.
 Prime Agent's snippet names `$AI_MEMORY_AUTH_TOKEN` rather than embedding the
 token, so export that variable where you launch `prime-agent`.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
 for Zero's no-stdout SessionStart behavior. Grok delivers on the first
 `PostToolUse` instead (Antigravity CLI uses `PreInvocation`).
+
+#### Cline CLI and FreeBuff
+
+Cline CLI is a first-party hooks + MCP integration:
+
+```bash
+ai-memory install-mcp --client cline --apply
+ai-memory install-hooks --agent cline --apply
+```
+
+The MCP writer reads `CLINE_MCP_SETTINGS_PATH` or defaults to
+`~/.cline/data/settings/cline_mcp_settings.json`; it writes top-level `type`,
+`url`, and optional `headers` fields and explicitly selects `streamableHttp`
+rather than Cline's legacy SSE default. The hook writer targets the CLI's `~/.cline/hooks` files;
+use `--scope project` for `.cline/hooks` in one checkout. Restart Cline after
+installation. Yolo mode disables Cline hooks, and task-start hooks are
+detached, so recover pending handoffs through MCP. The VS Code extension's
+separate `~/Documents/Cline/Hooks` convention is not modified.
+
+FreeBuff is MCP-only:
+
+```bash
+ai-memory install-mcp --client freebuff --apply
+```
+
+This merges a sessionless stdio bridge under `mcpServers` in
+`~/.agents/mcp.json`. FreeBuff finds that file while walking from the current
+directory to the home directory and already reads `AGENTS.md`. A file-backed
+server bearer stays in ai-memory's data directory; an explicit `--auth-token`
+is stored in the stdio entry's environment map. No lifecycle hooks or managed
+workstream are claimed.
 
 #### Clients without an `install-mcp` writer
 
@@ -2351,8 +2392,8 @@ expands environment variables in its config, the example reads the token
 from `AI_MEMORY_AUTH_TOKEN`; export it in the shell that starts the client.
 Where the client documents no expansion, the example shows `<token>`, and the
 token has to be written into that file, so keep the file private. All of
-these clients speak HTTP MCP natively; `ai-memory mcp-bridge` is a Claude
-Code-only adapter and is not needed.
+these clients speak HTTP MCP natively, so `ai-memory mcp-bridge` is not needed
+for these hand-written recipes.
 
 ##### Warp
 
@@ -2379,34 +2420,6 @@ on macOS; the docs give no Linux path). Documented for Warp
 v0.2026.10.07.08.29.
 Sources: <https://docs.warp.dev/agents/capabilities/mcp>,
 <https://docs.warp.dev/agents/cli/configuration/>.
-
-##### Cline
-
-The Cline CLI reads `~/.cline/data/settings/cline_mcp_settings.json`
-(override the path with `CLINE_MCP_SETTINGS_PATH`). In the VS Code extension,
-open the **MCP Servers** icon, then **Configure > Configure MCP Servers**, and
-edit the same `mcpServers` map. Set `type` to `streamableHttp`: without it,
-Cline falls back to the legacy SSE transport.
-
-```json
-{
-  "mcpServers": {
-    "ai-memory": {
-      "type": "streamableHttp",
-      "url": "http://127.0.0.1:49374/mcp",
-      "headers": { "Authorization": "Bearer <token>" },
-      "disabled": false
-    }
-  }
-}
-```
-
-Cline does not document environment-variable expansion in `headers`. Leave
-out `headers` when the server has no bearer token; in that case the CLI can
-write the entry with
-`cline mcp add ai-memory http://127.0.0.1:49374/mcp --transport http`.
-Documented for the Cline extension 4.1.23 and CLI 3.0.70.
-Source: <https://docs.cline.bot/mcp/mcp-overview>.
 
 ##### Kilo Code
 
@@ -3248,7 +3261,7 @@ Linux, and macOS. This does not rewrite line endings in user-authored files.
 |---|---|
 | `--no-skills` | Refresh only the markered instruction block. |
 | `--skills-scope <scope>` | Choose project-local or user-global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, GitHub Copilot CLI's `.github/skills`, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `copilot-cli`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
+| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, `.hermes/skills`, GitHub Copilot CLI's `.github/skills`, Google Antigravity's roots, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `copilot-cli`, `hermes`, `antigravity`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
 | `--skills-target-dir <dir>` | Write managed skill directories below an explicit root instead of inferring from scope and agent. |
 | `--skills-force` | Replace unmanaged same-name skills during `install-instructions`; without it, they are left untouched and the command exits with an actionable error. |
 
@@ -3261,6 +3274,8 @@ ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
 ai-memory install-skills --scope global --agent copilot-cli
+ai-memory install-skills --scope global --agent hermes
+ai-memory install-skills --scope global --agent antigravity
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -3270,17 +3285,17 @@ ai-memory install-skills --target-dir .custom/skills --force
 | Flag | Meaning |
 |---|---|
 | `--scope <scope>` | Install into this project or the current user's global skill roots. Values: `project`, `global`. Defaults to `project`. |
-| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, Grok's skill root, GitHub Copilot CLI's skill root, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `copilot-cli`, `both`. Defaults to `claude-code`. |
+| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, Devin's skill root, Grok's skill root, Hermes Agent's skill root, GitHub Copilot CLI's skill root, Google Antigravity's skill roots, or both Claude/Agents roots. Values: `claude-code`, `agents`, `devin`, `grok`, `copilot-cli`, `hermes`, `antigravity` (aliases `antigravity-cli`, `agy`), `both`. Defaults to `claude-code`. |
 | `--target-dir <dir>` | Write managed skill directories below an explicit root; `--scope` and `--agent` are ignored. |
 | `--print` | Print target paths and `SKILL.md` contents without writing files. A global Grok plan also prints `$GROK_HOME/rules/ai-memory-handoff.md`. |
 | `--force` | Replace unmanaged same-name skills (and, for global Grok, an unmanaged first-turn rule); without it, user-authored same-name files are preserved. |
 
 Default skill target roots:
 
-| Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` |
-|---|---|---|---|---|---|
-| `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) |
+| Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` | `--agent hermes` | `--agent antigravity` |
+|---|---|---|---|---|---|---|---|
+| `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` | `.hermes/skills` | `.agents/skills` |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) | `~/.hermes/skills` | both `~/.gemini/config/skills` (Antigravity App and IDE) and `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 
@@ -3503,6 +3518,15 @@ neither Bearer nor human auth stays anonymous.
 CIDRs in `AI_MEMORY_AUTH__TRUSTED_PROXY_CIDRS` may supply `X-Forwarded-For`
 for login rate limits; untrusted peers' XFF is ignored. Behind HTTPS, set
 `AI_MEMORY_AUTH__SECURE_COOKIE=true` as noted above.
+
+An operator who intentionally accepts unencrypted human authentication on a
+private LAN can instead pass `serve --allow-insecure-human-auth` (or set
+`AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`, including in Docker). The option is
+off by default and does not make plaintext transport safe: passwords, Bearer
+and API credentials, session cookies, and memory data can all be intercepted
+or modified. It bypasses only the non-loopback human-cookie posture check; a
+server without authentication still needs the separate
+`--allow-insecure-no-auth` override.
 
 ## Operating without auth
 

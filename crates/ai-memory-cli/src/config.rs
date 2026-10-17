@@ -567,6 +567,8 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Server-side session lifecycle (idle auto-end tick).
+    pub sessions: SessionsSettings,
     /// Lower edge (inclusive) of `memory_lint`'s A5 zero-LLM
     /// contradiction-detection cosine-similarity band. Two cold pages whose
     /// embeddings sit in `[contradiction_band_min, contradiction_band_max)`
@@ -1294,8 +1296,9 @@ pub struct RoutingSettings {
 }
 
 /// `[ingest]`: tool events the server drops whatever the client sends
-/// (#1241). Both lists are empty by default and apply to every project on the
-/// server. Validated once by [`Config::load`] into [`Self::drop_list`].
+/// (#1241). The tool lists and the event-kind list are all empty by default
+/// and apply to every project on the server. Validated once by
+/// [`Config::load`] into [`Self::drop_list`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IngestSettings {
@@ -1303,10 +1306,23 @@ pub struct IngestSettings {
     pub drop_tool_use_id_prefixes: Vec<String>,
     /// Drop a tool event whose tool name equals one of these exactly.
     pub drop_tool_names: Vec<String>,
+    /// Drop whole hook event kinds, whatever the client sends. Each value is a
+    /// hook event kind (e.g. `pre-tool-use`); a matching event is acknowledged
+    /// and discarded before it is stored. Empty by default (nothing dropped).
+    ///
+    /// `session-start` and `session-end` are rejected at load: the router uses
+    /// them to open and close a session, so dropping them would strand the
+    /// session state machine. Accepts either a TOML/JSON sequence
+    /// (`["pre-tool-use"]`) or a comma-separated env string
+    /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub drop_events: Vec<String>,
     /// The validated list the hook router checks. Set by [`Config::load`];
-    /// never read from or written to a config file.
+    /// never read from or written to a config file. Kept off the `Config`
+    /// stack frame because that value is constructed in short-stack CLI
+    /// entry points on Windows.
     #[serde(skip)]
-    pub drop_list: ai_memory_hooks::IngestDropList,
+    pub drop_list: Box<ai_memory_hooks::IngestDropList>,
 }
 
 /// Client-side hook spool retry policy.
@@ -1385,6 +1401,7 @@ impl Default for Config {
             embedding_document_prefix: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            sessions: SessionsSettings::default(),
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             dream: DreamSettings::default(),
@@ -1827,6 +1844,21 @@ impl Default for MaintenanceSettings {
             reconcile_tombstones_deleted_pages: false,
         }
     }
+}
+
+/// `[sessions]` server-side session lifecycle.
+///
+/// Env form: `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS=24`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionsSettings {
+    /// Hours of silence after which the maintenance tick ends an open
+    /// session that never received a `SessionEnd` (crashed harness, closed
+    /// terminal, timed-out hook): summary page + consolidation job, no
+    /// handoff. `0` (the default) disables the tick — the explicit
+    /// `finalize-on-exit` / `repair-backfill-timestamps` path stays the only
+    /// end for sessions an operator may still come back to.
+    pub idle_end_after_hours: u32,
 }
 
 /// `[dream]` — the opt-in LLM dream pass (docs/design-memory-aging.md §B2–B4).
@@ -2375,6 +2407,19 @@ impl Config {
 
         validate_run_profiles(&config.run)?;
 
+        // The idle auto-end tick turns `idle_end_after_hours` into a
+        // microsecond cutoff: a value above a year is a configuration
+        // mistake (a typo of minutes for days), and a huge value would also
+        // push the cutoff microsecond arithmetic toward `i64` overflow.
+        // Bound it at load rather than at 3am inside the tick.
+        if config.sessions.idle_end_after_hours > 8760 {
+            anyhow::bail!(
+                "sessions.idle_end_after_hours must be 0 (off) or at most 8760 hours \
+                 (one year); got {}",
+                config.sessions.idle_end_after_hours
+            );
+        }
+
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
                 "decay.breadth_weight must be a finite number greater than or equal to zero"
@@ -2450,11 +2495,14 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
-        config.ingest.drop_list = ai_memory_hooks::IngestDropList::new(
-            config.ingest.drop_tool_use_id_prefixes.clone(),
-            config.ingest.drop_tool_names.clone(),
-        )
-        .map_err(|message| anyhow::anyhow!(message))?;
+        config.ingest.drop_list = Box::new(
+            ai_memory_hooks::IngestDropList::new(
+                config.ingest.drop_tool_use_id_prefixes.clone(),
+                config.ingest.drop_tool_names.clone(),
+                &config.ingest.drop_events,
+            )
+            .map_err(|message| anyhow::anyhow!(message))?,
+        );
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -3134,9 +3182,10 @@ impl Config {
     /// Base URL for `provider`, from the two sources that can supply one.
     ///
     /// An explicit ai-memory setting (`llm_base_url` in `config.toml`, or
-    /// `AI_MEMORY_LLM_BASE_URL`) configures any provider: naming ai-memory is
-    /// how an operator says they mean it, and proxying a vendor endpoint is a
-    /// legitimate deployment.
+    /// `AI_MEMORY_LLM_BASE_URL`) configures every HTTP API provider: naming
+    /// ai-memory is how an operator says they mean it, and proxying a vendor
+    /// endpoint is a legitimate deployment. The ChatGPT backend
+    /// (`openai-oauth`, `codex`) and `cursor`'s CLI take no override.
     ///
     /// The bare `LLM_BASE_URL` is different in kind — a cross-tool convention
     /// an operator exports once for a local Ollama and forgets. It reaches
@@ -4994,10 +5043,11 @@ input_token_safety_margin = {margin}
         .unwrap();
         let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(
-            config.ingest.drop_list,
-            ai_memory_hooks::IngestDropList::new(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::new(
                 vec!["toolu_plugin_".into()],
-                vec!["mcp__noisy__poll".into()]
+                vec!["mcp__noisy__poll".into()],
+                &[]
             )
             .unwrap()
         );
@@ -5011,8 +5061,108 @@ input_token_safety_margin = {margin}
 
         // Default: empty, so nothing is dropped.
         assert_eq!(
-            Config::default().ingest.drop_list,
-            ai_memory_hooks::IngestDropList::default()
+            Config::default().ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    /// `[ingest] drop_events` names whole hook event kinds to drop (#1241
+    /// sibling). It loads into the same validated list the hook router checks,
+    /// defaults to empty (nothing dropped), and rejects a session-state kind
+    /// and an unknown kind at load.
+    #[test]
+    fn ingest_drop_events_load_into_the_router_list_and_reject_bad_kinds() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"pre-tool-use\"]\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        // The raw value survives, and the validated list is built from it.
+        assert_eq!(config.ingest.drop_events, vec!["pre-tool-use".to_string()]);
+        assert_eq!(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::new(Vec::new(), Vec::new(), &["pre-tool-use".into()])
+                .unwrap()
+        );
+
+        // A session-state kind fails startup with a clear error (session start…)
+        std::fs::write(
+            &config_path,
+            "[ingest]\ndrop_events = [\"session-start\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("session-start")
+                && format!("{error:#}").contains("session state"),
+            "{error:#}"
+        );
+
+        // …and session end.
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"session-end\"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("session-end")
+                && format!("{error:#}").contains("session state"),
+            "{error:#}"
+        );
+
+        // An unknown kind fails startup naming the value.
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"pre-tool-us\"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("pre-tool-us")
+                && format!("{error:#}").contains("not a known hook event kind"),
+            "{error:#}"
+        );
+
+        // Default: empty, so nothing is dropped.
+        assert_eq!(Config::default().ingest.drop_events, Vec::<String>::new());
+        assert_eq!(
+            Config::default().ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    /// The env form of `[ingest] drop_events` (`AI_MEMORY_INGEST__DROP_EVENTS`,
+    /// a comma-separated string) loads into the same validated list. Uses the
+    /// child-process marker pattern because `std::env::set_var` is unsafe and
+    /// forbidden in this crate's multi-threaded test binary.
+    #[test]
+    fn ingest_drop_events_env_overrides_default() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_DROP_EVENTS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            // No drop_events in the file; the env var supplies it.
+            std::fs::write(&config_path, "[ingest]\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert_eq!(
+                config.ingest.drop_events,
+                vec!["pre-tool-use".to_string(), "stop".to_string()]
+            );
+            println!("drop-events-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::ingest_drop_events_env_overrides_default")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_INGEST__DROP_EVENTS", "pre-tool-use,stop")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("drop-events-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 
@@ -6720,6 +6870,80 @@ fn ambient_llm_base_url_still_configures_opencode() {
     assert_eq!(
         provider.base_url.as_deref(),
         Some("https://opencode.ai/zen/v1")
+    );
+}
+
+// --- `[sessions] idle_end_after_hours` ------------------------------
+
+/// The key defaults to `0` (off) when absent, parses from TOML, and the
+/// load-time bound rejects a year-plus value by naming the key.
+#[test]
+fn sessions_idle_end_defaults_off_loads_from_toml_and_rejects_out_of_range() {
+    use tempfile::TempDir;
+    assert_eq!(Config::default().sessions.idle_end_after_hours, 0);
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    // Absent key keeps the default.
+    std::fs::write(&config_path, "# nothing\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 0);
+
+    // TOML parse.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 24\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 24);
+
+    // Boundary: one year is accepted.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 8760\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 8760);
+
+    // Above the bound the load fails and names the key.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 8761\n").unwrap();
+    let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+        .expect_err("above the bound must fail at load");
+    assert!(
+        error.to_string().contains("idle_end_after_hours"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// The env form `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS` outranks the
+/// TOML value, like every other flat config key.
+#[test]
+fn sessions_idle_end_env_overrides_config() {
+    use tempfile::TempDir;
+    const CHILD_MARKER: &str = "AI_MEMORY_TEST_SESSIONS_IDLE_END_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 24\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.sessions.idle_end_after_hours, 48);
+        println!("sessions-idle-end-env-applied");
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("config::sessions_idle_end_env_overrides_config")
+        .arg("--test-threads=1")
+        .arg("--nocapture")
+        .env(CHILD_MARKER, "1")
+        .env("AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS", "48")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child test failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("sessions-idle-end-env-applied"),
+        "child stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
