@@ -4288,4 +4288,3 @@ async fn open_feedback_findings_ignores_expired_pages() {
     assert_eq!(findings[0].kind, "stale");
     assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
 }
-
