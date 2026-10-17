@@ -76,6 +76,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `ReaderPool::contradiction_edges`, so a contradiction pointing at a
   tombstoned or expired page is reported as unresolved instead of active, and
   expired source pages do not emit contradiction findings. (#1367)
+- Verified target latest status and expiration in
+  `ReaderPool::dangling_cross_project_links`, so cross-project links to
+  tombstoned or expired pages are reported as dangling instead of resolved,
+  and expired source pages do not emit dangling link findings. (#1368)
 
 ## [3.1.0] - 2026-10-16
 

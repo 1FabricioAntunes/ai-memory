@@ -9067,10 +9067,11 @@ impl ReaderPool {
         .await
     }
 
-    /// List unresolved cross-project links authored by pages in this project
-    /// — declared dependencies on another project's page that don't resolve.
-    /// Each row says whether the named target project exists, so the lint can
-    /// tell a typo'd project name from a missing / renamed target page.
+    /// List unresolved cross-project links authored by latest unexpired pages
+    /// in this project — declared dependencies on another project's page that
+    /// don't resolve to an existing, latest, unexpired page. Each row says
+    /// whether the named target project exists, so the lint can tell a
+    /// typo'd project name from a missing / renamed target page.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -9080,7 +9081,9 @@ impl ReaderPool {
         project_id: ProjectId,
     ) -> StoreResult<Vec<DanglingCrossLink>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
+            let from_ttl = not_expired("fp", "?3");
+            let to_ttl = not_expired("tp", "?3");
+            let sql = format!(
                 "SELECT fp.path, l.to_workspace, l.to_project, l.to_path, \
                         EXISTS ( \
                             SELECT 1 FROM projects pr \
@@ -9093,12 +9096,15 @@ impl ReaderPool {
                         ) AS project_exists \
                  FROM links l \
                  JOIN pages fp ON fp.id = l.from_page_id \
-                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1 \
-                 WHERE l.to_page_id IS NULL AND l.to_project IS NOT NULL \
-                 ORDER BY fp.path, l.to_project, l.to_path",
-            )?;
+                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1{from_ttl} \
+                 LEFT JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
+                 WHERE tp.id IS NULL AND l.to_project IS NOT NULL \
+                 ORDER BY fp.path, l.to_project, l.to_path"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let now = now_us();
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
                 |row| {
                     let exists: i64 = row.get(4)?;
                     Ok(DanglingCrossLink {
