@@ -3456,6 +3456,12 @@ pub struct ServeArgs {
     /// or a loopback bind instead.
     #[arg(long)]
     pub allow_insecure_no_auth: bool,
+    /// DANGEROUS: allow human login over plain HTTP on a non-loopback bind.
+    ///
+    /// HTTP-only. Passwords, session cookies, API credentials, and memory data
+    /// can be read or modified by anyone able to intercept the connection.
+    #[arg(long, env = "AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH")]
+    pub allow_insecure_human_auth: bool,
     /// Skip the filesystem watcher; useful for transient debugging.
     #[arg(long)]
     pub no_watcher: bool,
@@ -3797,19 +3803,35 @@ mod tests {
     }
 
     #[test]
-    fn serve_parses_insecure_no_auth_override() {
+    fn serve_parses_insecure_transport_overrides() {
         let parsed = Cli::try_parse_from([
             "ai-memory",
             "serve",
             "--transport",
             "http",
             "--allow-insecure-no-auth",
+            "--allow-insecure-human-auth",
         ])
         .expect("serve override parses");
         let Command::Serve(args) = parsed.command else {
             panic!("expected serve command");
         };
         assert!(args.allow_insecure_no_auth);
+        assert!(args.allow_insecure_human_auth);
+
+        let command = Cli::command();
+        let serve = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "serve")
+            .expect("serve subcommand exists");
+        let human_override = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "allow_insecure_human_auth")
+            .expect("human-auth override exists");
+        assert_eq!(
+            human_override.get_env(),
+            Some(std::ffi::OsStr::new("AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH"))
+        );
     }
 
     #[test]

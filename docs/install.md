@@ -3519,6 +3519,15 @@ CIDRs in `AI_MEMORY_AUTH__TRUSTED_PROXY_CIDRS` may supply `X-Forwarded-For`
 for login rate limits; untrusted peers' XFF is ignored. Behind HTTPS, set
 `AI_MEMORY_AUTH__SECURE_COOKIE=true` as noted above.
 
+An operator who intentionally accepts unencrypted human authentication on a
+private LAN can instead pass `serve --allow-insecure-human-auth` (or set
+`AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`, including in Docker). The option is
+off by default and does not make plaintext transport safe: passwords, Bearer
+and API credentials, session cookies, and memory data can all be intercepted
+or modified. It bypasses only the non-loopback human-cookie posture check; a
+server without authentication still needs the separate
+`--allow-insecure-no-auth` override.
+
 ## Operating without auth
 
 For local-only / single-machine deploys you can skip the bearer

@@ -37,8 +37,12 @@ Bearer deployments may still bind authenticated plain HTTP and receive a loud
 warning because those credentials remain sniffable. Human authentication is
 stricter: a non-loopback listener refuses startup unless
 `AI_MEMORY_AUTH__SECURE_COOKIE=true`, which is the operator's explicit signal
-that a trusted HTTPS proxy owns the browser-facing edge. Non-Secure human
-cookies are supported only on an actual loopback listener.
+that a trusted HTTPS proxy owns the browser-facing edge. The only exception is
+the explicit `serve --allow-insecure-human-auth` escape hatch (environment
+`AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) for an operator who knowingly
+accepts plaintext passwords, credentials, session cookies, and memory data on
+a private LAN. The option is disabled by default, does not bypass the
+unauthenticated-exposure guard, and prints an unconditional warning.
 
 ## Pick a path
 
