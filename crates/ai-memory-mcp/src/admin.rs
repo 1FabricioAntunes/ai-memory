@@ -323,11 +323,10 @@ struct AutoImproveRequest {
     /// Pending proposal sidecar folder.
     #[serde(default = "default_auto_improve_pending_path")]
     pending_path: String,
-    /// Optional executable proposal eval gate. When omitted, direct admin
-    /// requests inherit the server's configured eval policy; CLI requests send
-    /// their local config explicitly.
+    /// Removed compatibility field. Executable eval policy is server-owned;
+    /// requests that still send this field fail closed.
     #[serde(default)]
-    eval: Option<ai_memory_consolidate::AutoImproveEvalConfig>,
+    eval: Option<serde_json::Value>,
     /// Removed compatibility field. Requests that still send it fail closed so
     /// old preview callers cannot accidentally write pages.
     #[serde(default)]
@@ -2384,6 +2383,14 @@ async fn handle_auto_improve(
     headers: HeaderMap,
     Json(req): Json<AutoImproveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if req.eval.is_some() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "auto-improve eval request field was removed; configure [auto_improve.eval] on the server"
+            })),
+        ));
+    }
     if req.dry_run.is_some() || req.stage.is_some() || req.mode.is_some() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2430,10 +2437,7 @@ async fn handle_auto_improve(
         max_final_body_chars: req.max_final_body_chars,
         max_rule_page_tokens: req.max_rule_page_tokens,
         max_procedure_page_tokens: req.max_procedure_page_tokens,
-        eval: req
-            .eval
-            .clone()
-            .unwrap_or_else(|| state.auto_improve_review_config.eval.clone()),
+        eval: state.auto_improve_review_config.eval.clone(),
     };
 
     let report =
@@ -11711,7 +11715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_improve_admin_omitted_eval_inherits_server_defaults() {
+    async fn auto_improve_admin_refuses_request_eval_and_inherits_server_defaults() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -11770,6 +11774,44 @@ mod tests {
             min_delta: 0.0,
         };
         let router = admin_router(state);
+
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5,
+                            "eval": {
+                                "enabled": true,
+                                "command": tmp.path().join("request-controlled-program").display().to_string(),
+                                "timeout_secs": 1,
+                                "targets": ["notes"],
+                                "min_delta": 0.0
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"],
+            "auto-improve eval request field was removed; configure [auto_improve.eval] on the server"
+        );
 
         let resp = router
             .oneshot(

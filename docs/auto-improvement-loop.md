@@ -235,7 +235,8 @@ timeouts, invalid JSON, `passed = false`, missing `passed`, or score deltas belo
 `min_delta` reject only that targeted proposal. Non-targeted proposals bypass the
 gate. If all proposals fail eval, the run is still staged with zero proposals and
 the rejected candidates so the rejection buffer can remember the failed attempt.
-Hooks never run the eval command. See
+The server owns this executable policy: neither the CLI nor a direct admin
+request can replace it. Hooks never run the eval command. See
 [`auto-improve-eval-gates.md`](auto-improve-eval-gates.md) for the full stdin /
 stdout contract and example scorer scripts.
 

@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Made the executable auto-improvement eval policy server-owned. Manual CLI and
+  HTTP reviews now use `[auto_improve.eval]` from the server process, and legacy
+  requests that try to supply an `eval` object fail closed with an upgrade
+  message.
 - Made managed cross-harness continuation survive quota exhaustion without a
   voluntary handoff. The startup packet now places its server-authored resume
   directive outside the untrusted transcript fence, and refreshed
