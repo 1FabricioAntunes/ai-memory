@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   and promised the response would carry `expired: true`; the flag was never
   written. The response now carries `expired: true` for an expired page, on
   both the markdown and the DB-fallback branch, and is unchanged for a live
-  one.
+  one. (#1371)
 
 ## [3.1.0] - 2026-10-16
 
