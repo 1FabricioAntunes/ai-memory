@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- `ai-memory auth login openai-oauth` and `auth login copilot` no longer print
+  a failed endpoint's whole response body. Error bodies are bounded, scrubbed
+  of secrets and terminal control sequences, then capped for display; provider
+  errors, including OIDC login and refresh, use the same ordering so a secret
+  at the display boundary is still redacted. (#1359)
 - Fixed OIDC device login and refresh sending credential-bearing requests to
   non-TLS endpoints. Issuers and advertised or persisted device/token endpoints
   must now use `https` outside loopback, and authentication requests do not

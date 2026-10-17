@@ -8,7 +8,7 @@ use ai_memory_llm::{
     CODEX_CLIENT_ID, CopilotToken, DeviceAuthorizationResponse, GITHUB_ACCESS_TOKEN_URL,
     GITHUB_COPILOT_CLIENT_ID, GITHUB_DEVICE_CODE_URL, OIDC_DEFAULT_SCOPE, OPENAI_OAUTH_TOKEN_URL,
     OidcDiscovery, OidcToken, OidcTokenResponse, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
-    PollOutcome, discover, poll_token_once, request_device_code,
+    PollOutcome, discover, poll_token_once, provider_error_body, request_device_code,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use secrecy::ExposeSecret as _;
@@ -336,7 +336,7 @@ async fn start_device_authorization(client: &reqwest::Client) -> Result<DeviceAu
         .context("starting openai-oauth device authorization")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = provider_error_body(resp).await;
         bail!("openai-oauth device authorization failed ({status}): {body}");
     }
     resp.json::<DeviceAuthorization>()
@@ -381,7 +381,7 @@ async fn poll_device_authorization(
             && resp.status() != reqwest::StatusCode::NOT_FOUND
         {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = provider_error_body(resp).await;
             bail!("openai-oauth authorization polling failed ({status}): {body}");
         }
         sleep(interval).await;
@@ -406,7 +406,7 @@ async fn exchange_authorization_code(
         .context("exchanging openai-oauth authorization code")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = provider_error_body(resp).await;
         bail!("openai-oauth token exchange failed ({status}): {body}");
     }
     resp.json::<OpenAiOAuthTokenResponse>()
@@ -427,7 +427,7 @@ async fn start_github_device_authorization(
         .context("starting copilot GitHub device authorization")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = provider_error_body(resp).await;
         bail!("copilot GitHub device authorization failed ({status}): {body}");
     }
     resp.json::<GitHubDeviceAuthorization>()
@@ -462,7 +462,7 @@ async fn poll_github_device_authorization(
             .context("polling copilot GitHub device authorization")?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = provider_error_body(resp).await;
             bail!("copilot GitHub authorization polling failed ({status}): {body}");
         }
         let body = resp
