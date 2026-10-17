@@ -17,7 +17,7 @@ use ai_memory_store::{
 };
 use tokio::sync::RwLock;
 
-use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
+use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp, is_admission_unavailable};
 use crate::confinement::{
     Prepare, project_path, project_root as confined_project_root, tree_path, workspace_path,
 };
@@ -2063,6 +2063,9 @@ impl Wiki {
                             project_id,
                             proposal_id,
                             reason,
+                            // An outage is not a verdict on the proposal; keep
+                            // it out of the reviewer's "avoid repeating" context.
+                            record_rejection: !is_admission_unavailable(&e),
                             actor,
                             author_id,
                         })

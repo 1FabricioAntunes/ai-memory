@@ -1040,6 +1040,7 @@ mod tests {
                 project_id: proj,
                 proposal_id: id,
                 reason: "admission denied".into(),
+                record_rejection: true,
                 actor: actor.clone(),
                 author_id: None,
             })
@@ -1069,12 +1070,70 @@ mod tests {
                     project_id: proj,
                     proposal_id: id,
                     reason: "again".into(),
+                    record_rejection: true,
                     actor,
                     author_id: None,
                 })
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_fail_without_rejection_leaves_rejections_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/outage.md",
+                    AutoImproveProposalOperation::Create,
+                    "outage",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        store
+            .writer
+            .fail_auto_improve_proposal(FailAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: id,
+                reason: "admission webhook policy request failed".into(),
+                record_rejection: false,
+                actor: ActorContext::default(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Failed);
+        assert_eq!(detail.events.last().unwrap().event, "failed");
+        let rejections = store
+            .reader
+            .recent_auto_improve_rejections(ws, proj, 10, None)
+            .await
+            .unwrap();
+        assert!(rejections.is_empty(), "{rejections:?}");
     }
 
     #[tokio::test]
@@ -1199,6 +1258,7 @@ mod tests {
                 project_id: proj,
                 proposal_id: failed_id,
                 reason: "admission denied".into(),
+                record_rejection: true,
                 actor: actor.clone(),
                 author_id: None,
             })
