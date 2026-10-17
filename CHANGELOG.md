@@ -57,9 +57,9 @@ version in [`docs/changelog/`](docs/changelog/):
   digest stats still report the true total. (#1349)
 - Fixed auto-improve approvals that failed because a `reject`-policy admission
   webhook was unreachable, timed out, rate-limited or answered 5xx being
-  stored as rejections. The proposal is still marked `failed`, but the outage no longer
-  enters the rejection buffer, so later reviews are not told to avoid a
-  proposal nobody refused and rejection telemetry counts only real
+  stored as rejections. The proposal is still marked `failed`, but the outage
+  no longer enters the rejection buffer, so later reviews are not told to
+  avoid a proposal nobody refused and rejection telemetry counts only real
   refusals. (#1358)
 - Fixed consolidation persisting non-page `relations:` targets in YAML
   frontmatter on disk. Raw titles containing dots, directory paths, or stemless
@@ -72,6 +72,10 @@ version in [`docs/changelog/`](docs/changelog/):
   that name no existing page. Relations among pages in the same atomic batch
   remain valid, and ordinary same-project body wikilinks may still point to a
   page that will be written later. (#1353)
+- Verified target latest status and expiration in
+  `ReaderPool::contradiction_edges`, so a contradiction pointing at a
+  tombstoned or expired page is reported as unresolved instead of active, and
+  expired source pages do not emit contradiction findings. (#1367)
 
 ## [3.1.0] - 2026-10-16
 
