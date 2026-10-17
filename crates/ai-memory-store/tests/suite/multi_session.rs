@@ -928,6 +928,30 @@ async fn existing_latest_paths_reports_exactly_the_live_paths() {
         .await
         .unwrap();
     assert!(found.is_empty());
+
+    // An expired page is never reported as live.
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired page");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let mut future_exp = page(ws, proj, "notes/future.md", "Future", "future page");
+    future_exp.expires_at = Some(jiff::Timestamp::from_second(4_102_444_800).unwrap());
+    store.writer.upsert_page(future_exp).await.unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/expired.md".to_string(),
+                "notes/future.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["notes/future.md"]);
 }
 
 /// The link guard's path probe is no existence oracle for a restricted
