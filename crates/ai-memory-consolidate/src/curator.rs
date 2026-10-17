@@ -176,7 +176,9 @@ pub async fn run_curator_report_with_breadth(
     cold.sort_by(|a, b| a.message.cmp(&b.message));
     findings.extend(cold.into_iter().take(params.max_findings_per_kind));
 
-    let pages = reader.list_unexpired_pages(workspace_name, project_name).await?;
+    let pages = reader
+        .list_unexpired_pages(workspace_name, project_name)
+        .await?;
     let mut stale_slots = Vec::new();
     let mut titles: HashMap<String, Vec<String>> = HashMap::new();
     for page in &pages {
