@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Verified target latest status and expiration in `ReaderPool::contradiction_edges`,
+  so a contradiction pointing at a tombstoned or expired page is reported as
+  unresolved instead of active, and expired source pages do not emit contradiction
+  findings.
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
