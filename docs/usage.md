@@ -632,7 +632,7 @@ namespace, history or session view the header search box searches that project;
 elsewhere it searches every project with FTS5, like
 `memory_query(global=true)`, and the search page's "Search in" selector picks
 a project, and its "Kind" and "Tier" selects (`kind=` and `tier=`) keep only
-the pages of that kind or tier. A page shows an outline of its headings, the pages that cite it and
+the pages of that kind or tier. A page shows an outline of its headings, an `expired` badge once its `expires_at` TTL has passed, the pages that cite it and
 the pages it cites; a folder's namespace listing sorts by recent update or by
 title and shows 25 pages at a time. The search on a project page ranks with
 the same hybrid ranker as `memory_query` for that project, and its "Explain
