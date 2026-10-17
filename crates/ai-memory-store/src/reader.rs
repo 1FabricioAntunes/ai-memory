@@ -9084,9 +9084,10 @@ impl ReaderPool {
         .await
     }
 
-    /// Typed `contradicts` edges declared by latest pages of one project
-    /// (docs/okf.md relations vocabulary). Each row feeds one rule-based
-    /// lint finding.
+    /// Typed `contradicts` edges declared by latest unexpired pages of one
+    /// project (docs/okf.md relations vocabulary). Each row feeds one
+    /// rule-based lint finding; `resolved` is true when the target resolves
+    /// to a latest unexpired page.
     ///
     /// # Errors
     /// Propagates SQL errors from the read pool.
@@ -9096,11 +9097,22 @@ impl ReaderPool {
         project_id: ProjectId,
     ) -> StoreResult<Vec<ContradictionEdge>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT fp.path, l.to_path,                         l.to_page_id IS NOT NULL AS resolved                  FROM links l                  JOIN pages fp ON fp.id = l.from_page_id                      AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1                  WHERE l.link_type = 'contradicts'                  ORDER BY fp.path, l.to_path",
-            )?;
+            let from_ttl = not_expired("fp", "?3");
+            let to_ttl = not_expired("tp", "?3");
+            let sql = format!(
+                "SELECT fp.path, l.to_path, \
+                        tp.id IS NOT NULL AS resolved \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id \
+                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1{from_ttl} \
+                 LEFT JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
+                 WHERE l.link_type = 'contradicts' \
+                 ORDER BY fp.path, l.to_path"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let now = now_us();
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
                 |row| {
                     let resolved: i64 = row.get(2)?;
                     Ok(ContradictionEdge {
