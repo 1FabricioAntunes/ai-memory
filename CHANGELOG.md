@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed the `/web` project tree and its recent-activity list, the namespace
+  listing, and the `/api/v1` `pages` list and legacy `recent` array showing
+  pages whose `expires_at` TTL had passed, which search, `memory_recent`, the
+  incremental `recent` form and page history already hid. A project move and
+  the curator still see every current page, and an exact-path read of an
+  expired page still answers.
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
