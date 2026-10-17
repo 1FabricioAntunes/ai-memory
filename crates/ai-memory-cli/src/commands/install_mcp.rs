@@ -26,7 +26,9 @@ use serde_json::json;
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
-use crate::commands::render_shared::{bearer_header_value, yaml_single_quote};
+use crate::commands::render_shared::{
+    bearer_header_value, hook_embedded_exe_path, shell_quote, yaml_single_quote,
+};
 use crate::config::{Config, DEFAULT_MCP_URL};
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
@@ -206,10 +208,41 @@ fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> 
     Ok(())
 }
 
-/// The command a stdio bridge entry runs. Resolved through `PATH` like the
-/// Claude Code entry, so the Docker wrapper (which intercepts `mcp-bridge`)
-/// and a native install both answer to it.
+/// The bare command name, resolved through `PATH`. Inside a container the
+/// Docker wrapper on the host intercepts `mcp-bridge`, so the entry must name
+/// the wrapper rather than the container's own binary.
 const BRIDGE_COMMAND: &str = "ai-memory";
+
+/// The command a stdio bridge entry runs: this binary's absolute path, the
+/// same one hook commands embed, because clients often start MCP servers
+/// without the login shell's `PATH` and a bare `ai-memory` then fails to
+/// spawn. Inside a container, or when the path cannot be trusted to survive
+/// (see [`hook_embedded_exe_path`]), the bare [`BRIDGE_COMMAND`].
+fn bridge_command() -> String {
+    bridge_command_for(
+        ai_memory_wiki::backup::running_in_container(),
+        hook_embedded_exe_path(),
+    )
+}
+
+fn bridge_command_for(in_container: bool, exe: PathBuf) -> String {
+    if in_container {
+        BRIDGE_COMMAND.to_owned()
+    } else {
+        exe.to_string_lossy().into_owned()
+    }
+}
+
+/// Whether `command` runs ai-memory: the bare name, what [`bridge_command`]
+/// writes from this binary, or an absolute path to a binary named `ai-memory`
+/// that an earlier install wrote.
+fn is_bridge_command(command: &str) -> bool {
+    if command == BRIDGE_COMMAND || command == bridge_command() {
+        return true;
+    }
+    let path = Path::new(command);
+    path.is_absolute() && path.file_stem().and_then(|stem| stem.to_str()) == Some(BRIDGE_COMMAND)
+}
 
 /// Arguments of the session-less bridge for `args`: the URL carries the
 /// client's schema-flavor marker, because the bridge forwards `tools/list`
@@ -224,12 +257,12 @@ fn session_less_bridge_args(args: &InstallMcpArgs) -> Vec<String> {
     ]
 }
 
-/// The upstream URL of an ai-memory bridge entry: `command: "ai-memory"` with
+/// The upstream URL of an ai-memory bridge entry: an ai-memory `command` with
 /// `args`, or OpenCode's single `command` array, running `mcp-bridge` with a
 /// `--server-url`. `None` for any other entry.
 pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
     let argv: Vec<&str> = match entry.get("command")? {
-        serde_json::Value::String(command) if command == BRIDGE_COMMAND => entry
+        serde_json::Value::String(command) if is_bridge_command(command) => entry
             .get("args")?
             .as_array()?
             .iter()
@@ -237,7 +270,7 @@ pub(crate) fn bridge_entry_url(entry: &serde_json::Value) -> Option<&str> {
             .collect(),
         serde_json::Value::Array(command) => {
             let mut words = command.iter().filter_map(serde_json::Value::as_str);
-            if words.next() != Some(BRIDGE_COMMAND) {
+            if !words.next().is_some_and(is_bridge_command) {
                 return None;
             }
             words.collect()
@@ -340,10 +373,10 @@ pub(crate) fn existing_entry_endpoint(
 /// take no stdio entry here.
 fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
     let bridge = session_less_bridge_args(args);
-    let plain = || json!({"command": BRIDGE_COMMAND, "args": bridge.clone()});
-    let typed =
-        |kind: &str| json!({"type": kind, "command": BRIDGE_COMMAND, "args": bridge.clone()});
-    let mut opencode_argv = vec![BRIDGE_COMMAND.to_owned()];
+    let command = bridge_command();
+    let plain = || json!({"command": command, "args": bridge.clone()});
+    let typed = |kind: &str| json!({"type": kind, "command": command, "args": bridge.clone()});
+    let mut opencode_argv = vec![command.clone()];
     opencode_argv.extend(bridge.iter().cloned());
     Some(match args.client {
         McpClient::ClaudeDesktop
@@ -354,7 +387,7 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         | McpClient::Openclaw
         | McpClient::IbmBob => plain(),
         McpClient::GeminiCli | McpClient::AntigravityCli => json!({
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "timeout": GEMINI_MCP_TIMEOUT_MS,
         }),
@@ -363,20 +396,20 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         }
         McpClient::Omp => json!({
             "type": "stdio",
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "enabled": true,
         }),
         McpClient::CopilotCli => json!({
             "type": "local",
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
             "tools": ["*"],
         }),
         McpClient::CommandCode => json!({
             "transport": "stdio",
             "enabled": true,
-            "command": BRIDGE_COMMAND,
+            "command": command,
             "args": bridge,
         }),
         McpClient::OpenCode => json!({"type": "local", "command": opencode_argv, "enabled": true}),
@@ -1541,7 +1574,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::ClaudeCode => {
             if args.session_aware {
                 entry.insert("type".into(), json!("stdio"));
-                entry.insert("command".into(), json!("ai-memory"));
+                entry.insert("command".into(), json!(bridge_command()));
                 entry.insert(
                     "args".into(),
                     json!(["mcp-bridge", "--server-url", base_url]),
@@ -1804,7 +1837,7 @@ fn build_mcp_entry_muse(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("stdio"));
-    entry.insert("command".into(), json!(BRIDGE_COMMAND));
+    entry.insert("command".into(), json!(bridge_command()));
     let mut argv = vec![
         json!("mcp-bridge"),
         json!("--agent"),
@@ -1952,7 +1985,7 @@ fn grok_upsert_mcp_server(
     let mut server = Table::new();
     if args.stdio_bridge {
         // Grok picks stdio from `command` (and HTTP from `url`).
-        server["command"] = value(BRIDGE_COMMAND);
+        server["command"] = value(bridge_command());
         server["args"] = value(
             session_less_bridge_args(args)
                 .iter()
@@ -2013,8 +2046,9 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
             .map(|token| format!(" --env \"AI_MEMORY_AUTH_TOKEN={token}\""))
             .unwrap_or_default();
         format!(
-            "claude mcp add --transport stdio{env} {name} -- \\\n    ai-memory mcp-bridge --server-url {url}",
+            "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}",
             name = args.name,
+            command = shell_quote(&bridge_command()),
             url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
         )
     } else if let Some(b) = &bearer {
@@ -2325,7 +2359,7 @@ fn render_dsh_snippet(args: &InstallMcpArgs) -> String {
         out.push_str("        transport: stdio\n");
         out.push_str(&format!(
             "        command: {}\n",
-            yaml_single_quote(BRIDGE_COMMAND)
+            yaml_single_quote(&bridge_command())
         ));
         out.push_str("        args:\n");
         for arg in session_less_bridge_args(args) {
@@ -2768,7 +2802,7 @@ mod tests {
             entry,
             json!({
                 "type": "stdio",
-                "command": "ai-memory",
+                "command": bridge_command(),
                 "args": ["mcp-bridge", "--agent", "muse", "--server-url", "http://127.0.0.1:49374/mcp"],
                 "mode": "optional",
             })
@@ -3821,6 +3855,37 @@ mod tests {
     }
 
     #[test]
+    fn bridge_command_names_the_binary_by_absolute_path_outside_a_container() {
+        let exe = PathBuf::from("/opt/ai-memory/ai-memory");
+        assert_eq!(
+            bridge_command_for(false, exe.clone()),
+            "/opt/ai-memory/ai-memory"
+        );
+        assert_eq!(bridge_command_for(true, exe), BRIDGE_COMMAND);
+    }
+
+    #[test]
+    fn bridge_entries_are_recognized_by_bare_name_or_absolute_path() {
+        for command in ["ai-memory", "/opt/ai-memory/ai-memory"] {
+            let entry =
+                json!({"command": command, "args": ["mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(bridge_entry_url(&entry), Some("http://h/mcp"), "{command}");
+            let opencode =
+                json!({"command": [command, "mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(
+                bridge_entry_url(&opencode),
+                Some("http://h/mcp"),
+                "{command}"
+            );
+        }
+        for command in ["other", "/usr/bin/other", "bin/ai-memory"] {
+            let entry =
+                json!({"command": command, "args": ["mcp-bridge", "--server-url", "http://h/mcp"]});
+            assert_eq!(bridge_entry_url(&entry), None, "{command}");
+        }
+    }
+
+    #[test]
     fn claude_code_session_aware_entry_uses_owned_stdio_bridge() {
         let mut args = args_with_token(McpClient::ClaudeCode);
         args.server_url = Some("https://memory.example/mcp".into());
@@ -3829,7 +3894,7 @@ mod tests {
         let entry = build_mcp_entry(&args).unwrap();
 
         assert_eq!(entry["type"], "stdio");
-        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(entry["command"], bridge_command());
         assert_eq!(
             entry["args"],
             json!(["mcp-bridge", "--server-url", "https://memory.example/mcp"])
@@ -3840,7 +3905,10 @@ mod tests {
 
         let rendered = render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap();
         assert!(rendered.contains("claude mcp add --transport stdio"));
-        assert!(rendered.contains("ai-memory mcp-bridge --server-url"));
+        assert!(rendered.contains(&format!(
+            "{} mcp-bridge --server-url",
+            shell_quote(&bridge_command())
+        )));
     }
 
     #[test]
@@ -4145,7 +4213,7 @@ mod tests {
         };
         let opencode = entry(McpClient::OpenCode);
         assert_eq!(opencode["type"], "local");
-        assert_eq!(opencode["command"][0], "ai-memory");
+        assert_eq!(opencode["command"][0], bridge_command());
         assert_eq!(opencode["command"][1], "mcp-bridge");
         assert_eq!(opencode["enabled"], true);
         assert!(entry(McpClient::OpenCode2).get("enabled").is_none());
@@ -4165,7 +4233,10 @@ mod tests {
         let mut doc = toml_edit::DocumentMut::new();
         grok_upsert_mcp_server(&mut doc, &grok).unwrap();
         let text = doc.to_string();
-        assert!(text.contains("command = \"ai-memory\""), "{text}");
+        assert!(
+            text.contains(&format!("command = {:?}", bridge_command())),
+            "{text}"
+        );
         assert!(!text.contains("url ="), "{text}");
 
         let mut dsh = args_for(McpClient::Dsh);

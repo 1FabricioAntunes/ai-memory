@@ -109,6 +109,13 @@ version in [`docs/changelog/`](docs/changelog/):
   page links that yielded 404 responses in the web browser. They now remain as
   literal text, aligning web wikilink preprocessing with the wiki engine's link
   extractor. (#1364)
+- `install-mcp` now writes the absolute path of the `ai-memory` binary as the
+  `command` of every stdio bridge entry (Claude Code's session-aware entry,
+  Muse Code and the session-less bridge of the other clients), as hook
+  commands already did. A client started without `~/.local/bin` on its `PATH`
+  no longer fails to spawn the bridge. The Docker wrapper keeps the bare
+  `ai-memory`, and existing entries with either form are still recognized.
+  (#1362)
 
 ## [3.1.0] - 2026-10-16
 
