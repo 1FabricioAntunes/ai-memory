@@ -24,6 +24,7 @@ mod hook_payload;
 mod install_script;
 mod jail_toggles_e2e;
 mod marker_scope;
+mod mcp_bridge_stdio;
 mod message_e2e;
 mod opencode_dialect;
 mod packaging;

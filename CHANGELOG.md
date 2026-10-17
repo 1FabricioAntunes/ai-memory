@@ -135,6 +135,17 @@ version in [`docs/changelog/`](docs/changelog/):
   reports major 2. A failed probe writes no OpenCode wiring and is reported
   as a setup problem; `--agent opencode2` still forces V2 without probing.
   (#1356)
+- Fixed `ai-memory mcp-bridge` exiting when a client sent `server/discover`
+  before `initialize`. A client that supports both the 2026-07-28 MCP revision
+  and the older `initialize` handshake, such as Antigravity CLI 1.4 and the
+  Antigravity 2.24 app, sends that probe first and falls back to `initialize`
+  when the server answers with an error. The bridge ended the session instead,
+  so the fallback found a closed pipe (`calling initialize: client is closing:
+  EOF`) and the client never connected. Until `initialize` arrives, the bridge
+  now answers every other request with a JSON-RPC Method not found error,
+  ignores notifications such as the client cancelling its probe, and still
+  answers `ping`. A client that starts with `initialize` sees no change.
+  (#1355)
 
 ## [3.1.0] - 2026-10-16
 
