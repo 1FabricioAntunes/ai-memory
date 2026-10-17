@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `/admin/purge-session`, `/admin/move-project` and `/admin/handoffs/expire`
   now read an omitted `confirm` as `false` and return the documented 400 that
   names the flag, as `/admin/merge-workspace` already did. Nothing runs without
-  `confirm: true`.
+  `confirm: true`. ([#1394](https://github.com/akitaonrails/ai-memory/pull/1394))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
