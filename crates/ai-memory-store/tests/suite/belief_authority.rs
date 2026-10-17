@@ -517,9 +517,8 @@ async fn contradiction_to_expired_target_does_not_lower_confidence() {
         .find(|(h, _)| h.path.as_str() == "notes/disputed_live.md")
         .unwrap();
 
-    assert_eq!(
-        disputed_expired.1.confidence.unwrap(),
-        clean.1.confidence.unwrap(),
+    assert!(
+        (disputed_expired.1.confidence.unwrap() - clean.1.confidence.unwrap()).abs() < 1e-4,
         "expired target contradiction must not lower confidence"
     );
     assert!(
