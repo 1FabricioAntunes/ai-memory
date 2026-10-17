@@ -10044,8 +10044,8 @@ impl ReaderPool {
 
     /// All `is_latest = 1` pages under a given (workspace, project),
     /// ordered by path ascending, TTL-expired pages included: a project
-    /// move copies every current page, and the curator reports on every
-    /// one. A listing shown to a reader uses [`Self::list_unexpired_pages`].
+    /// move copies every current page. Reader-facing listings and curator
+    /// reports use [`Self::list_unexpired_pages`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
