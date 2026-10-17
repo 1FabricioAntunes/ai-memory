@@ -455,11 +455,13 @@ leaves adherence to whether the agent does. See
 `install-instructions` prints a note when it writes only `AGENTS.md` while a
 `CLAUDE.local.md`, `.claude/CLAUDE.md` or `CLAUDE.md` in the directory or above
 it would make Claude Code read that file instead, unless one of them imports
-the `AGENTS.md` being written. The import is resolved from the file that
-contains it (`@AGENTS.md` in `.claude/CLAUDE.md` points at `.claude/AGENTS.md`;
-that file needs `@../AGENTS.md`), `~/` expands from the home directory, and an
-`@path` inside a code span or fenced block does not count. Imports are followed
-through other imported files up to four hops, as Claude Code follows them.
+the `AGENTS.md` being written. Claude Code's user-level
+`~/.claude/CLAUDE.md` does not count, including when `$HOME` reaches that
+directory through a symlink. The import is resolved from the file that contains
+it (`@AGENTS.md` in `.claude/CLAUDE.md` points at `.claude/AGENTS.md`; that file
+needs `@../AGENTS.md`), `~/` expands from the home directory, and an `@path`
+inside a code span or fenced block does not count. Imports are followed through
+other imported files up to four hops, as Claude Code follows them.
 
 To refresh only the managed Agent Skills:
 
