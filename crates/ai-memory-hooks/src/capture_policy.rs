@@ -1145,7 +1145,11 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
         | AgentKind::Muse
         | AgentKind::CodeBuddy
-        | AgentKind::IbmBob => object
+        | AgentKind::IbmBob
+        // DSH's Claude Code hooks bridge forwards the same `tool_name` /
+        // `tool_input` pair, so its file and shell calls read the ignore
+        // paths exactly as Claude Code's do.
+        | AgentKind::Dsh => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -1245,7 +1249,9 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // started and returns what it printed, like Codex `write_stdin`.
         output_reader: reads_earlier_output(name)
             || (agent == AgentKind::Muse && name.eq_ignore_ascii_case("bash_input")),
-        powershell: name.eq_ignore_ascii_case("powershell"),
+        // Claude Code's `PowerShell` and DSH's Windows `pwsh` share the
+        // backquote escaping the command splitter has to model.
+        powershell: name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh"),
         inline_code: family == ToolFamily::NonFile
             && INLINE_CODE_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
         call_id,
@@ -1494,8 +1500,12 @@ pub const SEARCH_LIST_TOOL_NAMES: &[&str] = &[
 /// Gemini CLI's `run_shell_command`, `{command, dir_path?}`) and the Hermes
 /// Agent tools that execute code, drive a browser, or fetch the web
 /// (agent/shell_hooks.py envelope; names from the model_tools registry,
-/// live-captured 2026-10-07). They are non-file rather than unknown because
-/// family `unknown` drops the tool output from observation bodies.
+/// live-captured 2026-10-07). DeepSeek Harness reaches the same shell through
+/// the win32 layer: its POSIX tool is `bash` and its Windows tool is `pwsh`
+/// (`@deepseek-ai/dsh-tool-pwsh`), so both names must classify or an active
+/// `ignore_paths` never reads the command's arguments. They are non-file
+/// rather than unknown because family `unknown` drops the tool output from
+/// observation bodies.
 pub const NON_FILE_TOOL_NAMES: &[&str] = &[
     "bash",
     "shell",
@@ -1511,8 +1521,10 @@ pub const NON_FILE_TOOL_NAMES: &[&str] = &[
     "execute_bash",
     "execute_cmd",
     "powershell",
+    "pwsh",
     "run_shell_command",
     "execute_code",
+    "run_code",
     "browser_exec",
     "browser_navigate",
     "web_extract",
@@ -1521,9 +1533,13 @@ pub const NON_FILE_TOOL_NAMES: &[&str] = &[
 ];
 
 /// Non-file tools whose input is program source (Hermes `execute_code`,
-/// `{"code": "..."}`): like `python3 -c`, it builds paths at run time, so
-/// nothing lexical proves it read no ignored file.
-pub const INLINE_CODE_TOOL_NAMES: &[&str] = &["execute_code"];
+/// `{"code": "..."}`, and DSH's reserved `run_code` Code Mode transport,
+/// which takes the same `code` field —
+/// <https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/core/tools>):
+/// like `python3 -c`, the program builds its paths at run time, so nothing
+/// lexical proves it read no ignored file. DSH's `headless` profile mounts
+/// Code Mode, so `run_code` is the tool its one-shot runs call.
+pub const INLINE_CODE_TOOL_NAMES: &[&str] = &["execute_code", "run_code"];
 
 /// Tools that return output of a command started by an earlier call: Claude
 /// Code `BashOutput`/`TaskOutput`, Codex `write_stdin`, Hermes and OpenClaw
@@ -4881,6 +4897,113 @@ mod tests {
         );
     }
 
+    /// DSH's Claude Code hooks bridge forwards Claude Code-shaped tool
+    /// payloads, so a DSH file or shell call must pass through the same
+    /// capture exclusions as the harness it borrows its shape from. Without a
+    /// DSH mapping `extract` returns the default extraction, `inspect` sees
+    /// `ToolFamily::Unknown`, and an active `ignore_paths` keeps the call
+    /// instead of dropping it.
+    #[test]
+    fn dsh_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "dsh-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("Read", json!({"file_path": "secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("Read", json!({"file_path": "src/lib.rs"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
+        // DSH's Windows shell tool is `pwsh`; the POSIX one is `bash`.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("pwsh", json!({"command": "cat secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call("bash", json!({"command": "cat secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        // DSH's `headless` profile mounts Code Mode, so its one-shot runs call
+        // the reserved `run_code` transport with program source that builds
+        // its paths at run time. Like any other inline-code tool it must fall
+        // back to metadata under an active policy instead of keeping the
+        // program and its output.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Dsh,
+                    &call(
+                        "run_code",
+                        json!({
+                            "code": "const r = await tools.read({file_path: 'secret/token'}); console.log(r)",
+                            "description": "read an ignored file",
+                        }),
+                    ),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::MetadataOnly
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Other,
+                    &call("Read", json!({"file_path": "secret/token"})),
+                    "/repo"
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep,
+            "without the DSH mapping the call is not recognized"
+        );
+    }
+
     #[test]
     fn droid_tool_calls_honor_capture_exclusions() {
         let policy = CapturePolicy::resolve(
@@ -6152,6 +6275,15 @@ mod tests {
             (
                 AgentKind::Devin,
                 json!({"tool_name": "exec", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            // DSH's Windows shell tool beside its POSIX `bash`.
+            (
+                AgentKind::Dsh,
+                json!({"tool_name": "pwsh", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
+            (
+                AgentKind::Dsh,
+                json!({"tool_name": "bash", "tool_input": {"command": "cat docs/adr/x.md"}}),
             ),
         ] {
             let decision = policy.inspect(agent, &raw, "/repo");

@@ -53,7 +53,12 @@ version in [`docs/changelog/`](docs/changelog/):
   prints a Cordis patch fragment that mounts DSH's official
   `@deepseek-ai/dsh-hooks-claude-code` bridge on
   `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (the patch file itself is
-  never auto-written). DSH sessions are stored as `agent=dsh`. The bridge
+  never auto-written). DSH sessions are stored as `agent=dsh`, and its bridge
+  forwards Claude Code-shaped tool payloads, so `[capture] ignore_paths`
+  exclusions apply to its file, search and shell calls (Windows `pwsh`, POSIX
+  `bash`) like any other Claude-shaped adapter; the reserved Code Mode
+  `run_code` transport that its `headless` profile calls is treated as inline
+  program source. The bridge
   delivers exactly seven events (no `PreCompact` or `SessionEnd`) and runs
   `SessionStart` detached, so finished sessions close with
   `finalize-session --agent dsh` and pending handoffs are recovered via
