@@ -56,11 +56,18 @@ version in [`docs/changelog/`](docs/changelog/):
   store reads at most 500 titles for it, and the page's prompt count and the
   digest stats still report the true total. (#1349)
 - Fixed auto-improve approvals that failed because a `reject`-policy admission
-  webhook was unreachable, timed out, rate-limited or answered 5xx being stored as
-  rejections. The proposal is still marked `failed`, but the outage no longer
+  webhook was unreachable, timed out, rate-limited or answered 5xx being
+  stored as rejections. The proposal is still marked `failed`, but the outage no longer
   enters the rejection buffer, so later reviews are not told to avoid a
   proposal nobody refused and rejection telemetry counts only real
   refusals. (#1358)
+- Fixed consolidation persisting non-page `relations:` targets in YAML
+  frontmatter on disk. Raw titles containing dots, directory paths, or stemless
+  `.md` strings in `relations:` were previously written into frontmatter and
+  retained by `prune_relations` when `extract_relation_links` returned an empty
+  list, causing the wiki watcher to emit repeated warnings on every
+  reconciliation pass. Targets are now validated through `extract_relation_links`
+  before frontmatter assembly and during relation pruning. (#1353, #1366)
 
 ## [3.1.0] - 2026-10-16
 

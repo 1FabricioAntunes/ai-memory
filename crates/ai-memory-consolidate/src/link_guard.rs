@@ -150,9 +150,9 @@ pub(crate) fn prune_relations(frontmatter: &mut serde_json::Value, unresolved: &
         };
         list.retain(|entry| {
             let probe = serde_json::json!({ "relations": { relation.as_str(): [entry] } });
-            ai_memory_wiki::extract_relation_links(&probe)
-                .into_iter()
-                .all(|link| {
+            let links = ai_memory_wiki::extract_relation_links(&probe);
+            !links.is_empty()
+                && links.into_iter().all(|link| {
                     !unresolved.contains(&(
                         link.workspace,
                         link.project,
@@ -210,5 +210,24 @@ mod tests {
         let mut fm = original;
         prune_relations(&mut fm, &BTreeSet::from([key("ghost", "x.md")]));
         assert!(fm.get("relations").is_none());
+    }
+
+    #[test]
+    fn prune_relations_drops_unparseable_entries() {
+        let mut fm = serde_json::json!({
+            "relations": {
+                "contradicts": [
+                    "upgrade 3.0.0 to 3.1.0 with residue",
+                    "notes/",
+                    "notes/.md",
+                    "local/valid.md"
+                ]
+            }
+        });
+        prune_relations(&mut fm, &BTreeSet::from([key("ghost", "x.md")]));
+        assert_eq!(
+            fm["relations"]["contradicts"],
+            serde_json::json!(["local/valid.md"])
+        );
     }
 }
