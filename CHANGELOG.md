@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   longer lists such a page. The response now carries `expired: true` for an
   expired page, on both the markdown and the DB-fallback branch, and
   `read-page` prints an `expired: true` line (the field also appears in
-  `--json`); a live page's output is unchanged.
+  `--json`); a live page's output is unchanged. (#1373)
 
 ## [3.1.0] - 2026-10-16
 
