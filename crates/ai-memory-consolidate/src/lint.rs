@@ -375,7 +375,7 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         std::collections::HashMap::new();
 
     for c in candidates {
-        if c.expires_at_us.is_some_and(|us| us <= now_us) {
+        if candidate_is_expired(c, now_us) {
             continue;
         }
         // Stale: episodic, older than the lambda-derived threshold, zero accesses.
@@ -474,6 +474,10 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
     }
 
     out
+}
+
+fn candidate_is_expired(candidate: &DecayCandidate, now_us: i64) -> bool {
+    candidate.expires_at_us.is_some_and(|us| us <= now_us)
 }
 
 // ── A5: zero-LLM contradiction detection (cosine-similarity band) ──────────
@@ -602,7 +606,7 @@ async fn detected_contradiction_pass(
         .iter()
         .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
         .filter(|c| !c.path.as_str().starts_with("_lint/"))
-        .filter(|c| !c.expires_at_us.is_some_and(|us| us <= now_us))
+        .filter(|c| !candidate_is_expired(c, now_us))
         .collect();
     eligible.sort_by(|a, b| {
         a.access_count
@@ -669,7 +673,7 @@ async fn contradiction_pass(
     let mut subset: Vec<&DecayCandidate> = candidates
         .iter()
         .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
-        .filter(|c| !c.expires_at_us.is_some_and(|us| us <= now_us))
+        .filter(|c| !candidate_is_expired(c, now_us))
         .collect();
     if subset.len() < 2 {
         return Ok(Vec::new());
@@ -1149,17 +1153,46 @@ mod tests {
             salience: None,
             compacted_at_us: None,
         };
-        let candidates = vec![
-            expired_episodic,
-            expired_rule,
-            live_page,
-            expired_duplicate,
-        ];
+        let candidates = vec![expired_episodic, expired_rule, live_page, expired_duplicate];
         let findings = rule_based_findings(&candidates, STALE_DAYS);
         assert!(
             findings.is_empty(),
             "expired pages must not produce stale, rule_suggestion, or duplicate findings: {findings:?}"
         );
+    }
+
+    #[test]
+    fn expiry_filter_keeps_future_ttl_and_excludes_the_boundary() {
+        let now_us = Timestamp::now().as_microsecond();
+        let candidate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/ttl.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: now_us,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: "{}".into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+
+        assert!(!candidate_is_expired(&candidate, now_us));
+        assert!(!candidate_is_expired(
+            &DecayCandidate {
+                expires_at_us: Some(now_us + 1),
+                ..candidate.clone()
+            },
+            now_us
+        ));
+        assert!(candidate_is_expired(
+            &DecayCandidate {
+                expires_at_us: Some(now_us),
+                ..candidate
+            },
+            now_us
+        ));
     }
 
     // ── LintFinding tolerant deserialization ─────────────────────────────

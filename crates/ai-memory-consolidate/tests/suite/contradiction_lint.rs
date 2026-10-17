@@ -328,18 +328,8 @@ async fn no_embeddings_is_a_clean_no_op() {
 #[tokio::test]
 async fn contradiction_pass_skips_expired_pages() {
     let fx = seed_fixture().await;
-    let live = write_semantic(
-        &fx,
-        "concepts/live-claim.md",
-        "The retry budget is 5.",
-    )
-    .await;
-    let expired = write_semantic(
-        &fx,
-        "concepts/expired-claim.md",
-        "The retry budget is 3.",
-    )
-    .await;
+    let live = write_semantic(&fx, "concepts/live-claim.md", "The retry budget is 5.").await;
+    let expired = write_semantic(&fx, "concepts/expired-claim.md", "The retry budget is 3.").await;
     seed_embedding(&fx, live, &[1.0, 0.0]);
     seed_embedding(&fx, expired, &[0.6, 0.8]);
 
