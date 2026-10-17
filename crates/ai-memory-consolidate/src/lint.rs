@@ -375,6 +375,9 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         std::collections::HashMap::new();
 
     for c in candidates {
+        if c.expires_at_us.is_some_and(|us| us <= now_us) {
+            continue;
+        }
         // Stale: episodic, older than the lambda-derived threshold, zero accesses.
         #[allow(clippy::cast_precision_loss)]
         let age_days = (now_us - c.updated_at_us) as f64 / US_PER_DAY;
@@ -594,10 +597,12 @@ async fn detected_contradiction_pass(
     // knowledge pages a user compounds (semantic / procedural), not session
     // logs or the lint report itself. "Coldest first" = fewest accesses, then
     // oldest update, so a large corpus is trimmed to its most-stale knowledge.
+    let now_us = Timestamp::now().as_microsecond();
     let mut eligible: Vec<&DecayCandidate> = candidates
         .iter()
         .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
         .filter(|c| !c.path.as_str().starts_with("_lint/"))
+        .filter(|c| !c.expires_at_us.is_some_and(|us| us <= now_us))
         .collect();
     eligible.sort_by(|a, b| {
         a.access_count
@@ -660,9 +665,11 @@ async fn contradiction_pass(
 ) -> Result<Vec<LintFinding>, LintError> {
     // Focus on semantic / procedural pages — those are the ones the
     // user actually compounds knowledge on.
+    let now_us = Timestamp::now().as_microsecond();
     let mut subset: Vec<&DecayCandidate> = candidates
         .iter()
         .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
+        .filter(|c| !c.expires_at_us.is_some_and(|us| us <= now_us))
         .collect();
     if subset.len() < 2 {
         return Ok(Vec::new());
