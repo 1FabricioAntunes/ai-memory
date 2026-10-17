@@ -634,7 +634,9 @@ elsewhere it searches every project with FTS5, like
 a project, and its "Kind" and "Tier" selects (`kind=` and `tier=`) keep only
 the pages of that kind or tier. A page shows an outline of its headings, the pages that cite it and
 the pages it cites; a folder's namespace listing sorts by recent update or by
-title and shows 25 pages at a time. The search on a project page ranks with
+title and shows 25 pages at a time. The tree, the recent-activity list and a
+namespace listing leave out a page whose `expires_at` TTL has passed, as search
+does; its own URL still opens it. The search on a project page ranks with
 the same hybrid ranker as `memory_query` for that project, and its "Explain
 ranking" box shows each hit's stream ranks, RRF contributions, authority and rerank score, plus the per-stream timings.
 Root also gets `/web/health`: hook counters (429s included), the writer queue,
