@@ -1974,8 +1974,9 @@ pub struct SetupArgs {
     pub yes: bool,
     /// Wire this agent instead of the detected ones. Repeat for several.
     /// Detection looks for each harness's session store or MCP config under
-    /// your home; OpenCode 2 and the Kiro CLI v3 engine are only wired when
-    /// named here.
+    /// your home. A detected or named `opencode` is wired for the major
+    /// `opencode --version` reports (`opencode2` forces V2 without probing);
+    /// the Kiro CLI v3 engine is only wired when named here.
     #[arg(long = "agent", value_enum)]
     pub agents: Vec<AgentChoice>,
     /// Do not install or start a user service; use this when the server
