@@ -6,6 +6,7 @@
 //! soft cap: a connection that comes back when the pool is already full
 //! is simply dropped.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2160,6 +2161,45 @@ pub struct PageMeta {
     /// is hidden from retrieval and awaiting the next forget sweep.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub expired: bool,
+}
+
+/// Soft cap on nodes in a project link graph. Pages with the fewest
+/// same-project neighbours drop first when a project is larger, then the
+/// oldest of those; the rest stay reachable from the page tree.
+pub const PROJECT_LINK_GRAPH_MAX_NODES: usize = 120;
+
+/// One latest page kept in a project link graph.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LinkGraphNode {
+    /// Relative wiki path.
+    pub path: String,
+    /// Page title.
+    pub title: String,
+    /// Number of resolved same-project neighbours (either direction).
+    pub degree: u64,
+}
+
+/// One resolved same-project edge in a project link graph.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LinkGraphEdge {
+    /// Source page path.
+    pub from_path: String,
+    /// Target page path.
+    pub to_path: String,
+}
+
+/// Latest unexpired pages in one project and the resolved wikilinks among
+/// them. Powers `/web/w/{workspace}/{project}/graph` and
+/// `GET /api/v1/workspaces/{workspace}/projects/{project}/graph`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LinkGraph {
+    /// Pages kept after the degree-then-recency cap.
+    pub nodes: Vec<LinkGraphNode>,
+    /// Resolved same-project edges whose both ends are in `nodes`.
+    pub edges: Vec<LinkGraphEdge>,
+    /// `true` when the project has more live pages than
+    /// [`PROJECT_LINK_GRAPH_MAX_NODES`].
+    pub truncated: bool,
 }
 
 /// One resolved cross-project edge (a link whose endpoints live in
@@ -9475,6 +9515,117 @@ impl ReaderPool {
                 }
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Latest unexpired pages in one project and the resolved wikilinks
+    /// among them.
+    ///
+    /// Cross-project and unresolved links are omitted: this is the in-project
+    /// map the project graph page draws. Expired pages are hidden the same way
+    /// other retrieval surfaces hide them. When the project has more live
+    /// pages than [`PROJECT_LINK_GRAPH_MAX_NODES`], pages with the fewest
+    /// same-project neighbours drop first, then the oldest of those.
+    ///
+    /// Personal slots are included, matching [`Self::list_pages`]: the caller
+    /// has already authorized the project.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn project_link_graph(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<LinkGraph> {
+        self.with_conn(move |conn| {
+            let now = now_us();
+            let ttl = not_expired("pg", "?3");
+            let mut page_stmt = conn.prepare(&format!(
+                "SELECT pg.id, pg.path, pg.title, pg.updated_at \
+                 FROM pages pg \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 \
+                   AND pg.is_latest = 1{ttl}"
+            ))?;
+            let page_rows = page_stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    Ok((id, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)?))
+                },
+            )?;
+            let mut pages: Vec<(PageId, String, String, i64)> = Vec::new();
+            for row in page_rows {
+                let (id, path, title, updated_at) = row?;
+                pages.push((PageId::from_slice(&id)?, path, title, updated_at));
+            }
+
+            let from_ttl = not_expired("fp", "?3");
+            let to_ttl = not_expired("tp", "?3");
+            let mut edge_stmt = conn.prepare(&format!(
+                "SELECT DISTINCT fp.id, tp.id, fp.path, tp.path \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1{from_ttl} \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
+                 WHERE fp.workspace_id = ?1 AND fp.project_id = ?2 \
+                   AND tp.workspace_id = ?1 AND tp.project_id = ?2 \
+                 ORDER BY fp.path, tp.path"
+            ))?;
+            let edge_rows = edge_stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now],
+                |row| {
+                    let from_id: Vec<u8> = row.get(0)?;
+                    let to_id: Vec<u8> = row.get(1)?;
+                    Ok((from_id, to_id, row.get(2)?, row.get(3)?))
+                },
+            )?;
+            let mut raw_edges: Vec<(PageId, PageId, String, String)> = Vec::new();
+            for row in edge_rows {
+                let (from_id, to_id, from_path, to_path) = row?;
+                raw_edges.push((
+                    PageId::from_slice(&from_id)?,
+                    PageId::from_slice(&to_id)?,
+                    from_path,
+                    to_path,
+                ));
+            }
+
+            let mut degree: HashMap<PageId, u64> = HashMap::new();
+            for (from_id, to_id, _, _) in &raw_edges {
+                *degree.entry(*from_id).or_insert(0) += 1;
+                if from_id != to_id {
+                    *degree.entry(*to_id).or_insert(0) += 1;
+                }
+            }
+
+            pages.sort_by(|a, b| {
+                let da = degree.get(&a.0).copied().unwrap_or(0);
+                let db = degree.get(&b.0).copied().unwrap_or(0);
+                db.cmp(&da)
+                    .then_with(|| b.3.cmp(&a.3))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            let truncated = pages.len() > PROJECT_LINK_GRAPH_MAX_NODES;
+            pages.truncate(PROJECT_LINK_GRAPH_MAX_NODES);
+            let keep: HashSet<PageId> = pages.iter().map(|page| page.0).collect();
+            let nodes = pages
+                .into_iter()
+                .map(|(id, path, title, _)| LinkGraphNode {
+                    degree: degree.get(&id).copied().unwrap_or(0),
+                    path,
+                    title,
+                })
+                .collect();
+            let edges = raw_edges
+                .into_iter()
+                .filter(|(from_id, to_id, _, _)| keep.contains(from_id) && keep.contains(to_id))
+                .map(|(_, _, from_path, to_path)| LinkGraphEdge { from_path, to_path })
+                .collect();
+            Ok(LinkGraph {
+                nodes,
+                edges,
+                truncated,
+            })
         })
         .await
     }

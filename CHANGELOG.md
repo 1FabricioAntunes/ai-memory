@@ -75,6 +75,20 @@ version in [`docs/changelog/`](docs/changelog/):
   preserve the same roots, including the shared project `.agents/skills`.
   (#1357)
 
+- Added a read-only wiki link graph in `/web`. The header **Graph** link opens
+  `/web/graph`, a server-rendered map of resolved wikilinks whose endpoints sit
+  in different projects, plus a table of those edges. Each project page links
+  to `/web/w/<workspace>/<project>/graph`, which shows that project's latest
+  unexpired pages and the resolved same-project links between them as an SVG
+  and a table. Both pages are HTML with no JavaScript.
+  `GET /api/v1/graph` now accepts `workspace` and `project` together to return
+  only edges that touch that project (passing only one of them is `400`), and
+  `GET /api/v1/workspaces/{workspace}/projects/{project}/graph` returns the
+  in-project node and edge lists. A project graph keeps at most 120 pages,
+  preferring those with the most same-project neighbours and then the most
+  recently updated. Expired pages stay hidden. An edge still requires both
+  ends to be readable.
+
 ### Fixed
 - Fixed native hook events getting stranded forever when a harness killed the
   process after the spool file was synced but before its atomic rename. A later

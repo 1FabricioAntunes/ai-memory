@@ -56,6 +56,12 @@ pub(crate) fn session_href(workspace: &str, project: &str, session_id: &str) -> 
     )
 }
 
+/// Build a project link-graph URL (`w/{ws}/{proj}/graph`), percent-encoded.
+#[must_use]
+pub(crate) fn graph_href(workspace: &str, project: &str) -> String {
+    format!("{}/graph", project_href(workspace, project))
+}
+
 /// The last eight characters of a UUID, for display. The ids here are
 /// UUIDv7, whose leading characters are a shared timestamp prefix.
 #[must_use]
@@ -261,6 +267,8 @@ pub(crate) struct ProjectView {
     pub mailbox_capped: bool,
     /// The project's most recent sessions the viewer may see.
     pub sessions: Vec<SessionRow>,
+    /// Link to this project's link graph.
+    pub graph_href: String,
 }
 
 /// One recent session on the project page.
@@ -822,6 +830,78 @@ pub(crate) struct HealthSection {
     pub rows: Vec<HealthRow>,
 }
 
+/// One node in the server-rendered SVG link graph.
+pub(crate) struct GraphSvgNode {
+    /// Target for the node (`w/…` or `w/…/p/…`).
+    pub href: String,
+    /// Full label for the SVG tooltip.
+    pub tooltip: String,
+    /// Truncated label drawn next to the node.
+    pub label: String,
+    /// Circle centre x, in viewBox pixels.
+    pub x: i32,
+    /// Circle centre y, in viewBox pixels.
+    pub y: i32,
+    /// Baseline y of the label.
+    pub label_y: i32,
+}
+
+/// One SVG line between two graph nodes.
+pub(crate) struct GraphSvgEdge {
+    /// Start x.
+    pub x1: i32,
+    /// Start y.
+    pub y1: i32,
+    /// End x.
+    pub x2: i32,
+    /// End y.
+    pub y2: i32,
+}
+
+/// One row of the graph's accessible edge table.
+pub(crate) struct GraphEdgeRow {
+    /// Link to the source page.
+    pub from_href: String,
+    /// Source label (path, or `workspace/project:path`).
+    pub from_label: String,
+    /// Link to the target page.
+    pub to_href: String,
+    /// Target label.
+    pub to_label: String,
+}
+
+/// View-model for `GET /graph` and `GET /w/:workspace/:project/graph`.
+#[derive(Template)]
+#[template(path = "graph.html")]
+pub(crate) struct GraphView {
+    /// Project graph (scoped header search and breadcrumb) vs the global one.
+    pub is_project: bool,
+    /// Workspace name; empty on the global graph.
+    pub workspace: String,
+    /// Project name; empty on the global graph.
+    pub project: String,
+    /// Link back to the project overview; empty on the global graph.
+    pub project_href: String,
+    /// Page heading.
+    pub heading: String,
+    /// One-line explanation under the heading.
+    pub blurb: String,
+    /// Empty-state copy when there are no nodes.
+    pub empty_message: String,
+    /// The node cap dropped some pages.
+    pub truncated: bool,
+    /// Nodes actually drawn.
+    pub shown: usize,
+    /// Cap shown in the truncation notice.
+    pub node_cap: usize,
+    /// SVG nodes.
+    pub svg_nodes: Vec<GraphSvgNode>,
+    /// SVG edges.
+    pub svg_edges: Vec<GraphSvgEdge>,
+    /// Accessible edge table.
+    pub rows: Vec<GraphEdgeRow>,
+}
+
 /// View-model for the root-only `GET /health`.
 #[derive(Template)]
 #[template(path = "health.html")]
@@ -910,6 +990,10 @@ mod tests {
         assert_eq!(
             page_href("default", "scratch", "notes/a b%25.md"),
             "w/default/scratch/p/notes/a%20b%2525.md"
+        );
+        assert_eq!(
+            graph_href("default space", "proj#one"),
+            "w/default%20space/proj%23one/graph"
         );
     }
 }

@@ -22,6 +22,7 @@ mod page_first_created;
 mod pinned_pages;
 mod profile;
 mod project_authz;
+mod project_link_graph;
 mod reclaim_ledger_versions;
 mod related_walk;
 mod retrieval_observation_stream;

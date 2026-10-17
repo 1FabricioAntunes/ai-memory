@@ -4076,6 +4076,83 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         );
     }
 
+    // The HTML graph and the in-project graph use the same both-ends-readable
+    // rule. A scoped `/graph?workspace=&project=` call is not a way to see
+    // the far end of an edge the viewer cannot read.
+    for viewer in [Some(alice), Some(bob)] {
+        let (status, body) = get(web.clone(), "/graph", viewer).await;
+        assert_eq!(status, StatusCode::OK, "{viewer:?}");
+        assert!(
+            !shows(&body, "alpha-plan"),
+            "{viewer:?} sees the HTML edge: {body}"
+        );
+        assert!(
+            !shows(&body, "beta-plan"),
+            "{viewer:?} sees the HTML edge: {body}"
+        );
+        assert!(
+            !shows(&body, "client-work"),
+            "{viewer:?} HTML graph leaked client-work: {body}"
+        );
+    }
+    for viewer in [Some(carol), None] {
+        let (status, body) = get(web.clone(), "/graph", viewer).await;
+        assert_eq!(status, StatusCode::OK, "{viewer:?}");
+        assert!(
+            shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+            "{viewer:?} lost the HTML edge: {body}"
+        );
+    }
+
+    let (status, body) = get(web.clone(), "/w/shared/alpha/graph", Some(bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        !shows(&body, "alpha-plan"),
+        "bob's 403 leaked alpha: {body}"
+    );
+    let (status, body) = get(
+        api.clone(),
+        "/workspaces/shared/projects/alpha/graph",
+        Some(bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!shows(&body, "alpha-plan"), "{body}");
+
+    let (status, body) = get(web.clone(), "/w/shared/beta/graph", Some(bob)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(shows(&body, "beta-plan"), "{body}");
+    assert!(
+        !shows(&body, "alpha-plan"),
+        "bob's project graph leaked alpha: {body}"
+    );
+
+    let (status, body) = get(
+        api.clone(),
+        "/graph?workspace=shared&project=beta",
+        Some(bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !shows(&body, "alpha-plan") && !shows(&body, "beta-plan"),
+        "bob scoped graph leaked the hidden far end: {body}"
+    );
+    let (status, body) = get(
+        api.clone(),
+        "/graph?workspace=shared&project=beta",
+        Some(carol),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+        "carol lost a scoped edge she can read: {body}"
+    );
+    let (status, body) = get(api.clone(), "/graph?workspace=shared", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(shows(&body, "together"), "{body}");
+
     // A page's link panel is the same edge seen from one page. The panel,
     // not the body: beta's own text names the link, and that text is bob's to
     // read. What must not appear is the resolved far end — alpha's title,

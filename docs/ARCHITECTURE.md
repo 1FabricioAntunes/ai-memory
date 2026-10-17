@@ -1583,7 +1583,9 @@ the server URL is loopback and no `default` server profile is registered.
 * **Richer read surfaces for the web UI.** The multi-workspace read-only
   wiki browser shipped in `ai-memory-web` (`/web`: project list, page
   tree, page view, page history with a server-side unified diff, a paged
-  session timeline, project search through `memory_query`'s hybrid ranker
+  session timeline, a server-rendered link graph at `/web/graph` and
+  `/web/w/<workspace>/<project>/graph`, project search through
+  `memory_query`'s hybrid ranker
   with a recall trace, the root-only `/web/health` panel, and the root-only
   `/web/pending` triage page,
   whose approve and reject buttons post to the existing
@@ -1596,8 +1598,8 @@ the server URL is loopback and no `default` server profile is registered.
   a concurrent write replaced stays visible (invariant #16). TTL expiry still
   applies: an expired version is neither listed nor readable by id, and a page
   whose live version expired shows no history, since the forget sweep deletes
-  every row at its path. Better *reading*
-  (graph exploration) is open. See
+  every row at its path. The link graph is a circular SVG plus an edge table;
+  larger layouts and interactive clustering remain open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
 * **Retrieval measurement gaps.** The LongMemEval-S harness ships in
   `evals/` (pipeline, component and decomposition modes; results in
