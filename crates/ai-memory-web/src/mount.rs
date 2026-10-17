@@ -846,6 +846,13 @@ mod tests {
             "dismissal key must be migration-stamped"
         );
         assert!(body.contains("Unpack the archive"));
+        // Keyboard contract for the aria-modal dialog.
+        assert!(
+            body.contains(r#"id="okf-dialog-close" type="button""#),
+            "close button must not default to submit"
+        );
+        assert!(body.contains("\"Escape\"") && body.contains("keydown"));
+        assert!(body.contains("closeBtn.focus()"), "dialog must take focus");
 
         // Archive deleted → dialog still explains, recovery falls back
         // to the git checkpoint; the inline banner is gone.

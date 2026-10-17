@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the `/web` OKF upgrade dialog ignoring the keyboard: it now takes focus
+  when it opens, closes on Escape, keeps Tab inside, and returns focus when
+  closed. (#TBD)
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
