@@ -14,7 +14,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 - Fixed the `/web` page view showing only relative "Updated"/"Created" times;
   hovering them now shows the exact timestamp, as the history and session views
-  already do. (#TBD)
+  already do. ([#1391](https://github.com/akitaonrails/ai-memory/pull/1391))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
