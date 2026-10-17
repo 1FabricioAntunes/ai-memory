@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
+  now omits expired pages before evaluating episodic staleness, rule suggestions,
+  duplicate titles, and vector or LLM contradiction candidates, preventing
+  findings for expired pages that are pending forget-sweep deletion.
+  ([#1390](https://github.com/akitaonrails/ai-memory/pull/1390))
 - Fixed curator reporting TTL-expired pages as cold episodic candidates,
   stale slots, or title collisions. The curator now filters out expired pages
   before evaluating episodic retention scores, and uses `list_unexpired_pages`
