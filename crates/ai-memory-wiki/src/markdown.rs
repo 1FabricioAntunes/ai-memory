@@ -764,31 +764,45 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKe
 }
 
 fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
-    let mut start_at = 0;
-    while let Some(rel_start) = line[start_at..].find('[') {
-        let start = start_at + rel_start;
-        if start > 0 && line.as_bytes()[start - 1] == b'!' {
-            start_at = start + 1;
-            continue;
+    // Track labels in one pass: rescanning an unmatched outer label would
+    // make repeated `[` quadratic and hide valid inner links.
+    let mut labels = Vec::new();
+    let mut last_escaped = None;
+    let mut pos = 0;
+    while pos < line.len() {
+        match line.as_bytes()[pos] {
+            b'\\' => {
+                pos += 1;
+                if let Some(next) = line[pos..].chars().next() {
+                    last_escaped = Some(pos);
+                    pos += next.len_utf8();
+                }
+            }
+            b'[' => {
+                labels.push(
+                    pos > 0 && line.as_bytes()[pos - 1] == b'!' && last_escaped != Some(pos - 1),
+                );
+                pos += 1;
+            }
+            b']' => {
+                let image = labels.pop();
+                pos += 1;
+                if let Some(image) = image
+                    && line.as_bytes().get(pos) == Some(&b'(')
+                    && let Some((raw, target_end)) = parse_link_destination(&line[pos + 1..])
+                {
+                    if !image && let Some(path) = normalize_link_target(raw, page_path, false) {
+                        out.insert((None, None, path));
+                    }
+                    pos += target_end + 2;
+                    // Images may appear in a link's label; links may not.
+                    if !image {
+                        labels.clear();
+                    }
+                }
+            }
+            _ => pos += 1,
         }
-        let after_start = start + 1;
-        let Some(rel_close) = line[after_start..].find(']') else {
-            break;
-        };
-        let close = after_start + rel_close;
-        if !line[close + 1..].starts_with('(') {
-            start_at = close + 1;
-            continue;
-        }
-        let target_start = close + 2;
-        let Some((raw, target_end)) = parse_link_destination(&line[target_start..]) else {
-            start_at = close + 1;
-            continue;
-        };
-        if let Some(path) = normalize_link_target(raw, page_path, false) {
-            out.insert((None, None, path));
-        }
-        start_at = target_start + target_end + 1;
     }
 }
 
@@ -2003,6 +2017,59 @@ mod tests {
             linked("[a](g.md 'single') [b](h.md (paren title))"),
             ["g.md", "h.md"]
         );
+    }
+
+    #[test]
+    fn extract_links_handles_nested_and_escaped_labels() {
+        for label in [
+            "array[0] access",
+            r"array\[0\] access",
+            r"closing \] bracket",
+            r"literal \\ [index]",
+            "日本語 [索引]",
+            "outer [middle [inner]] label",
+        ] {
+            assert_eq!(linked(&format!("[{label}](b.md)")), ["b.md"], "{label}");
+        }
+        assert_eq!(linked("[unclosed [inner](b.md)"), ["b.md"]);
+        assert_eq!(linked("[outer [inner](b.md)](c.md)"), ["b.md"]);
+        assert!(linked(r"\[literal](b.md)").is_empty());
+        assert!(linked("![array[0] access](b.md)").is_empty());
+        assert_eq!(linked("[outer ![icon](image.png)](b.md)"), ["b.md"]);
+        assert_eq!(linked(r"\![label](b.md)"), ["b.md"]);
+        assert!(linked("`[array[0] access](b.md)`").is_empty());
+        assert!(linked("[unclosed [label]").is_empty());
+    }
+
+    #[test]
+    fn export_labels_keep_their_link_when_reindexed() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        for label in ["array[0] access", r"C:\work\notes", "日本語 [索引]"] {
+            let source = format!("[[notes/array.md|{label}]]");
+            let rewritten = rewrite_local_wikilinks(&source, &path, "proj");
+            assert_eq!(
+                extract_links(&rewritten, &path)
+                    .iter()
+                    .map(|link| link.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["notes/array.md"],
+                "{rewritten}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_links_stays_linear_on_nested_and_unclosed_labels() {
+        let root = PagePath::new("here.md").unwrap();
+        let started = std::time::Instant::now();
+        for body in [
+            "[".repeat(256 * 1024),
+            format!("{}[kept](b.md)", "[".repeat(256 * 1024)),
+            format!("{}{}(b.md)", "[".repeat(128 * 1024), "]".repeat(128 * 1024)),
+        ] {
+            let _ = extract_links(&body, &root);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
