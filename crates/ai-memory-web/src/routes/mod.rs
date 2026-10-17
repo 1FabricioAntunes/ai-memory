@@ -9,6 +9,7 @@ use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
 
 mod api;
+mod graph;
 mod health;
 mod history;
 mod index;
@@ -112,7 +113,12 @@ pub(crate) async fn require_admin(
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index::handler))
+        .route("/graph", get(graph::global_handler))
         .route("/w/{workspace}/{project}", get(project::handler))
+        .route(
+            "/w/{workspace}/{project}/graph",
+            get(graph::project_handler),
+        )
         .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
         .route("/w/{workspace}/{project}/h/{*path}", get(history::handler))
         .route(

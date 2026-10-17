@@ -9,7 +9,9 @@
 //!
 //! Routes (all under whatever prefix the host nests this router at):
 //! - `GET /`                              → project list (cards)
+//! - `GET /graph`                         → cross-project link graph (SVG + table)
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
+//! - `GET /w/:workspace/:project/graph`   → in-project link graph (SVG + table)
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
 //! - `GET /w/:workspace/:project/h/*path` → version history + unified diff
 //! - `GET /w/:workspace/:project/s/:session` → session timeline, paged

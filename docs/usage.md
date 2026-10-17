@@ -629,7 +629,11 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, and search. On a project, page,
+breadcrumbs, rendered markdown, metadata, search, and a link graph.
+The header **Graph** link opens `/web/graph` (cross-project wikilinks);
+each project page links to `/web/w/<ws>/<proj>/graph` (pages in that
+project and the resolved links between them). Both are a server-rendered
+SVG plus a table, with no JavaScript. On a project, page,
 namespace, history or session view the header search box searches that project;
 elsewhere it searches every project with FTS5, like
 `memory_query(global=true)`, and the search page's "Search in" selector picks
