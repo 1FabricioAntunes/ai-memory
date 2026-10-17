@@ -20,7 +20,7 @@
 //!   returned nor walked through. The seed lookup is an exact-path read
 //!   and still starts from an expired page.
 
-use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Tier, UserId, WorkspaceId};
+use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Relation, Tier, UserId, WorkspaceId};
 use ai_memory_store::{
     AccessMode, GrantLevel, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, Store,
 };
@@ -54,6 +54,15 @@ fn same_project_link(path: &str) -> ai_memory_core::LinkTarget {
         project: None,
         path: PagePath::new(path).unwrap(),
         relation: None,
+    }
+}
+
+fn contradiction_link(path: &str) -> ai_memory_core::LinkTarget {
+    ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: Some(Relation::Contradicts),
     }
 }
 
@@ -847,4 +856,150 @@ async fn page_links_preview_caps_in_sql_and_counts_only_readable_neighbours() {
         .collect();
     let cut_root: Vec<&str> = root.backlinks.iter().map(|p| p.path.as_str()).collect();
     assert_eq!(cut_root, head);
+}
+
+/// `contradiction_edges` returns declared contradicts edges from latest
+/// unexpired pages. A target edge resolves only when pointing at an existing,
+/// latest, and unexpired page. If the target was tombstoned, expired, or never
+/// existed, `resolved` evaluates to false. An expired source page is omitted
+/// entirely from contradiction edges.
+#[tokio::test]
+async fn contradiction_edges_require_latest_unexpired_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page_with_links(ws, app, "notes/live_target.md", vec![]))
+        .await
+        .unwrap();
+
+    let tombstoned_target_id = store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            app,
+            "notes/tombstoned_target.md",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(ws, app, "notes/expired_target.md", vec![]),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(ws, app, "notes/future_target.md", vec![]),
+            future_at(),
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(page_with_links(
+            ws,
+            app,
+            "notes/source.md",
+            vec![
+                contradiction_link("notes/live_target.md"),
+                contradiction_link("notes/tombstoned_target.md"),
+                contradiction_link("notes/expired_target.md"),
+                contradiction_link("notes/future_target.md"),
+                contradiction_link("notes/missing_target.md"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired_source.md",
+                vec![contradiction_link("notes/live_target.md")],
+            ),
+            expired_at(),
+        ))
+        .await
+        .unwrap();
+
+    let soft_deleted = store
+        .writer
+        .soft_delete_for_decay_if_latest(
+            ws,
+            app,
+            PagePath::new("notes/tombstoned_target.md").unwrap(),
+            tombstoned_target_id,
+        )
+        .await
+        .unwrap();
+    assert!(soft_deleted, "tombstone soft delete succeeded");
+
+    let edges = store
+        .reader
+        .contradiction_edges(ws, app)
+        .await
+        .unwrap();
+
+    assert!(
+        !edges.iter().any(|e| e.from_path == "notes/expired_source.md"),
+        "expired source page must not emit contradiction edges"
+    );
+
+    let pairs: Vec<(String, String, bool)> = edges
+        .into_iter()
+        .map(|e| (e.from_path, e.to_path, e.resolved))
+        .collect();
+
+    assert_eq!(
+        pairs,
+        vec![
+            (
+                "notes/source.md".to_string(),
+                "notes/expired_target.md".to_string(),
+                false,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/future_target.md".to_string(),
+                true,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/live_target.md".to_string(),
+                true,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/missing_target.md".to_string(),
+                false,
+            ),
+            (
+                "notes/source.md".to_string(),
+                "notes/tombstoned_target.md".to_string(),
+                false,
+            ),
+        ]
+    );
 }
