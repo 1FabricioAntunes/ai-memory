@@ -831,6 +831,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classifies_tombstoned_cross_project_target_as_dangling() {
+        let fx = seed_fixture().await;
+        let infra = fx
+            .store
+            .writer
+            .get_or_create_project(fx.ws, "infra", None)
+            .await
+            .unwrap();
+        let target_id = fx
+            .store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: fx.ws,
+                project_id: infra,
+                path: PagePath::new("runbooks/retired.md").unwrap(),
+                title: "Retired Runbook".to_string(),
+                body: "old steps".to_string(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        write(
+            &fx,
+            "notes/depends.md",
+            "Depends",
+            Tier::Semantic,
+            false,
+            "dep: [[infra:runbooks/retired.md]]",
+        )
+        .await;
+
+        let soft_deleted = fx
+            .store
+            .writer
+            .soft_delete_for_decay_if_latest(
+                fx.ws,
+                infra,
+                PagePath::new("runbooks/retired.md").unwrap(),
+                target_id,
+            )
+            .await
+            .unwrap();
+        assert!(soft_deleted);
+
+        let report = run_report(&fx).await;
+        let dangling = findings_of_kind(&report, "dangling_cross_project_link");
+        assert_eq!(dangling.len(), 1, "tombstoned target reported as dangling");
+        assert_eq!(dangling[0].pages, ["notes/depends.md"]);
+        assert!(
+            dangling[0]
+                .message
+                .contains("default/infra/runbooks/retired.md")
+        );
+        assert_eq!(
+            dangling[0].detail.as_ref().unwrap()["project_exists"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
     async fn empty_project_reports_no_findings() {
         let fx = seed_fixture().await;
 
