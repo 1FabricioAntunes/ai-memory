@@ -12,7 +12,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
-- Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope.
+- Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope. ([#1382](https://github.com/akitaonrails/ai-memory/pull/1382))
 
 ## [3.1.1] - 2026-10-17
 
