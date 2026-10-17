@@ -1093,6 +1093,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rule_pass_skips_expired_pages() {
+        let past = Timestamp::now().as_microsecond() - 1_000_000;
+        let very_old = Timestamp::now().as_microsecond() - (90 * 86_400_000_000i64);
+        let expired_episodic = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("sessions/old.md").unwrap(),
+            tier: Tier::Episodic,
+            pinned: false,
+            updated_at_us: very_old,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: "{}".into(),
+            expires_at_us: Some(past),
+            salience: None,
+            compacted_at_us: None,
+        };
+        let expired_rule = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("_rules/expired.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: very_old,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"kind": "rule"}"#.into(),
+            expires_at_us: Some(past),
+            salience: None,
+            compacted_at_us: None,
+        };
+        let live_page = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/live.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 1,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Shared Title"}"#.into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+        let expired_duplicate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/expired-dupe.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: very_old,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Shared Title"}"#.into(),
+            expires_at_us: Some(past),
+            salience: None,
+            compacted_at_us: None,
+        };
+        let candidates = vec![
+            expired_episodic,
+            expired_rule,
+            live_page,
+            expired_duplicate,
+        ];
+        let findings = rule_based_findings(&candidates, STALE_DAYS);
+        assert!(
+            findings.is_empty(),
+            "expired pages must not produce stale, rule_suggestion, or duplicate findings: {findings:?}"
+        );
+    }
+
     // ── LintFinding tolerant deserialization ─────────────────────────────
 
     /// The old prompt used `summary`/`detail` instead of `message` and
