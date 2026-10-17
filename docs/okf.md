@@ -18,6 +18,10 @@ standardized. The files are greppable, open in Obsidian, and import into
 anything OKF-aware. Nothing is locked in: the export is a validated copy of
 the files ai-memory already stores its memory in.
 
+Local wikilink labels containing brackets or backslashes remain ordinary
+Markdown links in an exported bundle. Reindexing the extracted concept files
+preserves their link targets.
+
 Backup and OKF export downloads replace their output only after the whole
 response arrives. An interrupted download keeps the previous archive intact.
 New files and replacement symlinks are private; existing regular files keep

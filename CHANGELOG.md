@@ -12,6 +12,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import. ([#1380](https://github.com/akitaonrails/ai-memory/pull/1380))
 - Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
   pages. The store query now filters out expired page targets against the
   current timestamp, preventing `memory_lint` from emitting `feedback_flagged`
