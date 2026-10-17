@@ -360,14 +360,25 @@ pub fn discover_assets(
                 ".gemini/antigravity-cli/mcp_config.json",
                 "antigravity/antigravity_mcp.json",
             );
+            let [app_skills, cli_skills] =
+                super::install_skills::antigravity_global_skill_roots(home);
             collect_dir_assets(
                 &mut assets,
                 AgentKind::AntigravityCli,
                 AgentAssetKind::Skill,
                 AgentAssetScope::Global,
-                &gemini_dir.join("antigravity-cli").join("skills"),
+                &app_skills,
+                ".gemini/config/skills",
+                "antigravity/app-ide-skills",
+            )?;
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::AntigravityCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &cli_skills,
                 ".gemini/antigravity-cli/skills",
-                "antigravity/skills",
+                "antigravity/cli-skills",
             )?;
             collect_dir_assets(
                 &mut assets,
@@ -379,15 +390,18 @@ pub fn discover_assets(
                 "antigravity/plugins",
             )?;
         }
-        if want_project {
+        // `.agents/skills` is shared with Codex. Attribute it to Codex when
+        // both agents are selected so one archive never maps two entries to
+        // the same restore target; an Antigravity-only backup still owns it.
+        if want_project && !filter_agent(AgentKind::Codex) {
             collect_dir_assets(
                 &mut assets,
                 AgentKind::AntigravityCli,
                 AgentAssetKind::Skill,
                 AgentAssetScope::Project,
-                &cwd.join(".gemini").join("skills"),
-                ".gemini/skills",
-                "project/gemini/skills",
+                &cwd.join(".agents").join("skills"),
+                ".agents/skills",
+                "project/antigravity/skills",
             )?;
         }
     }

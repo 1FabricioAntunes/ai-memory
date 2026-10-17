@@ -6418,7 +6418,8 @@ impl AiMemoryServer {
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
         `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, \
-        `.github/skills`, `.hermes/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), \
+        `.github/skills`, `.hermes/skills`, Antigravity's `.gemini` skill roots, \
+        `$GROK_HOME/skills` (default `~/.grok/skills`), \
         `$COPILOT_HOME/skills` (default `~/.copilot/skills`), and Devin Windows global roots. \
         Use when the user asks to install or refresh ai-memory routing in this project. \
         Pass `compact: true` to return the compact routing block that delegates \
@@ -6484,7 +6485,8 @@ impl AiMemoryServer {
                     "devin": ".devin/skills",
                     "grok": ".grok/skills",
                     "copilot_cli": ".github/skills",
-                    "hermes": ".hermes/skills"
+                    "hermes": ".hermes/skills",
+                    "antigravity_cli": ".agents/skills"
                 },
                 "global": {
                     "claude_code": "~/.claude/skills",
@@ -6495,7 +6497,11 @@ impl AiMemoryServer {
                     },
                     "grok": "$GROK_HOME/skills (default: ~/.grok/skills)",
                     "copilot_cli": "$COPILOT_HOME/skills (default: ~/.copilot/skills)",
-                    "hermes": "~/.hermes/skills"
+                    "hermes": "~/.hermes/skills",
+                    "antigravity_cli": [
+                        "~/.gemini/config/skills",
+                        "~/.gemini/antigravity-cli/skills"
+                    ]
                 }
             },
             "overwrite_guidance": {
@@ -6509,7 +6515,7 @@ impl AiMemoryServer {
                 "If the target file already uses the compact routing block (or if managed Agent Skills handle detailed routing), call memory_install_self_routing with compact: true so the compact format is preserved.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
-                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, .grok/skills/<relative_path>, $GROK_HOME/skills/<relative_path> (default ~/.grok/skills), .github/skills/<relative_path> or $COPILOT_HOME/skills/<relative_path> (default ~/.copilot/skills) for GitHub Copilot CLI, or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
+                "Install each managed_skills item under the selected skill root from target_hints using its relative_path. When a hint is an array, install the item under every listed root; Antigravity's global hint intentionally lists its App/IDE and CLI roots. On Windows, Devin's global root is %APPDATA%\\devin\\skills.",
                 "Existing skill files containing the managed marker <!-- ai-memory-managed: routing-skill --> may be replaced; unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
             ]
         });
@@ -9519,6 +9525,24 @@ mod tests {
             "~/.hermes/skills"
         );
         assert_eq!(
+            response["target_hints"]["project"]["antigravity_cli"]
+                .as_str()
+                .unwrap(),
+            ".agents/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["antigravity_cli"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|root| root.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "~/.gemini/config/skills",
+                "~/.gemini/antigravity-cli/skills"
+            ]
+        );
+        assert_eq!(
             response["target_hints"]["global"]["claude_code"]
                 .as_str()
                 .unwrap(),
@@ -9576,6 +9600,8 @@ mod tests {
             .join("\n");
         assert!(notes.contains(ai_memory_core::routing_skills::MANAGED_MARKER));
         assert!(notes.contains("unmanaged same-name skills"));
+        assert!(notes.contains("When a hint is an array"));
+        assert!(notes.contains("Antigravity"));
         assert!(notes.contains("%APPDATA%\\devin\\skills"));
         assert!(notes.contains("explicitly forces replacement"));
     }
