@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `install-instructions` printing a false "Claude Code reads <file> instead
+  of AGENTS.md" note when `$HOME` is reached through a symlink. The home
+  `.claude/CLAUDE.md` skip now compares with the same canonicalising
+  `paths_match` helper the import check uses, so a symlinked home matches its
+  resolved path. (#1345)
 - Corrected stale claims in `docs/comparison.md` and `docs/competitive-parity.md`
   that said Windows has no service step and the Windows install is experimental.
   The 3.1 `install.ps1` + `setup` Windows service step is shipped production,

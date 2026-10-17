@@ -552,3 +552,94 @@ fn install_instructions_warns_when_claude_code_will_skip_agents_md() {
     // A CLAUDE.md alongside becomes a target too, so Claude Code sees the block.
     assert!(!run(&[("CLAUDE.md", "# claude\n")]).contains(note));
 }
+
+const MEMORY_FILES: [&str; 3] = ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"];
+
+/// Whether any ancestor strictly above `dir` holds one of the memory files the
+/// binary scans for. A temp-dir `home` on a developer box usually sits under a
+/// real user profile that may itself carry `CLAUDE.md` / `.claude/CLAUDE.md`,
+/// which would pollute the "no note" controls (see #1346). When that is the
+/// case, skip the negative assertion instead of failing spuriously.
+fn ancestor_above_has_memory_file(dir: &Path) -> bool {
+    dir.parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .any(|ancestor| {
+            MEMORY_FILES
+                .iter()
+                .any(|name| ancestor.join(name).is_file())
+        })
+}
+
+/// #1345: with the project under `$HOME` and `$HOME/.claude/CLAUDE.md` present,
+/// the file is the user's own memory, not a project blocker, so no note should
+/// be printed. This also guards the `HOME` wiring: passing `None` would make the
+/// ancestor walk treat the home `.claude/CLAUDE.md` as a blocker and print the
+/// note.
+#[test]
+fn install_instructions_no_note_when_project_under_home() {
+    let note = "so Claude Code reads it instead of AGENTS.md";
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("AGENTS.md"), "# Project\n").unwrap();
+    fs::create_dir_all(home.path().join(".claude")).unwrap();
+    fs::write(home.path().join(".claude/CLAUDE.md"), "# user memory\n").unwrap();
+
+    let output = run_ai_memory(
+        &project,
+        home.path(),
+        &["install-instructions", "--no-skills"],
+    );
+    assert_success(output.clone());
+    if ancestor_above_has_memory_file(home.path()) {
+        eprintln!("skipping no-note control: an ancestor of the temp home holds a memory file");
+        return;
+    }
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(note),
+        "home .claude/CLAUDE.md must not trigger the note:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #1345: with `$HOME` given through a symlink, the ancestor walk resolves the
+/// physical home path while `HOME` is the symlink, so a plain `==` comparison
+/// misfires. The note must stay suppressed in that case too.
+#[cfg(unix)]
+#[test]
+fn install_instructions_no_note_when_home_is_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let note = "so Claude Code reads it instead of AGENTS.md";
+    let real_home = tempfile::tempdir().unwrap();
+    let project = real_home.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("AGENTS.md"), "# Project\n").unwrap();
+    fs::create_dir_all(real_home.path().join(".claude")).unwrap();
+    fs::write(
+        real_home.path().join(".claude/CLAUDE.md"),
+        "# user memory\n",
+    )
+    .unwrap();
+
+    let link_parent = tempfile::tempdir().unwrap();
+    let home_link = link_parent.path().join("homelink");
+    symlink(real_home.path(), &home_link).unwrap();
+
+    let output = run_ai_memory(
+        &project,
+        &home_link,
+        &["install-instructions", "--no-skills"],
+    );
+    assert_success(output.clone());
+    if ancestor_above_has_memory_file(real_home.path()) {
+        eprintln!("skipping no-note control: an ancestor of the temp home holds a memory file");
+        return;
+    }
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(note),
+        "symlinked HOME must not trigger the note:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
