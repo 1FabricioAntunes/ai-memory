@@ -165,6 +165,103 @@ async fn session_end_readers_refuse_foreign_session_ids() {
     );
 }
 
+/// The point-fetch rowid API is scoped to the snapshot's session: a
+/// `rowid` belonging to another session is refused through a legitimate
+/// snapshot, while the session's own rowid is returned (the legitimate
+/// control). A constructor-only test cannot see the removal of the
+/// `session_id = ?1` predicate alone — this one hands a foreign rowid to a
+/// legitimate session and asserts the refusal.
+#[tokio::test]
+async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    for (session, tag) in [(session_a, "a"), (session_b, "b")] {
+        for i in 0..12u32 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id: session,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::PostToolUse,
+                        extension: None,
+                        source_event: None,
+                        title: "routine".into(),
+                        body: format!("{tag} row {i}"),
+                        importance: 1,
+                    },
+                    &sanitizer,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    // Each session's first rowid: session B's rows landed after session
+    // A's, so the rowids are distinct.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let first_rowid = |session: SessionId| {
+        conn.query_row(
+            "SELECT rowid FROM observations WHERE session_id = ?1 ORDER BY rowid LIMIT 1",
+            rusqlite::params![session.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let rowid_a = first_rowid(session_a);
+    let rowid_b = first_rowid(session_b);
+    assert_ne!(rowid_a, rowid_b, "the attack needs distinct rowids");
+
+    // Legitimate control: a session reads its own rowid through its own
+    // legitimate snapshot.
+    let own = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        own.as_ref().map(|observation| observation.body.as_str()),
+        Some("a row 0"),
+        "the session's own rowid must be readable"
+    );
+
+    // The attack: session A's legitimate snapshot handed session B's rowid.
+    let foreign = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_b)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign.is_none(),
+        "a foreign session's rowid must be refused by the session-scoped fetch"
+    );
+
+    // And the mirror: session B's snapshot handed session A's rowid.
+    let foreign_mirror = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_b, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign_mirror.is_none(),
+        "the refusal must hold in both directions"
+    );
+}
+
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
     NewPage {
         workspace_id: ws,

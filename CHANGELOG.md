@@ -44,6 +44,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `AI_MEMORY_PREVIOUS_SESSION_HISTORY` dossier when the managed-run variables
   are present. The dossier remains untrusted evidence and stays local to the
   launcher machine.
+- Fixed unbounded memory use in consolidation and auto-improve for long
+  sessions: both paths now read a bounded projection of the session's
+  observations instead of loading every row, keeping the LLM input
+  byte-identical. Sessions with no observations in the consolidator's target
+  scope (purged or foreign) are refused before any work, exactly as empty
+  sessions were before. (#1363)
 
 ## [3.1.0] - 2026-10-16
 

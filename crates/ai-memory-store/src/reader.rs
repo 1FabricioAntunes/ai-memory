@@ -3840,6 +3840,57 @@ impl ReaderPool {
         .await
     }
 
+    /// [`Self::read_session_observations`] gated on the session holding at
+    /// least one observation in the given scope, instead of on its
+    /// `sessions` row.
+    ///
+    /// The consolidator resolves the repository a session consolidates into
+    /// from where its observations actually landed, not from the (possibly
+    /// stale) `sessions` row, so its bounded reads gate on the observations
+    /// themselves: a session with rows in the scope opens, and a session
+    /// with none there — including a purged one — is refused as
+    /// [`StoreError::SessionCollision`], like the `sessions`-row gate.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error, and whatever `read` returns.
+    pub async fn read_session_observations_in_scope<F, T>(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        read: F,
+    ) -> StoreResult<T>
+    where
+        F: FnOnce(&SessionObservationSnapshot<'_>) -> StoreResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let in_scope = tx.query_row(
+                "SELECT EXISTS(\
+                    SELECT 1 FROM observations \
+                    WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3\
+                )",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes()
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !in_scope {
+                return Err(StoreError::SessionCollision);
+            }
+            let snapshot = SessionObservationSnapshot {
+                conn: &tx,
+                session_id: session_id.as_bytes().to_vec(),
+                rows_read: std::cell::Cell::new(0),
+            };
+            read(&snapshot)
+        })
+        .await
+    }
+
     /// Page through one session's raw observations as seen from one scope.
     ///
     /// Only the rows that landed in `(workspace_id, project_id)` are returned:
@@ -12160,6 +12211,21 @@ pub struct SessionKindSummary {
     pub last_prompt_at: Option<i64>,
 }
 
+/// Row count and `created_at` span of one session's observations, in one
+/// aggregate pass: what a bounded projection and a session duration need
+/// before a single row is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationProjectionTotals {
+    /// Rows the session holds — every observation of it, regardless of the
+    /// scope the consolidation target was resolved from.
+    pub total: usize,
+    /// Oldest `created_at` (microseconds since the epoch); `None` while the
+    /// session holds no rows.
+    pub first_created_at: Option<i64>,
+    /// Newest `created_at`; `None` while the session holds no rows.
+    pub last_created_at: Option<i64>,
+}
+
 /// Tool names a session used, grouped in SQL.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionToolTitles {
@@ -12248,6 +12314,25 @@ impl SessionObservationSnapshot<'_> {
             },
         )?;
         Ok(summary)
+    }
+
+    /// Row count and the session's first and last `created_at` in one
+    /// aggregate pass, without reading a row.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn projection_totals(&self) -> StoreResult<ObservationProjectionTotals> {
+        let (total, first, last): (i64, Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT COUNT(*), MIN(created_at), MAX(created_at) \
+             FROM observations WHERE session_id = ?1",
+            params![self.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(ObservationProjectionTotals {
+            total: usize::try_from(total).unwrap_or(usize::MAX),
+            first_created_at: first,
+            last_created_at: last,
+        })
     }
 
     /// The tool names the session used, grouped in SQL.
@@ -12440,20 +12525,90 @@ impl SessionObservationSnapshot<'_> {
         }
         Ok(None)
     }
+
+    /// Walk the session's rows in capture order (`created_at`, then `rowid`),
+    /// one resident at a time, giving `visit` each row's `rowid` beside the
+    /// materialised [`Observation`].
+    ///
+    /// A caller that wants more than one row back from a streamed pass keeps
+    /// the `rowid`s it liked here and re-reads those rows with
+    /// [`Self::row_by_rowid`]: one indexed point fetch per kept row instead
+    /// of a second full walk.
+    ///
+    /// `visit` returning `false` stops the walk early, so a caller that
+    /// needs only the first matching row does not pay for the rest. Like
+    /// [`Self::scan`], this keeps a single row in memory whatever the
+    /// session holds.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn each_row_with_rowid(
+        &self,
+        mut visit: impl FnMut(i64, &Observation) -> bool,
+    ) -> StoreResult<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rowid, id, session_id, workspace_id, project_id, kind, extension, \
+                    source_event, title, body, importance, created_at \
+             FROM observations WHERE session_id = ?1 \
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let mut rows = stmt.query(params![self.session_id])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let observation = row_to_observation_at(row, 1)??;
+            self.rows_read.set(self.rows_read.get() + 1);
+            if !visit(rowid, &observation) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialise one row of the session by its `rowid` — the point fetch a
+    /// streamed pass uses to re-read a body it chose to keep. One row, or
+    /// none when the `rowid` belongs to another session or is gone.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn row_by_rowid(&self, rowid: i64) -> StoreResult<Option<Observation>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                    title, body, importance, created_at \
+             FROM observations WHERE session_id = ?1 AND rowid = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.session_id, rowid])?;
+        match rows.next()? {
+            Some(row) => {
+                let observation = row_to_observation(row)??;
+                self.rows_read.set(self.rows_read.get() + 1);
+                Ok(Some(observation))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Observation>> {
-    let id_bytes: Vec<u8> = row.get(0)?;
-    let session_bytes: Vec<u8> = row.get(1)?;
-    let workspace_bytes: Vec<u8> = row.get(2)?;
-    let project_bytes: Vec<u8> = row.get(3)?;
-    let kind_str: String = row.get(4)?;
-    let extension: Option<String> = row.get(5)?;
-    let source_event: Option<String> = row.get(6)?;
-    let title: String = row.get(7)?;
-    let body: String = row.get(8)?;
-    let importance: i64 = row.get(9)?;
-    let created_us: i64 = row.get(10)?;
+    row_to_observation_at(row, 0)
+}
+
+/// [`row_to_observation`] with its columns shifted by `base` — the snapshot
+/// streams whose `SELECT` leads with `rowid`.
+fn row_to_observation_at(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> rusqlite::Result<StoreResult<Observation>> {
+    let id_bytes: Vec<u8> = row.get(base)?;
+    let session_bytes: Vec<u8> = row.get(base + 1)?;
+    let workspace_bytes: Vec<u8> = row.get(base + 2)?;
+    let project_bytes: Vec<u8> = row.get(base + 3)?;
+    let kind_str: String = row.get(base + 4)?;
+    let extension: Option<String> = row.get(base + 5)?;
+    let source_event: Option<String> = row.get(base + 6)?;
+    let title: String = row.get(base + 7)?;
+    let body: String = row.get(base + 8)?;
+    let importance: i64 = row.get(base + 9)?;
+    let created_us: i64 = row.get(base + 10)?;
     Ok(materialise_observation(
         id_bytes,
         session_bytes,
