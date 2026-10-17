@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   pages whose `expires_at` TTL had passed, which search, `memory_recent`, the
   incremental `recent` form and page history already hid. A project move and
   the curator still see every current page, and an exact-path read of an
-  expired page still answers.
+  expired page still answers. (#1369)
 
 ## [3.1.0] - 2026-10-16
 
