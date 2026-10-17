@@ -39,6 +39,7 @@ version in [`docs/changelog/`](docs/changelog/):
   of either vendor now receives the traffic. The docs now name the backends that
   take no override: the ChatGPT backend behind `openai-oauth` and `codex`, and
   `cursor`'s CLI. (#1347)
+- Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import.
 - Corrected the `ExtractionState::NotApplicable` documentation and aligned the
   generated OpenCode capture policy with the native evaluator: only an active
   policy dropping a search/list tool reports `not-applicable`; an invalid
