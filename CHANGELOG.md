@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the `/web` header links having no navigation landmark; they now sit in
+  a labelled `nav` and the current section is marked for screen readers. The
+  header row also wraps on narrow screens instead of overflowing sideways.
+  (#TBD)
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
