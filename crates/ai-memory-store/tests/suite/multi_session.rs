@@ -1089,6 +1089,115 @@ async fn a_second_accept_cannot_steal_an_accepted_handoff() {
     );
 }
 
+/// Two parallel sessions in separate Tokio worker threads concurrently race
+/// to claim the exact same open handoff baton via `tokio::join!`.
+///
+/// Invariant: Under genuine multi-threaded concurrency, the single-writer
+/// transaction guard (`WHERE state = 'open'`) must ensure that exactly one
+/// session claims the baton (`true`) and the loser receives `false`.
+/// The winning session's attribution is committed atomically and cannot be
+/// overwritten or corrupted by the losing task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_accept_race_on_single_handoff_yields_exactly_one_winner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            from_session_id: None,
+            summary: "concurrent race for the baton".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let accept = |agent: AgentKind, session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: agent,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+
+    let (res_a, res_b) = tokio::join!(
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::Codex, session_a)),
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::OpenCode, session_b)),
+    );
+    let outcome_a = res_a.unwrap();
+    let outcome_b = res_b.unwrap();
+
+    // Invariant: Exactly one must succeed, and the other must be refused.
+    assert!(
+        (outcome_a && !outcome_b) || (!outcome_a && outcome_b),
+        "exactly one session must win the claim; got outcome_a={outcome_a}, outcome_b={outcome_b}"
+    );
+
+    let (winner_agent, winner_session, loser_agent, loser_session) = if outcome_a {
+        ("codex", session_a, AgentKind::OpenCode, session_b)
+    } else {
+        ("opencode", session_b, AgentKind::Codex, session_a)
+    };
+
+    let handoff_bytes = id.as_bytes().to_vec();
+    let (state, accepted_by, accepted_session): (String, Option<String>, Option<Vec<u8>>) = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT state, accepted_by, accepted_by_session FROM handoffs WHERE id = ?1",
+                rusqlite::params![handoff_bytes],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state, "accepted",
+        "the baton state must be transitioned to accepted"
+    );
+    assert_eq!(
+        accepted_by.as_deref(),
+        Some(winner_agent),
+        "the winner agent must be recorded as accepted_by"
+    );
+    assert_eq!(
+        accepted_session.as_deref(),
+        Some(&winner_session.as_bytes()[..]),
+        "the winning session id must be recorded in accepted_by_session"
+    );
+
+    // Subsequent retry by the loser must be cleanly rejected without modifying anything.
+    let retry = store
+        .writer
+        .accept_handoff(accept(loser_agent, loser_session))
+        .await
+        .unwrap();
+    assert!(
+        !retry,
+        "subsequent retry by the losing session must return false"
+    );
+}
+
 /// The receiver named in a claim must be a real session of the claim's own
 /// workspace, project and agent kind. A session from a sibling project, from
 /// another workspace (even one using the same project name), of a different
