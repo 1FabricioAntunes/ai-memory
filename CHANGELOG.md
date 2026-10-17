@@ -12,6 +12,13 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the guarded admin routes answering a body without `confirm` with a bare
+  422 from the JSON extractor. `POST /admin/compact`,
+  `/admin/reclaim-ledger-versions`, `/admin/purge-project`,
+  `/admin/purge-session`, `/admin/move-project` and `/admin/handoffs/expire`
+  now read an omitted `confirm` as `false` and return the documented 400 that
+  names the flag, as `/admin/merge-workspace` already did. Nothing runs without
+  `confirm: true`.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
