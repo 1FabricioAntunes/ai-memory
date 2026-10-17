@@ -956,14 +956,12 @@ async fn contradiction_edges_require_latest_unexpired_target() {
         .unwrap();
     assert!(soft_deleted, "tombstone soft delete succeeded");
 
-    let edges = store
-        .reader
-        .contradiction_edges(ws, app)
-        .await
-        .unwrap();
+    let edges = store.reader.contradiction_edges(ws, app).await.unwrap();
 
     assert!(
-        !edges.iter().any(|e| e.from_path == "notes/expired_source.md"),
+        !edges
+            .iter()
+            .any(|e| e.from_path == "notes/expired_source.md"),
         "expired source page must not emit contradiction edges"
     );
 
