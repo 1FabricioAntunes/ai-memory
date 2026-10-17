@@ -4890,7 +4890,13 @@ mod tests {
         // The reader-facing listing drops it, and only it: a TTL still
         // ahead and no TTL at all both stay.
         assert_eq!(
-            paths(store.reader.list_unexpired_pages("default", "scratch").await.unwrap()),
+            paths(
+                store
+                    .reader
+                    .list_unexpired_pages("default", "scratch")
+                    .await
+                    .unwrap()
+            ),
             ["future.md", "live.md"]
         );
     }

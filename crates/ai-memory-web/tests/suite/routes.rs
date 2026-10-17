@@ -5066,7 +5066,11 @@ async fn seed_expiry_mix(
     .await
     .unwrap();
     for (path, body, expires_at) in [
-        ("notes/expired.md", "# Expired Note\n\nPast its date.", "2000-01-01"),
+        (
+            "notes/expired.md",
+            "# Expired Note\n\nPast its date.",
+            "2000-01-01",
+        ),
         ("notes/future.md", "# Future Note\n\nNot yet.", "2999-01-01"),
     ] {
         let mut request = wiki_req(ws, proj, path, body);
