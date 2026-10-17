@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Made managed cross-harness continuation survive quota exhaustion without a
+  voluntary handoff. The startup packet now places its server-authored resume
+  directive outside the untrusted transcript fence, and refreshed
+  `CLAUDE.md` / `AGENTS.md` routing tells an incoming agent that "continue",
+  "resume", and "pick up where we left off" must consult the private
+  `AI_MEMORY_PREVIOUS_SESSION_HISTORY` dossier when the managed-run variables
+  are present. The dossier remains untrusted evidence and stays local to the
+  launcher machine.
+
 ## [3.1.0] - 2026-10-16
 
 ### Added

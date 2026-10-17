@@ -115,6 +115,15 @@ AI_MEMORY_PREVIOUS_SESSION_HISTORY=/private/temp/.../history.md
 
 The startup packet tells the receiving agent to read the file when the user
 asks to continue or an exact detail is absent from the bounded portable packet.
+That server-authored directive is outside the packet's untrusted-history fence;
+only the imported transcript evidence is inside the fence. The canonical
+ai-memory routing block provides the same fallback: when all three
+wrapper-owned variables `AI_MEMORY_RUN_ID`, `AI_MEMORY_WORKSTREAM_ID`, and
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY` are present, "continue", "resume", or
+"pick up where we left off" means to read the named file before inferring the
+unfinished task. This covers quota exhaustion and other abrupt exits where the
+outgoing harness cannot prepare a handoff.
+
 The dossier is evidence, not instructions: it is fenced as untrusted history,
 contains no hidden reasoning or unsupported/private records, and disappears
 when the child exits. The remote ai-memory server never receives its path or
@@ -122,6 +131,21 @@ body. A same-harness resume needs no dossier because that harness resumes its
 own native session. If the prior store is missing, unreadable, on another
 machine, or above the adapter's safety bounds, launch continues with the
 portable ledger and handoff and prints one warning.
+
+If a same-machine harness switch has no
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY`, check the executable used by the exact
+shell that launched it:
+
+```bash
+type -a ai-memory
+ai-memory --version
+```
+
+Native-history continuation requires the 3.1.0 or newer host client. A stale
+Cargo or package-manager binary earlier in `PATH` can shadow an updated Docker
+wrapper and its checksum-verified native runner. Upgrade or remove the
+shadowing executable, then restart the managed run; an already-running child
+keeps the environment inherited from its old launcher.
 
 After an interactive managed session exits successfully, `ai-memory run` offers
 the installed harnesses, a way to run the current harness again, and quit.
