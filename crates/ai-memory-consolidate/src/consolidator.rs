@@ -1759,26 +1759,31 @@ fn build_frontmatter(
     serde_json::Value::Object(map)
 }
 
+fn is_valid_relation_target(relation: ai_memory_core::Relation, target: &str) -> bool {
+    let probe = serde_json::json!({ "relations": { relation.as_str(): [target] } });
+    !ai_memory_wiki::extract_relation_links(&probe).is_empty()
+}
+
 fn insert_relations(map: &mut serde_json::Map<String, serde_json::Value>, relations: &Relations) {
     // Typed edges (2.0 item 3): only vocabulary keys survive — an LLM
     // inventing `blames:` must not mint a new edge kind. The wiki write
     // boundary parses this frontmatter into typed links.
-    let relations: serde_json::Map<String, serde_json::Value> = relations
-        .non_empty()
-        .map(|(relation, targets)| {
-            (
-                relation.as_str().to_string(),
-                serde_json::Value::Array(
-                    targets
-                        .iter()
-                        .map(|t| serde_json::Value::String(t.clone()))
-                        .collect(),
-                ),
-            )
-        })
-        .collect();
-    if !relations.is_empty() {
-        map.insert("relations".into(), serde_json::Value::Object(relations));
+    // Drop non-page targets up front so raw titles cannot persist in YAML
+    // frontmatter and trigger repeated watcher reconciliation warnings.
+    let mut out = serde_json::Map::new();
+    for (relation, targets) in relations.non_empty() {
+        let valid: Vec<serde_json::Value> = targets
+            .iter()
+            .filter(|t| is_valid_relation_target(relation, t))
+            .map(|t| serde_json::Value::String(t.clone()))
+            .collect();
+        if !valid.is_empty() {
+            let key = relation.as_str().to_string();
+            out.insert(key, serde_json::Value::Array(valid));
+        }
+    }
+    if !out.is_empty() {
+        map.insert("relations".into(), serde_json::Value::Object(out));
     }
 }
 
@@ -3829,6 +3834,37 @@ mod tests {
         let relations = fm["relations"].as_object().unwrap();
         assert_eq!(relations.len(), 1, "{relations:?}");
         assert_eq!(relations["fixes"][0], "gotchas/g.md");
+    }
+
+    #[test]
+    fn insert_relations_drops_non_page_targets() {
+        let page = ConsolidatedPage {
+            title: "T".into(),
+            body_markdown: "b".into(),
+            tags: vec![],
+            summary: None,
+            relations: Relations {
+                fixes: vec![
+                    "upgrade 3.0.0 to 3.1.0 with residue".into(),
+                    "notes/".into(),
+                    "notes/.md".into(),
+                    "/abs.md".into(),
+                    "../escape.md".into(),
+                ],
+                causes: vec![],
+                contradicts: vec![
+                    "upgrade 3.0.0 to 3.1.0 with residue".into(),
+                    "decisions/0001.md".into(),
+                ],
+            },
+        };
+        let fm = build_frontmatter(&page, SessionId::new(), AgentKind::Cursor);
+        let relations = fm["relations"].as_object().unwrap();
+        assert!(relations.get("fixes").is_none());
+        assert_eq!(
+            relations["contradicts"],
+            serde_json::json!(["decisions/0001.md"])
+        );
     }
 
     /// #630: the `relations` schema must be a FIXED object with named fields,
