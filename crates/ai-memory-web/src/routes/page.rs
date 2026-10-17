@@ -203,7 +203,7 @@ async fn namespace_or_not_found(
         return not_found_response();
     }
     let prefix = format!("{namespace}/");
-    let all = match state.reader.list_pages(workspace, project).await {
+    let all = match state.reader.list_unexpired_pages(workspace, project).await {
         Ok(p) => p,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
