@@ -259,6 +259,8 @@ bytes); the bytes left deepen
 pages to an L1 excerpt (`summary` first, 500 bytes, the same clip as A2
 compaction) and then to the whole body, pinned and `_slots/` pages before the
 rest, other bodies cheapest first (`ai_memory_hooks::brief_tiers`). A body is included whole or not at all.
+A body shorter than the frontmatter excerpt it would replace always shows
+whole, priced at its own size.
 Four or more unpinned excerpts of one family share a heading. Pages that do not
 fit are listed by path for `memory_read_page`, and the count of them is
 reserved before any page is deepened. The security notice, the

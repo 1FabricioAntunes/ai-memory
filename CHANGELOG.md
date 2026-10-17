@@ -117,6 +117,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory`, and existing entries with either form are still recognized.
   (#1362)
 
+- Fixed the session-start brief hiding a page's body behind a longer
+  frontmatter excerpt. When a pinned, `_rules/` or `_slots/` page had a
+  `summary:` or `abstract:` longer than its body, the brief printed that
+  excerpt instead of the body, however much of `[briefing] max_chars` was
+  left, so a small wiki whose pages fit did not get every body whole. Such a
+  body now shows whole: it is priced at its own size when the brief decides
+  which pages fit, and the bytes it saves over the excerpt go to other pages.
+  A page with an empty body keeps its excerpt. (#1360)
+
 ## [3.1.0] - 2026-10-16
 
 ### Added
