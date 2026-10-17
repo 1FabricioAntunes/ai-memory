@@ -18,10 +18,11 @@ version in [`docs/changelog/`](docs/changelog/):
   62-second total wait budget unchanged), so a gateway that answers 503
   with `Retry-After` while temporarily out of capacity no longer drops
   most of the pages of an `ai-memory embed` backfill.
+  ([#1397](https://github.com/akitaonrails/ai-memory/pull/1397))
 - `ai-memory embed` now exits with a non-zero status when the report
   shows pages that failed to embed, while keeping the full JSON report
   on stdout; a run in which every page failed previously returned
-  success.
+  success. ([#1397](https://github.com/akitaonrails/ai-memory/pull/1397))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
