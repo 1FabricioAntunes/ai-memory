@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Fixed `page_belief_inputs` counting contradictions against TTL-expired target
+  pages as active live contradictions. When a page declares a `contradicts`
+  relation to a target whose `expires_at` TTL has passed, the declaration is
+  stale and must not weaken belief strength or reduce confidence in retrieval
+  ranking. `contradiction_sql` now applies the `not_expired` guard on the target
+  page, aligning belief input aggregation with the lint's resolved/stale split.
+
 ## [3.1.1] - 2026-10-17
 
 ### Fixed
