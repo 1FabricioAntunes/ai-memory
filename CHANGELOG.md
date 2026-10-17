@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   retained by `prune_relations` when `extract_relation_links` returned an empty
   list, causing the wiki watcher to emit repeated warnings on every
   reconciliation pass. Targets are now validated through `extract_relation_links`
-  before frontmatter assembly and during relation pruning. (#1353)
+  before frontmatter assembly and during relation pruning. (#1353, #1366)
 
 ## [3.1.0] - 2026-10-16
 
