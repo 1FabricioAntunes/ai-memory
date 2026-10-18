@@ -7943,7 +7943,7 @@ impl ReaderPool {
                 .collect::<Result<Vec<_>, _>>()?;
 
             let (cross_project_dependents, cross_project_dependencies) =
-                cross_project_degree(conn, workspace_id, project_id)?;
+                cross_project_degree(conn, workspace_id, project_id, now_us)?;
 
             let settled: Vec<SettledPage> = if settled_first {
                 let settled_kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
@@ -13475,34 +13475,42 @@ fn count_project(
 /// Cross-project link degree for a project: `(dependents, dependencies)`.
 /// `dependents` = distinct other projects whose pages link into this one;
 /// `dependencies` = distinct other projects this one links out to. Counts
-/// resolved links only (`to_page_id` is set); project ids are globally
-/// unique, so a bare `!= project_id` excludes self across all workspaces.
+/// resolved links between latest unexpired pages only (`to_page_id` is set);
+/// project ids are globally unique, so a bare `!= project_id` excludes self
+/// across all workspaces.
 fn cross_project_degree(
     conn: &Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    now_us: i64,
 ) -> StoreResult<(u64, u64)> {
+    let tp_ttl = not_expired("tp", "?3");
+    let fp_ttl = not_expired("fp", "?3");
     let dependents: Option<i64> = conn
         .query_row(
-            "SELECT COUNT(DISTINCT fp.project_id) \
-             FROM links l \
-             JOIN pages tp ON tp.id = l.to_page_id \
-                 AND tp.workspace_id = ?1 AND tp.project_id = ?2 AND tp.is_latest = 1 \
-             JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
-             WHERE fp.project_id != ?2",
-            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            &format!(
+                "SELECT COUNT(DISTINCT fp.project_id) \
+                 FROM links l \
+                 JOIN pages tp ON tp.id = l.to_page_id \
+                     AND tp.workspace_id = ?1 AND tp.project_id = ?2 AND tp.is_latest = 1{tp_ttl} \
+                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1{fp_ttl} \
+                 WHERE fp.project_id != ?2"
+            ),
+            params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
             |row| row.get(0),
         )
         .optional()?;
     let dependencies: Option<i64> = conn
         .query_row(
-            "SELECT COUNT(DISTINCT tp.project_id) \
-             FROM links l \
-             JOIN pages fp ON fp.id = l.from_page_id \
-                 AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1 \
-             JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
-             WHERE tp.project_id != ?2",
-            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            &format!(
+                "SELECT COUNT(DISTINCT tp.project_id) \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id \
+                     AND fp.workspace_id = ?1 AND fp.project_id = ?2 AND fp.is_latest = 1{fp_ttl} \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{tp_ttl} \
+                 WHERE tp.project_id != ?2"
+            ),
+            params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
             |row| row.get(0),
         )
         .optional()?;
