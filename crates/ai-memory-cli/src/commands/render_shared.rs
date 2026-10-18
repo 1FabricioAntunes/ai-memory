@@ -4677,7 +4677,14 @@ $payload = [Console]::In.ReadToEnd()
             ("PreInvocation", "pre-invocation.sh"),
         ] {
             let cmd = group[event][0]["command"].as_str().unwrap();
-            assert!(cmd.ends_with(&format!("/{script}")), "{event}: {cmd}");
+            // The script path's separator and quoting follow the platform
+            // (`'...\session-start.sh'` on Windows), so compare the file name.
+            let file = cmd
+                .trim_end_matches(['\'', '"'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap();
+            assert_eq!(file, script, "{event}: {cmd}");
         }
     }
 
