@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Kept a short last prompt that only starts like an acknowledgment in the
+  automatic handoff. The compound check stripped every letter after a matching
+  prefix, so `好的，接下来写单元测试` ("OK, next write the unit tests"),
+  `好像有个bug` or a one-word `kubectl` were treated as "ok" and dropped from
+  the `Continue from:` line, while `ok, thanks` was not recognized at all.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing

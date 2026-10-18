@@ -4735,17 +4735,37 @@ fn is_acknowledgment(text: &str) -> bool {
     if trimmed.chars().count() <= 20 && ACK_PHRASES.contains(&trimmed) {
         return true;
     }
-    // Also catch "ok, thanks" / "好的，谢谢" style compounds up to 20 chars.
-    if trimmed.chars().count() <= 20 && ACK_PHRASES.iter().any(|phrase| trimmed.starts_with(phrase))
-    {
-        let remainder = trimmed
-            .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || !c.is_ascii())
-            .trim_start_matches([',', '.', ' ', '，', '。']);
-        if remainder.is_empty() {
+    // Also catch "ok, thanks" / "好的，谢谢" style compounds up to 20 chars:
+    // the prompt must be made of acknowledgment phrases and separators
+    // only. Each step consumes a whole phrase (the longest that fits), and
+    // an ASCII phrase must end at a word boundary, so "kubectl" is not
+    // "k" + more and "好的，接下来写单元测试" keeps its instruction.
+    if trimmed.chars().count() > 20 {
+        return false;
+    }
+    let mut rest = trimmed;
+    loop {
+        rest = rest.trim_start_matches([',', '.', ' ', '，', '。']);
+        if rest.is_empty() {
             return true;
         }
+        let phrase = ACK_PHRASES
+            .iter()
+            .filter(|phrase| {
+                rest.strip_prefix(**phrase).is_some_and(|after| {
+                    !phrase.is_ascii()
+                        || !after
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphanumeric())
+                })
+            })
+            .max_by_key(|phrase| phrase.len());
+        let Some(phrase) = phrase else {
+            return false;
+        };
+        rest = &rest[phrase.len()..];
     }
-    false
 }
 
 /// Cap so a single long prompt does not blow up the handoff body.
@@ -20192,6 +20212,43 @@ pub(crate) mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// A compound acknowledgment is acknowledgment phrases and separators
+    /// only. The old check stripped every leading letter after a matching
+    /// prefix, so a short instruction that merely starts like an
+    /// acknowledgment ("好的，接下来写单元测试", "kubectl") was discarded and
+    /// the handoff lost the user's real last request.
+    #[test]
+    fn is_acknowledgment_requires_whole_phrases() {
+        for ack in [
+            "ok, thanks",
+            "ok thanks",
+            "好的，谢谢",
+            "好的谢谢",
+            "thanks.",
+            "sure, will do",
+        ] {
+            assert!(is_acknowledgment(ack), "{ack:?} is an acknowledgment");
+        }
+        for request in [
+            "好的，接下来写单元测试",
+            "好像有个bug",
+            "了解一下这个函数",
+            "kubectl",
+            "typecheck",
+            "okay, now run it",
+        ] {
+            assert!(!is_acknowledgment(request), "{request:?} is a request");
+        }
+
+        let obs = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "p",
+            "好的，接下来写单元测试",
+        )];
+        let q = derive_open_questions(&obs, &Some("好的，接下来写单元测试".to_string()));
+        assert_eq!(q, ["Continue from: 好的，接下来写单元测试"]);
     }
 
     /// End-to-end proof that a client-supplied `occurred_at` reaches every
