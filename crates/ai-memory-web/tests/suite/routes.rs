@@ -5358,6 +5358,12 @@ async fn project_tree_and_namespace_listing_hide_expired_pages() {
     assert!(!project.contains("Expired Note"), "{project}");
     assert!(!project.contains("Only Gone"), "{project}");
 
+    // The home page cards count only unexpired pages.
+    let (status, home) = get_body(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(home.contains("2 pages"), "{home}");
+    assert!(!home.contains("4 pages"), "{home}");
+
     let (status, namespace) = get_body(&app, "/w/default/scratch/p/notes/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -5426,6 +5432,17 @@ async fn api_page_lists_hide_expired_pages_like_the_incremental_recent_form() {
     // The single-page read keeps answering for the expired page.
     let (status, _) = get_body(&app, &format!("{base}/pages/notes/expired.md")).await;
     assert_eq!(status, StatusCode::OK);
+
+    // Project and workspace summaries count only unexpired pages.
+    let (status, projects) = get_body(&app, "/projects").await;
+    assert_eq!(status, StatusCode::OK);
+    let projects: Value = serde_json::from_str(&projects).unwrap();
+    assert_eq!(projects[0]["page_count"], 2);
+
+    let (status, workspaces) = get_body(&app, "/workspaces").await;
+    assert_eq!(status, StatusCode::OK);
+    let workspaces: Value = serde_json::from_str(&workspaces).unwrap();
+    assert_eq!(workspaces[0]["page_count"], 2);
 }
 
 #[tokio::test]

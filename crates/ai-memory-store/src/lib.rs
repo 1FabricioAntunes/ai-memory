@@ -4795,6 +4795,78 @@ mod tests {
         assert!(s.last_updated.is_some());
     }
 
+    #[tokio::test]
+    async fn list_projects_and_workspaces_with_stats_hide_expired_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let mixed = store
+            .writer
+            .get_or_create_project(ws, "mixed", None)
+            .await
+            .unwrap();
+        let expired_only = store
+            .writer
+            .get_or_create_project(ws, "expired-only", None)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_second();
+        let at = |seconds: i64| Some(jiff::Timestamp::from_second(seconds).unwrap());
+
+        for (path, expires_at) in [
+            ("expired.md", at(now - 60)),
+            ("future.md", at(now + 3_600)),
+            ("live.md", None),
+        ] {
+            let mut page = sample_page(ws, mixed, path, "body");
+            page.expires_at = expires_at;
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let mut only = sample_page(ws, expired_only, "stale.md", "stale body");
+        only.expires_at = at(now - 120);
+        store.writer.upsert_page(only).await.unwrap();
+
+        // Project summaries omit the expired pages from page_count and last_updated.
+        let summaries = store.reader.list_projects_with_stats(None).await.unwrap();
+        assert_eq!(summaries.len(), 2);
+
+        let mixed_summary = summaries
+            .iter()
+            .find(|s| s.project_name == "mixed")
+            .expect("mixed project summary");
+        assert_eq!(mixed_summary.page_count, 2);
+        assert!(mixed_summary.last_updated.is_some());
+
+        let expired_summary = summaries
+            .iter()
+            .find(|s| s.project_name == "expired-only")
+            .expect("expired-only project summary");
+        assert_eq!(expired_summary.page_count, 0);
+        assert_eq!(expired_summary.last_updated, None);
+
+        // Filtered by workspace matches.
+        let ws_projects = store
+            .reader
+            .list_projects_with_stats_for_workspace("default".to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(ws_projects.len(), 2);
+
+        // Workspace aggregates count only unexpired pages across projects.
+        let ws_summaries = store.reader.list_workspaces_with_stats(None).await.unwrap();
+        assert_eq!(ws_summaries.len(), 1);
+        assert_eq!(ws_summaries[0].workspace_name, "default");
+        assert_eq!(ws_summaries[0].project_count, 2);
+        assert_eq!(ws_summaries[0].page_count, 2);
+        assert!(ws_summaries[0].last_updated.is_some());
+    }
+
     /// #1208: a project id is an address, so it must be exposed exactly where
     /// the name is -- no wider. Boundary row 9's rule is that a restricted
     /// project is hidden from a caller without a grant, and this pins that the

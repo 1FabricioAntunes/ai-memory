@@ -1874,7 +1874,7 @@ pub struct ProjectSummary {
     pub project_id: String,
     /// Name of the project within the workspace.
     pub project_name: String,
-    /// Number of `is_latest = 1` pages.
+    /// Number of unexpired `is_latest = 1` pages.
     pub page_count: u64,
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the project has no pages yet.
@@ -2038,7 +2038,7 @@ pub struct WorkspaceSummary {
     pub workspace_name: String,
     /// Number of projects in this workspace.
     pub project_count: u64,
-    /// Number of `is_latest = 1` pages across the workspace.
+    /// Number of unexpired `is_latest = 1` pages across the workspace.
     pub page_count: u64,
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the workspace has no pages yet.
@@ -9297,7 +9297,7 @@ impl ReaderPool {
     /// Return one row per (workspace, project) with page-count and
     /// last-updated aggregates. Used by the web UI project-list view.
     ///
-    /// Only `is_latest = 1` pages are counted. `viewer` lists only the
+    /// Only unexpired `is_latest = 1` pages are counted. `viewer` lists only the
     /// repositories that user may read — see [`readable_repository_filter`];
     /// `None` lists every one.
     ///
@@ -9312,7 +9312,7 @@ impl ReaderPool {
 
     /// Return one row per project within one workspace.
     ///
-    /// Only `is_latest = 1` pages are counted. `viewer` as for
+    /// Only unexpired `is_latest = 1` pages are counted. `viewer` as for
     /// [`Self::list_projects_with_stats`].
     ///
     /// # Errors
@@ -9336,6 +9336,7 @@ impl ReaderPool {
             // three organisations listed by name — so the filter is on the
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
+            let ttl = not_expired("pg", "?2");
             let mut stmt = conn.prepare(&format!(
                 "SELECT w.id AS workspace_id, \
                         w.name AS workspace_name, \
@@ -9345,12 +9346,13 @@ impl ReaderPool {
                         MAX(pg.updated_at) AS last_updated_us \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
-                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
+                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
                  WHERE (?1 IS NULL OR w.name = ?1){visible} \
                  GROUP BY w.id, p.id \
                  ORDER BY last_updated_us DESC NULLS LAST"
             ))?;
-            let rows = stmt.query_map(params![workspace], |row| {
+            let now = now_us();
+            let rows = stmt.query_map(params![workspace, now], |row| {
                 let workspace_id: Vec<u8> = row.get(0)?;
                 let workspace_name: String = row.get(1)?;
                 let project_id: Vec<u8> = row.get(2)?;
@@ -9602,7 +9604,7 @@ impl ReaderPool {
     /// last-updated aggregates. Used by custom frontends that need a
     /// workspace chooser before narrowing into projects.
     ///
-    /// Only `is_latest = 1` pages are counted.
+    /// Only unexpired `is_latest = 1` pages are counted.
     ///
     /// With a `viewer`, a workspace is listed only when it holds at least one
     /// repository that user may read, and its counts cover only those. A
@@ -9627,6 +9629,7 @@ impl ReaderPool {
             } else {
                 ""
             };
+            let ttl = not_expired("pg", "?1");
             let mut stmt = conn.prepare(&format!(
                 "SELECT w.name AS workspace_name, \
                         COUNT(DISTINCT p.id) AS project_count, \
@@ -9634,11 +9637,12 @@ impl ReaderPool {
                         MAX(pg.updated_at) AS last_updated_us \
                  FROM workspaces w \
                  LEFT JOIN projects p ON p.workspace_id = w.id{visible} \
-                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
+                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
                  GROUP BY w.id{only_readable} \
                  ORDER BY w.name ASC"
             ))?;
-            let rows = stmt.query_map([], |row| {
+            let now = now_us();
+            let rows = stmt.query_map(params![now], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_count: i64 = row.get(1)?;
                 let page_count: i64 = row.get(2)?;
