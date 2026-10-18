@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Refused two more DOS device spellings at page-write time: a device name
+  followed by spaces before its extension (`notes/con .md`), which Windows
+  still opens as the device, and the superscript serial and printer ports
+  `COM¹`-`COM³` and `LPT¹`-`LPT³` that Windows also reserves.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
