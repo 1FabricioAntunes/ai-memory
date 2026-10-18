@@ -12,6 +12,12 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- A malformed `handoff_id` (`memory_handoff_accept`, `memory_handoff_cancel`)
+  or `message_id` (`memory_message_pop`, `memory_message_cancel`) now fails as
+  `invalid params` (`-32602`) instead of an internal error (`-32603`), like a
+  malformed session id or page path; the messages are unchanged.
+  `memory_handoff_cancel` also trims whitespace around the id, as the other
+  three tools already do.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
