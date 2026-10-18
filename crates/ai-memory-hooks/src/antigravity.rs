@@ -277,12 +277,19 @@ pub struct TranscriptCursor {
     /// File name of the transcript the offset belongs to.
     #[serde(default)]
     pub file: Option<String>,
+    /// Fingerprint of the transcript's first complete line. Antigravity only
+    /// appends, so a different first line means the file was rewritten (a
+    /// rewind), even when it did not get shorter.
+    #[serde(default)]
+    pub head: Option<String>,
     /// Byte offset just past the last line consumed.
     #[serde(default)]
     pub offset: u64,
-    /// Highest `step_index` of a prompt already returned. A rewritten or
-    /// truncated transcript is re-read from the start, and this keeps its
-    /// old prompts from being returned twice.
+    /// Highest `step_index` of a prompt already returned in the current
+    /// file. It is cleared when the file is rewritten or truncated, because a
+    /// rewind can reuse step numbers for new prompts; the prompts that file
+    /// still holds come back once more and the server drops them by their
+    /// content-derived ingest keys.
     #[serde(default)]
     pub last_step: Option<u64>,
     /// The previous read stopped inside a line longer than the scan budget;
@@ -378,7 +385,7 @@ fn open_regular_file(path: &Path) -> Option<File> {
     if !before.is_file() {
         return None;
     }
-    let file = File::open(path).ok()?;
+    let file = open_no_follow(path)?;
     let after = file.metadata().ok()?;
     if !after.is_file() {
         return None;
@@ -390,7 +397,65 @@ fn open_regular_file(path: &Path) -> Option<File> {
             return None;
         }
     }
+    // The directories were canonical when checked, but one swapped for a
+    // symlink afterwards would still be followed by the open, and the inode
+    // comparison above sees the same swapped file. The descriptor's own path
+    // must be the one that was checked.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        let opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+        if opened != path {
+            return None;
+        }
+    }
     Some(file)
+}
+
+/// Bytes of the first line that identify a transcript file.
+const TRANSCRIPT_HEAD_BYTES: usize = 256;
+
+/// Short fingerprint of the first complete line (or of its first
+/// [`TRANSCRIPT_HEAD_BYTES`] when it is longer). `None` while the first line
+/// is still being written, so a growing file is never mistaken for a
+/// rewritten one. Leaves the file positioned at its start.
+fn head_fingerprint(file: &mut File) -> std::io::Result<Option<String>> {
+    use sha2::{Digest as _, Sha256};
+    let mut buf = [0_u8; TRANSCRIPT_HEAD_BYTES];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let head = match buf[..filled].iter().position(|&b| b == b'\n') {
+        Some(newline) => &buf[..newline],
+        None if filled == buf.len() => &buf[..],
+        None => return Ok(None),
+    };
+    let digest = format!("{:x}", Sha256::digest(head));
+    Ok(Some(digest[..16].to_owned()))
+}
+
+/// `O_NOFOLLOW` refuses a final-component symlink swapped in after the
+/// metadata check, and `O_NONBLOCK` keeps a FIFO swapped in from blocking the
+/// open (and so the hook) indefinitely; reads of a regular file are
+/// unaffected.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> Option<File> {
+    File::open(path).ok()
 }
 
 /// Read the user prompts written to `path` since `cursor`. At most
@@ -400,13 +465,19 @@ fn open_regular_file(path: &Path) -> Option<File> {
 #[must_use]
 pub fn read_transcript_prompts(path: &Path, cursor: &TranscriptCursor) -> Option<TranscriptRead> {
     let name = path.file_name()?.to_str()?.to_owned();
-    let file = open_regular_file(path)?;
+    let mut file = open_regular_file(path)?;
     let len = file.metadata().ok()?.len();
+    let head = head_fingerprint(&mut file).ok()?;
     let mut next = cursor.clone();
-    if next.file.as_deref() != Some(name.as_str()) || len < next.offset {
+    let rewritten = matches!((&next.head, &head), (Some(old), Some(new)) if old != new);
+    if next.file.as_deref() != Some(name.as_str()) || len < next.offset || rewritten {
         next.file = Some(name);
         next.offset = 0;
         next.resync = false;
+        next.last_step = None;
+    }
+    if head.is_some() {
+        next.head = head;
     }
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     reader.seek(SeekFrom::Start(next.offset)).ok()?;
@@ -1206,6 +1277,60 @@ mod tests {
         read.prompts.iter().map(|p| p.text.as_str()).collect()
     }
 
+    /// A rewind truncates or rewrites the transcript and can reuse step
+    /// numbers for new prompts: they must still be returned, whether the file
+    /// got shorter or kept its length. An append is not a rewrite.
+    #[test]
+    fn transcript_rewrites_return_new_prompts_that_reuse_step_numbers() {
+        let home = tempdir().unwrap();
+        let path = write_transcript(
+            home.path(),
+            "antigravity",
+            "conv-rewind",
+            "transcript.jsonl",
+            &[
+                &user_input(0, "first long prompt about the parser module"),
+                &user_input(1, "second prompt"),
+            ],
+        );
+        let first = read_transcript_prompts(&path, &TranscriptCursor::default()).unwrap();
+        assert_eq!(
+            texts(&first),
+            ["first long prompt about the parser module", "second prompt"]
+        );
+
+        // Control: an append returns only the new prompt.
+        let mut appended = fs::read_to_string(&path).unwrap();
+        appended.push_str(&format!("{}\n", user_input(2, "third prompt")));
+        fs::write(&path, &appended).unwrap();
+        let after_append = read_transcript_prompts(&path, &first.cursor).unwrap();
+        assert_eq!(texts(&after_append), ["third prompt"]);
+
+        // Shorter rewrite reusing step 0.
+        fs::write(&path, format!("{}\n", user_input(0, "edited"))).unwrap();
+        let shorter = read_transcript_prompts(&path, &after_append.cursor).unwrap();
+        assert_eq!(texts(&shorter), ["edited"]);
+
+        // Same-or-longer rewrite reusing steps 0 and 1.
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                user_input(0, "rewritten first prompt, now even longer than before"),
+                user_input(1, "rewritten second prompt that keeps growing")
+            ),
+        )
+        .unwrap();
+        let longer = read_transcript_prompts(&path, &shorter.cursor).unwrap();
+        assert_eq!(
+            texts(&longer),
+            [
+                "rewritten first prompt, now even longer than before",
+                "rewritten second prompt that keeps growing"
+            ]
+        );
+    }
+
     #[test]
     fn reads_prompts_from_the_app_transcript_and_the_cli_full_transcript() {
         let home = tempdir().unwrap();
@@ -1325,7 +1450,10 @@ mod tests {
         assert_eq!(texts(&next), ["third"]);
         assert_eq!(next.cursor.prompts, 3);
 
-        // Rewritten shorter: re-read from the start, old steps not repeated.
+        // Rewritten shorter: re-read from the start. A rewind can reuse step
+        // numbers, so the file's prompts all come back; the ones already
+        // delivered carry the same content-derived ingest key and the server
+        // drops them.
         fs::write(
             &path,
             format!(
@@ -1336,7 +1464,7 @@ mod tests {
         )
         .unwrap();
         let rewritten = read_transcript_prompts(&path, &next.cursor).unwrap();
-        assert_eq!(texts(&rewritten), ["after rewrite"]);
+        assert_eq!(texts(&rewritten), ["third", "after rewrite"]);
 
         // A cursor for the other transcript file starts over too.
         let mut other = rewritten.cursor.clone();
@@ -1442,6 +1570,63 @@ mod tests {
         assert_eq!(
             texts(&read_transcript_prompts(&path, &TranscriptCursor::default()).unwrap()),
             ["not a transcript"]
+        );
+    }
+
+    /// A FIFO named like the transcript must be refused without blocking the
+    /// hook, and a directory swapped for a symlink after the containment check
+    /// must not let the open reach a file outside the checked path.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn transcript_reader_refuses_fifos_and_swapped_directories() {
+        use std::os::unix::fs::symlink;
+        let home = tempdir().unwrap();
+        let path = write_transcript(
+            home.path(),
+            "antigravity",
+            "conv-fifo",
+            "transcript.jsonl",
+            &[],
+        );
+        fs::remove_file(&path).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_transcript_prompts(&path, &TranscriptCursor::default()),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        // `.system_generated` swapped for a symlink to a foreign tree.
+        let path = write_transcript(
+            home.path(),
+            "antigravity",
+            "conv-swap",
+            "transcript.jsonl",
+            &[&user_input(0, "real prompt")],
+        );
+        let system_generated = path.parent().unwrap().parent().unwrap().to_path_buf();
+        let foreign = home.path().join("foreign");
+        fs::create_dir_all(foreign.join("logs")).unwrap();
+        fs::write(
+            foreign.join("logs").join("transcript.jsonl"),
+            format!("{}\n", user_input(0, "foreign secret")),
+        )
+        .unwrap();
+        // Control: before the swap the checked path is read.
+        assert_eq!(
+            texts(&read_transcript_prompts(&path, &TranscriptCursor::default()).unwrap()),
+            ["real prompt"]
+        );
+        fs::remove_dir_all(&system_generated).unwrap();
+        symlink(&foreign, &system_generated).unwrap();
+        assert_eq!(
+            read_transcript_prompts(&path, &TranscriptCursor::default()),
+            None
         );
     }
 }

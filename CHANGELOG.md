@@ -123,7 +123,14 @@ version in [`docs/changelog/`](docs/changelog/):
   for a conversation whose prompts were already captured. Rerun
   `install-hooks --agent antigravity-cli --apply` to add `SessionStart`;
   existing native-hook installs get the prompts and checkpoints without it.
-  (#TBD)
+  A turn checkpoint never ends a conversation, even a turn with no captured
+  prompt or tool call, so a handoff it claimed at start is never offered
+  again; the conversation start is claimed atomically, so a concurrent
+  `SessionStart` and first `PreInvocation` cannot both claim a handoff;
+  prompt ingest keys include the prompt's time and text, so a rewind that
+  reuses step numbers keeps its new prompts; and the transcript is opened
+  with `O_NOFOLLOW | O_NONBLOCK` and, on Linux, checked against the opened
+  descriptor's real path. (#TBD)
 
 ### Fixed
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass

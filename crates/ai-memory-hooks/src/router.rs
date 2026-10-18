@@ -4199,6 +4199,18 @@ async fn process_authorized(
             .reader
             .session_has_substantive_observation(page_ws, page_proj, session_id)
             .await?;
+        // A turn checkpoint never ends a session. A turn with no captured
+        // prompt or tool call (an answer without tools, or a prompt the
+        // transcript reader skipped) would otherwise take the lifecycle-only
+        // end path below, which closes the live conversation and reopens the
+        // handoff it claimed at start, so the next session would receive it
+        // a second time and later turns would never checkpoint.
+        if turn_checkpoint && !substantive {
+            if let Some(key) = ingest_key {
+                state.writer.complete_observation_ingest(proj, key).await?;
+            }
+            return Ok(outcome);
+        }
         if !substantive {
             let lifecycle_outcome = state
                 .writer
@@ -14191,6 +14203,115 @@ pub(crate) mod tests {
                 .await
                 .unwrap(),
             Some(session)
+        );
+    }
+
+    /// A turn with nothing captured (an answer without tools, or a prompt
+    /// the transcript reader skipped) is still only a checkpoint: it must not
+    /// take the lifecycle-only end path, which would close the conversation
+    /// and reopen the handoff it claimed at start for a second receiver.
+    #[tokio::test]
+    async fn antigravity_lifecycle_only_turn_keeps_conversation_open_and_handoff_claimed() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let prior = "agy-prior-conversation";
+        antigravity_turn(&state, prior, "Earlier work on the parser", None).await;
+        process(
+            &state,
+            antigravity_event(prior, "session-end", ""),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let conversation = "agy-quiet-turn";
+        let session = SessionId::from_native(conversation);
+        process(
+            &state,
+            antigravity_event(conversation, "session-start", ""),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let receiver = |agent: &str, session_id: String| HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
+            agent: Some(agent.into()),
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        let quiet =
+            jiff::Timestamp::now() + LIVE_BATON_QUIET_PERIOD + jiff::SignedDuration::from_secs(1);
+        let claimed = fetch_and_accept_handoff_at(
+            &state,
+            receiver("antigravity-cli", session.to_string()),
+            None,
+            Vec::new(),
+            None,
+            quiet,
+        )
+        .await
+        .unwrap()
+        .expect("the new conversation claims the earlier handoff");
+        assert!(claimed.contains("Earlier work on the parser"), "{claimed}");
+
+        // The model finished a turn without any tool and no prompt was captured.
+        process(
+            &state,
+            antigravity_event(conversation, "stop", ""),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .session_end_disposition(
+                    session,
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::AntigravityCli
+                )
+                .await
+                .unwrap(),
+            ai_memory_store::SessionEndDisposition::Open,
+            "a turn checkpoint must not end the conversation"
+        );
+        assert!(
+            fetch_and_accept_handoff_at(
+                &state,
+                receiver("claude-code", SessionId::new().to_string()),
+                None,
+                Vec::new(),
+                None,
+                quiet,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a claimed handoff is never offered again"
+        );
+
+        // Control: once the conversation does real work, its idle turn checkpoints.
+        let pages_before = session_pages(&state).await.len();
+        antigravity_turn(&state, conversation, "Now fix the lexer", None).await;
+        assert_eq!(session_pages(&state).await.len(), pages_before + 1);
+        assert_eq!(
+            state
+                .reader
+                .session_end_disposition(
+                    session,
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::AntigravityCli
+                )
+                .await
+                .unwrap(),
+            ai_memory_store::SessionEndDisposition::Open
         );
     }
 

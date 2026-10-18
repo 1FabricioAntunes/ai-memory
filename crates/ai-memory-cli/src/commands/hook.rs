@@ -567,6 +567,31 @@ fn antigravity_conversation_start_marker(
     )
 }
 
+/// Claims an Antigravity conversation's start atomically. `create_new` lets
+/// exactly one of a concurrent native SessionStart and first-turn
+/// PreInvocation win, so only one of them posts session-start and claims a
+/// handoff. `false` means the conversation already started; any other
+/// failure counts as a win, as the best-effort marker always has (the worst
+/// case is a repeated start, never a lost one).
+fn claim_conversation_start(marker: &Path) -> bool {
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(_) => {
+            // Rewrites the empty marker and applies the bounded retention.
+            mark_briefed(marker);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => true,
+    }
+}
+
 /// Transcript read cursors kept at once. A cursor that falls out only makes
 /// the next read of its conversation start over, and the server's ingest
 /// keys drop the prompts it already has.
@@ -631,9 +656,10 @@ pub(crate) fn antigravity_transcript_prompts_captured(data_dir: &Path, conversat
         > 0
 }
 
-/// Ingest key of a recovered prompt: stable per conversation and step, so a
-/// repeated read (a lost cursor, a crash before it was stored) is dropped by
-/// the server instead of stored twice.
+/// Ingest key of a recovered prompt: stable per conversation, step, time and
+/// text, so a repeated read (a lost cursor, a crash before it was stored, a
+/// rewind that re-reads the file) is dropped by the server instead of stored
+/// twice, while a new prompt that reuses a rewound step number is not.
 fn antigravity_prompt_ingest_key(
     conversation: &str,
     prompt: &ai_memory_hooks::TranscriptPrompt,
@@ -642,8 +668,16 @@ fn antigravity_prompt_ingest_key(
         || format!("offset:{}", prompt.line_offset),
         |step| format!("step:{step}"),
     );
+    let text = format!("{:x}", Sha256::digest(prompt.text.as_bytes()));
+    let created_at = prompt.created_at.as_deref().unwrap_or("");
     let mut hasher = Sha256::new();
-    for part in ["antigravity-transcript-prompt", conversation, step.as_str()] {
+    for part in [
+        "antigravity-transcript-prompt",
+        conversation,
+        step.as_str(),
+        created_at,
+        text.as_str(),
+    ] {
         hasher.update(part.len().to_be_bytes());
         hasher.update(part.as_bytes());
     }
@@ -1075,11 +1109,7 @@ where
             &json,
         );
         let started = match &marker {
-            Some(marker) if marker.exists() => true,
-            Some(marker) => {
-                mark_briefed(marker);
-                false
-            }
+            Some(marker) => !claim_conversation_start(marker),
             None => antigravity == AntigravityBoundary::TurnStart,
         };
         if started && antigravity == AntigravityBoundary::ConversationStart {
@@ -6306,6 +6336,69 @@ mod tests {
         assert!(first_request(&mut requests).await.is_none());
     }
 
+    /// A re-read of the same prompt keeps its key (the server drops it), while
+    /// a rewind's new prompt that reuses the step number gets a new one.
+    #[test]
+    fn antigravity_prompt_ingest_key_follows_step_time_and_text() {
+        let prompt = |text: &str, created_at: Option<&str>| ai_memory_hooks::TranscriptPrompt {
+            step_index: Some(4),
+            line_offset: 0,
+            text: text.into(),
+            created_at: created_at.map(Into::into),
+        };
+        let at = Some("2026-10-18T10:00:00Z");
+        let key = antigravity_prompt_ingest_key("conv", &prompt("fix the parser", at));
+        assert_eq!(
+            key,
+            antigravity_prompt_ingest_key("conv", &prompt("fix the parser", at)),
+            "a repeated read is deduplicated"
+        );
+        for other in [
+            antigravity_prompt_ingest_key("conv", &prompt("rewound prompt", at)),
+            antigravity_prompt_ingest_key(
+                "conv",
+                &prompt("fix the parser", Some("2026-10-18T11:00:00Z")),
+            ),
+            antigravity_prompt_ingest_key("other-conv", &prompt("fix the parser", at)),
+        ] {
+            assert_ne!(key, other);
+        }
+        assert!(key.starts_with("agy_") && key.len() == 64);
+    }
+
+    /// A concurrent native SessionStart and first-turn PreInvocation race
+    /// for the same marker: exactly one of them may claim the start (and so
+    /// the handoff); a later boundary of the same conversation never does.
+    #[test]
+    fn antigravity_conversation_start_is_claimed_exactly_once_under_races() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("briefed").join("agy-start-race");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let winners = (0..8)
+            .map(|_| {
+                let marker = marker.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_conversation_start(&marker)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "exactly one boundary claims the start");
+        assert!(marker.is_file());
+        assert!(
+            !claim_conversation_start(&marker),
+            "a later turn never re-claims"
+        );
+        // Control: another conversation still claims its own start.
+        let other = tmp.path().join("briefed").join("agy-start-other");
+        assert!(claim_conversation_start(&other));
+    }
+
     #[test]
     fn antigravity_conversation_marker_is_keyed_by_a_sanitized_conversation_id() {
         let dir = Path::new("/d");
@@ -6667,11 +6760,14 @@ mod tests {
             &ai_memory_hooks::TranscriptPrompt {
                 step_index: Some(0),
                 line_offset: 0,
-                text: String::new(),
-                created_at: None,
+                text: "Fix the login redirect".into(),
+                created_at: Some("2026-10-18T10:00:00Z".into()),
             },
         );
-        assert_eq!(key, expected_key, "stable per conversation and step");
+        assert_eq!(
+            key, expected_key,
+            "stable per conversation, step, time and text"
+        );
         assert_eq!(query_param(&first.url, "agent"), Some("antigravity-cli"));
         // The prompt is scoped exactly like the event it rode with.
         let scope = |url: &str| {
@@ -6795,6 +6891,7 @@ mod tests {
         let dir = tmp.path().join("hook-state/antigravity-transcripts");
         let cursor = ai_memory_hooks::TranscriptCursor {
             file: Some("transcript.jsonl".into()),
+            head: Some("0123456789abcdef".into()),
             offset: 42,
             last_step: Some(3),
             resync: false,
