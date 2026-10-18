@@ -123,8 +123,8 @@ pub fn emit(md: &Markdown) -> WikiResult<String> {
 
 /// Derive a page title.
 ///
-/// Priority: frontmatter.title (string) → first `# ` heading in body →
-/// path stem with the `.md` suffix stripped.
+/// Priority: frontmatter.title (string) → first `# ` heading in body
+/// outside fenced code blocks → path stem with the `.md` suffix stripped.
 #[must_use]
 pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath) -> String {
     if let Some(t) = frontmatter.get("title").and_then(serde_json::Value::as_str) {
@@ -133,7 +133,15 @@ pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath
             return trimmed.to_string();
         }
     }
+    let mut fence = None;
     for line in body.lines() {
+        // A `# ` line inside a fenced block is a shell or Python comment,
+        // not a heading.
+        let (next, in_code) = CodeFence::step(fence, line);
+        fence = next;
+        if in_code {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("# ") {
             let trimmed = rest.trim();
             if !trimmed.is_empty() {
@@ -1672,6 +1680,35 @@ mod tests {
         assert_eq!(
             derive_title(&serde_json::Value::Null, "no heading", &path),
             "foo"
+        );
+    }
+
+    /// Agent-written pages often open with a fenced command block. A
+    /// `# comment` inside it is code, not the page's H1, so it must not
+    /// become the indexed title.
+    #[test]
+    fn title_skips_comment_lines_inside_code_fences() {
+        let path = PagePath::new("notes/setup.md").unwrap();
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            derive_title(
+                &null,
+                "```bash\n# install deps\nnpm i\n```\n# Real Title\n",
+                &path
+            ),
+            "Real Title"
+        );
+        assert_eq!(
+            derive_title(&null, "~~~python\n# compute\nx = 1\n~~~\nbody\n", &path),
+            "setup",
+            "a fenced comment must not replace the stem fallback"
+        );
+        // An unclosed fence runs to the end of the body.
+        assert_eq!(derive_title(&null, "```sh\n# only code\n", &path), "setup");
+        // A heading after an inline triple-backtick span is still a heading.
+        assert_eq!(
+            derive_title(&null, "```inline``` text\n# Heading\n", &path),
+            "Heading"
         );
     }
 
