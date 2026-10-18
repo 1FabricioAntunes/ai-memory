@@ -301,6 +301,52 @@ async fn web_page_view_omits_author_chrome_for_anonymous_pages() {
 }
 
 #[tokio::test]
+async fn web_page_view_exposes_exact_timestamps() {
+    // The relative "Updated 3 days ago" text hides the exact time; history and
+    // session views already expose it, so the page view must too.
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/times.md", "time body"))
+        .await
+        .unwrap();
+    let meta = store
+        .reader
+        .page_meta("default", "scratch", "notes/times.md")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/notes/times.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    for (label, at) in [("Updated", &meta.updated_at), ("Created", &meta.created_at)] {
+        let tag = format!("<time datetime=\"{at}\" title=\"{at}\">");
+        assert!(text.contains(&tag), "{label} must carry {tag}: {text}");
+    }
+}
+
+#[tokio::test]
 async fn web_page_view_renders_author_chip_for_attributed_pages() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -455,19 +501,33 @@ async fn web_page_view_created_is_the_first_versions_date() {
         }
     };
 
+    // The relative value sits inside a `<time>` that carries the exact timestamp.
+    let shown = |text: &str, label: &str| -> String {
+        let start = text
+            .find(&format!("{label} <time"))
+            .unwrap_or_else(|| panic!("no {label} time: {text}"));
+        let rest = &text[start..];
+        let open = rest.find('>').unwrap() + 1;
+        let close = rest.find("</time>").unwrap();
+        rest[open..close].to_owned()
+    };
+
     let text = get("/w/default/scratch/p/notes/versions.md").await;
-    assert!(
-        text.contains("Created 1 month ago"),
-        "Created should be the oldest version's date: {text}"
+    assert_eq!(
+        shown(&text, "Created"),
+        "1 month ago",
+        "Created should be the oldest version's date"
     );
-    assert!(
-        text.contains("Updated just now"),
-        "Updated stays the latest version's date: {text}"
+    assert_eq!(
+        shown(&text, "Updated"),
+        "just now",
+        "Updated stays the latest version's date"
     );
     let text = get("/w/default/scratch/p/notes/single.md").await;
-    assert!(
-        text.contains("Created just now"),
-        "a single-version page keeps its own date: {text}"
+    assert_eq!(
+        shown(&text, "Created"),
+        "just now",
+        "a single-version page keeps its own date"
     );
 
     // The JSON API reads the same page-level date, so SPA clients agree.
