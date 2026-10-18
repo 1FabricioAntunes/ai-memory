@@ -364,9 +364,10 @@ ships something ai-memory does not, it is named.
   packaging, its `memu-agent detect` for unknown agents, and its hosted cloud,
   and EverOS's ANN vector index, optional Milvus backend and published
   end-to-end benchmark. EverOS v1.4.2 also reserves query-embedding capacity
-  from background writes; ai-memory's reranker fails open under saturation,
-  but embedding backfill and foreground query embedding do not yet have an
-  equivalent measured capacity split.
+  from background writes. ai-memory now does the same for in-process local
+  inference, backed by an opt-in real-model contention probe; hosted embedding
+  providers keep their existing concurrency, and the reranker remains bounded
+  and fail-open.
 - **From Caura (governed multi-agent fleet memory):** a different buyer. Caura
   optimizes org-scale fleet governance (agent/team/org visibility scopes, four
   trust tiers, an audit log, PII flagging) on Postgres+pgvector with LLM
@@ -392,19 +393,19 @@ ships something ai-memory does not, it is named.
 
 ## Where we're behind, or different by choice
 
-- **No human workstream operations view.** Managed workstreams, run leases,
-  handoffs, and portable event history exist, but `/web` does not turn them
-  into a scannable queue of active, blocked, review-ready, and completed work.
-  claude-mem v14's local “My Work” view is better for a human supervising
-  several requests.
+- **Workstream operations are now visible to operators.** `/web/workstreams`
+  presents trusted lifecycle states for managed workstreams without exposing
+  checkout paths, native session ids, or transcript content. It deliberately
+  does not infer blocked or review-ready states from untrusted prose.
 - **No structured page filters on search.** Scope and `as_of` are typed, but
   `memory_query` cannot narrow by path prefix, kind, tier, tag, or author
   before ranking. Mem0 has directory/category scopes; basic-memory's
   unreleased v0.24 adds a broader structured filter set.
-- **Foreground embedding has no measured reservation from backfill.** The LLM
-  reranker is bounded and fails open, but query embedding and administrative
-  embedding backfill share the configured embedder without a dedicated
-  foreground budget. EverOS v1.4.2 shows the latency value of separating them.
+- **Local foreground embedding is isolated from background writes.** A
+  real-model probe demonstrated CPU contention, so local document inference is
+  limited to one slot and a second slot remains available for query embedding.
+  Hosted providers retain their existing concurrency policy; the LLM reranker
+  remains separately bounded and fail-open.
 - **Marketplace reach is narrower than harness support.** ai-memory now ships
   its own Claude Code and Codex marketplace plugins and `ai-memory setup`
   detects and wires installed agents across Linux, macOS, and Windows. It is

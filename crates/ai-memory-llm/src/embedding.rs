@@ -120,6 +120,14 @@ pub async fn embed_search_query(embedder: &dyn Embedder, query: &str) -> Option<
             model: embedder.model_identity(),
             dim: embedder.dim(),
         }),
+        Err(LlmError::CapacityBusy(_)) => {
+            debug!(
+                provider = embedder.provider(),
+                model = embedder.model(),
+                "embedding capacity busy; degrading search to FTS5 + entity + graph"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(
                 provider = embedder.provider(),

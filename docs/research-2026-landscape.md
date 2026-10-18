@@ -688,7 +688,7 @@ explicitly.
 | **Memori** | No commits since 2026-10-03 and no new release. | No material change. |
 | **memvid** | No commits since 2026-07-14 and no new release. | Remains quiet; its relative benchmark claim is still not independently useful. |
 | **memU** | No feature release. Four Windows path/idempotency fixes landed. | No material change. |
-| **EverOS** | **Released v1.4.2.** Fixes an FD leak, separates query embedding capacity from background writes, batches embeddings, keys indexes by the full scope tuple, self-repairs damaged indexes, and hardens path containment. | The capacity split is worth copying in principle. ai-memory's reranker already fails open behind a shared gate, but query embedding and administrative backfill share the embedder without a foreground reservation. Add a contention benchmark before changing it. |
+| **EverOS** | **Released v1.4.2.** Fixes an FD leak, separates query embedding capacity from background writes, batches embeddings, keys indexes by the full scope tuple, self-repairs damaged indexes, and hardens path containment. | Adopted for the in-process local embedder after measurement: eight background workers raised query p50/p95 from 36/41 ms to 74/76 ms on the reference host; one document slot plus one reserved query slot brought them to 39/51 ms. Hosted providers and the reranker retain their existing policies. |
 | **MemOS** | No commits or release after the prior cutoff. Its current headline remains DeepSeek Harness integration, multimodal memory, memory cubes, asynchronous ingestion, and feedback/correction. | No material change. The memory-OS and multimodal tradeoffs remain different from ai-memory's scope. |
 | **Honcho** | **Released v3.3.0.** Adds an optional Chroma backend, scoped custom instructions, cursor pagination, prompt-budget handling, and performance fixes; stable object `uid` work followed on `main`. | No core work. Its theory-of-mind buyer remains different. Operation-scoped instructions are a useful reference if per-operation LLM profiles are designed. |
 | **Engram** | No new tag after v3.4.0. `main` adds local aliases/routing preview, project provenance, compact search/history clients, capture guards, tombstones, and sync isolation. | No new gap. ai-memory already has stronger repository identity, routing diagnostics, tombstone/supersession semantics, and conflict-aware wiki sync. |
@@ -870,11 +870,12 @@ Each item needs its own design and approval before implementation.
    workstreams when the schema has no such relationship. This borrows
    claude-mem's useful human visibility without turning ai-memory into a kanban
    system or cloud collaboration product.
-2. **P1 - Protect interactive recall from background embedding.** Build a
-   contention benchmark first. If administrative backfill can delay query
-   embedding, give foreground queries reserved capacity or separate gates.
-   Preserve the current fail-open behavior: lexical/entity/graph retrieval
-   must still answer when embedding or reranking is saturated.
+2. **P1 - Protect interactive recall from background embedding. Completed.**
+   The opt-in real-model probe found material local CPU contention, so local
+   inference now admits one document embedding and reserves a second slot for
+   queries. The same probe verifies the improvement; hosted providers remain
+   unchanged, and provider failures still degrade to lexical/entity/graph
+   retrieval.
 3. **P2 - Structured query filters.** Expose the existing pre-rank kind/tier
    filters through `memory_query`, then add bounded path-prefix and exact-tag
    filters. Keep `as_of` as the valid-time control and defer author until null

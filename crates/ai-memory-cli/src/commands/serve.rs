@@ -16,7 +16,7 @@ use ai_memory_hooks::{
     CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
     WorkstreamState, hook_router, workstream_router,
 };
-use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder};
+use ai_memory_llm::{Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
@@ -2916,6 +2916,7 @@ async fn configure_embedder(
         return Ok((wiki, None));
     };
     let provider_name = cfg.provider.name().to_string();
+    let is_local = cfg.provider == ai_memory_llm::EmbedderChoice::Local;
     let model = cfg.model.clone();
     let dim = cfg.dim;
     let defaulted = cfg.defaulted;
@@ -3007,6 +3008,14 @@ async fn configure_embedder(
         "embedder enabled"
     );
     let embedder = provider_health.wrap_embedder(embedder, provider_name, model, dim);
+    let embedder: Arc<dyn Embedder> = if is_local {
+        // all-MiniLM inference parallelizes internally. A single background
+        // document slot plus one reserved query slot avoids CPU oversubscription
+        // while keeping interactive vector retrieval available during writes.
+        Arc::new(EmbeddingCapacity::new(embedder, 2)?)
+    } else {
+        embedder
+    };
     Ok((wiki.with_embedder(embedder.clone()), Some(embedder)))
 }
 

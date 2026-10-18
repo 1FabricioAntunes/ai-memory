@@ -281,7 +281,7 @@ invariants), **ALREADY** (we have it and should say so).
 | Capability seen in the field | Verdict | Why |
 |---|---|---|
 | Human workstream operations view (claude-mem v14 “My Work”) | ADOPT | The managed-workstream ledger already has runs, leases, events, and handoff evidence, but humans cannot scan active/attention/review-ready work in `/web`. Build a read-only derived view; add only a minimal review marker, not a second task system |
-| Foreground query capacity isolated from embedding backfill (EverOS v1.4.2) | MEASURE-FIRST, then ADOPT if contention is real | The reranker already has a shared fail-open gate. Query embedding and administrative backfill share the embedder without a foreground reservation. Add a contention benchmark; preserve lexical/entity/graph results under saturation |
+| Foreground query capacity isolated from embedding backfill (EverOS v1.4.2) | SHIPPED (3.2) for local inference | A real-model probe measured eight-worker query p50/p95 rising from 36/41 ms idle to 74/76 ms. Limiting local document inference to one slot while reserving one query slot reduced loaded latency to 39/51 ms. Hosted providers keep their existing concurrency; provider failures still degrade to lexical/entity/graph retrieval |
 | Structured pre-rank filters (Mem0; basic-memory v0.24 unreleased) | ADOPT | Bounded path-prefix, kind, tier, tag, author, and valid-time filters improve monorepo/tool ergonomics without changing ranking. All paths must reuse `ScopeResolver` and fail closed on incomplete scope |
 | Per-operation LLM provider/model profiles (Graphiti v0.31; Hindsight `main`) | MEASURE-FIRST | Potentially lowers cost and latency for consolidation, rerank, and auto-improvement, but expands config and auth surface. Prototype against the evals before adding public settings |
 | Retrieval recall through capture (several tools rank whole raw sessions) | SHIPPED (3.0) | The 2026-10-12 decomposition showed our zero-LLM session page indexed only 80-character turn titles; the observation stream recovered it (FTS hit@5 0.662 → 0.951, local 0.800 → 0.945, all 470). Chasing another tool's headline number is declined: those numbers measure different things |
@@ -323,8 +323,8 @@ which should be checked before any work is scoped.
 2. **Structured filters before ranking** for path prefix, kind, tier, tag,
    author, and valid time (Mem0; basic-memory v0.24, currently unreleased).
 3. **Foreground embedding isolation backed by a contention benchmark**
-   (EverOS v1.4.2). Reserve query capacity only if the benchmark shows
-   administrative backfill can harm interactive latency.
+   (EverOS v1.4.2) is now shipped for the in-process local model. The manual
+   probe remains in-tree so the capacity can be rechecked on other CPU classes.
 4. **One reproducible end-to-end QA number** beside hit@5, with reader,
    judge, context tokens and latency stated, and more benchmarks than
    LongMemEval (Mem0, Zep, Hindsight and EverOS publish QA numbers; Hindsight's

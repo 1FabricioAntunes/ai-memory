@@ -79,6 +79,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor_agent;
 pub mod embedding;
+pub mod embedding_capacity;
 pub mod error;
 pub mod factory;
 pub mod fallback;
@@ -121,6 +122,7 @@ pub use embedding::{
     Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, QueryVector, SyntheticEmbedder, VoyageEmbedder,
     cosine, embed_search_query,
 };
+pub use embedding_capacity::EmbeddingCapacity;
 pub use error::{LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,

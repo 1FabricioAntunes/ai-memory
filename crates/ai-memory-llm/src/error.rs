@@ -65,6 +65,12 @@ pub enum LlmError {
     #[error("auth: {0}")]
     Auth(String),
 
+    /// Optional local work could not start without waiting behind already
+    /// active work. Callers should use their non-provider fallback instead of
+    /// retrying or reporting the provider unhealthy.
+    #[error("{0} capacity is busy")]
+    CapacityBusy(&'static str),
+
     /// JSON schema for structured output could not be derived.
     #[error("schema: {0}")]
     Schema(String),
@@ -127,6 +133,7 @@ impl LlmError {
             Self::EmptyContent { .. } => "empty-content",
             Self::NotConfigured(_) => "not-configured",
             Self::Auth(_) => "auth",
+            Self::CapacityBusy(_) => "capacity-busy",
             Self::Schema(_) => "schema",
             Self::AllCandidatesFailed { .. } => "all-candidates-failed",
         }
@@ -178,6 +185,7 @@ mod tests {
     #[test]
     fn deterministic_errors_are_not_transient() {
         assert!(!LlmError::Auth("expired".into()).is_transient());
+        assert!(!LlmError::CapacityBusy("embedding").is_transient());
         assert!(!LlmError::Schema("bad".into()).is_transient());
         assert!(!LlmError::Serde("nope".into()).is_transient());
         assert!(!LlmError::UnexpectedShape("no tool block".into()).is_transient());
@@ -274,6 +282,7 @@ mod tests {
             ),
             (LlmError::NotConfigured("no key".into()), "not-configured"),
             (LlmError::Auth("expired".into()), "auth"),
+            (LlmError::CapacityBusy("embedding"), "capacity-busy"),
             (LlmError::Schema("bad".into()), "schema"),
             (
                 LlmError::AllCandidatesFailed {
