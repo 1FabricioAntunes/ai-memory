@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed the OKF export turning a wikilink with an empty or blank label
+  (`[[decisions/b.md|]]`) into a Markdown link with no text. The export now
+  shows the target, as the web view already does.
+  ([#1419](https://github.com/akitaonrails/ai-memory/pull/1419))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
