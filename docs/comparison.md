@@ -412,6 +412,11 @@ ships something ai-memory does not, it is named.
   provider-reported usage for each closed internal workload. It records no
   prompt or output text. Provider/model selection remains global until real
   measurements and quality evaluation justify a larger configuration surface.
+- **Document extraction is optional and text-first.** The standalone importer
+  turns one explicit local text/Markdown, text-layer PDF, DOCX, PPTX, XLSX,
+  VTT, or SRT file into attributed, sanitized markdown with
+  bounded parsing and a conditional write. Unlike hosted multimodal products,
+  it has no connectors, OCR, image understanding, or raw media transcription.
 - **Marketplace reach is narrower than harness support.** ai-memory now ships
   its own Claude Code and Codex marketplace plugins and `ai-memory setup`
   detects and wires installed agents across Linux, macOS, and Windows. It is

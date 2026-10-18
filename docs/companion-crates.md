@@ -142,6 +142,11 @@ Initial source support is intentionally narrow:
   Observations are dropped unless replayed as `external-import` sessions
   through `/hook/batch`; records with no ai-memory counterpart are counted in
   the manifest. Details are in the importer README.
+- one explicitly selected local text/Markdown, text-layer PDF, DOCX, PPTX,
+  XLSX, VTT, or SRT document (`document`, Unix-only). Extraction is bounded and
+  sanitized, pages carry source digest and extractor provenance, and writes
+  use MCP `create_only` so reruns are idempotent and conflicts never overwrite
+  another page. OCR, images, and raw audio/video stay outside the companion.
 
 Future sources can include:
 

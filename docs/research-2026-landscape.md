@@ -854,9 +854,11 @@ retrieval harness and accuracy/latency/context reporting exist. `memory_query`
 now exposes kind, tier, literal path-prefix, and exact-array tag predicates
 before every page-ranking stream, including global, historical, profile, and
 pinned results. Author remains deferred until null root/anonymous attribution
-has explicit semantics. Connectors and document
-extraction, if adopted, stay in the importer companion so untrusted input still
-crosses the sanitizer boundary and the server remains text-first.
+has explicit semantics. Document extraction now stays in the importer
+companion: explicit local text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, and
+VTT/SRT become attributed sanitized markdown through bounded
+conditional writes. The server remains text-first; connectors, OCR, images,
+and raw media remain out of scope.
 
 ### Current plan after the 2026-10-18 pass
 
@@ -889,14 +891,19 @@ Items not marked complete still need their own design and approval.
    not affect the provider wire request. Real measurements still need to show
    a quality/cost benefit before public per-workload provider/model settings or
    a cheap decision tier are added.
-5. **P3 - Optional document importer.** If demand is real, extend the
-   importer companion to extract PDF/Office/media transcripts into attributed,
-   sanitized markdown. Keep opaque files and native multimodal embeddings out
-   of the server core.
-6. **P3 - End-to-end QA evaluation.** Use the shipped answerer/judge path for
-   a deliberate full 470-question run and publish its receipt with accuracy,
-   p50/p95 latency, context tokens, and exact models. Do not build a duplicate
-   path or claim a cross-tool ranking without a shared harness.
+5. **P3 - Optional document importer. Completed.** The companion extracts one
+   explicit local text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, VTT, or SRT
+   file into attributed, sanitized markdown. Source, archive, extracted
+   text, sheet, and cell limits fail closed; deterministic digest paths and
+   conditional MCP writes make reruns idempotent without overwriting a foreign
+   page. Opaque files, OCR, raw media, connectors, and native multimodal
+   embeddings stay out of the server core.
+6. **P3 - End-to-end QA evaluation. Deferred to an authorized paid run.** Use
+   the shipped answerer/judge path for one deliberate full 470-question run and
+   publish its receipt with accuracy, p50/p95 latency, context tokens, and exact
+   models. This is not a release gate and needs explicit provider/budget
+   approval because it makes roughly 940 paid model calls. Do not build a
+   duplicate path or claim a cross-tool ranking without a shared harness.
 
 **Deliberately not recommended:** joining the memory-OS camp (agent
 self-editing its memory is token-expensive, and Letta's own successor now

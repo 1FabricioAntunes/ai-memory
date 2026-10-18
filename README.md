@@ -588,6 +588,9 @@ prompts, tool calls, and session boundaries; session end turns them into
 readable wiki pages; the next session starts with a handoff.
 
 - Ask "where did we leave off?" to continue from the pending handoff.
+- Import a local PDF, DOCX, PPTX, XLSX, Markdown file, or VTT/SRT transcript as
+  attributed, sanitized memory with the optional
+  [`ai-memory-importer`](companions/ai-memory-importer) `document` command.
 - Ask "have we discussed X?" or "search memory for Y" to query the wiki.
 - Narrow a large wiki before ranking with `memory_query` filters such as
   `path_prefix: "procedures/"`, `tag: "rust"`, `kind: "decision"`, or
