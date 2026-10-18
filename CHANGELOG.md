@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `list_projects_with_stats` and `list_workspaces_with_stats` counting
+  TTL-expired pages and including their timestamps in project and workspace
+  aggregates. The queries now apply the `not_expired` guard in their `LEFT JOIN`
+  clauses, aligning home page project cards and `/api/v1` project and workspace
+  summaries with `list_unexpired_pages`. ([#1425](https://github.com/akitaonrails/ai-memory/issues/1425))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
