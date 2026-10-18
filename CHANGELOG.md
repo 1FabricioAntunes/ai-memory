@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Kept Antigravity step output that contains bytes which are not valid UTF-8,
+  such as cp1252 text from a Windows command or binary data. Everything after
+  the first invalid byte was dropped, and output starting with one was recorded
+  as "(no output captured)"; invalid bytes now become U+FFFD.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
