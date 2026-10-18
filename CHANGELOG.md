@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Kept a `title:` or `body:` search filter on its column when the term carries
+  punctuation. `title:ai-memory` was quoted whole into phrases that required
+  the literal word "title" and filtered no column, so it found nothing; it now
+  becomes `title:("ai-memory" OR "ai memory")`.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
