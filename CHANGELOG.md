@@ -130,7 +130,7 @@ version in [`docs/changelog/`](docs/changelog/):
   prompt ingest keys include the prompt's time and text, so a rewind that
   reuses step numbers keeps its new prompts; and the transcript is opened
   with `O_NOFOLLOW | O_NONBLOCK` and, on Linux, checked against the opened
-  descriptor's real path. (#TBD)
+  descriptor's real path. (#1416)
 
 ### Fixed
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
