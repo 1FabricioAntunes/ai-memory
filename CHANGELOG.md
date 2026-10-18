@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Recognized a frontmatter block whose closing `---` fence is the last line of
+  the file with no trailing newline. Such frontmatter-only files (a `_meta.md`
+  scope manifest or a stub page saved by an editor that adds no final newline)
+  were read as body, losing the manifest's workspace name and a page's title,
+  tier, pin and TTL, and letting the OKF file pass write a second block above it.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
