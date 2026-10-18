@@ -4327,7 +4327,13 @@ async fn memory_health_ignores_expired_pages() {
     live_stale.tier = Tier::Episodic;
     store.writer.upsert_page(live_stale).await.unwrap();
 
-    let mut expired_stale = page(ws, proj, "notes/expired_stale.md", "ExpiredStale", "content");
+    let mut expired_stale = page(
+        ws,
+        proj,
+        "notes/expired_stale.md",
+        "ExpiredStale",
+        "content",
+    );
     expired_stale.tier = Tier::Episodic;
     expired_stale.expires_at = Some(past_time);
     store.writer.upsert_page(expired_stale).await.unwrap();
@@ -4342,7 +4348,13 @@ async fn memory_health_ignores_expired_pages() {
 
     // 3. Orphans: live_stale and live_dup have no links.
     // An expired orphan page should not be counted or listed as an orphan.
-    let mut expired_orphan = page(ws, proj, "notes/expired_orphan.md", "ExpiredOrphan", "content");
+    let mut expired_orphan = page(
+        ws,
+        proj,
+        "notes/expired_orphan.md",
+        "ExpiredOrphan",
+        "content",
+    );
     expired_orphan.expires_at = Some(past_time);
     store.writer.upsert_page(expired_orphan).await.unwrap();
 
@@ -4356,28 +4368,55 @@ async fn memory_health_ignores_expired_pages() {
     .unwrap();
 
     // Workspace-level health counts and detail:
-    let (stale, dups, orphans) = store.reader.memory_health_for_workspace(ws, None).await.unwrap();
-    assert_eq!(stale, 1, "only live_stale is counted, expired_stale is ignored");
-    assert_eq!(dups, 0, "SameTitle has only one live page, expired_dup is ignored");
-    assert_eq!(orphans, 2, "only live_stale and live_dup are orphans; expired_orphan is ignored");
+    let (stale, dups, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale, 1,
+        "only live_stale is counted, expired_stale is ignored"
+    );
+    assert_eq!(
+        dups, 0,
+        "SameTitle has only one live page, expired_dup is ignored"
+    );
+    assert_eq!(
+        orphans, 2,
+        "only live_stale and live_dup are orphans; expired_orphan is ignored"
+    );
 
-    let detail = store.reader.health_detail_for_workspace(ws, 10, None).await.unwrap();
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
     assert_eq!(detail.stale.len(), 1);
     assert_eq!(detail.stale[0].path, "notes/live_stale.md");
     assert!(detail.duplicates.is_empty());
     let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
-    assert_eq!(orphan_paths, vec!["notes/live_dup.md", "notes/live_stale.md"]);
+    assert_eq!(
+        orphan_paths,
+        vec!["notes/live_dup.md", "notes/live_stale.md"]
+    );
 
     // Project-level health counts and detail:
-    let (p_stale, p_dups, p_orphans) = store.reader.memory_health_for_project(ws, proj).await.unwrap();
+    let (p_stale, p_dups, p_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
     assert_eq!(p_stale, 1);
     assert_eq!(p_dups, 0);
     assert_eq!(p_orphans, 2);
 
-    let p_detail = store.reader.health_detail_for_project(ws, proj, 10).await.unwrap();
+    let p_detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
     assert_eq!(p_detail.stale.len(), 1);
     assert_eq!(p_detail.stale[0].path, "notes/live_stale.md");
     assert!(p_detail.duplicates.is_empty());
     assert_eq!(p_detail.orphans.len(), 2);
 }
-
