@@ -118,6 +118,7 @@ version in [`docs/changelog/`](docs/changelog/):
   model, or dimension as missing an embedding in `ai-memory status` and the
   web `/health` page, so the count no longer reads zero after an
   embedding-model switch.
+  ([#1431](https://github.com/akitaonrails/ai-memory/pull/1431))
 
 ## [3.1.1] - 2026-10-17
 
