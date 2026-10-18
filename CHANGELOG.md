@@ -12,7 +12,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
-- Fixed `cross_project_degree` counting TTL-expired pages in project briefing degree metrics. The store queries now filter out expired source and target pages against the current timestamp, preventing expired pages from inflating `cross_project_dependents` and `cross_project_dependencies` in project briefings and overview snapshots.
+- Fixed `cross_project_degree` counting TTL-expired pages in project briefing degree metrics. The store queries now filter out expired source and target pages against the current timestamp, preventing expired pages from inflating `cross_project_dependents` and `cross_project_dependencies` in project briefings and overview snapshots. ([#1422](https://github.com/akitaonrails/ai-memory/pull/1422))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
