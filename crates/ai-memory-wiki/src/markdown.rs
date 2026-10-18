@@ -677,7 +677,11 @@ fn resolve_local_wikilink(
         });
     let mut href = relative_href(&page_dir, &target);
     href.push_str(suffix);
-    let display = label.map_or(target_part, str::trim).to_string();
+    let display = label
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or(target_part)
+        .to_string();
     Some((href, display))
 }
 
@@ -1776,6 +1780,22 @@ mod tests {
         assert_eq!(
             rewrite_local_wikilinks("[[decisions/b.md|the decision]]", &path, "proj"),
             "[the decision](../decisions/b.md)"
+        );
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_falls_back_to_target_for_an_empty_label() {
+        // An empty or blank `|label` must not export as `[](…)`, a link with
+        // no text to click. The web view and `delink_wikilinks` already show
+        // the target in that case.
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b.md|]]", &path, "proj"),
+            "[decisions/b.md](../decisions/b.md)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b|  ]]", &path, "proj"),
+            "[decisions/b](../decisions/b.md)"
         );
     }
 
