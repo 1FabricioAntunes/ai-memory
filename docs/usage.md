@@ -72,11 +72,11 @@ project. Root-authorized recovery can pass `any_owner: true` to
 that switch.
 
 Handoffs are next-session transfer, not a live message bus between agents that
-are still running. In particular, Antigravity CLI exposes `PreInvocation`
-before every model call; ai-memory fetches a handoff only on invocation zero,
-which is the hook contract's startup boundary. A handoff created later in that
-conversation stays open instead of being consumed by its creator's next model
-call.
+are still running. In particular, Antigravity fetches a handoff only once per
+conversation: on `SessionStart`, or on builds without it, on the first turn's
+`PreInvocation` with invocation zero. Its later turns and model calls never
+fetch one, so a handoff created later in that conversation stays open instead
+of being consumed by its creator's next model call.
 
 If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_cancel` and the `handoff_id` returned by

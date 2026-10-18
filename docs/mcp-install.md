@@ -919,7 +919,7 @@ The rendered snippet writes to `mcp_config.json` under `mcpServers`:
 Antigravity CLI uses a named-groups hook format. Each top-level key
 is a hook group name; inside, event arrays map to handlers. Tool
 events (`PreToolUse`, `PostToolUse`) use nested shape with matcher;
-lifecycle events (`PreInvocation`, `Stop`) use flat shape.
+lifecycle events (`SessionStart`, `PreInvocation`, `Stop`) use flat shape.
 
 ```bash
 # One-shot via CLI:
@@ -931,10 +931,16 @@ The rendered hooks config looks like:
 ```json
 {
   "ai-memory": {
-    "PreInvocation": [
+    "SessionStart": [
       {
         "type": "command",
         "command": "AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /path/to/session-start.sh"
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /path/to/pre-invocation.sh"
       }
     ],
     "PreToolUse": [
@@ -983,20 +989,25 @@ The rendered hooks config looks like:
   as `CLIXML` hook stderr. Rerun
   `install-hooks --agent antigravity-cli --apply` after upgrading to refresh
   existing entries.
-- The `PreInvocation` event fires before each model call (not just at
-  session start). ai-memory uses it as the closest equivalent to Gemini
-  CLI's `SessionStart`; when a pending handoff exists, the hook injects
-  it via Antigravity's `injectSteps[].ephemeralMessage` output.
-- Antigravity CLI does not expose a true session-end hook. `Stop` records a
-  stop observation only because it marks the end of one execution loop, not
-  the conversation. After the final turn, run
-  `ai-memory finalize-session --agent antigravity-cli` to close the session and,
-  when it contains substantive events, create the final summary and automatic
-  handoff and queue opt-in SessionEnd consolidation. If the conversation
+- `SessionStart` delivers a pending handoff through Antigravity's
+  `injectSteps[].systemMessage` output, which stays in the conversation for
+  later turns. `PreInvocation` fires before each model call; at
+  `invocationNum = 0`, the start of a user turn, the native hook records the
+  turn's prompt from the conversation's transcript, and on builds without
+  `SessionStart` the first turn's `PreInvocation` delivers the handoff
+  instead.
+- Antigravity has no conversation-end hook. A `Stop` that finished the turn
+  with nothing left running writes a turn checkpoint (summary page and one
+  refreshed handoff, conversation left open), which a new session in the
+  project receives once the conversation has been quiet for 10 minutes. Run
+  `ai-memory finalize-session --agent antigravity-cli` to close the session at
+  once and queue opt-in SessionEnd consolidation. If the conversation
   continues after that first finalize, re-close it with
   `ai-memory finalize-session --agent antigravity-cli --reopen --session-id <uuid>`
   so the session-end path re-runs over the new observations (re-running with
-  nothing new is a harmless no-op).
+  nothing new is a harmless no-op). See
+  [`docs/install.md`](install.md#antigravity-lifecycle-hooks) for the
+  transcript read's limits.
 - `memory_handoff_begin` always creates an explicit manual handoff with no
   `from_session_id` and `from_agent = other`; it is project-wide for cwd
   matching but belongs to the creating operator by default. Pass `shared=true`

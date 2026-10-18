@@ -4158,13 +4158,19 @@ async fn process_authorized(
     // Substantive sessions synthesize the summary page and auto-handoff below.
     // OpenCode's service outlives its CLI: a completed root turn publishes a
     // continuation checkpoint without claiming the native session has ended.
-    let turn_checkpoint = env.agent == AgentKind::OpenCode
-        && env.event == HookEvent::Stop
-        && env
-            .raw
-            .get("turn_checkpoint")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
+    // Antigravity has no conversation-end event at all, so a turn its model
+    // finished with nothing left running in the background does the same.
+    let turn_checkpoint = env.event == HookEvent::Stop
+        && match env.agent {
+            AgentKind::OpenCode => {
+                env.raw
+                    .get("turn_checkpoint")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            }
+            AgentKind::AntigravityCli => crate::antigravity::stop_is_turn_checkpoint(&env.raw),
+            _ => false,
+        }
         && !managed
         && !body_is_subagent(&env.raw);
     if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
@@ -4302,10 +4308,10 @@ async fn process_authorized(
         // Other harnesses are not gated: Claude Code also sets `agent_type` on
         // a top-level `--agent` session, which still owns its baton.
         let child_session = env.agent == AgentKind::OpenCode && body_is_subagent(&env.raw);
-        // The opt-out covers both automatic batons: a session's end and an
-        // OpenCode root-turn checkpoint, which is OpenCode's only baton since
-        // a plugin unload no longer ends its sessions. The checkpoint still
-        // refreshes the summary page.
+        // The opt-out covers both automatic batons: a session's end and a
+        // turn checkpoint, which is OpenCode's only baton since a plugin
+        // unload no longer ends its sessions, and Antigravity's since it has
+        // no end event. The checkpoint still refreshes the summary page.
         let should_create_handoff =
             !managed && !child_session && state.create_handoff_on_session_end;
         let handoff = should_create_handoff.then(|| {
@@ -14031,6 +14037,326 @@ pub(crate) mod tests {
             1,
             "claiming one baton must not sweep the baton of a session in use"
         );
+    }
+
+    /// An Antigravity event as its hooks deliver it: `prompt` is the
+    /// native hook's transcript-recovered prompt, `stop` the documented
+    /// `Stop` input of a finished turn.
+    fn antigravity_event(conversation: &str, event: &str, text: &str) -> HookEnvelope {
+        let mut body = serde_json::json!({
+            "conversationId": conversation,
+            "modelName": "gemini-3-pro",
+        });
+        match event {
+            "user-prompt" => body["prompt"] = text.into(),
+            "post-tool-use" => {
+                body["toolCall"] = serde_json::json!({
+                    "name": "run_command",
+                    "args": {"CommandLine": text},
+                });
+                body["stepIdx"] = 3.into();
+            }
+            "stop" => {
+                body["executionNum"] = 0.into();
+                body["terminationReason"] = "NO_TOOL_CALL".into();
+                body["fullyIdle"] = true.into();
+            }
+            _ => {}
+        }
+        HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: event.into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            body,
+        )
+    }
+
+    async fn antigravity_turn(
+        state: &HookState,
+        conversation: &str,
+        text: &str,
+        actor: Option<IdentityKey>,
+    ) {
+        for event in ["user-prompt", "post-tool-use", "stop"] {
+            process(
+                state,
+                antigravity_event(conversation, event, text),
+                actor.clone(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Antigravity has no conversation-end event: a finished, fully idle
+    /// turn refreshes the summary page and the conversation's one baton,
+    /// and leaves the native session open, the OpenCode turn-checkpoint path.
+    #[tokio::test]
+    async fn antigravity_idle_stop_checkpoints_page_and_baton_without_ending_the_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let conversation = "ec33ebf9-0cba-4100-8142-c61503f6c587";
+        process(
+            &state,
+            antigravity_event(conversation, "session-start", ""),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let session = SessionId::from_native(conversation);
+        let mut previous_handoff = None;
+        for text in ["Fix the login redirect", "Add a regression test"] {
+            antigravity_turn(&state, conversation, text, None).await;
+            assert_eq!(session_pages(&state).await.len(), 1);
+            let page = state
+                .reader
+                .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|page| page.path.as_str().starts_with("sessions/"))
+                .unwrap();
+            let body = state
+                .wiki
+                .read_page(state.workspace_id, state.project_id, &page.path)
+                .unwrap()
+                .body;
+            assert!(body.contains(text), "{body}");
+            let handoff = state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .expect("a finished turn publishes a baton");
+            assert_eq!(handoff.origin.from_agent, AgentKind::AntigravityCli);
+            assert_eq!(handoff.origin.from_session_id, Some(session));
+            assert!(
+                handoff.content.summary.contains(text),
+                "{:?}",
+                handoff.content
+            );
+            if let Some(previous) = previous_handoff {
+                assert_eq!(previous, handoff.scope.id, "one baton, refreshed in place");
+            }
+            previous_handoff = Some(handoff.scope.id);
+            assert_eq!(
+                state
+                    .reader
+                    .session_end_disposition(
+                        session,
+                        state.workspace_id,
+                        state.project_id,
+                        AgentKind::AntigravityCli
+                    )
+                    .await
+                    .unwrap(),
+                ai_memory_store::SessionEndDisposition::Open
+            );
+        }
+        let batons = state
+            .reader
+            .list_handoffs(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batons.len(), 1, "one baton row per live conversation");
+
+        // `finalize-session` still closes the same conversation explicitly.
+        process(
+            &state,
+            antigravity_event(conversation, "session-end", ""),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(session)
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_stop_checkpoint_requires_a_finished_idle_root_unmanaged_stop() {
+        for case in [
+            "control",
+            "busy",
+            "cancelled",
+            "errored",
+            "web-spelling",
+            "no-reason",
+            "subagent",
+            "managed",
+            "wrong-agent",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let state = make_state(&tmp).await;
+            let conversation = format!("agy-{case}");
+            for event in ["user-prompt", "post-tool-use"] {
+                process(
+                    &state,
+                    antigravity_event(&conversation, event, "Real work"),
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            }
+            let mut stop = antigravity_event(&conversation, "stop", "");
+            match case {
+                "busy" => stop.raw["fullyIdle"] = false.into(),
+                "cancelled" => stop.raw["terminationReason"] = "USER_CANCELED".into(),
+                "errored" => stop.raw["error"] = "model unavailable".into(),
+                "web-spelling" => stop.raw["terminationReason"] = "model_stop".into(),
+                "no-reason" => {
+                    stop.raw
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("terminationReason");
+                }
+                "subagent" => stop.raw["subagentType"] = "research".into(),
+                "managed" => stop.managed_run = Some(ManagedRunId::new().to_string()),
+                "wrong-agent" => stop.agent = AgentKind::Codex,
+                _ => {}
+            }
+            process(&state, stop, None, Vec::new()).await.unwrap();
+            let checkpointed = matches!(case, "control" | "web-spelling");
+            assert_eq!(
+                !session_pages(&state).await.is_empty(),
+                checkpointed,
+                "{case}"
+            );
+            assert_eq!(open_handoff_exists(&state).await, checkpointed, "{case}");
+        }
+    }
+
+    /// Invariant #16 for Antigravity's turn checkpoints. Conversations
+    /// never end, so every operator's parallel conversations hold live
+    /// batons at once: pages stay shared, each baton stays with its owner,
+    /// one conversation's turn never retires another's baton, a conversation
+    /// still in use keeps its baton, and each baton is claimed exactly once.
+    #[tokio::test]
+    async fn antigravity_parallel_conversations_keep_owned_batons_claimed_once() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = IdentityKey::User("alice".into());
+        let bob = IdentityKey::User("bob".into());
+        let conversations = [
+            ("agy-alice-1", "alice first conversation", &alice),
+            ("agy-alice-2", "alice second conversation", &alice),
+            ("agy-bob-1", "bob conversation", &bob),
+        ];
+        for (conversation, text, owner) in conversations {
+            antigravity_turn(&state, conversation, text, Some(owner.clone())).await;
+        }
+        let open_batons = || async {
+            state
+                .reader
+                .list_handoffs(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                    10,
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.lifecycle.state == ai_memory_core::HandoffState::Open)
+                .collect::<Vec<_>>()
+        };
+        let batons = open_batons().await;
+        assert_eq!(
+            batons.len(),
+            3,
+            "a turn must not retire another conversation's baton"
+        );
+        for (conversation, _, owner) in conversations {
+            let baton = batons
+                .iter()
+                .find(|h| h.origin.from_session_id == Some(SessionId::from_native(conversation)))
+                .unwrap();
+            assert_eq!(
+                baton.origin.owner_user,
+                Some(owner.storage_key()),
+                "{conversation}"
+            );
+        }
+        // Pages are shared: author attribution is never a read filter.
+        assert_eq!(session_pages(&state).await.len(), 3);
+
+        let receiver = || HandoffQuery {
+            profile_contribute: None,
+            profile_consume: None,
+            profile_digest: None,
+            agent: Some("claude-code".into()),
+            session_id: Some(SessionId::new().to_string()),
+            ..Default::default()
+        };
+        // Every conversation captured just now, so none is handed over yet.
+        let busy = fetch_and_accept_handoff_at(
+            &state,
+            receiver(),
+            Some(alice.clone()),
+            Vec::new(),
+            None,
+            jiff::Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            busy.is_none(),
+            "a conversation in use keeps its baton: {busy:?}"
+        );
+
+        let quiet =
+            jiff::Timestamp::now() + LIVE_BATON_QUIET_PERIOD + jiff::SignedDuration::from_secs(1);
+        let claim = |actor: &IdentityKey| {
+            fetch_and_accept_handoff_at(
+                &state,
+                receiver(),
+                Some(actor.clone()),
+                Vec::new(),
+                None,
+                quiet,
+            )
+        };
+        // Alice gets her newest baton; it supersedes her own older quiet one
+        // and never touches Bob's.
+        let alices = claim(&alice).await.unwrap().expect("alice's own baton");
+        assert!(alices.contains("alice second conversation"), "{alices}");
+        assert!(!alices.contains("bob"), "{alices}");
+        assert_eq!(open_batons().await.len(), 1);
+        assert!(
+            claim(&alice).await.unwrap().is_none(),
+            "alice cannot reach bob's baton or reclaim her own"
+        );
+        let bobs = claim(&bob)
+            .await
+            .unwrap()
+            .expect("bob's baton survived alice's claim");
+        assert!(bobs.contains("bob conversation"), "{bobs}");
+        assert!(claim(&bob).await.unwrap().is_none(), "claimed exactly once");
+        assert!(open_batons().await.is_empty());
     }
 
     // Live incident: a `.ai-memory.toml` naming a workspace appeared under
