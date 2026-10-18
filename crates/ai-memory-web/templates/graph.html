@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}{% if is_project %}{{ workspace }}/{{ project }} graph — ai-memory{% else %}Link graph — ai-memory{% endif %}{% endblock %}
+{% block nav_graph_current %}aria-current="page"{% endblock %}
 
 {% block header_search %}
 {% if is_project %}
