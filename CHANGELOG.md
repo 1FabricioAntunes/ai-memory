@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Kept the FTS5 prefix operator on search terms that carry punctuation. A
+  search such as `ai-mem*` or `ui-ref*` was quoted with the `*` inside the
+  phrase, where FTS5 reads it as a separator, so it became an exact search and
+  matched nothing; the `*` now follows each quoted phrase.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing

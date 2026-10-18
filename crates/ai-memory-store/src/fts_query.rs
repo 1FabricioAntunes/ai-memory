@@ -269,15 +269,24 @@ fn quote_fts5_token(token: &str) -> String {
     // punctuation that would otherwise be FTS5 query grammar — the original
     // `current.md` → `syntax error` bug.) With no punctuation the two coincide
     // and we emit a single phrase.
+    //
+    // A trailing `*` is the FTS5 prefix operator. Inside a quoted string it is
+    // only a separator, so it moves outside each closing quote instead:
+    // `ai-mem*` becomes `("ai-mem"* OR "ai mem"*)`, which FTS5 reads as a
+    // prefix match on the phrase's last token.
+    let (token, prefix) = match token.strip_suffix('*') {
+        Some(core) if core.chars().any(char::is_alphanumeric) => (core, "*"),
+        _ => (token, ""),
+    };
     let split = token
         .chars()
         .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
         .collect::<String>();
     let split = split.split_whitespace().collect::<Vec<_>>().join(" ");
     if split.is_empty() || split == token {
-        format!("\"{token}\"")
+        format!("\"{token}\"{prefix}")
     } else {
-        format!("(\"{token}\" OR \"{split}\")")
+        format!("(\"{token}\"{prefix} OR \"{split}\"{prefix})")
     }
 }
 
@@ -435,6 +444,28 @@ mod tests {
     #[test]
     fn prefix_star_token_stays_bare() {
         assert_eq!(prepare_fts5_query("curr*"), "curr*");
+    }
+
+    /// A punctuated token is quoted, and inside an FTS5 string `*` is only a
+    /// separator. The prefix operator has to follow each closing quote, or
+    /// `ai-mem*` silently becomes an exact search for `ai-mem`.
+    #[test]
+    fn prefix_star_survives_quoting_of_punctuated_tokens() {
+        assert_eq!(prepare_fts5_query("ai-mem*"), r#"("ai-mem"* OR "ai mem"*)"#);
+        assert_eq!(
+            prepare_fts5_query("current.m*"),
+            r#"("current.m"* OR "current m"*)"#
+        );
+        // Unknown column syntax is split, and the prefix stays on its term.
+        assert_eq!(prepare_fts5_query("pick:hand*"), r#""pick" OR "hand"*"#);
+        // A token of punctuation alone has no term to prefix-match.
+        assert_eq!(quote_fts5_token("-*"), r#""-*""#);
+        for raw in ["ai-mem*", "current.m*", "pick:hand*", "a-* b", "-*", "x.*"] {
+            let prepared = prepare_fts5_query(raw);
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
     }
 
     #[test]
