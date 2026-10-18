@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Stopped the managed-session event search from deleting `title:`, `body:`
+  and `content:` from inside words. A query such as `subtitle:rendering` was
+  searched as `subrendering`, and `somebody: help` lost `somebody`; only a
+  prefix at the start of a word is now treated as a column filter.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
