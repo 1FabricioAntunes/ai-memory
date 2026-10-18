@@ -8535,17 +8535,21 @@ impl ReaderPool {
                 readable_repository_predicate("p.project_id", viewer),
             );
 
+            let ttl = not_expired("pages", "?");
+            let ttl_p = not_expired("p", "?");
+
             let stale: i64 = conn
                 .query_row(
                     &format!(
                         "SELECT COUNT(*) FROM pages \
                          WHERE workspace_id = ? AND is_latest = 1 \
-                           AND tier = 'episodic' AND updated_at < ?{clause}"
+                           AND tier = 'episodic' AND updated_at < ?{clause}{ttl}"
                     ),
                     params_from_iter(
                         [ws(), Value::Integer(cutoff_30d)]
                             .into_iter()
-                            .chain(proj.clone()),
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us))),
                     ),
                     |row| row.get(0),
                 )
@@ -8557,11 +8561,15 @@ impl ReaderPool {
                     &format!(
                         "SELECT COALESCE(SUM(c - 1), 0) FROM ( \
                             SELECT COUNT(*) c FROM pages \
-                            WHERE workspace_id = ? AND is_latest = 1{clause} \
+                            WHERE workspace_id = ? AND is_latest = 1{clause}{ttl} \
                             GROUP BY title HAVING c > 1 \
                          )"
                     ),
-                    params_from_iter(std::iter::once(ws()).chain(proj.clone())),
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us))),
+                    ),
                     |row| row.get(0),
                 )
                 .optional()?
@@ -8571,11 +8579,15 @@ impl ReaderPool {
                 .query_row(
                     &format!(
                         "SELECT COUNT(*) FROM pages p \
-                         WHERE p.workspace_id = ? AND p.is_latest = 1{clause_p} \
+                         WHERE p.workspace_id = ? AND p.is_latest = 1{clause_p}{ttl_p} \
                            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id) \
                            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)"
                     ),
-                    params_from_iter(std::iter::once(ws()).chain(proj.clone())),
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us))),
+                    ),
                     |row| row.get(0),
                 )
                 .optional()?
@@ -8667,10 +8679,13 @@ impl ReaderPool {
                    JOIN workspaces w ON w.id = pg.workspace_id "
             );
 
-            // Params follow placeholder order: ws, cutoff, [proj], limit.
+            let ttl_pg = not_expired("pg", "?");
+            let ttl_inner = not_expired("pages", "?");
+
+            // Params follow placeholder order: ws, cutoff, [proj], now_us, limit.
             let stale_sql = format!(
                 "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1 \
-                   AND pg.tier = 'episodic' AND pg.updated_at < ?{clause} \
+                   AND pg.tier = 'episodic' AND pg.updated_at < ?{clause}{ttl_pg} \
                  ORDER BY pg.updated_at ASC LIMIT ?"
             );
             let mut stale_stmt = conn.prepare(&stale_sql)?;
@@ -8680,18 +8695,19 @@ impl ReaderPool {
                         [ws(), Value::Integer(cutoff_30d)]
                             .into_iter()
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(limit))),
                     ),
                     health_page_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Params: ws, [proj], ws(inner), [proj(inner)], limit.
+            // Params: ws, [proj], now_us, ws(inner), [proj(inner)], now_us(inner), limit.
             let dup_sql = format!(
-                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause}{ttl_pg} \
                    AND pg.title IN ( \
                        SELECT title FROM pages \
-                       WHERE workspace_id = ? AND is_latest = 1{inner_clause} \
+                       WHERE workspace_id = ? AND is_latest = 1{inner_clause}{ttl_inner} \
                        GROUP BY title HAVING COUNT(*) > 1 \
                    ) \
                  ORDER BY pg.title, p.name LIMIT ?"
@@ -8702,17 +8718,19 @@ impl ReaderPool {
                     params_from_iter(
                         std::iter::once(ws())
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(ws()))
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(limit))),
                     ),
                     health_page_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Params: ws, [proj], limit.
+            // Params: ws, [proj], now_us, limit.
             let orphan_sql = format!(
-                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause}{ttl_pg} \
                    AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = pg.id) \
                    AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = pg.id) \
                  ORDER BY pg.updated_at DESC LIMIT ?"
@@ -8723,6 +8741,7 @@ impl ReaderPool {
                     params_from_iter(
                         std::iter::once(ws())
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(limit))),
                     ),
                     health_page_from_row,
