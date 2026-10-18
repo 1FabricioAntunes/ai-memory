@@ -846,7 +846,8 @@ beside every vector and stale models excluded.
 **R7: Progressive-disclosure brief tiers - shipped.** The session brief now
 starts with bounded extracts for all standing pages, then spends the remaining
 budget on pinned and slot content. It runs without an LLM or migration. The
-remaining retrieval gap is a path-prefix filter, now part of P2 below.
+remaining retrieval gap was a path-prefix filter, now shipped with the other
+structured MCP filters described below.
 
 **R8: Queryable metadata/tag filters + a published eval triple - partly
 open.** The retrieval harness and accuracy/latency/context reporting exist.
@@ -876,11 +877,13 @@ Each item needs its own design and approval before implementation.
    queries. The same probe verifies the improvement; hosted providers remain
    unchanged, and provider failures still degrade to lexical/entity/graph
    retrieval.
-3. **P2 - Structured query filters.** Expose the existing pre-rank kind/tier
-   filters through `memory_query`, then add bounded path-prefix and exact-tag
-   filters. Keep `as_of` as the valid-time control and defer author until null
-   root/anonymous attribution has explicit semantics. Reuse `ScopeResolver`;
-   partial or missing scopes continue to fail closed.
+3. **P2 - Structured query filters. Completed.** `memory_query` now exposes
+   the existing pre-rank kind/tier filters plus bounded literal path-prefix and
+   exact-array tag filters. The same predicate covers normal hybrid streams,
+   global FTS, `as_of`, profile results, and pinned prepends; filtered misses
+   omit metadata-less raw observations. `as_of` remains the valid-time control,
+   and author remains deferred until null root/anonymous attribution has
+   explicit semantics.
 4. **P2 - Per-operation LLM profiles, measure first.** Prototype separate
    provider/model choices for consolidation, reranking, and auto-improvement,
    plus a cheap structured decision tier. Measure cost, latency, call count,

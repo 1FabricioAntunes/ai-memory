@@ -872,7 +872,7 @@ pub struct VectorQuery<'a> {
     pub dim: u32,
 }
 
-/// Narrows a search to pages of one kind and/or tier.
+/// Narrows a search to pages with the requested metadata and path prefix.
 ///
 /// Every stream applies it in its own SQL, so each returns only pages the
 /// filter keeps and a rare kind cannot be crowded out by other kinds. Entity
@@ -885,9 +885,23 @@ pub struct PageFilter<'a> {
     pub kind: Option<&'a str>,
     /// Memory tier to keep; `None` keeps every tier.
     pub tier: Option<&'a str>,
+    /// Literal path prefix to keep; `None` keeps every path.
+    pub path_prefix: Option<&'a str>,
+    /// Exact frontmatter tag to keep, compared ASCII case-insensitively.
+    /// Only string members of a `tags` array match.
+    pub tag: Option<&'a str>,
 }
 
 impl PageFilter<'_> {
+    /// Whether this filter narrows the candidate set.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.kind.is_some()
+            || self.tier.is_some()
+            || self.path_prefix.is_some()
+            || self.tag.is_some()
+    }
+
     /// An ` AND …` predicate over the pages row `alias`, taking each bound
     /// value's placeholder from `placeholder`, and those values in order.
     fn sql(&self, alias: &str, mut placeholder: impl FnMut() -> String) -> (String, Vec<Value>) {
@@ -907,6 +921,29 @@ impl PageFilter<'_> {
         if let Some(tier) = self.tier {
             clause.push_str(&format!(" AND {alias}.tier = {}", placeholder()));
             values.push(Value::Text(tier.to_owned()));
+        }
+        if let Some(path_prefix) = self.path_prefix {
+            let like_placeholder = placeholder();
+            let length_placeholder = placeholder();
+            let exact_placeholder = placeholder();
+            clause.push_str(&format!(
+                " AND {alias}.path LIKE {like_placeholder} ESCAPE '\\' \
+                 AND substr({alias}.path, 1, length({length_placeholder})) = \
+                     {exact_placeholder} COLLATE BINARY"
+            ));
+            values.push(Value::Text(format!("{}%", like_escape(path_prefix))));
+            values.push(Value::Text(path_prefix.to_owned()));
+            values.push(Value::Text(path_prefix.to_owned()));
+        }
+        if let Some(tag) = self.tag {
+            clause.push_str(&format!(
+                " AND json_type({alias}.frontmatter_json, '$.tags') = 'array' \
+                 AND EXISTS (SELECT 1 FROM json_each({alias}.frontmatter_json, '$.tags') AS filter_tag \
+                 WHERE filter_tag.type = 'text' \
+                   AND filter_tag.value = {} COLLATE NOCASE)",
+                placeholder()
+            ));
+            values.push(Value::Text(tag.to_owned()));
         }
         (clause, values)
     }
@@ -945,7 +982,8 @@ pub struct HybridSearch<'a> {
     /// Who is asking, as the session timeline sees them: an observation
     /// excerpt is attached only from a session this filter admits.
     pub owner: &'a OwnerFilter,
-    /// Keep only pages of this kind and/or tier; the default keeps all.
+    /// Keep only pages matching these metadata/path constraints; the default
+    /// keeps all pages.
     pub filter: PageFilter<'a>,
 }
 
@@ -2774,8 +2812,8 @@ impl ReaderPool {
     ///
     /// `viewer` restricts the hits to repositories that user may read — see
     /// [`readable_repository_filter`]. `None` searches every repository.
-    /// `filter` keeps only pages of a kind and/or tier, before the cut to
-    /// `limit`.
+    /// `filter` keeps only pages matching its metadata/path constraints,
+    /// before the cut to `limit`.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -3022,13 +3060,16 @@ impl ReaderPool {
         query: String,
         candidate_limit: usize,
         as_of_us: i64,
+        filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
+        let (kept, kept_params) = filter.sql("pages", numbered_placeholders(7));
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+            let limit_placeholder = 7 + kept_params.len();
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
                         snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
@@ -3040,46 +3081,45 @@ impl ReaderPool {
                    AND pages.workspace_id = ?2 \
                    AND pages.project_id = ?3 \
                    AND pages.valid_from <= ?4 \
-                   AND (pages.valid_to IS NULL OR pages.valid_to > ?5){not_expired} \
+                   AND (pages.valid_to IS NULL OR pages.valid_to > ?5){not_expired}{kept} \
                  ORDER BY pages_fts.rank \
-                 LIMIT ?7",
+                 LIMIT ?{limit_placeholder}",
                 not_expired = not_expired("pages", "?6"),
             );
             let mut stmt = conn.prepare(&sql)?;
+            let mut sql_params = vec![
+                Value::Text(fts_query),
+                Value::Blob(workspace_id.as_bytes().to_vec()),
+                Value::Blob(project_id.as_bytes().to_vec()),
+                Value::Integer(as_of_us),
+                Value::Integer(as_of_us),
+                Value::Integer(as_of_us),
+            ];
+            sql_params.extend(kept_params);
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![
-                    fts_query,
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    as_of_us,
-                    as_of_us,
-                    as_of_us,
-                    candidate_limit as i64
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let path: String = row.get(1)?;
-                    let title: String = row.get(2)?;
-                    let snippet: String = row.get(3)?;
-                    let rank: f64 = row.get(4)?;
-                    let tier: String = row.get(5)?;
-                    let pinned = row.get::<_, i64>(6)? != 0;
-                    let frontmatter_json: String = row.get(7)?;
-                    let kind: String = row.get(8)?;
-                    Ok((
-                        id_bytes,
-                        path,
-                        title,
-                        snippet,
-                        rank,
-                        tier,
-                        pinned,
-                        frontmatter_json,
-                        kind,
-                    ))
-                },
-            )?;
+            sql_params.push(Value::Integer(candidate_limit as i64));
+            let rows = stmt.query_map(params_from_iter(sql_params), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: String = row.get(3)?;
+                let rank: f64 = row.get(4)?;
+                let tier: String = row.get(5)?;
+                let pinned = row.get::<_, i64>(6)? != 0;
+                let frontmatter_json: String = row.get(7)?;
+                let kind: String = row.get(8)?;
+                Ok((
+                    id_bytes,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    tier,
+                    pinned,
+                    frontmatter_json,
+                    kind,
+                ))
+            })?;
 
             let mut candidates = Vec::new();
             for row in rows {
@@ -3130,12 +3170,37 @@ impl ReaderPool {
         as_of_us: i64,
         explain: bool,
     ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
+        self.search_pages_for_project_at_filtered(
+            workspace_id,
+            project_id,
+            query,
+            limit,
+            as_of_us,
+            explain,
+            PageFilter::default(),
+        )
+        .await
+    }
+
+    /// [`Self::search_pages_for_project_at`] returning only pages `filter`
+    /// keeps. Every historical stream applies the filter before ranking.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_pages_for_project_at_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        limit: usize,
+        as_of_us: i64,
+        explain: bool,
+        filter: PageFilter<'_>,
+    ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let candidate_limit = authority_candidate_limit(limit);
         let entity_hits = self
-            .entity_hits_for_project_at(
+            .entity_hits_filtered(
                 workspace_id,
                 project_id,
                 &query,
@@ -3145,6 +3210,7 @@ impl ReaderPool {
                 // The as_of branch resolves versions by ingestion window, so
                 // this flag is inert; false keeps the audit path unchanged.
                 false,
+                filter,
             )
             .await?;
         let fts_candidates = self
@@ -3154,6 +3220,7 @@ impl ReaderPool {
                 query,
                 candidate_limit,
                 as_of_us,
+                filter,
             )
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
@@ -3407,6 +3474,11 @@ impl ReaderPool {
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
+        // The ranked observation window must contain only sessions whose
+        // latest page survives the page filter. Otherwise a common excluded
+        // kind or tag can crowd a rare eligible session out before mapping.
+        let (candidate_kept, candidate_kept_params) =
+            filter.sql("candidate_page", numbered_placeholders(8));
         // The session pages' lookup takes anonymous `?`s after its IN list.
         let (kept, kept_params) = filter.sql("pages", anonymous_placeholder);
         let row_limit = candidate_limit
@@ -3436,6 +3508,12 @@ impl ReaderPool {
                 // CROSS JOIN pins the FTS table as the outer loop: left to
                 // itself the planner drives from the observations scope index
                 // and re-enters FTS once per row, which is far slower.
+                let candidate_path =
+                    "'sessions/' || substr(lower(hex(observations.session_id)), 1, 8) || '-' || \
+                     substr(lower(hex(observations.session_id)), 9, 4) || '-' || \
+                     substr(lower(hex(observations.session_id)), 13, 4) || '-' || \
+                     substr(lower(hex(observations.session_id)), 17, 4) || '-' || \
+                     substr(lower(hex(observations.session_id)), 21, 12) || '.md'";
                 let mut stmt = tx.prepare(&format!(
                     "SELECT observations.id, observations.session_id, \
                             snippet(observations_fts, 1, '<mark>', '</mark>', '…', \
@@ -3447,27 +3525,36 @@ impl ReaderPool {
                        AND observations_fts.rowid <= ?6 \
                        AND observations.workspace_id = ?2 \
                        AND observations.project_id = ?3 \
+                       AND EXISTS ( \
+                         SELECT 1 FROM pages AS candidate_page \
+                         WHERE candidate_page.workspace_id = observations.workspace_id \
+                           AND candidate_page.project_id = observations.project_id \
+                           AND candidate_page.is_latest = 1 \
+                           AND candidate_page.path = {candidate_path} \
+                           {candidate_not_expired}{candidate_kept} \
+                       ) \
                      ORDER BY observations_fts.rank \
                      LIMIT ?4",
+                    candidate_not_expired = not_expired("candidate_page", "?7"),
                 ))?;
                 #[allow(clippy::cast_possible_wrap)]
-                let rows = stmt.query_map(
-                    params![
-                        fts_query,
-                        workspace_id.as_bytes(),
-                        project_id.as_bytes(),
-                        row_limit as i64,
-                        first_rowid,
-                        last_rowid,
-                    ],
-                    |row| {
+                let mut candidate_params = vec![
+                    Value::Text(fts_query),
+                    Value::Blob(workspace_id.as_bytes().to_vec()),
+                    Value::Blob(project_id.as_bytes().to_vec()),
+                    Value::Integer(row_limit as i64),
+                    Value::Integer(first_rowid),
+                    Value::Integer(last_rowid),
+                    Value::Integer(cutoff),
+                ];
+                candidate_params.extend(candidate_kept_params);
+                let rows = stmt.query_map(params_from_iter(candidate_params.iter()), |row| {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
                             row.get::<_, String>(2)?,
                         ))
-                    },
-                )?;
+                    })?;
                 let mut index: std::collections::HashMap<SessionId, usize> =
                     std::collections::HashMap::new();
                 for row in rows {
@@ -3629,7 +3716,20 @@ impl ReaderPool {
         project_id: ProjectId,
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
+        self.list_pinned_pages_filtered(workspace_id, project_id, limit, PageFilter::default())
+            .await
+    }
+
+    /// [`Self::list_pinned_pages`] returning only pages `filter` keeps.
+    pub async fn list_pinned_pages_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+        filter: PageFilter<'_>,
+    ) -> StoreResult<Vec<PageHit>> {
         let limit = limit.clamp(1, 100);
+        let (kept, kept_params) = filter.sql("pages", numbered_placeholders(5));
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT id, path, title, \
@@ -3637,30 +3737,29 @@ impl ReaderPool {
                         CAST(updated_at AS REAL) AS rank \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND is_latest = 1 AND pinned = 1{not_expired} \
+                   AND is_latest = 1 AND pinned = 1{not_expired}{kept} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
                 descriptor = page_descriptor_expr("body", "frontmatter_json"),
                 not_expired = not_expired("pages", "?4"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
+            let mut sql_params = vec![
+                Value::Blob(workspace_id.as_bytes().to_vec()),
+                Value::Blob(project_id.as_bytes().to_vec()),
+                Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+                Value::Integer(now_us()),
+            ];
+            sql_params.extend(kept_params);
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![
-                    workspace_id.as_bytes(),
-                    project_id.as_bytes(),
-                    limit as i64,
-                    now_us()
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let path: String = row.get(1)?;
-                    let title: String = row.get(2)?;
-                    let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
-                    let rank: f64 = row.get(4)?;
-                    Ok((id_bytes, path, title, snippet, rank))
-                },
-            )?;
+            let rows = stmt.query_map(params_from_iter(sql_params), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                let rank: f64 = row.get(4)?;
+                Ok((id_bytes, path, title, snippet, rank))
+            })?;
             let mut hits = Vec::new();
             for row in rows {
                 let (id_bytes, path, title, snippet, rank) = row?;

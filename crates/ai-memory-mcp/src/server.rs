@@ -218,7 +218,10 @@ again, and say which you applied.\n\
   `superseded: true`. Pass `pin_first=true` to prepend the project's \
   bounded pinned latest pages ahead of the search hits (deduped, each \
   marked `pinned: true`) when standing operator-curated context should be \
-  seen before the ranked matches. Pass `answer=true` (opt-in, off by \
+  seen before the ranked matches. Use `kind`, `tier`, literal `path_prefix`, \
+  and exact `tag` to narrow page candidates before ranking; filtered misses \
+  intentionally omit raw observations because they have no page metadata. \
+  Pass `answer=true` (opt-in, off by \
   default, and only when the server has an LLM provider) to also synthesize \
   a cited natural-language answer over the top hits, attached as \
   `answer: { text, citations }`; with no provider it returns the hits plus \
@@ -608,6 +611,8 @@ pub struct AiMemoryServer {
 }
 
 const MAX_QUERY_SCOPES: usize = 25;
+const MAX_QUERY_PATH_PREFIX_LEN: usize = 1_024;
+const MAX_QUERY_TAG_LEN: usize = 128;
 
 /// Upper bound on how many pinned latest pages `memory_query(pin_first=true)`
 /// prepends, so standing context never crowds out the search result entirely.
@@ -629,6 +634,22 @@ struct QueryArgs {
     /// Maximum number of hits to return (default 10, max 100).
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
+    /// Keep only pages of this semantic kind (ASCII case-insensitive).
+    /// Custom kinds are accepted. Applied before ranking.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Keep only pages in this memory tier: `working`, `episodic`,
+    /// `semantic`, or `procedural`. Applied before ranking.
+    #[serde(default)]
+    tier: Option<String>,
+    /// Keep only pages whose project-relative path starts with this literal
+    /// prefix. `%`, `_`, and backslash have no wildcard meaning.
+    #[serde(default)]
+    path_prefix: Option<String>,
+    /// Keep only pages whose frontmatter `tags` array contains this exact
+    /// string (ASCII case-insensitive). Applied before ranking.
+    #[serde(default)]
+    tag: Option<String>,
     /// Project to search. Session-aware clients may omit it for the current
     /// project. Static MCP clients must pass it together with `workspace` for
     /// every project-scoped call. Omit it for `global=true`.
@@ -814,6 +835,61 @@ struct ProjectSearchOptions<'a> {
     /// The caller's session-timeline owner filter: observation excerpts come
     /// only from sessions it admits.
     owner: &'a ai_memory_core::OwnerFilter,
+    filter: ai_memory_store::PageFilter<'a>,
+}
+
+fn bounded_query_filter<'a>(
+    name: &str,
+    value: Option<&'a str>,
+    max_len: usize,
+) -> Result<Option<&'a str>, McpError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().take(max_len + 1).count() > max_len || value.chars().any(char::is_control) {
+        return Err(McpError::invalid_params(
+            format!(
+                "{name} must be at most {max_len} characters and contain no control characters"
+            ),
+            None,
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn query_page_filter(args: &QueryArgs) -> Result<ai_memory_store::PageFilter<'_>, McpError> {
+    let kind = bounded_query_filter(
+        "kind",
+        args.kind.as_deref(),
+        ai_memory_core::page::MAX_PAGE_KIND_LEN,
+    )?;
+    let path_prefix = bounded_query_filter(
+        "path_prefix",
+        args.path_prefix.as_deref(),
+        MAX_QUERY_PATH_PREFIX_LEN,
+    )?;
+    let tag = bounded_query_filter("tag", args.tag.as_deref(), MAX_QUERY_TAG_LEN)?;
+    let tier = match bounded_query_filter("tier", args.tier.as_deref(), 16)? {
+        Some(value) => Some(
+            ai_memory_core::Tier::ALL
+                .iter()
+                .find(|tier| tier.as_str().eq_ignore_ascii_case(value))
+                .map(ai_memory_core::Tier::as_str)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "tier must be working, episodic, semantic or procedural",
+                        None,
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    Ok(ai_memory_store::PageFilter {
+        kind,
+        tier,
+        path_prefix,
+        tag,
+    })
 }
 
 /// Borrow an embedded query as the store's vector-stream input.
@@ -2506,7 +2582,7 @@ impl AiMemoryServer {
                     include_superseded: options.include_superseded,
                     explain: options.explain,
                     owner: options.owner,
-                    filter: ai_memory_store::PageFilter::default(),
+                    filter: options.filter,
                 },
             )
             .await
@@ -2699,8 +2775,12 @@ impl AiMemoryServer {
         `timings` in milliseconds. \
         Cross-project `global=true` search is FTS-only and therefore reports \
         `streams_active` without per-hit RRF details. \
+        Optional `kind`, `tier`, literal `path_prefix`, and exact `tag` \
+        filters narrow page candidates before ranking in every search mode. \
         If compiled wiki search misses in default/project/`scopes` mode, \
         `raw_hits` contains bounded raw observation fallback matches; \
+        filtered searches omit this fallback because observations do not carry \
+        page metadata. \
         `global=true` searches compiled wiki pages only and returns no raw \
         fallback. Single-project calls (project implicit or named with \
         `workspace`+`project`) also return \
@@ -2724,6 +2804,8 @@ impl AiMemoryServer {
         let include_expired = args.include_expired.unwrap_or(false);
         let include_superseded = args.include_superseded.unwrap_or(false);
         let explain = args.explain.unwrap_or(false);
+        let filter = query_page_filter(&args)?;
+        let filtered = filter.is_active();
         // A repo that opted into `[recall] default_global` (published on the
         // ActiveProject by the hook) makes a query with NO explicit scoping
         // behave as `global=true`. Precedence is strict: an explicit
@@ -2758,7 +2840,7 @@ impl AiMemoryServer {
                     limit,
                     include_expired.then_some(i64::MIN),
                     Self::viewer_from_parts(Some(&parts)),
-                    ai_memory_store::PageFilter::default(),
+                    filter,
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2821,13 +2903,14 @@ impl AiMemoryServer {
                 .await?;
             let fused = self
                 .reader
-                .search_pages_for_project_at(
+                .search_pages_for_project_at_filtered(
                     ws,
                     proj,
                     args.query.clone(),
                     limit,
                     instant.as_microsecond(),
                     explain,
+                    filter,
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2880,6 +2963,7 @@ impl AiMemoryServer {
             explain,
             include_superseded,
             owner: &owner_filter,
+            filter,
         };
         let hits = if let Some(scopes) = &resolved_scopes {
             self.search_scopes(scopes, options).await
@@ -2914,7 +2998,7 @@ impl AiMemoryServer {
         // for explicit `scopes` — the recommended scope-bleed mitigation —
         // by searching observations in each resolved (ws, proj) and
         // rank-merging, so the fallback isn't lost on the scoped path.
-        let raw_hits = if !hits.is_empty() {
+        let raw_hits = if !hits.is_empty() || filtered {
             Vec::new()
         } else if let Some(scopes) = &resolved_scopes {
             let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
@@ -2999,6 +3083,7 @@ impl AiMemoryServer {
                                     explain,
                                     include_superseded,
                                     owner: &owner_filter,
+                                    filter,
                                 },
                             )
                             .await
@@ -3069,6 +3154,7 @@ impl AiMemoryServer {
                                     explain,
                                     include_superseded,
                                     owner: &owner_filter,
+                                    filter,
                                 },
                             )
                             .await
@@ -3115,7 +3201,7 @@ impl AiMemoryServer {
                 .await?;
             let pins = self
                 .reader
-                .list_pinned_pages(ws, proj, limit.min(PIN_FIRST_MAX))
+                .list_pinned_pages_filtered(ws, proj, limit.min(PIN_FIRST_MAX), filter)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             if pins.is_empty() {
@@ -8168,6 +8254,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "Karpathy".into(),
                         limit: Some(10),
                         project: None,
@@ -8212,6 +8302,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "Karpathy".into(),
                         limit: Some(10),
                         project: None,
@@ -9320,7 +9414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompts_and_tool_schema_document_query_explain_mode() {
+    async fn prompts_and_tool_schema_document_query_options() {
         assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("explain=true") || prompt.contains("explain: true"),
@@ -9350,6 +9444,16 @@ mod tests {
             .and_then(serde_json::Value::as_object)
             .expect("memory_query schema must expose properties");
         assert!(properties.contains_key("explain"));
+        for field in ["kind", "tier", "path_prefix", "tag"] {
+            assert!(
+                properties.contains_key(field),
+                "memory_query schema must expose {field}: {properties:?}"
+            );
+        }
+        assert!(
+            description.contains("path_prefix") && description.contains("before ranking"),
+            "tool description must explain structured pre-rank filters: {description}"
+        );
     }
 
     #[test]
@@ -10487,6 +10591,10 @@ mod tests {
         store.writer.upsert_page(v1).await.unwrap();
 
         let args = |as_of: Option<String>, global: Option<bool>| QueryArgs {
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
             query: "postgres".into(),
             limit: Some(5),
             project: Some("scratch".into()),
@@ -10529,6 +10637,10 @@ mod tests {
         let fts_now = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "migrated".into(),
                     limit: Some(5),
                     project: Some("scratch".into()),
@@ -10602,6 +10714,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -10632,6 +10748,10 @@ mod tests {
         let explained = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -10720,6 +10840,10 @@ mod tests {
                 server
                     .memory_query(
                         Parameters(QueryArgs {
+                            kind: None,
+                            tier: None,
+                            path_prefix: None,
+                            tag: None,
                             query: "karpathy".into(),
                             limit: Some(5),
                             project: None,
@@ -10820,6 +10944,10 @@ mod tests {
             let result = server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: q.into(),
                         limit: Some(10),
                         project: None,
@@ -10911,6 +11039,10 @@ mod tests {
             .unwrap();
 
         let query = |workspace: Option<&str>, project: Option<&str>| QueryArgs {
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
             query: "karpathy".into(),
             limit: Some(5),
             project: project.map(str::to_string),
@@ -11067,6 +11199,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "sharedterm".into(),
                     limit: Some(10),
                     project: Some("scratch".into()),
@@ -11107,6 +11243,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -11245,6 +11385,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "quokka".into(),
                     limit: Some(5),
                     project: None,
@@ -11276,6 +11420,355 @@ mod tests {
             "expected raw fallback; got {text}"
         );
         assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+
+        let mut filtered_args = query_in("scratch", "quokka");
+        filtered_args.tag = Some("animals".into());
+        let filtered = server
+            .memory_query(
+                Parameters(filtered_args),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let filtered = tool_json(&filtered);
+        assert!(filtered["hits"].as_array().unwrap().is_empty());
+        assert!(
+            filtered.get("raw_hits").is_none(),
+            "observations do not carry page tags and must not bypass a filter: {filtered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_filters_apply_before_every_result_source() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        for (path, kind, tier, tags, pinned) in [
+            (
+                "notes/percent%_literal.md",
+                "decision",
+                Tier::Procedural,
+                serde_json::json!(["Storage", "release"]),
+                true,
+            ),
+            (
+                "notes/other.md",
+                "note",
+                Tier::Semantic,
+                serde_json::json!(["Storage"]),
+                true,
+            ),
+            (
+                "other/decision.md",
+                "decision",
+                Tier::Procedural,
+                serde_json::json!(["Storage"]),
+                true,
+            ),
+            (
+                "notes/scalar-tag.md",
+                "decision",
+                Tier::Procedural,
+                serde_json::json!("Storage"),
+                false,
+            ),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: ws,
+                    project_id: proj,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: "filterneedle shared text".into(),
+                    tier,
+                    frontmatter_json: serde_json::json!({"kind": kind, "tags": tags}),
+                    pinned,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: vec!["filterneedle".into()],
+                    evidence: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut combined = query_in("scratch", "filterneedle");
+        combined.kind = Some("DECISION".into());
+        combined.tier = Some("PROCEDURAL".into());
+        combined.path_prefix = Some("notes/percent%_".into());
+        combined.tag = Some("storage".into());
+        let combined = server
+            .memory_query(Parameters(combined), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let combined = tool_json(&combined);
+        assert_eq!(
+            combined["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["notes/percent%_literal.md"],
+            "all filters must combine before ranking: {combined}"
+        );
+
+        let mut differently_cased_path = query_in("scratch", "filterneedle");
+        differently_cased_path.path_prefix = Some("NOTES/".into());
+        let differently_cased_path = server
+            .memory_query(
+                Parameters(differently_cased_path),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tool_json(&differently_cased_path)["hits"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "literal path prefixes are case-sensitive"
+        );
+
+        let mut tag_only = query_in("scratch", "filterneedle");
+        tag_only.tag = Some("STORAGE".into());
+        let tag_only = server
+            .memory_query(Parameters(tag_only), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let tag_paths: std::collections::HashSet<String> = tool_json(&tag_only)["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(!tag_paths.contains("notes/scalar-tag.md"));
+        assert!(tag_paths.contains("notes/other.md"));
+
+        let mut pinned = query_in("scratch", "doesnotexist");
+        pinned.pin_first = Some(true);
+        pinned.path_prefix = Some("notes/percent%_".into());
+        let pinned = server
+            .memory_query(Parameters(pinned), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&pinned)["hits"][0]["path"],
+            "notes/percent%_literal.md",
+            "unfiltered pinned pages must not bypass path_prefix"
+        );
+
+        let mut global = query_in("scratch", "filterneedle");
+        global.workspace = None;
+        global.project = None;
+        global.global = Some(true);
+        global.path_prefix = Some("other/".into());
+        let global = server
+            .memory_query(Parameters(global), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&global)["global_hits"][0]["path"],
+            "other/decision.md"
+        );
+
+        let sibling = store
+            .writer
+            .get_or_create_project(ws, "filter-sibling", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: sibling,
+                path: PagePath::new("other/sibling.md").unwrap(),
+                title: "Sibling decision".into(),
+                body: "filterneedle shared text".into(),
+                tier: Tier::Procedural,
+                frontmatter_json: serde_json::json!({"kind": "decision", "tags": ["Storage"]}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut scoped = query_in("scratch", "filterneedle");
+        scoped.workspace = None;
+        scoped.project = None;
+        scoped.scopes = vec![
+            MemoryScopeArg {
+                workspace: "default".into(),
+                project: "scratch".into(),
+            },
+            MemoryScopeArg {
+                workspace: "default".into(),
+                project: "filter-sibling".into(),
+            },
+        ];
+        scoped.path_prefix = Some("other/".into());
+        scoped.tag = Some("storage".into());
+        let scoped = server
+            .memory_query(Parameters(scoped), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let scoped_paths: std::collections::HashSet<String> = tool_json(&scoped)["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            scoped_paths,
+            [
+                "other/decision.md".to_owned(),
+                "other/sibling.md".to_owned()
+            ]
+            .into_iter()
+            .collect(),
+            "every explicit scope must apply the structured filter"
+        );
+
+        let mut historical = query_in("scratch", "filterneedle");
+        historical.as_of = Some(jiff::Timestamp::now().to_string());
+        historical.path_prefix = Some("other/".into());
+        historical.tag = Some("storage".into());
+        let historical = server
+            .memory_query(Parameters(historical), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&historical)["hits"][0]["path"],
+            "other/decision.md"
+        );
+
+        let history_path = PagePath::new("history/choice.md").unwrap();
+        let mut history_page = NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: history_path.clone(),
+            title: "Historical decision".into(),
+            body: "filterhistory shared text".into(),
+            tier: Tier::Procedural,
+            frontmatter_json: serde_json::json!({"kind": "decision", "tags": ["old"]}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: vec!["filterhistory".into()],
+            evidence: Vec::new(),
+        };
+        store
+            .writer
+            .upsert_page(history_page.clone())
+            .await
+            .unwrap();
+        history_page.title = "Current note".into();
+        history_page.tier = Tier::Semantic;
+        history_page.frontmatter_json = serde_json::json!({"kind": "note", "tags": ["new"]});
+        store.writer.upsert_page(history_page).await.unwrap();
+
+        let mut superseded = query_in("scratch", "filterhistory");
+        superseded.include_superseded = Some(true);
+        superseded.kind = Some("decision".into());
+        superseded.tag = Some("old".into());
+        let superseded = server
+            .memory_query(Parameters(superseded), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let superseded = tool_json(&superseded);
+        assert_eq!(superseded["hits"][0]["path"], history_path.as_str());
+        assert_eq!(superseded["hits"][0]["superseded"], true);
+
+        let global_scope = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: global_scope.workspace_id,
+                project_id: global_scope.project_id,
+                path: PagePath::new("profile/filtered.md").unwrap(),
+                title: "Filtered profile".into(),
+                body: "filterprofile shared text".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"kind": "preference", "tags": ["shell"]}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut profile_union = query_in("scratch", "filterprofile");
+        profile_union.path_prefix = Some("profile/".into());
+        profile_union.tag = Some("shell".into());
+        let profile_union = server
+            .memory_query(
+                Parameters(profile_union),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&profile_union)["global_scope_hits"][0]["path"],
+            "profile/filtered.md"
+        );
+        let mut excluded_profile = query_in("scratch", "filterprofile");
+        excluded_profile.path_prefix = Some("notes/".into());
+        let excluded_profile = server
+            .memory_query(
+                Parameters(excluded_profile),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tool_json(&excluded_profile)
+                .get("global_scope_hits")
+                .is_none(),
+            "the reserved-global/profile union must not bypass filters"
+        );
+
+        let mut traversal = query_in("scratch", "filterneedle");
+        traversal.path_prefix = Some("../".into());
+        let traversal = server
+            .memory_query(Parameters(traversal), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert!(tool_json(&traversal)["hits"].as_array().unwrap().is_empty());
+
+        let mut invalid = query_in("scratch", "filterneedle");
+        invalid.tier = Some("archive".into());
+        let error = server
+            .memory_query(Parameters(invalid), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("unknown tiers must be rejected");
+        assert!(error.to_string().contains("tier must be"), "{error}");
+
+        let mut control = query_in("scratch", "filterneedle");
+        control.path_prefix = Some("notes/\nprivate/".into());
+        let error = server
+            .memory_query(Parameters(control), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("control characters must be rejected");
+        assert!(error.to_string().contains("control characters"), "{error}");
+
+        let mut long_tag = query_in("scratch", "filterneedle");
+        long_tag.tag = Some("é".repeat(MAX_QUERY_TAG_LEN + 1));
+        let error = server
+            .memory_query(Parameters(long_tag), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("overlong Unicode tags must be rejected by character count");
+        assert!(
+            error.to_string().contains("at most 128 characters"),
+            "{error}"
+        );
     }
 
     /// `memory_query` hands the store the caller's session-timeline owner
@@ -11368,6 +11861,10 @@ mod tests {
                 let result = server
                     .memory_query(
                         Parameters(QueryArgs {
+                            kind: None,
+                            tier: None,
+                            path_prefix: None,
+                            tag: None,
                             query: term,
                             limit: Some(5),
                             project: Some("scratch".into()),
@@ -11475,6 +11972,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "quokka".into(),
                     limit: Some(5),
                     project: None,
@@ -11568,6 +12069,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "rank_token".into(),
                         limit: Some(3),
                         project: None,
@@ -11638,6 +12143,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "dedupe_token".into(),
                         limit: Some(10),
                         project: None,
@@ -11690,6 +12199,10 @@ mod tests {
         let err = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "missing_scope_token".into(),
                     limit: Some(10),
                     project: None,
@@ -11763,6 +12276,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "mixed_scope_token".into(),
                         limit: Some(10),
                         project: None,
@@ -11842,6 +12359,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "workspace_specific_token".into(),
                     limit: Some(5),
                     project: Some("unit-testing".into()),
@@ -13361,6 +13882,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "multi_scope_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13483,6 +14008,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "global_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13534,6 +14063,10 @@ mod tests {
         let include_expired = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "global_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13618,6 +14151,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "recall_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13654,6 +14191,10 @@ mod tests {
         let scoped = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "recall_token".into(),
                     limit: Some(10),
                     project: Some("runbooks".into()),
@@ -13694,6 +14235,10 @@ mod tests {
         let err = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "x".into(),
                     limit: Some(5),
                     project: Some("product".into()),
@@ -14069,6 +14614,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -15900,6 +16449,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "globalverify".into(),
                     limit: Some(5),
                     project: Some("acme-app".into()),
@@ -15961,6 +16514,10 @@ mod tests {
 
     fn query_in(project: &str, query: &str) -> QueryArgs {
         QueryArgs {
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
             query: query.into(),
             limit: Some(10),
             project: Some(project.into()),
@@ -16834,6 +17391,10 @@ mod tests {
                 let result = server
                     .memory_query(
                         Parameters(QueryArgs {
+                            kind: None,
+                            tier: None,
+                            path_prefix: None,
+                            tag: None,
                             reasoning: None,
                             answer: None,
                             include_superseded: None,
@@ -17023,6 +17584,10 @@ mod tests {
                     server
                         .memory_query(
                             Parameters(QueryArgs {
+                                kind: None,
+                                tier: None,
+                                path_prefix: None,
+                                tag: None,
                                 reasoning: None,
                                 answer: None,
                                 include_superseded: None,
@@ -20563,6 +21128,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "Karpathy".into(),
                     limit: Some(99_999),
                     project: None,
@@ -20601,6 +21170,10 @@ mod tests {
         let err = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "\"unbalanced".into(),
                     limit: Some(10),
                     project: None,

@@ -589,6 +589,9 @@ readable wiki pages; the next session starts with a handoff.
 
 - Ask "where did we leave off?" to continue from the pending handoff.
 - Ask "have we discussed X?" or "search memory for Y" to query the wiki.
+- Narrow a large wiki before ranking with `memory_query` filters such as
+  `path_prefix: "procedures/"`, `tag: "rust"`, `kind: "decision"`, or
+  `tier: "procedural"`.
 - Ask "catch me up" for a prose digest of recent project activity.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.

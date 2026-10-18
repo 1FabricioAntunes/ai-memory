@@ -397,10 +397,11 @@ ships something ai-memory does not, it is named.
   presents trusted lifecycle states for managed workstreams without exposing
   checkout paths, native session ids, or transcript content. It deliberately
   does not infer blocked or review-ready states from untrusted prose.
-- **No structured page filters on search.** Scope and `as_of` are typed, but
-  `memory_query` cannot narrow by path prefix, kind, tier, tag, or author
-  before ranking. Mem0 has directory/category scopes; basic-memory's
-  unreleased v0.24 adds a broader structured filter set.
+- **Structured page filters are available before ranking.** `memory_query`
+  accepts kind, tier, literal path prefix, and exact-array tag filters across
+  normal, scoped, global, historical, profile, and pinned results. `as_of`
+  remains the valid-time control. Author filtering is intentionally deferred
+  until null root/anonymous attribution has explicit semantics.
 - **Local foreground embedding is isolated from background writes.** A
   real-model probe demonstrated CPU contention, so local document inference is
   limited to one slot and a second slot remains available for query embedding.

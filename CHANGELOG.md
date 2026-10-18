@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added structured pre-rank filters to `memory_query`: case-insensitive
+  `kind` and exact-array `tag`, typed `tier`, and literal `path_prefix`.
+  Filters apply consistently to project/scopes hybrid streams, cross-project
+  global FTS, `as_of` history, supplemental profile hits, and `pin_first`.
+  Filtered misses omit raw observations because those rows carry no page
+  metadata.
 - Added a read-only managed-workstream operations page at
   `/web/workstreams`. On multi-user servers it is root-only; single-operator
   installs retain their existing admin access. The bounded overview orders

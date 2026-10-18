@@ -280,9 +280,9 @@ mod tests {
     use ai_memory_core::{
         ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
         ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
-        ObservationId, ObservationKind, PageEvidence, PageEvidenceKind, PageId, PagePath,
-        ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
-        WorkstreamId,
+        ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageEvidenceKind, PageId,
+        PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId,
+        WorkstreamEventKind, WorkstreamId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -3213,6 +3213,146 @@ mod tests {
             "a vector-ranked hit must carry a snippet, got {:?}",
             target_vector_hit.snippet
         );
+    }
+
+    #[tokio::test]
+    async fn structured_filters_hold_in_vector_and_both_graph_directions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "filters", None)
+            .await
+            .unwrap();
+
+        for path in ["kept/vector.md", "other/vector.md"] {
+            let id = store
+                .writer
+                .upsert_page(sample_page(ws, proj, path, "vector-only content"))
+                .await
+                .unwrap();
+            store
+                .writer
+                .store_embedding(
+                    id,
+                    f32_vec_to_bytes(&[1.0, 0.0]),
+                    "test".into(),
+                    "two-dim".into(),
+                    2,
+                )
+                .await
+                .unwrap();
+        }
+        let query_vector = [1.0, 0.0];
+        let (vector_hits, _) = store
+            .reader
+            .hybrid_search_scopes(
+                &[(ws, proj)],
+                HybridSearch {
+                    query: "no-lexical-match",
+                    vector: Some(VectorQuery {
+                        vector: &query_vector,
+                        provider: "test",
+                        model: "two-dim",
+                        dim: 2,
+                    }),
+                    limit: 10,
+                    expiry_cutoff_us: None,
+                    include_superseded: false,
+                    explain: true,
+                    owner: &OwnerFilter::Any,
+                    filter: PageFilter {
+                        path_prefix: Some("kept/"),
+                        ..PageFilter::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(vector_hits.len(), 1, "{vector_hits:?}");
+        assert_eq!(vector_hits[0].0.path.as_str(), "kept/vector.md");
+        assert_eq!(
+            vector_hits[0]
+                .1
+                .as_ref()
+                .and_then(|details| details.vector_rank),
+            Some(1)
+        );
+
+        let tagged = |path: &str, body: &str, tag: &str| {
+            let mut page = sample_page(ws, proj, path, body);
+            page.frontmatter_json = serde_json::json!({"tags": [tag]});
+            page
+        };
+        let mut seed = tagged("graph/seed.md", "graphneedle source", "route");
+        seed.links = vec![
+            PagePath::new("graph/out.md").unwrap().into(),
+            PagePath::new("graph/out-denied.md").unwrap().into(),
+        ];
+        store.writer.upsert_page(seed).await.unwrap();
+        store
+            .writer
+            .upsert_page(tagged("graph/out.md", "outgoing target", "route"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(tagged(
+                "graph/out-denied.md",
+                "excluded outgoing target",
+                "other",
+            ))
+            .await
+            .unwrap();
+        for (path, tag) in [("graph/in.md", "route"), ("graph/in-denied.md", "other")] {
+            let mut incoming = tagged(path, "incoming pointer", tag);
+            incoming.links = vec![PagePath::new("graph/seed.md").unwrap().into()];
+            store.writer.upsert_page(incoming).await.unwrap();
+        }
+
+        let (graph_hits, _) = store
+            .reader
+            .hybrid_search_scopes(
+                &[(ws, proj)],
+                HybridSearch {
+                    query: "graphneedle",
+                    vector: None,
+                    limit: 10,
+                    expiry_cutoff_us: None,
+                    include_superseded: false,
+                    explain: true,
+                    owner: &OwnerFilter::Any,
+                    filter: PageFilter {
+                        tag: Some("route"),
+                        ..PageFilter::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let graph_paths: std::collections::HashSet<_> = graph_hits
+            .iter()
+            .map(|(hit, _)| hit.path.as_str())
+            .collect();
+        assert_eq!(
+            graph_paths,
+            ["graph/seed.md", "graph/out.md", "graph/in.md"]
+                .into_iter()
+                .collect()
+        );
+        for path in ["graph/out.md", "graph/in.md"] {
+            let details = graph_hits
+                .iter()
+                .find(|(hit, _)| hit.path.as_str() == path)
+                .and_then(|(_, details)| details.as_ref())
+                .unwrap();
+            assert!(details.graph_rank.is_some(), "{path}: {details:?}");
+        }
     }
 
     /// P3 (docs/design-hindsight-borrowings.md): a typed edge (`fixes`) is
