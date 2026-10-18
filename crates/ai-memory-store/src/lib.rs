@@ -7152,6 +7152,72 @@ mod tests {
         }
     }
 
+    /// The column prefixes the event search strips are filters only at the
+    /// start of a word. `subtitle:rendering` used to lose its `title:` and
+    /// search for `subrendering`, and `somebody: help` lost the word
+    /// `somebody`.
+    #[tokio::test]
+    async fn search_events_keeps_words_that_end_in_a_column_name() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-search-words").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(
+                    run.run_id,
+                    vec![
+                        managed_event(
+                            "ev-1",
+                            AgentKind::Codex,
+                            "native-x",
+                            "subtitle rendering broke",
+                        ),
+                        managed_event("ev-2", AgentKind::Codex, "native-x", "somebody asked"),
+                        managed_event("ev-3", AgentKind::Codex, "native-x", "unrelated"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let search = |query: &str| {
+            let reader = store.reader.clone();
+            let query = query.to_string();
+            let workstream_id = run.workstream_id;
+            async move {
+                reader
+                    .search_workstream_events(
+                        workstream_id,
+                        query,
+                        10,
+                        ai_memory_core::Sanitizer::default(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.event_id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(search("subtitle:rendering").await, ["ev-1"]);
+        assert_eq!(search("somebody:").await, ["ev-2"]);
+        // A real column prefix is still stripped, including inside a group.
+        assert_eq!(search("(title:somebody)").await, ["ev-2"]);
+    }
+
     #[tokio::test]
     async fn link_native_session_rejects_blank_wrong_agent_and_inactive_targets() {
         let tmp = TempDir::new().unwrap();
