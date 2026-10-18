@@ -593,7 +593,8 @@ readable wiki pages; the next session starts with a handoff.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
-  the wiki and a JSON API under `/api/v1`. On a server with a bearer token
+  the wiki, a root/operator managed-workstream overview at `/web/workstreams`,
+  and a JSON API under `/api/v1`. On a server with a bearer token
   and no user accounts (every fresh install), the browser asks for a username
   and password: any username, and the contents of
   `<data_dir>/auth-tokens/default` as the password.

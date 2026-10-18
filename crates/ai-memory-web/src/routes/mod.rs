@@ -20,6 +20,7 @@ mod project;
 mod search;
 mod session;
 pub(crate) mod statics;
+mod workstreams;
 
 /// Whether the viewer may read `workspace/project` (#708).
 ///
@@ -127,6 +128,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         )
         .route("/search", get(search::handler))
         .route("/pending", get(pending::handler))
+        .route("/workstreams", get(workstreams::handler))
         .route("/health", get(health::handler))
         .with_state(state)
 }

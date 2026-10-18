@@ -7,6 +7,15 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+When the server runs with `--enable-web`, root can inspect all managed ledgers
+at `/web/workstreams`. The read-only page shows trusted lifecycle state, the
+latest harness/run, current harness links, event counts, and activity times. It
+does not infer "waiting for input" from captured prose, and it never displays
+checkout paths, fingerprints, lease-owner strings, native session ids, source
+record ids, or transcript content. This cross-project operator view is not a
+discovery API: `ai-memory resume` and normal run selection remain restricted to
+the exact repository/worktree fingerprints described below.
+
 `ai-memory run` is the preferred way to start a harness: if in doubt, run
 with ai-memory. Besides session continuity, the first time it launches a given
 harness it auto-installs that harness's ai-memory hooks and MCP if they are

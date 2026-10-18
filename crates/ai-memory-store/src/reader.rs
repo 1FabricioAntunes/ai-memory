@@ -37,7 +37,10 @@ use crate::fts_query::{FtsStopwords, prepare_fts5_query};
 use crate::maintenance::MaintenanceJob;
 use crate::retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 use crate::users::TOKEN_HASH_LEN;
-use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstreamSummary};
+use crate::workstream::{
+    ManagedRunContext, OperationalWorkstreamSummary, StoredManagedRunStatus,
+    StoredWorkstreamSummary,
+};
 
 /// TTL guard for retrieval surfaces (search / recent / embedding hits /
 /// graph neighbours / briefing lists): appended to a WHERE clause that
@@ -2657,6 +2660,22 @@ impl ReaderPool {
             )
         })
         .await
+    }
+
+    /// Return one bounded page of cross-scope managed-workstream lifecycle
+    /// summaries for an already-authorized root/operator surface.
+    ///
+    /// This reader performs no authorization by itself; unlike
+    /// [`Self::recent_workstreams`], it intentionally aggregates checkouts and
+    /// projects. Callers must enforce `Capability::Admin` before invoking it.
+    pub async fn operational_workstreams(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<OperationalWorkstreamSummary>> {
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        self.with_conn(move |conn| crate::workstream::list_operational(conn, limit, offset, now_us))
+            .await
     }
 
     /// Run a full-text search against the FTS5 index, apply the bounded page

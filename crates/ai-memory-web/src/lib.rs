@@ -20,6 +20,8 @@
 //!   through `memory_query`'s hybrid ranker, with the recall trace
 //! - `GET /pending`                       → root-only pending-writes triage;
 //!   its buttons post to `/admin/pending-writes/*`, not to this crate
+//! - `GET /workstreams`                   → root-only managed-run operations
+//!   overview derived from trusted lifecycle fields
 //! - `GET /health`                        → root-only server health panel
 //! - `GET /login` / `GET /change-password` → public human-auth HTML forms
 //! - `GET /static/*`                      → embedded CSS + logo (public)

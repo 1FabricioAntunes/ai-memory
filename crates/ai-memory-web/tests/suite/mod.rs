@@ -8,6 +8,7 @@ mod history_replay;
 mod pending;
 mod recall_trace;
 mod routes;
+mod workstreams;
 
 #[cfg(feature = "management-ui")]
 mod management;

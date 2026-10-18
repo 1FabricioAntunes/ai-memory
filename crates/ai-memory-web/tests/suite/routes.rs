@@ -5065,7 +5065,7 @@ async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
 #[tokio::test]
 async fn header_links_sit_in_a_main_nav_and_mark_the_current_section() {
     let (_tmp, store, wiki) = setup().await;
-    // /pending and /health are root-only.
+    // /workstreams, /pending and /health are root-only.
     let app = router(store.reader.clone(), wiki).layer(axum::middleware::from_fn(
         |mut req: Request<Body>, next: axum::middleware::Next| async move {
             req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
@@ -5079,12 +5079,17 @@ async fn header_links_sit_in_a_main_nav_and_mark_the_current_section() {
     };
 
     // (uri, section whose link is the current one)
-    let cases = [("/", ""), ("/pending", "pending"), ("/health", "health")];
+    let cases = [
+        ("/", ""),
+        ("/workstreams", "workstreams"),
+        ("/pending", "pending"),
+        ("/health", "health"),
+    ];
     for (uri, current) in cases {
         let (status, body) = get_body(&app, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
         assert!(body.contains(r#"<nav aria-label="Main""#), "{uri}: nav");
-        for href in ["pending", "health"] {
+        for href in ["workstreams", "pending", "health"] {
             assert_eq!(
                 tag(&body, href).contains(r#"aria-current="page""#),
                 href == current,

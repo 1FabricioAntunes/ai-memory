@@ -287,6 +287,54 @@ pub(crate) struct SessionRow {
     pub open: bool,
 }
 
+// ---------------------------------------------------------------------------
+// workstreams.html
+// ---------------------------------------------------------------------------
+
+/// One managed ledger on the root/operator operations page.
+pub(crate) struct WorkstreamRow {
+    /// Link to the workstream's project overview.
+    pub project_href: String,
+    /// Unambiguous `workspace/project` display label.
+    pub scope_label: String,
+    /// Human-readable managed-workstream name.
+    pub name: String,
+    /// Last eight characters of the stable workstream id.
+    pub short_id: String,
+    /// Stable lifecycle status token used by template conditionals.
+    pub status: String,
+    /// Human-facing lifecycle status.
+    pub status_label: String,
+    /// Harness used by the latest managed run, or empty before first launch.
+    pub latest_agent: String,
+    /// Last eight characters of the latest managed run id, or empty.
+    pub latest_run_short: String,
+    /// Current harness links, in recency order.
+    pub linked_harnesses: Vec<String>,
+    /// Portable events imported across all runs.
+    pub event_count: u64,
+    /// Humanised last selection/import time.
+    pub last_active_relative: String,
+    /// Humanised latest run start, or empty.
+    pub latest_started_relative: String,
+    /// Humanised latest run end, or empty.
+    pub latest_ended_relative: String,
+}
+
+/// Root/operator managed-workstream overview.
+#[derive(Template)]
+#[template(path = "workstreams.html")]
+pub(crate) struct WorkstreamsView {
+    /// Current page rows, attention-first then newest activity.
+    pub rows: Vec<WorkstreamRow>,
+    /// One-based page number.
+    pub page: usize,
+    /// Previous page link, when applicable.
+    pub prev_href: Option<String>,
+    /// Next page link, when another row exists.
+    pub next_href: Option<String>,
+}
+
 /// View-model for a namespace (directory) listing — `GET
 /// /w/:workspace/:project/p/:namespace/` when the path names a namespace
 /// rather than a page (#603).

@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a read-only managed-workstream operations page at
+  `/web/workstreams`. On multi-user servers it is root-only; single-operator
+  installs retain their existing admin access. The bounded overview orders
+  live and interrupted work first and derives `active`, `interrupted`,
+  `completed`, and `empty` only from trusted run lifecycle fields and imported
+  event counts. It exposes no checkout paths, repository fingerprints, lease
+  owners, native session ids, source metadata, or transcript content, and it
+  does not broaden checkout-local `resume` discovery.
 - Added `ai-memory recent` and `GET /admin/recent` to list the most recently
   updated wiki pages, newest first. The listing is scoped to the current
   project by default (cwd / marker, or `--workspace`/`--project`); `--global`

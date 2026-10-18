@@ -777,9 +777,9 @@ public, open artifact is the MIT npm client `@liquidlm/cli` (stable v0.1.6).
   over long horizons, and finds every evaluated system far from it. Two
   implications: our product framing matches where evaluation is going, and
   the in-repo evaluation harness should keep expanding beyond retrieval. We
-  now publish reproducible retrieval-through-capture numbers, but still lack
-  a comparable end-to-end QA result with reader, judge, context, and latency
-  recorded together.
+  now publish reproducible retrieval-through-capture numbers and ship an
+  answerer/judge path with context, latency, and exact-model receipts. The
+  remaining evidence gap is a published run over the full 470-question set.
 - **Bi-temporal validity (Zep paper, arXiv:2501.13956, now mainstream
   via Graphiti)** is the one *specific* mechanism from the graph camp
   worth studying: every fact/edge carries event-time and
@@ -817,13 +817,13 @@ their headings state what has shipped.
 with generated index/log projections and `ai-memory okf check`. No export-only
 compatibility layer is needed.
 
-**R2: Reproducible eval harness - shipped for retrieval, still open for
-end-to-end QA.** The in-repo harness publishes retrieval-through-capture and
-component results with run commands and receipts. It also keeps the
+**R2: Reproducible eval harness - shipped; full-set QA run still open.** The
+in-repo harness publishes retrieval-through-capture and component results with
+run commands and receipts, and includes an opt-in answerer/judge QA mode with
+per-question outcomes and exact provider/model provenance. It also keeps the
 belief-strength and LLM dream features off by default because neither has
-shown a useful retrieval delta. The remaining work is a reproducible
-end-to-end QA path that records the answerer, judge, context budget, latency,
-and exact metric.
+shown a useful retrieval delta. The remaining work is operational: run and
+publish the full 470-question QA set rather than only the existing sample.
 
 **R3: Typed relation edges - shipped.** `causes`, `fixes`, and `contradicts`
 are stored and explained, related-page reads can traverse them, and
@@ -850,8 +850,10 @@ remaining retrieval gap is a path-prefix filter, now part of P2 below.
 
 **R8: Queryable metadata/tag filters + a published eval triple - partly
 open.** The retrieval harness and accuracy/latency/context reporting exist.
-Search still cannot filter by path, kind, tier, author, or tag before ranking.
-That bounded filter surface is the remaining work. Connectors and document
+The store and web search already filter kind and tier before every ranking
+stream; `memory_query` does not expose them, and path prefix, author, and tag
+remain absent. Extending that bounded filter surface is the remaining work.
+Connectors and document
 extraction, if adopted, stay in the importer companion so untrusted input still
 crosses the sanitizer boundary and the server remains text-first.
 
@@ -860,21 +862,24 @@ crosses the sanitizer boundary and the server remains text-first.
 This is the short list that remains after removing work already shipped.
 Each item needs its own design and approval before implementation.
 
-1. **P1 - Workstream operations view.** Add a read-only `/web` view over the
-   managed-workstream ledger: active, waiting for input, ready to review,
-   finished, and stale; show the latest run, handoff, and bounded evidence.
-   Store only a minimal human review marker if the derived states are not
-   enough. This borrows claude-mem's useful human visibility without turning
-   ai-memory into a kanban system or cloud collaboration product.
+1. **P1 - Workstream operations view.** Add a read-only, root/operator `/web`
+   view over the managed-workstream ledger. Derive only states the trusted
+   lifecycle columns support: active, interrupted, completed, and empty;
+   show the latest run and bounded operational evidence. Do not infer "waiting
+   for input" from untrusted transcript prose or pretend handoffs are linked to
+   workstreams when the schema has no such relationship. This borrows
+   claude-mem's useful human visibility without turning ai-memory into a kanban
+   system or cloud collaboration product.
 2. **P1 - Protect interactive recall from background embedding.** Build a
    contention benchmark first. If administrative backfill can delay query
    embedding, give foreground queries reserved capacity or separate gates.
    Preserve the current fail-open behavior: lexical/entity/graph retrieval
    must still answer when embedding or reranking is saturated.
-3. **P2 - Structured query filters.** Add bounded, optional filters for path
-   prefix, page kind, tier, tag, author, and valid time before ranking. Reuse
-   `ScopeResolver`; partial or missing scopes continue to fail closed. This is
-   the remaining half of R8 and the most concrete retrieval ergonomics gap.
+3. **P2 - Structured query filters.** Expose the existing pre-rank kind/tier
+   filters through `memory_query`, then add bounded path-prefix and exact-tag
+   filters. Keep `as_of` as the valid-time control and defer author until null
+   root/anonymous attribution has explicit semantics. Reuse `ScopeResolver`;
+   partial or missing scopes continue to fail closed.
 4. **P2 - Per-operation LLM profiles, measure first.** Prototype separate
    provider/model choices for consolidation, reranking, and auto-improvement,
    plus a cheap structured decision tier. Measure cost, latency, call count,
@@ -883,10 +888,10 @@ Each item needs its own design and approval before implementation.
    importer companion to extract PDF/Office/media transcripts into attributed,
    sanitized markdown. Keep opaque files and native multimodal embeddings out
    of the server core.
-6. **P3 - End-to-end QA evaluation.** Add a reproducible answerer/judge path
-   beside hit@5 and report accuracy, p50/p95 latency, context tokens, exact
-   models, and run receipts. Do not claim a cross-tool ranking without a
-   shared harness.
+6. **P3 - End-to-end QA evaluation.** Use the shipped answerer/judge path for
+   a deliberate full 470-question run and publish its receipt with accuracy,
+   p50/p95 latency, context tokens, and exact models. Do not build a duplicate
+   path or claim a cross-tool ranking without a shared harness.
 
 **Deliberately not recommended:** joining the memory-OS camp (agent
 self-editing its memory is token-expensive, and Letta's own successor now

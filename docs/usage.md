@@ -655,7 +655,8 @@ command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-w
 ```
 
 The web UI is read-only: project list, per-project page tree,
-breadcrumbs, rendered markdown, metadata, search, and a link graph.
+breadcrumbs, rendered markdown, metadata, search, a link graph, and an
+operator view of managed workstreams.
 The header **Graph** link opens `/web/graph` (cross-project wikilinks);
 each project page links to `/web/w/<ws>/<proj>/graph` (pages in that
 project and the resolved links between them). Both are a server-rendered
@@ -671,7 +672,13 @@ namespace listing leave out a page whose `expires_at` TTL has passed, as search
 does; its own URL still opens it. The search on a project page ranks with
 the same hybrid ranker as `memory_query` for that project, and its "Explain
 ranking" box shows each hit's stream ranks, RRF contributions, authority and rerank score, plus the per-stream timings.
-Root also gets `/web/health`: hook counters (429s included), the writer queue,
+Root also gets `/web/workstreams`: a bounded, attention-first overview of
+managed workstreams across projects. It derives `active`, `interrupted`,
+`completed`, and `empty` only from run leases, exit state, and imported
+event counts; it does not interpret transcript prose or expose checkout paths,
+repository fingerprints, lease owners, or native session ids. This operator
+aggregate does not change `ai-memory resume`, whose discovery remains scoped
+to the current checkout. Root also gets `/web/health`: hook counters (429s included), the writer queue,
 the local spool and recovery journal, the consolidation queue, embedder and
 provider state, and the failing checks with the command that fixes each. Each page links
 to its history (`/web/w/<ws>/<proj>/h/<path>`): every stored version, newest
