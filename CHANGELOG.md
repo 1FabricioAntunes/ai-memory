@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Required Write access before a session start records a project's `[profile]`
+  `profile_contribute` / `profile_consume` flags. A Read-only viewer's explicit
+  values now only narrow its own session instead of changing the flags for every
+  operator in the project.
+  ([#1421](https://github.com/akitaonrails/ai-memory/pull/1421))
 - Stopped the server from opening files named in a hook payload. Antigravity
   step-log enrichment now runs only in the client-side `ai-memory hook`; the
   `/hook` and `/hook/batch` ingest paths store the `tool_response` the client
