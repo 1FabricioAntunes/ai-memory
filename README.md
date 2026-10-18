@@ -592,6 +592,9 @@ readable wiki pages; the next session starts with a handoff.
 - Narrow a large wiki before ranking with `memory_query` filters such as
   `path_prefix: "procedures/"`, `tag: "rust"`, `kind: "decision"`, or
   `tier: "procedural"`.
+- Inspect content-free per-workload LLM call, outcome, latency, and usage
+  telemetry with `ai-memory status --json`; it diagnoses the configured
+  provider but does not route different workloads to different models.
 - Ask "catch me up" for a prose digest of recent project activity.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.

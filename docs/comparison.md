@@ -407,6 +407,11 @@ ships something ai-memory does not, it is named.
   limited to one slot and a second slot remains available for query embedding.
   Hosted providers retain their existing concurrency policy; the LLM reranker
   remains separately bounded and fail-open.
+- **Per-workload LLM behavior is measured before it is routed.** Root-only
+  status JSON reports bounded calls, outcomes, latency, estimated tokens, and
+  provider-reported usage for each closed internal workload. It records no
+  prompt or output text. Provider/model selection remains global until real
+  measurements and quality evaluation justify a larger configuration surface.
 - **Marketplace reach is narrower than harness support.** ai-memory now ships
   its own Claude Code and Codex marketplace plugins and `ai-memory setup`
   detects and wires installed agents across Linux, macOS, and Windows. It is

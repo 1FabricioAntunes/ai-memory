@@ -9357,7 +9357,7 @@ mod tests {
         ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
     };
     use ai_memory_core::{Sanitized, Sanitizer};
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmResult, LlmWorkload};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -9649,6 +9649,7 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
+        assert_eq!(json["providers"]["llm_workloads"], serde_json::json!([]));
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
         // 2.0 item 7: the report carries the wedged-writer gauge and the
         // wiki-format state — a fresh store is natively conformant (no
@@ -9656,6 +9657,79 @@ mod tests {
         assert!(json["write_queue"].is_array(), "{json}");
         assert_eq!(json["wiki_format"]["okf_migrated"], false);
         assert!(json["wiki_format"]["backup_archive"].is_null());
+    }
+
+    #[tokio::test]
+    async fn status_reports_bounded_content_free_llm_workload_telemetry() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let provider_health = ProviderHealth::default();
+        let llm = provider_health.wrap_llm_provider(
+            Arc::new(FakeAutoImproveLlm),
+            "fake-auto-improve",
+            "fake-model",
+            None,
+        );
+        llm.complete_with_operation_id(
+            ChatRequest::user_prompt("private prompt").with_max_tokens(16),
+            LlmOperationId::for_workload(LlmWorkload::QueryAnswer),
+        )
+        .await
+        .unwrap();
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: Some(llm),
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health,
+            decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let workloads = json["providers"]["llm_workloads"].as_array().unwrap();
+        assert_eq!(workloads.len(), LlmWorkload::ALL.len());
+        let query_answer = workloads
+            .iter()
+            .find(|entry| entry["workload"] == "query-answer")
+            .unwrap();
+        assert_eq!(query_answer["calls"], 1);
+        assert_eq!(query_answer["successes"], 1);
+        assert_eq!(query_answer["errors"], 0);
+        assert_eq!(query_answer["status"], "ok");
+        assert_eq!(query_answer["usage_reported_calls"], 0);
+        let encoded = serde_json::to_string(workloads).unwrap();
+        assert!(!encoded.contains("private prompt"));
     }
 
     /// The MCP-only complement: per-client tool-call counters served

@@ -280,10 +280,10 @@ invariants), **ALREADY** (we have it and should say so).
 
 | Capability seen in the field | Verdict | Why |
 |---|---|---|
-| Human workstream operations view (claude-mem v14 “My Work”) | ADOPT | The managed-workstream ledger already has runs, leases, events, and handoff evidence, but humans cannot scan active/attention/review-ready work in `/web`. Build a read-only derived view; add only a minimal review marker, not a second task system |
+| Human workstream operations view (claude-mem v14 “My Work”) | SHIPPED (3.2) | `/web/workstreams` shows bounded active, interrupted, completed, and empty lifecycle state to the root/operator without exposing checkout paths, native session ids, or transcript content. It does not invent attention/review states from prose or become a second task system |
 | Foreground query capacity isolated from embedding backfill (EverOS v1.4.2) | SHIPPED (3.2) for local inference | A real-model probe measured eight-worker query p50/p95 rising from 36/41 ms idle to 74/76 ms. Limiting local document inference to one slot while reserving one query slot reduced loaded latency to 39/51 ms. Hosted providers keep their existing concurrency; provider failures still degrade to lexical/entity/graph retrieval |
 | Structured pre-rank filters (Mem0; basic-memory v0.24 unreleased) | SHIPPED (3.2), except author | `memory_query` applies bounded kind, tier, literal path-prefix and exact-array tag predicates before every page-ranking stream, including global, historical, profile and pinned results. `as_of` is the valid-time control. Author stays deferred until null root/anonymous attribution has explicit semantics |
-| Per-operation LLM provider/model profiles (Graphiti v0.31; Hindsight `main`) | MEASURE-FIRST | Potentially lowers cost and latency for consolidation, rerank, and auto-improvement, but expands config and auth surface. Prototype against the evals before adding public settings |
+| Per-operation LLM provider/model profiles (Graphiti v0.31; Hindsight `main`) | TELEMETRY SHIPPED (3.2); ROUTING MEASURE-FIRST | Root-only status now measures calls, outcomes, latency, estimated tokens, reported usage and health for a fixed workload set without storing content. Labels remain routing-inert. Add public profiles only after real measurements plus quality evaluation show a benefit worth the config/auth surface |
 | Retrieval recall through capture (several tools rank whole raw sessions) | SHIPPED (3.0) | The 2026-10-12 decomposition showed our zero-LLM session page indexed only 80-character turn titles; the observation stream recovered it (FTS hit@5 0.662 → 0.951, local 0.800 → 0.945, all 470). Chasing another tool's headline number is declined: those numbers measure different things |
 | Local zero-LLM cross-encoder reranker | MEASURE-FIRST | Fits the zero-LLM invariant (a local model, not an LLM). Bar before building: hit@5 at least +0.03 on both FTS and local paths over the shipped ranking, p95 at most +100 ms on the reference host and measured on a low-end ARM host; default-on only if the keyless path gains. Measured headroom is small after the stream (component-mode FTS 0.972 vs pipeline 0.951) |
 | Editable browser viewer (edit / forget / bulk forget) | DECLINE | The web UI is read-only by design (`frontend-api.md` §10); wiki mutations go only through `Wiki::write_page`/`apply_batch`; agents already edit and forget via MCP (`memory_write_page` with `expected_page_id`, `memory_delete_page`) and the CLI |
@@ -317,22 +317,17 @@ which should be checked before any work is scoped.
 
 **Step up** (gaps a coding-agent user notices):
 
-1. **A human workstream operations view** over existing managed runs, with
-   attention/review states and bounded evidence (claude-mem v14). This should
-   expose work already tracked, not create a kanban subsystem.
-2. **Structured filters before ranking** for path prefix, kind, tier, tag,
-   author, and valid time (Mem0; basic-memory v0.24, currently unreleased).
-3. **Foreground embedding isolation backed by a contention benchmark**
+1. **Foreground embedding isolation backed by a contention benchmark**
    (EverOS v1.4.2) is now shipped for the in-process local model. The manual
    probe remains in-tree so the capacity can be rechecked on other CPU classes.
-4. **One reproducible end-to-end QA number** beside hit@5, with reader,
+2. **One reproducible end-to-end QA number** beside hit@5, with reader,
    judge, context tokens and latency stated, and more benchmarks than
    LongMemEval (Mem0, Zep, Hindsight and EverOS publish QA numbers; Hindsight's
    AMB harness is open, so an adapter is worth considering). Most numbers
    published in the field are QA numbers.
-5. **Git-history ingestion on first run**, zero-LLM and sanitized
+3. **Git-history ingestion on first run**, zero-LLM and sanitized
    (Hindsight), so a new repository starts with its commit history as context.
-6. **Answer harness-native memory reads from our store** (claude-mem's bridge
+4. **Answer harness-native memory reads from our store** (claude-mem's bridge
    for Claude Code and Codex memory folders). Careful: this touches trust
    and routing, and the gap decisions above decline a bidirectional bridge.
 
@@ -354,7 +349,9 @@ undelivered event for a later drain.
 - A statusline indicator (Cognee): shows capture is alive.
 - An opt-in local cross-encoder reranker (Hindsight, basic-memory,
   agentmemory), gated on the recall-eval bar in the table above.
-- Per-step model routing (Graphiti's `LLMRuntime`): cheaper consolidation.
+- Per-step model routing (Graphiti's `LLMRuntime`) only if the shipped workload
+  telemetry plus quality evaluation demonstrate cheaper or faster operation
+  without a meaningful quality loss.
 - A dry-run-first unified audit/repair command (MemPalace v3.11): consolidate
   the checks already spread across `doctor`, lint, reindex, health, and backup
   only if one operator workflow is demonstrably simpler.

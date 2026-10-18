@@ -804,6 +804,27 @@ series, and scope is never a label. The route sits behind the same
 `require_root_for_multiuser_admin` gate as every `/admin/*` route: root-only once
 the deployment distinguishes operators. Counters reset on restart.
 
+### LLM workload telemetry
+
+The root-protected `GET /admin/status` snapshot includes a bounded
+`providers.llm_workloads` array when an LLM is configured. Call sites attach
+one member of the closed `LlmWorkload` enum to the existing UUIDv7 logical
+operation id; its displayed/wire value remains only the UUID, so the label
+cannot affect a provider request or fallback correlation. The provider-health
+wrapper records one provider-interface invocation around the whole fallback
+chain (outer caller retries are separate invocations): outcome,
+wall time, fixed-bucket p50/p95 bounds, coarse four-characters-per-token
+estimates, provider-reported usage when available, and redacted error
+class/status. It stores no prompt, output, scope, project, model selected by a
+caller, or unbounded label. State is in memory, resets on restart, and does not
+choose a provider or model. The server constructs the wrapper once at startup;
+there is no runtime provider hot-reload.
+
+This instrumentation is the evidence gate for any future per-operation
+provider profiles. The current configuration remains one global provider plus
+its ordered fallback chain; no routing surface exists until measured latency,
+usage, and quality justify the added auth and configuration boundary.
+
 ### Web search and the recall trace
 
 A project search in the web UI (`/web/search` with `workspace` and `project`)
@@ -1472,6 +1493,11 @@ call, its last success/error timestamp, a redacted error class + HTTP
 status (never a response body or credential), and its circuit-open-until
 timestamp. It is empty for a plain single-provider setup; the top-level
 `llm` role fields are unchanged.
+
+The same response reports `llm_workloads`, a fixed-order, fixed-cardinality
+diagnostic described under [LLM workload telemetry](#llm-workload-telemetry).
+Use `ai-memory status --json` to inspect the rows; the ordinary human status
+output stays concise.
 
 Every chat request carries `User-Agent: ai-memory/<version>`
 (`ai_memory_llm::DEFAULT_USER_AGENT`, layered in `build_provider`). `reqwest`

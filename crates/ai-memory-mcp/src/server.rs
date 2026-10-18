@@ -3232,9 +3232,12 @@ impl AiMemoryServer {
                         &global_scope_hits,
                         args.reasoning.unwrap_or_default(),
                     );
-                    match ai_memory_llm::complete_structured::<AnswerSynthesis>(
+                    match ai_memory_llm::complete_structured_with_operation_id::<AnswerSynthesis>(
                         llm.as_ref(),
                         request,
+                        ai_memory_llm::LlmOperationId::for_workload(
+                            ai_memory_llm::LlmWorkload::QueryAnswer,
+                        ),
                     )
                     .await
                     {
@@ -6475,7 +6478,15 @@ impl AiMemoryServer {
             args.reasoning.unwrap_or_default(),
         );
         let provider = llm.llm();
-        let text = match provider.complete(request).await {
+        let text = match provider
+            .complete_with_operation_id(
+                request,
+                ai_memory_llm::LlmOperationId::for_workload(
+                    ai_memory_llm::LlmWorkload::QueryAnswer,
+                ),
+            )
+            .await
+        {
             Ok(resp) => resp.text,
             Err(e) => {
                 // Redacted fields only: the `Display` of a provider failure

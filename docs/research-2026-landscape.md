@@ -849,28 +849,26 @@ budget on pinned and slot content. It runs without an LLM or migration. The
 remaining retrieval gap was a path-prefix filter, now shipped with the other
 structured MCP filters described below.
 
-**R8: Queryable metadata/tag filters + a published eval triple - partly
-open.** The retrieval harness and accuracy/latency/context reporting exist.
-The store and web search already filter kind and tier before every ranking
-stream; `memory_query` does not expose them, and path prefix, author, and tag
-remain absent. Extending that bounded filter surface is the remaining work.
-Connectors and document
+**R8: Queryable metadata/tag filters shipped; full eval run still open.** The
+retrieval harness and accuracy/latency/context reporting exist. `memory_query`
+now exposes kind, tier, literal path-prefix, and exact-array tag predicates
+before every page-ranking stream, including global, historical, profile, and
+pinned results. Author remains deferred until null root/anonymous attribution
+has explicit semantics. Connectors and document
 extraction, if adopted, stay in the importer companion so untrusted input still
 crosses the sanitizer boundary and the server remains text-first.
 
 ### Current plan after the 2026-10-18 pass
 
-This is the short list that remains after removing work already shipped.
-Each item needs its own design and approval before implementation.
+This is the implementation ledger for the short list selected by that pass.
+Items not marked complete still need their own design and approval.
 
-1. **P1 - Workstream operations view.** Add a read-only, root/operator `/web`
-   view over the managed-workstream ledger. Derive only states the trusted
-   lifecycle columns support: active, interrupted, completed, and empty;
-   show the latest run and bounded operational evidence. Do not infer "waiting
-   for input" from untrusted transcript prose or pretend handoffs are linked to
-   workstreams when the schema has no such relationship. This borrows
-   claude-mem's useful human visibility without turning ai-memory into a kanban
-   system or cloud collaboration product.
+1. **P1 - Workstream operations view. Completed.** `/web/workstreams` is a
+   read-only root/operator view over bounded managed-run aggregates. It derives
+   only active, interrupted, completed, and empty from trusted lifecycle
+   columns and exposes no checkout path, native session id, or transcript
+   content. It does not infer task states from untrusted prose or create a
+   second task system.
 2. **P1 - Protect interactive recall from background embedding. Completed.**
    The opt-in real-model probe found material local CPU contention, so local
    inference now admits one document embedding and reserves a second slot for
@@ -884,10 +882,13 @@ Each item needs its own design and approval before implementation.
    omit metadata-less raw observations. `as_of` remains the valid-time control,
    and author remains deferred until null root/anonymous attribution has
    explicit semantics.
-4. **P2 - Per-operation LLM profiles, measure first.** Prototype separate
-   provider/model choices for consolidation, reranking, and auto-improvement,
-   plus a cheap structured decision tier. Measure cost, latency, call count,
-   and quality before adding public configuration or changing defaults.
+4. **P2 - Per-operation LLM profiles, telemetry completed; routing deferred.**
+   Root-protected status now reports bounded process-lifetime call count,
+   outcome, latency, coarse token estimates, reported usage, and health for a
+   closed set of workloads. It captures no prompts or outputs, and labels do
+   not affect the provider wire request. Real measurements still need to show
+   a quality/cost benefit before public per-workload provider/model settings or
+   a cheap decision tier are added.
 5. **P3 - Optional document importer.** If demand is real, extend the
    importer companion to extract PDF/Office/media transcripts into attributed,
    sanitized markdown. Keep opaque files and native multimodal embeddings out
