@@ -16533,6 +16533,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// `title:` must still filter on the title column when its term has
+    /// punctuation and has to be quoted.
+    #[test]
+    fn title_filter_on_punctuated_term_searches_only_titles() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &NewPage {
+                title: "ai-memory handoff".into(),
+                ..page(ws, proj, "notes/titled.md", "unrelated body")
+            },
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                "notes/mention.md",
+                "a body that mentions ai-memory",
+            ),
+        )
+        .unwrap();
+
+        let hits = fts_match_paths(&conn, "title:ai-memory")
+            .expect("column-filtered search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["notes/titled.md".to_string()]);
+    }
+
     /// Regression for the live-found hyphen bug: searching `ui-refresh`
     /// returned nothing in prod even though
     /// `follow-ups/ui-refresh-scroll-restoration.md` exists. The first fix

@@ -219,6 +219,18 @@ fn prepare_fts5_token(token: &str) -> Vec<String> {
             .collect();
     }
 
+    // A known column filter keeps its column when its term needs quoting:
+    // `title:ai-memory` becomes `title:("ai-memory" OR "ai memory")`, not a
+    // quoted phrase that also searches for the literal word `title`.
+    if !token.contains('"')
+        && let Some((column, term)) = token.split_once(':')
+        && matches!(column, "title" | "body")
+        && !term.is_empty()
+        && should_quote_fts5_token(term)
+    {
+        return vec![format!("{column}:{}", quote_fts5_token(term))];
+    }
+
     if should_quote_fts5_token(token) {
         vec![quote_fts5_token(token)]
     } else {
@@ -543,6 +555,27 @@ mod tests {
     #[test]
     fn known_columns_are_preserved() {
         assert_eq!(prepare_fts5_query("title:handoff"), "title:handoff");
+    }
+
+    /// A known column filter whose term carries punctuation keeps the filter
+    /// on the quoted term, instead of quoting `title:` into the phrase and
+    /// searching every column for the word "title".
+    #[test]
+    fn known_column_filter_survives_quoting_of_its_term() {
+        assert_eq!(
+            prepare_fts5_query("title:ai-memory"),
+            r#"title:("ai-memory" OR "ai memory")"#
+        );
+        assert_eq!(
+            prepare_fts5_query("body:current.md OR title:handoff"),
+            r#"body:("current.md" OR "current md") OR title:handoff"#
+        );
+        for raw in ["title:ai-memory", "body:a.b c", "title:-", "title:a:b"] {
+            let prepared = prepare_fts5_query(raw);
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
     }
 
     // --- issue #953: configurable stopword list -----------------------
