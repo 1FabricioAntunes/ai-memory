@@ -12,6 +12,13 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed page writes accepting a path component longer than 255 bytes. NTFS
+  counts a file name in UTF-16 units, so a Windows server stored and
+  checkpointed a name such as 100 CJK characters plus `.md` (303 bytes) that
+  ext4 refuses, and a Linux checkout of that wiki left the page missing. The
+  write-time portability check now refuses a component over 255 UTF-8 bytes;
+  pages already stored stay readable.
+  ([#1400](https://github.com/akitaonrails/ai-memory/pull/1400))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
