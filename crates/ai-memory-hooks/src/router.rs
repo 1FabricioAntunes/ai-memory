@@ -1659,7 +1659,25 @@ async fn fetch_and_accept_handoff_at(
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
     let brief_md = render_requested_session_brief(state, &query, ws, proj, actor.as_ref()).await?;
-    let profile_flags = persist_profile_flags(state, &query, ws, proj).await;
+    // The `[profile]` flags are project-wide settings every operator of the
+    // project inherits, so recording them is a write: a viewer granted only
+    // Read may narrow their own session but must not change the project.
+    let may_write_profile = match crate::grants::authorize_resolved(
+        &state.reader,
+        Some((ws, proj)),
+        viewer,
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(err) if err.is_forbidden() => false,
+        Err(err) => {
+            warn!(error = %err, "could not authorize recording the [profile] flags");
+            false
+        }
+    };
+    let profile_flags = persist_profile_flags(state, &query, ws, proj, may_write_profile).await;
     let profile_md =
         render_requested_profile_digest(state, &query, ws, proj, viewer, profile_flags.consume)
             .await;
@@ -2107,11 +2125,16 @@ fn explicit_profile_flag(value: Option<&str>) -> Option<bool> {
 /// session start costs one bounded read and no writer command. Never fails the
 /// session start: an unreadable stored value withholds the digest rather than
 /// guessing it was on.
+///
+/// Without `may_write` (a viewer holding only Read on the project) nothing is
+/// recorded and an explicit value can only switch a flag off for this session,
+/// never back on.
 async fn persist_profile_flags(
     state: &HookState,
     query: &HandoffQuery,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    may_write: bool,
 ) -> ai_memory_store::ProjectProfileFlags {
     let contribute = explicit_profile_flag(query.profile_contribute.as_deref());
     let consume = explicit_profile_flag(query.profile_consume.as_deref());
@@ -2129,6 +2152,12 @@ async fn persist_profile_flags(
             };
         }
     };
+    if !may_write {
+        return ai_memory_store::ProjectProfileFlags {
+            contribute: stored.contribute && contribute.unwrap_or(true),
+            consume: stored.consume && consume.unwrap_or(true),
+        };
+    }
     let wanted = ai_memory_store::ProjectProfileFlags {
         contribute: contribute.unwrap_or(stored.contribute),
         consume: consume.unwrap_or(stored.consume),
@@ -20630,6 +20659,107 @@ pub(crate) mod tests {
         assert!(session_start_text(&state, query).await.is_some());
         let flags = state.reader.project_profile_flags(ws, proj).await.unwrap();
         assert_eq!(flags, ai_memory_store::ProjectProfileFlags::default());
+    }
+    /// The `[profile]` flags are a project-wide setting, so recording them is a
+    /// write. A viewer holding only Read on a restricted project sends opt-out
+    /// and opt-in values at session start; neither may change what every other
+    /// operator of the project inherits. Control: a Write grant records them.
+    #[tokio::test]
+    async fn a_reader_cannot_change_a_projects_profile_flags_at_session_start() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let human = |name: &'static str, level: ai_memory_store::GrantLevel| {
+            let writer = state.writer.clone();
+            let project = state.project_id;
+            async move {
+                let user = writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                writer
+                    .grant_memory(user, project, level, None)
+                    .await
+                    .unwrap();
+                user
+            }
+        };
+        let reader = human("reader", ai_memory_store::GrantLevel::Read).await;
+        let writer = human("writer", ai_memory_store::GrantLevel::Write).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let state = Arc::new(state);
+        let session_start = |viewer: ai_memory_core::UserId, value: &'static str| {
+            let state = state.clone();
+            let mut query = profile_query(&cwd, "claude-code");
+            query.workspace = Some("default".into());
+            query.project = Some("scratch".into());
+            query.profile_contribute = Some(value.into());
+            query.profile_consume = Some(value.into());
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        Some(axum::Extension(AuthorizedViewer(viewer))),
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+        let stored = || {
+            let state = state.clone();
+            async move {
+                state
+                    .reader
+                    .project_profile_flags(state.workspace_id, state.project_id)
+                    .await
+                    .unwrap()
+            }
+        };
+        let on = ai_memory_store::ProjectProfileFlags::default();
+        let off = ai_memory_store::ProjectProfileFlags {
+            contribute: false,
+            consume: false,
+        };
+
+        // The reader's session start succeeds (Read is enough to open it) but
+        // its opt-out stays with this session and is not recorded.
+        let (status, body) = session_start(reader, "false").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, on, "a Read grant changed the project");
+
+        // Control: a Write grant records the project's opt-out.
+        let (status, body) = session_start(writer, "false").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, off);
+
+        // The reader cannot undo the writer's opt-out either.
+        let (status, body) = session_start(reader, "1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, off, "a Read grant re-enabled the profile");
+
+        // Control: the writer can turn it back on.
+        let (status, body) = session_start(writer, "1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored().await, on);
     }
 
     /// A multi-user server leaves the profile off unless the operator enables
