@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Stopped deriving a page title from a `# comment` line inside a fenced code
+  block. A page without a frontmatter title that opened with a shell or Python
+  block was indexed under that comment instead of its real `#` heading, or
+  instead of its filename when it had none.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
