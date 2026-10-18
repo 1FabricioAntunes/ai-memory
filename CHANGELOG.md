@@ -12,6 +12,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Fixed `memory_health` reporting findings for TTL-expired pages. The store now omits expired pages when computing stale, duplicate, and orphan metrics and drill-down lists, preventing expired pages awaiting forget-sweep deletion from distorting workspace and project health overviews.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
