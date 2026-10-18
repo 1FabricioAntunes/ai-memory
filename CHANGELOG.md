@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Stopped a session started at a Windows drive root (`C:\`) from capturing
+  every later event on that drive through session stickiness. The broad-anchor
+  guard refused only `/` and `$HOME`; a drive root normalizes to `c:`, so any
+  `C:\...` cwd counted as inside the session and was folded into its project.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing

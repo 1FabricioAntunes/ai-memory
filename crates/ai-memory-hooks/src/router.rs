@@ -3339,7 +3339,12 @@ fn sticky_within_session_tree(
 fn meaningful_session_anchor(session_cwd: Option<&str>, home_dir: Option<&str>) -> Option<String> {
     let session_cwd = session_cwd.filter(|s| !s.trim().is_empty())?;
     let session_norm = normalize_project_path_key(session_cwd);
-    if session_norm == "/" {
+    // The filesystem root, in each spelling it normalizes to: `/`, a bare
+    // Windows drive (`C:\` becomes `c:`), or nothing at all (`//`). Every
+    // path on that root would start with it.
+    let bytes = session_norm.as_bytes();
+    let drive_root = bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if session_norm == "/" || session_norm.is_empty() || drive_root {
         return None;
     }
     if let Some(home) = home_dir
@@ -6932,6 +6937,33 @@ pub(crate) mod tests {
         assert!(!sticky_within_session_tree(
             Some(r"C:\Users\alice"),
             Some(r"c:\users\alice\repo"),
+            Some(r"C:\Users\alice"),
+        ));
+        // A session rooted at a Windows drive root (or a cwd that
+        // normalizes to nothing) is the filesystem root too: every path on
+        // the drive would fold into it.
+        for root in [r"C:\", "C:/", "c:", "//", r"\\"] {
+            assert!(
+                !sticky_within_session_tree(
+                    Some(root),
+                    Some(r"C:\work\other-project"),
+                    Some(r"C:\Users\alice"),
+                ),
+                "{root:?} must not anchor a session"
+            );
+            assert!(
+                !sticky_out_of_tree_under_repo_root(
+                    Some(root),
+                    Some(r"C:\Users\alice"),
+                    ProjectStrategy::RepoRoot,
+                ),
+                "{root:?} must not anchor a session"
+            );
+        }
+        // A real directory on the drive still anchors.
+        assert!(sticky_within_session_tree(
+            Some(r"C:\work"),
+            Some(r"c:\work\repo"),
             Some(r"C:\Users\alice"),
         ));
     }
