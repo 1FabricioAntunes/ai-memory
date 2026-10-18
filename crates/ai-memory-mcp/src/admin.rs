@@ -3085,6 +3085,7 @@ struct ExpireHandoffsRequest {
     workspace: String,
     project: String,
     /// Mandatory. Without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Only expire handoffs at least this many days old. Omitted clears the
     /// whole open backlog for the scope.
@@ -4398,6 +4399,7 @@ struct PurgeSessionRequest {
     session_id: String,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
     /// delete commits. Off by default; see `ai_memory_store::Compaction` for
@@ -4931,6 +4933,7 @@ struct PurgeProjectRequest {
     project_id: Option<String>,
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
+    #[serde(default)]
     confirm: bool,
     /// Purge even when a managed workstream under this project still holds a
     /// live run lease. Off by default: the cascade would delete that lease row
@@ -5521,7 +5524,10 @@ struct CompactRequest {
     /// Mandatory confirmation. Not because compaction destroys anything — it
     /// deletes nothing — but because it takes an exclusive lock and rewrites
     /// the whole database, so every write blocks until it finishes. That is an
-    /// availability decision, and it should be deliberate.
+    /// availability decision, and it should be deliberate. An omitted field
+    /// reads as `false`, so the caller gets the 400 that says what to send
+    /// instead of the extractor's bare 422.
+    #[serde(default)]
     confirm: bool,
 }
 
@@ -5578,6 +5584,7 @@ struct ReclaimLedgerVersionsRequest {
     /// `compact` it is not reversible by re-running anything: the bytes are
     /// only in the markdown the ledger mirrors, and only if the file on disk
     /// still holds them.
+    #[serde(default)]
     confirm: bool,
     /// Report what would go without deleting it. A dry run changes nothing,
     /// so it needs no `confirm` — that is the whole point of it.
@@ -6069,6 +6076,7 @@ struct MoveProjectRequest {
     to_workspace: String,
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
+    #[serde(default)]
     confirm: bool,
     /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
