@@ -19,6 +19,17 @@ version in [`docs/changelog/`](docs/changelog/):
   to. Redirects inside the same origin still work; one that changes scheme,
   host or port now fails the request and names the origin it pointed at.
   ([#1396](https://github.com/akitaonrails/ai-memory/pull/1396))
+- Required Write access before a session start records a project's `[profile]`
+  `profile_contribute` / `profile_consume` flags. A Read-only viewer's explicit
+  values now only narrow its own session instead of changing the flags for every
+  operator in the project.
+  ([#1421](https://github.com/akitaonrails/ai-memory/pull/1421))
+- Stopped the server from opening files named in a hook payload. Antigravity
+  step-log enrichment now runs only in the client-side `ai-memory hook`; the
+  `/hook` and `/hook/batch` ingest paths store the `tool_response` the client
+  sent and never read `artifactDirectoryPath` or `transcriptPath` locations
+  on the server's own disk.
+  ([#1420](https://github.com/akitaonrails/ai-memory/pull/1420))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
