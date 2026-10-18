@@ -113,8 +113,10 @@ version in [`docs/changelog/`](docs/changelog/):
   conversation. The native hook now reads each turn's prompts from the
   conversation's own transcript (`transcriptPath`, only under
   `~/.gemini/<app>/brain/<conversationId>/`, no symlinks out of it, 8 MiB per
-  hook) and records them as user prompts, so summaries and handoffs carry
-  them. A `Stop` that finished the turn (`NO_TOOL_CALL` or `model_stop`) with
+  hook and a 100 ms filesystem deadline) and records them as user prompts,
+  so summaries and handoffs carry them. A timed-out read leaves its cursor
+  untouched and retries on the next hook. A `Stop` that finished the turn
+  (`NO_TOOL_CALL` or `model_stop`) with
   `fullyIdle: true` writes a turn checkpoint, the path OpenCode 2 uses: the
   summary page and one handoff are refreshed and the conversation stays open,
   so `finalize-session` is no longer needed for normal use. It remains the

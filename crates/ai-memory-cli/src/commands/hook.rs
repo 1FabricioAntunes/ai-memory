@@ -596,6 +596,12 @@ fn claim_conversation_start(marker: &Path) -> bool {
 /// the next read of its conversation start over, and the server's ingest
 /// keys drop the prompts it already has.
 const MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS: usize = 256;
+/// Cursor files are tiny JSON objects. Refuse a corrupted or replaced file
+/// before it can make a lifecycle hook allocate without a useful bound.
+const MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES: u64 = 16 * 1024;
+/// Filesystem work for transcript recovery must not hold up the harness. A
+/// timeout leaves the cursor untouched, so the next hook retries the read.
+const ANTIGRAVITY_TRANSCRIPT_READ_BUDGET: Duration = Duration::from_millis(100);
 
 /// `<data_dir>/hook-state/antigravity-transcripts/<conversationId>.json`.
 fn antigravity_transcript_cursor_path(data_dir: &Path, conversation: &str) -> PathBuf {
@@ -606,28 +612,26 @@ fn antigravity_transcript_cursor_path(data_dir: &Path, conversation: &str) -> Pa
 }
 
 fn load_antigravity_transcript_cursor(path: &Path) -> ai_memory_hooks::TranscriptCursor {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    let Some(bytes) = fs::File::open(path).ok().and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() as u64 <= MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES).then_some(bytes)
+    }) else {
+        return ai_memory_hooks::TranscriptCursor::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
-/// Atomic (tmp + rename) and best effort, with bounded retention: a lost
-/// write only makes the next read repeat prompts the server drops by key.
+/// Atomic (private random temp + fsync + rename + parent fsync) and best
+/// effort, with bounded retention: a lost write only makes the next read
+/// repeat prompts the server drops by key.
 fn store_antigravity_transcript_cursor(path: &Path, cursor: &ai_memory_hooks::TranscriptCursor) {
     let (Some(dir), Ok(bytes)) = (path.parent(), serde_json::to_vec(cursor)) else {
         return;
     };
-    if fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    let written = fs::File::create(&tmp).and_then(|mut file| {
-        std::io::Write::write_all(&mut file, &bytes)?;
-        file.sync_all()
-    });
-    if written.is_err() || fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
+    if ai_memory_wiki::write_atomic(path, &bytes).is_err() {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -635,7 +639,11 @@ fn store_antigravity_transcript_cursor(path: &Path, cursor: &ai_memory_hooks::Tr
     };
     let mut others = entries
         .filter_map(Result::ok)
-        .filter(|entry| entry.path() != path)
+        .filter(|entry| {
+            entry.path() != path
+                && entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
         .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
         .collect::<Vec<_>>();
     others.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
@@ -694,6 +702,20 @@ struct AntigravityPromptEvents {
     cursor: ai_memory_hooks::TranscriptCursor,
 }
 
+fn run_before_deadline<T: Send + 'static>(
+    budget: Duration,
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("ai-memory-antigravity-transcript".into())
+        .spawn(move || {
+            let _ = sender.send(task());
+        })
+        .ok()?;
+    receiver.recv_timeout(budget).ok()
+}
+
 /// The `user-prompt` events for the prompts Antigravity wrote to this
 /// conversation's transcript since the last read. Antigravity puts no
 /// prompt in any hook payload; `transcriptPath` names the transcript and is
@@ -707,13 +729,21 @@ fn antigravity_transcript_prompt_events(
     home: Option<&Path>,
     raw: &serde_json::Value,
 ) -> Option<AntigravityPromptEvents> {
-    let conversation = ai_memory_hooks::antigravity_conversation_id(raw)?;
-    let transcript = ai_memory_hooks::antigravity_transcript_path(raw, home?)?;
-    let cursor_path = antigravity_transcript_cursor_path(data_dir, conversation);
-    let read = ai_memory_hooks::read_transcript_prompts(
-        &transcript,
-        &load_antigravity_transcript_cursor(&cursor_path),
-    )?;
+    let conversation = ai_memory_hooks::antigravity_conversation_id(raw)?.to_owned();
+    let declared = raw.get("transcriptPath")?.as_str()?.to_owned();
+    let request = serde_json::json!({
+        "conversationId": conversation.clone(),
+        "transcriptPath": declared,
+    });
+    let home = home?.to_owned();
+    let cursor_path = antigravity_transcript_cursor_path(data_dir, &conversation);
+    let (cursor_path, read) =
+        run_before_deadline(ANTIGRAVITY_TRANSCRIPT_READ_BUDGET, move || {
+            let transcript = ai_memory_hooks::antigravity_transcript_path(&request, &home)?;
+            let cursor = load_antigravity_transcript_cursor(&cursor_path);
+            let read = ai_memory_hooks::read_transcript_prompts(&transcript, &cursor)?;
+            Some((cursor_path, read))
+        })??;
     let mut events = Vec::with_capacity(read.prompts.len());
     for prompt in &read.prompts {
         let mut body = serde_json::Map::new();
@@ -729,7 +759,7 @@ fn antigravity_transcript_prompt_events(
         let mut body = serde_json::Value::Object(body);
         ai_memory_hooks::cap_lifecycle_body_for_client(&mut body, HookEvent::UserPrompt);
         events.push((
-            antigravity_prompt_ingest_key(conversation, prompt),
+            antigravity_prompt_ingest_key(&conversation, prompt),
             serde_json::to_string(&body).ok()?,
         ));
     }
@@ -6908,6 +6938,17 @@ mod tests {
             load_antigravity_transcript_cursor(&path),
             ai_memory_hooks::TranscriptCursor::default()
         );
+        std::fs::write(
+            &path,
+            vec![0_u8; (MAX_ANTIGRAVITY_TRANSCRIPT_CURSOR_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert_eq!(
+            load_antigravity_transcript_cursor(&path),
+            ai_memory_hooks::TranscriptCursor::default()
+        );
+        let unrelated = dir.join("keep.lock");
+        std::fs::write(&unrelated, b"not a cursor").unwrap();
         for n in 0..MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS + 5 {
             store_antigravity_transcript_cursor(
                 &antigravity_transcript_cursor_path(tmp.path(), &format!("c{n}")),
@@ -6917,6 +6958,7 @@ mod tests {
         let names = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".json"))
             .collect::<Vec<_>>();
         assert!(
             names.len() <= MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS,
@@ -6927,6 +6969,24 @@ mod tests {
             names.iter().all(|name| name.ends_with(".json")),
             "{names:?}"
         );
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"not a cursor");
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")
+        }));
+    }
+
+    #[test]
+    fn antigravity_transcript_read_deadline_does_not_wait_for_blocked_work() {
+        assert_eq!(run_before_deadline(Duration::from_secs(1), || 42), Some(42));
+
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let result = run_before_deadline(Duration::from_millis(20), move || blocked.recv());
+        drop(release);
+        assert!(result.is_none());
     }
 
     #[tokio::test]

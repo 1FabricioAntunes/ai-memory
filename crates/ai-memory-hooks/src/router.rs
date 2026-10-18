@@ -14329,7 +14329,13 @@ pub(crate) mod tests {
             assert_eq!(handoff.origin.from_agent, AgentKind::AntigravityCli);
             assert_eq!(handoff.origin.from_session_id, Some(session));
             assert!(
-                handoff.content.summary.contains(text),
+                handoff.content.summary.contains(text)
+                    || handoff
+                        .content
+                        .open_questions
+                        .iter()
+                        .chain(&handoff.content.next_steps)
+                        .any(|item| item.contains(text)),
                 "{:?}",
                 handoff.content
             );

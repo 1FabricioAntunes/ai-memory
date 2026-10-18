@@ -1395,9 +1395,11 @@ The transcript is read only when `transcriptPath` names the conversation's own
 (or the `transcript_full.jsonl` beside it, which the CLI reports), with
 `<app>` one of `antigravity`, `antigravity-cli` or `antigravity-ide`. Another
 file, another conversation's transcript and a symlinked directory that leads
-out of the conversation are refused. One hook reads at most 8 MiB, and a
-cursor under `<data_dir>/hook-state/antigravity-transcripts/` resumes where
-the previous read stopped. Steps a hook injected are skipped, the text inside
+out of the conversation are refused. One hook reads at most 8 MiB under a
+100 ms filesystem deadline; a timeout leaves the cursor untouched so the next
+hook retries. The bounded cursor under
+`<data_dir>/hook-state/antigravity-transcripts/` resumes where the previous
+read stopped. Steps a hook injected are skipped, the text inside
 the CLI's `<USER_REQUEST>` wrapper is kept, and each prompt is capped and
 scrubbed like any other before the server sanitizes it again. Its ingest key
 comes from the conversation and step, so a repeated read stores it once. The
