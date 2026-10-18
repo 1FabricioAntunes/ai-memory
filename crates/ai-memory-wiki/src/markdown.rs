@@ -44,7 +44,8 @@ pub struct Markdown {
 ///
 /// Recognises only the canonical `---\n<yaml>\n---\n` block at the very
 /// start of the document, with either LF or CRLF line endings on the fence
-/// lines. Anything else is treated as body.
+/// lines. The closing fence may also end the file without a line ending.
+/// Anything else is treated as body.
 ///
 /// A leading UTF-8 BOM is dropped either way. It only means "this file is
 /// UTF-8" while it sits at offset zero; carried into `body` it is a
@@ -69,11 +70,17 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
         (trimmed.strip_prefix("---\n"), "\n")
     };
     let close = format!("\n---{newline}");
-    if let Some(rest) = rest
-        && let Some(end) = rest.find(&close)
-    {
-        let fm_str = rest[..end].trim_end_matches('\r');
-        let body = rest[end + close.len()..].to_string();
+    // The closing fence may also be the file's last line with no line
+    // ending after it: a frontmatter-only file (a `_meta.md` scope manifest,
+    // a stub page) saved by an editor that does not add a final newline.
+    let split = rest.and_then(|rest| {
+        rest.find(&close)
+            .map(|end| (&rest[..end], &rest[end + close.len()..]))
+            .or_else(|| rest.strip_suffix("\n---").map(|fm| (fm, "")))
+    });
+    if let Some((fm_str, body)) = split {
+        let fm_str = fm_str.trim_end_matches('\r');
+        let body = body.to_string();
         let fm_json = crate::frontmatter_yaml::parse(fm_str).map_err(WikiError::Yaml)?;
         return Ok(Markdown {
             frontmatter: fm_json,
@@ -1299,6 +1306,38 @@ mod tests {
         assert_eq!(md.frontmatter["pinned"], true);
         assert_eq!(md.frontmatter["tags"][0], "a");
         assert_eq!(md.body, "Body\r\n");
+    }
+
+    /// A frontmatter-only file whose closing fence is the last line, saved
+    /// without a final newline (the editor default in several editors). The
+    /// block is still the frontmatter: reading it as body loses the `_meta.md`
+    /// workspace name and a page's tier, pin and TTL, and the OKF file pass
+    /// would write a second frontmatter block above it.
+    #[test]
+    fn parses_frontmatter_closed_at_end_of_file() {
+        let md = parse("---\ntitle: Hello\npinned: true\n---").unwrap();
+        assert_eq!(md.frontmatter["title"], "Hello");
+        assert_eq!(md.frontmatter["pinned"], true);
+        assert_eq!(md.body, "");
+        assert_eq!(
+            emit(&md).unwrap(),
+            "---\ntitle: Hello\npinned: true\n---\n",
+            "re-emitting must keep a single frontmatter block"
+        );
+
+        let crlf = parse("\u{FEFF}---\r\ntitle: Hello\r\n---").unwrap();
+        assert_eq!(crlf.frontmatter["title"], "Hello");
+        assert_eq!(crlf.body, "");
+    }
+
+    /// A body line that merely starts with `---` at the end of the file is
+    /// not a closing fence.
+    #[test]
+    fn trailing_dashes_line_is_not_a_closing_fence() {
+        let src = "---\ntitle: Hello\n----";
+        let md = parse(src).unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, src);
     }
 
     /// A page a Windows editor saved with a UTF-8 BOM and no frontmatter:
