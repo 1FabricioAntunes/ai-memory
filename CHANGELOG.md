@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Parsed a Cursor agent answer whose surrounding prose contains brackets, such
+  as `Here is the result for [the request]:` before the JSON or `(see [schema])`
+  after it. The first-to-last bracket slice was invalid there, so the provider
+  reported "cursor agent did not return JSON" despite a well-formed object.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
