@@ -124,12 +124,14 @@
         e.preventDefault();
         close();
       } else if (e.key === "Tab") {
-        var first = e.shiftKey ? closeBtn : dismiss;
-        var next = e.shiftKey ? dismiss : closeBtn;
-        if (document.activeElement === first) {
+        var active = document.activeElement;
+        if (e.shiftKey && active === dismiss) {
           e.preventDefault();
-          next.focus();
-        } else if (document.activeElement !== next) {
+          closeBtn.focus();
+        } else if (!e.shiftKey && active === closeBtn) {
+          e.preventDefault();
+          dismiss.focus();
+        } else if (active !== dismiss && active !== closeBtn) {
           e.preventDefault();
           dismiss.focus();
         }

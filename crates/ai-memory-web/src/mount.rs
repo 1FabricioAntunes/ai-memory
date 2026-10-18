@@ -853,6 +853,10 @@ mod tests {
         );
         assert!(body.contains("\"Escape\"") && body.contains("keydown"));
         assert!(body.contains("closeBtn.focus()"), "dialog must take focus");
+        assert!(
+            body.contains("!e.shiftKey && active === closeBtn"),
+            "Tab from the last control must wrap to the first"
+        );
 
         // Archive deleted → dialog still explains, recovery falls back
         // to the git checkpoint; the inline banner is gone.
