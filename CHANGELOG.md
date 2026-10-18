@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Stripped a reasoning section that ends in a bare `</think>` (or
+  `</thinking>`, `</analysis>`, `</reasoning>`) from openai-compat structured
+  output. Chat templates that open the reasoning block themselves (DeepSeek-R1,
+  QwQ, Qwen3 thinking models) return no opening tag, so the reasoning stayed in
+  front of the answer and the JSON extractor could pick a draft object out of it.
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
