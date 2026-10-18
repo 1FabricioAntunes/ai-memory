@@ -148,7 +148,7 @@ async fn seed() -> Seeded {
             .await
             .unwrap();
     }
-    let status = store.reader.derived_index_status().await.unwrap();
+    let status = store.reader.derived_index_status(None).await.unwrap();
     assert_eq!(
         status.latest_pages_missing_embeddings, 0,
         "every seeded page must carry a vector"

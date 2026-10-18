@@ -143,7 +143,7 @@ async fn a_burst_larger_than_the_queue_applies_backpressure_and_loses_nothing() 
         t.await.unwrap();
     }
 
-    let status = store.reader.derived_index_status().await.unwrap();
+    let status = store.reader.derived_index_status(None).await.unwrap();
     assert_eq!(
         status.observations_rows, BURST as u64,
         "every write in a burst larger than the queue must land: backpressure, \

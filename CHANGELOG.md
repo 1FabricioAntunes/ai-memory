@@ -114,6 +114,10 @@ version in [`docs/changelog/`](docs/changelog/):
   page, aligning belief input aggregation with the lint's resolved/stale split.
   ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
 - Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+- Counted a latest page whose only stored vector belongs to another provider,
+  model, or dimension as missing an embedding in `ai-memory status` and the
+  web `/health` page, so the count no longer reads zero after an
+  embedding-model switch.
 
 ## [3.1.1] - 2026-10-17
 

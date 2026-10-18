@@ -483,7 +483,7 @@ async fn a_reclaimed_ledger_row_leaves_no_searchable_text_behind() {
         .await
         .unwrap();
 
-    let drift = store.reader.derived_index_status().await.unwrap();
+    let drift = store.reader.derived_index_status(None).await.unwrap();
     assert_eq!(
         drift.pages_fts_rows, drift.pages_rows,
         "the rebuilt index agrees with the content table again",

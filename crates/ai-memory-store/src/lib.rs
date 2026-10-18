@@ -8742,9 +8742,111 @@ mod tests {
             .upsert_page(sample_page(ws, proj, "notes/empty.md", "   "))
             .await
             .unwrap();
-        let derived = store.reader.derived_index_status().await.unwrap();
+        let derived = store.reader.derived_index_status(None).await.unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
         assert_eq!(derived.latest_pages_unembeddable, 1, "{derived:?}");
+    }
+
+    /// A model swap must not read as a covered index: with the configured
+    /// `(provider, model, dim)` triple, a latest page whose only vector is
+    /// from another triple counts as missing, while the historical `None`
+    /// count (no vector at all) is unchanged.
+    #[tokio::test]
+    async fn missing_embeddings_counted_against_configured_triple() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/stale.md", "body a"))
+            .await
+            .unwrap();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let insert_embedding = |path: &str, provider: &str, model: &str, dim: u32| {
+            let page_id: Vec<u8> = db
+                .query_row(
+                    "SELECT id FROM pages WHERE path = ?1 AND is_latest = 1",
+                    [path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            db.execute(
+                "INSERT INTO page_embeddings (page_id, vector, provider, model, dim, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0) \
+                 ON CONFLICT(page_id) DO UPDATE SET \
+                     vector = excluded.vector, provider = excluded.provider, \
+                     model = excluded.model, dim = excluded.dim, \
+                     created_at = excluded.created_at",
+                rusqlite::params![
+                    page_id,
+                    crate::f32_vec_to_bytes(&vec![0.5f32; dim as usize]),
+                    provider,
+                    model,
+                    dim,
+                ],
+            )
+            .unwrap();
+        };
+        // One latest page whose only vector is triple A.
+        let triple_a = ("prov-a".to_string(), "model-a".to_string(), 8);
+        let triple_b = ("prov-b".to_string(), "model-b".to_string(), 16);
+        insert_embedding("notes/stale.md", "prov-a", "model-a", 8);
+
+        // Historical behaviour: the page carries a vector, so nothing is
+        // missing.
+        let derived = store.reader.derived_index_status(None).await.unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
+
+        // Configured triple A: the page is covered by its own vector.
+        let derived = store
+            .reader
+            .derived_index_status(Some(triple_a.clone()))
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
+
+        // Configured triple B: the same page now counts as missing — its
+        // only vector is stale for the model in use.
+        let derived = store
+            .reader
+            .derived_index_status(Some(triple_b.clone()))
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+
+        // A second page under triple B only: each configured triple then
+        // sees exactly the page holding the other triple's vector, and a
+        // page covered by its own triple never counts.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/fresh.md", "body b"))
+            .await
+            .unwrap();
+        insert_embedding("notes/fresh.md", "prov-b", "model-b", 16);
+        let derived = store
+            .reader
+            .derived_index_status(Some(triple_a.clone()))
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+        let derived = store
+            .reader
+            .derived_index_status(Some(triple_b.clone()))
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+        let derived = store.reader.derived_index_status(None).await.unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
     }
 
     /// Typed edges surface in the derived status by relation.
@@ -8778,7 +8880,7 @@ mod tests {
             },
         ];
         store.writer.upsert_page(page).await.unwrap();
-        let derived = store.reader.derived_index_status().await.unwrap();
+        let derived = store.reader.derived_index_status(None).await.unwrap();
         assert_eq!(
             derived.typed_links_from_latest_pages,
             vec![("fixes".to_string(), 1)],

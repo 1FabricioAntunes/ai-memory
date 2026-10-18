@@ -46,7 +46,7 @@ async fn page_fts_rows_report_index_drift() {
         .await
         .unwrap();
 
-    let before = store.reader.derived_index_status().await.unwrap();
+    let before = store.reader.derived_index_status(None).await.unwrap();
     assert_eq!(before.pages_rows, 1);
     assert_eq!(
         before.pages_fts_rows, 1,
@@ -73,7 +73,7 @@ async fn page_fts_rows_report_index_drift() {
         assert_eq!(hits, 0, "the entry really left the index");
     }
 
-    let after = store.reader.derived_index_status().await.unwrap();
+    let after = store.reader.derived_index_status(None).await.unwrap();
     assert_eq!(after.pages_rows, 1, "the source row is untouched");
     assert_eq!(
         after.pages_fts_rows, 0,
@@ -129,7 +129,7 @@ async fn observation_fts_rows_report_index_drift() {
         .await
         .unwrap();
 
-    let before = store.reader.derived_index_status().await.unwrap();
+    let before = store.reader.derived_index_status(None).await.unwrap();
     assert_eq!(before.observations_rows, 1);
     assert_eq!(
         before.observations_fts_rows, 1,
@@ -154,7 +154,7 @@ async fn observation_fts_rows_report_index_drift() {
         assert_eq!(hits, 0, "the entry really left the index");
     }
 
-    let after = store.reader.derived_index_status().await.unwrap();
+    let after = store.reader.derived_index_status(None).await.unwrap();
     assert_eq!(after.observations_rows, 1, "the source row is untouched");
     assert_eq!(
         after.observations_fts_rows, 0,
