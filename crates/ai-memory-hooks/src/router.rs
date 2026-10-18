@@ -4547,8 +4547,31 @@ fn build_auto_handoff(
     // bounded queries when the digest loaded.
     let first_prompt = facts.first_prompt.clone();
     let last_prompt = facts.last_prompt.clone();
+    let open_questions = if turn_checkpoint {
+        // A completed turn is neither a native-session exit nor evidence that
+        // the user's last question remains unanswered.
+        last_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty() && !is_acknowledgment(prompt))
+            .map(|prompt| format!("Continue from last request: {}", cap_handoff_text(prompt)))
+            .into_iter()
+            .collect()
+    } else {
+        derive_open_questions(facts, &last_prompt)
+    };
+    // A heuristic that quotes the last prompt already carries it; the summary
+    // must not repeat it.
+    let last_quoted = last_prompt.as_deref().is_some_and(|last| {
+        let quoted = cap_handoff_text(last.trim());
+        !quoted.is_empty() && open_questions.iter().any(|q| q.ends_with(quoted.as_str()))
+    });
     let mut summary = match (&first_prompt, &last_prompt) {
+        (Some(first), Some(last)) if first == last && last_quoted => {
+            "Single-prompt session; the prompt is quoted under open questions.".to_string()
+        }
         (Some(first), Some(last)) if first == last => format!("Session focused on: {}", cap(first)),
+        (Some(first), Some(_)) if last_quoted => format!("Started: {}", cap(first)),
         (Some(first), Some(last)) => format!("Started: {}\n\nLast: {}", cap(first), cap(last),),
         (Some(first), None) => format!("Started: {}", cap(first)),
         _ => format!(
@@ -4568,19 +4591,6 @@ fn build_auto_handoff(
         summary.push_str("\n\nLatest assistant response: ");
         summary.push_str(assistant);
     }
-    let open_questions = if turn_checkpoint {
-        // A completed turn is neither a native-session exit nor evidence that
-        // the user's last question remains unanswered.
-        last_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty() && !is_acknowledgment(prompt))
-            .map(|prompt| format!("Continue from last request: {}", cap_handoff_text(prompt)))
-            .into_iter()
-            .collect()
-    } else {
-        derive_open_questions(facts, &last_prompt)
-    };
     let next_steps = if facts.tools.is_empty() {
         Vec::new()
     } else {
@@ -19954,10 +19964,7 @@ pub(crate) mod tests {
             ),
         ];
         let handoff = handoff_from(&observations, false);
-        assert_eq!(
-            handoff.summary,
-            "Started: map the sweep code\n\nLast: fix the pinned-page sweep"
-        );
+        assert_eq!(handoff.summary, "Started: map the sweep code");
         assert_eq!(
             handoff.open_questions,
             vec!["Continue from: fix the pinned-page sweep".to_string()]
@@ -19968,6 +19975,48 @@ pub(crate) mod tests {
                 .open_questions
                 .iter()
                 .all(|q| !q.contains("task-notification"))
+        );
+    }
+
+    #[test]
+    fn auto_handoff_quotes_a_single_prompt_once() {
+        let handoff = handoff_from(
+            &[mk_obs(
+                ObservationKind::UserPrompt,
+                "fix",
+                "fix the login bug",
+            )],
+            false,
+        );
+        assert_eq!(handoff.open_questions, ["Continue from: fix the login bug"]);
+        assert!(
+            !handoff.summary.contains("fix the login bug"),
+            "{}",
+            handoff.summary
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_the_last_prompt_in_the_summary_when_open_questions_do_not_quote_it() {
+        // File work with no Stop takes the abnormal-exit heuristic, which does
+        // not quote the prompt, so the summary is the only place it survives.
+        let handoff = handoff_from(
+            &[
+                mk_obs(ObservationKind::UserPrompt, "fix", "fix the login bug"),
+                mk_obs(
+                    ObservationKind::PostToolUse,
+                    "tool file",
+                    "tool_family: file",
+                ),
+            ],
+            false,
+        );
+        assert!(
+            handoff
+                .summary
+                .starts_with("Session focused on: fix the login bug"),
+            "{}",
+            handoff.summary
         );
     }
 
@@ -20050,7 +20099,12 @@ pub(crate) mod tests {
             "fix <div> alignment",
         )];
         let handoff = handoff_from(&observations, false);
-        assert_eq!(handoff.summary, "Session focused on: fix <div> alignment");
+        // The prompt is quoted under open questions, not repeated in the summary.
+        assert!(
+            !handoff.summary.contains("alignment"),
+            "{}",
+            handoff.summary
+        );
         assert_eq!(
             handoff.open_questions,
             vec!["Continue from: fix <div> alignment".to_string()]
@@ -20065,11 +20119,7 @@ pub(crate) mod tests {
             mk_obs(ObservationKind::UserPrompt, "paste", pasted),
         ];
         let handoff = handoff_from(&observations, false);
-        assert!(
-            handoff.summary.ends_with(&format!("Last: {pasted}")),
-            "got: {}",
-            handoff.summary
-        );
+        assert_eq!(handoff.summary, "Started: map the sweep code");
         assert_eq!(
             handoff.open_questions,
             vec![format!("Continue from: {pasted}")]
@@ -20081,7 +20131,7 @@ pub(crate) mod tests {
         let prompt = "\u{276f} rode o workflow de arquitetura";
         let observations = vec![mk_obs(ObservationKind::UserPrompt, "run", prompt)];
         let handoff = handoff_from(&observations, false);
-        assert_eq!(handoff.summary, format!("Session focused on: {prompt}"));
+        assert!(!handoff.summary.contains(prompt), "{}", handoff.summary);
         assert_eq!(
             handoff.open_questions,
             vec![format!("Continue from: {prompt}")]
