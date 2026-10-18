@@ -5499,6 +5499,92 @@ pub(crate) mod tests {
         assert_eq!(stored.len(), 1);
     }
 
+    /// PoC: a hook payload cannot make the server read its own disk.
+    ///
+    /// Any capture credential (a DB user's `aim_` key, or anyone on an
+    /// unauthenticated server) posts an Antigravity `PostToolUse` whose
+    /// `artifactDirectoryPath` (or `transcriptPath`) names a directory on the
+    /// SERVER. Envelope parsing used to open
+    /// `<dir>/.system_generated/steps/<stepIdx>/output.txt` there and store up
+    /// to 2 KiB of it as the observation body, which the caller then reads back
+    /// through `memory_search` / `memory_get_observations` / the web UI. The
+    /// file here stands in for anything the server process can read.
+    #[tokio::test]
+    async fn a_hook_payload_cannot_make_the_server_read_its_own_disk() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let server_only = TempDir::new().unwrap();
+        let step = server_only
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("7");
+        std::fs::create_dir_all(&step).unwrap();
+        std::fs::create_dir_all(server_only.path().join(".system_generated").join("logs")).unwrap();
+        std::fs::write(step.join("output.txt"), "SERVER_SECRET_SENTINEL=hunter2\n").unwrap();
+        let transcript = server_only
+            .path()
+            .join(".system_generated")
+            .join("logs")
+            .join("t.jsonl");
+
+        let mut sessions = Vec::new();
+        let mut items = Vec::new();
+        for (i, locator) in [
+            ("artifactDirectoryPath", server_only.path().to_path_buf()),
+            ("transcriptPath", transcript),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = SessionId::new().to_string();
+            let mut body = serde_json::json!({
+                "session_id": session,
+                "cwd": tmp.path().to_string_lossy(),
+                "toolCall": { "name": "view_file", "args": { "AbsolutePath": "x" } },
+                "stepIdx": 7,
+            });
+            body[locator.0] = serde_json::json!(locator.1.to_string_lossy());
+            items.push(HookBatchItem {
+                url: format!("http://h/hook?event=post-tool-use&agent=antigravity-cli&i={i}"),
+                body,
+            });
+            sessions.push(session);
+        }
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut stored_any = false;
+        for session in sessions {
+            for obs in state
+                .reader
+                .observations_for_session(session.parse().unwrap())
+                .await
+                .unwrap()
+            {
+                stored_any = true;
+                assert!(
+                    !obs.body.contains("SERVER_SECRET_SENTINEL"),
+                    "a hook payload made the server read a file from its own disk: {:?}",
+                    obs.body
+                );
+            }
+        }
+        assert!(stored_any, "the events themselves are still captured");
+        assert!(
+            !any_file_contains(tmp.path(), b"SERVER_SECRET_SENTINEL"),
+            "server file content reached the store"
+        );
+    }
     /// A capture that opens a new project records the user capturing as its
     /// creator.
     ///
