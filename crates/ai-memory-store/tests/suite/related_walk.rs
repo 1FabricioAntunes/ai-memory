@@ -1273,10 +1273,7 @@ async fn cross_project_degree_ignores_expired_pages() {
         .briefing_for_project(ws, lib, 5, ai_memory_core::OwnerFilter::Any, false)
         .await
         .unwrap();
-    assert_eq!(
-        lib_brief.cross_project_dependents, 1,
-        "app depends on lib"
-    );
+    assert_eq!(lib_brief.cross_project_dependents, 1, "app depends on lib");
     assert_eq!(lib_brief.cross_project_dependencies, 0);
 
     let other_brief = store
@@ -1293,4 +1290,3 @@ async fn cross_project_degree_ignores_expired_pages() {
         "app's expired link to other does not make other a dependency of app"
     );
 }
-
