@@ -107,7 +107,7 @@ cargo run --release -p ai-memory-eval -- retrieval --embeddings local
 - Local inference has two process-wide slots. Background document embeddings
   use one slot, leaving the other available to search queries. This avoids
   page writes and administrative backfill crowding interactive recall off the
-  CPU. A query that arrives while both slots are serving queries falls back
+  CPU. A query that arrives while both slots are busy falls back
   immediately to lexical/entity/graph retrieval instead of building an
   unbounded queue. Hosted embedding providers are not subject to this local
   scheduler.
