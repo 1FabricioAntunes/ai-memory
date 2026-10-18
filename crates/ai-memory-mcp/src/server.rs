@@ -2641,8 +2641,11 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach the wiki handle. Without this, `memory_forget_sweep`
-    /// and `memory_lint` cannot write their report pages.
+    /// Attach the wiki handle. Without this, `memory_lint` returns an
+    /// error, and `memory_forget_sweep` refuses every pass that
+    /// deletes or rewrites a page (TTL, decay eviction, compaction,
+    /// cold-cluster dedup) and skips tombstone cleanup and the event-ledger
+    /// pass; only the observation prune still runs.
     #[must_use]
     pub fn with_wiki(mut self, wiki: Wiki) -> Self {
         self.wiki = Some(wiki);

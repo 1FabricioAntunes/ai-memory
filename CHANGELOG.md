@@ -12,6 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Corrected the `AiMemoryServer::with_wiki` documentation, which said the
+  forget sweep only lost its report page without a wiki handle. It now says the
+  sweep refuses every page-mutating pass and skips tombstone cleanup and the
+  event-ledger pass, and that `memory_lint` returns an error.
+  ([#1401](https://github.com/akitaonrails/ai-memory/pull/1401))
 - Fixed `memory_lint` reporting findings for TTL-expired pages. The lint pass
   now omits expired pages before evaluating episodic staleness, rule suggestions,
   duplicate titles, and vector or LLM contradiction candidates, preventing
