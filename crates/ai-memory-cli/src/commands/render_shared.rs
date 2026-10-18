@@ -1514,8 +1514,16 @@ pub(crate) const ANTIGRAVITY_TOOL_EVENTS: [(&str, &str); 2] = [
     ("PostToolUse", "post-tool-use.sh"),
 ];
 
-pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
-    [("PreInvocation", "session-start.sh"), ("Stop", "stop.sh")];
+/// `SessionStart` starts a conversation and delivers the handoff.
+/// `PreInvocation` fires before every model call; its invocation zero starts
+/// a user turn, where the native hook recovers the turn's prompts from the
+/// transcript, and stands in for `SessionStart` on builds that have none.
+/// `Stop` ends one execution loop; a finished, idle one is a turn checkpoint.
+pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 3] = [
+    ("SessionStart", "session-start.sh"),
+    ("PreInvocation", "pre-invocation.sh"),
+    ("Stop", "stop.sh"),
+];
 
 /// Build the Antigravity CLI (`agy`) `hooks.json` payload.
 ///
@@ -1523,8 +1531,8 @@ pub(crate) const ANTIGRAVITY_LIFECYCLE_EVENTS: [(&str, &str); 2] =
 /// maps hook-group names to their event configurations. Each group
 /// can contain any subset of the supported events. Tool events
 /// (`PreToolUse`, `PostToolUse`) use the nested shape with matcher;
-/// lifecycle events (`PreInvocation`, `Stop`) use a flat handler
-/// list where matcher is ignored.
+/// lifecycle events (`SessionStart`, `PreInvocation`, `Stop`) use a flat
+/// handler list where matcher is ignored.
 ///
 /// The output is `{ "ai-memory": { <events> } }`.
 pub(crate) fn build_antigravity_payload_with_data_dir(
@@ -4651,12 +4659,56 @@ $payload = [Console]::In.ReadToEnd()
             "Stop must record a stop observation, not synthesize session-end handoffs: {stop_cmd}"
         );
 
-        // All expected events present
-        for expected in ["PreToolUse", "PostToolUse", "PreInvocation", "Stop"] {
-            assert!(
-                group.contains_key(expected),
-                "missing Antigravity event {expected}"
-            );
+        // All expected events present, each lifecycle event on its own
+        // script: SessionStart starts the conversation, PreInvocation marks
+        // a turn (and stands in for SessionStart on builds without it).
+        assert_eq!(
+            group.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "PreToolUse",
+                "PostToolUse",
+                "SessionStart",
+                "PreInvocation",
+                "Stop"
+            ]
+        );
+        for (event, script) in [
+            ("SessionStart", "session-start.sh"),
+            ("PreInvocation", "pre-invocation.sh"),
+        ] {
+            let cmd = group[event][0]["command"].as_str().unwrap();
+            // The script path's separator and quoting follow the platform
+            // (`'...\session-start.sh'` on Windows), so compare the file name.
+            let file = cmd
+                .trim_end_matches(['\'', '"'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap();
+            assert_eq!(file, script, "{event}: {cmd}");
+        }
+    }
+
+    /// The native command's event token is the script stem, so the native
+    /// hook tells SessionStart and PreInvocation apart by their tokens.
+    #[test]
+    fn antigravity_native_commands_carry_distinct_start_tokens() {
+        let v = build_antigravity_payload_for_platform(
+            Path::new("/host/hooks/antigravity-cli"),
+            "http://localhost:49374",
+            None,
+            HookCommandPlatform::PosixNative,
+            "antigravity-cli",
+            None,
+            None,
+        );
+        for (event, token) in [
+            ("SessionStart", "--event session-start "),
+            ("PreInvocation", "--event pre-invocation "),
+            ("Stop", "--event stop "),
+        ] {
+            let cmd = v["ai-memory"][event][0]["command"].as_str().unwrap();
+            assert!(cmd.contains(token), "{event}: {cmd}");
+            assert!(cmd.contains("--agent antigravity-cli"), "{event}: {cmd}");
         }
     }
 

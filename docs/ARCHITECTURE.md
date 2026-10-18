@@ -111,7 +111,10 @@ from hook paths.
    without a reliable true session-end hook need an explicit ending action:
    `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI
    (Codex has a native `SessionEnd` since CLI 0.145.0; `finalize-session
-   --agent codex` is only the fallback on older Codex).
+   --agent codex` is only the fallback on older Codex). OpenCode 2 and
+   Antigravity also publish a turn checkpoint on a finished `Stop`: the
+   session page and the session's one open handoff are refreshed in place
+   while the session stays open.
    The command selects the latest matching open session and enters the same
    canonical SessionEnd path as a native hook. Generated session-page
    frontmatter records `session_id` plus the immutable `sessions.agent_kind`
@@ -332,8 +335,8 @@ metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.
 With server-wide `[handoff].create_on_session_end = false`, session end writes
 the summary page and enqueues consolidation but skips creating an automatic
-baton, and an OpenCode root-turn checkpoint refreshes the page without one
-(#1043). Manual handoffs take precedence;
+baton, and an OpenCode or Antigravity turn checkpoint refreshes the page
+without one (#1043). Manual handoffs take precedence;
 otherwise the newest cwd-eligible automatic handoff is delivered, and that
 same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
@@ -401,10 +404,14 @@ harness cwd. Session identity and compiled-session ownership do not move; only
 the raw observations are attributed to the touched project (#932; #1199:
 Hermes reports its process cwd and locates each tool by `workdir`/`path`).
 
-Antigravity CLI has no native SessionStart event. Its `PreInvocation` hook
-fires before every model call, so the bridge maps only the documented
-`invocationNum = 0` payload to `session-start`; later invocations are ignored
-before spool or network side effects.
+Antigravity's `SessionStart` maps to `session-start`. Its `PreInvocation` hook
+fires before every model call, so the bridge acts only on the documented
+`invocationNum = 0` payload, the start of a user turn: it records the turn's
+prompts from the conversation's transcript (no Antigravity payload carries a
+prompt), and on builds without `SessionStart` the first turn's call posts
+`session-start` in its place, once per conversation. Later invocations are
+ignored before spool or network side effects. A `Stop` that finished the turn
+with nothing left running is a turn checkpoint, as for OpenCode 2.
 
 Unknown events do **not** expand the enum and, by default, leave no
 source-event metadata in storage; they collapse to `other`. Third-party
@@ -1140,7 +1147,7 @@ per_user = false                  # shared + own slots in agent context
 
 [handoff]                         # optional server-wide handoff policy
 claim_on_session_start = true     # false offers metadata; explicit accept claims
-create_on_session_end = true      # false stops automatic handoffs at session end and OpenCode turn checkpoints
+create_on_session_end = true      # false stops automatic handoffs at session end and OpenCode/Antigravity turn checkpoints
 
 [profile]                         # cross-project profile (docs/cross-project-profile.md)
 enabled = "auto"                  # auto: on for single-user, off for multi-user; true / false
@@ -1331,7 +1338,7 @@ drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-t
                                   # call that never finished ends lifecycle-only; post-tool-use
                                   # loses results and the completed-call count; stop loses the
                                   # opt-in assistant reply,
-                                  # the normal-completion signal and OpenCode's turn checkpoint;
+                                  # the normal-completion signal and OpenCode's and Antigravity's turn checkpoints;
                                   # pre-compact/post-compaction lose the compaction checkpoint
                                   # and its rewrite job (the session is not ended);
                                   # notification loses the observation;

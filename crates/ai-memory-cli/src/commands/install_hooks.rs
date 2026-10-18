@@ -3122,7 +3122,7 @@ fn merge_gemini_hooks(
 /// Antigravity CLI uses a named-groups format where hook groups are
 /// top-level keys (e.g. `"ai-memory"`) containing event arrays. Tool
 /// events (`PreToolUse`, `PostToolUse`) use nested shape with matcher;
-/// lifecycle events (`PreInvocation`, `Stop`) use flat shape.
+/// lifecycle events (`SessionStart`, `PreInvocation`, `Stop`) use flat shape.
 ///
 /// Config file: `~/.gemini/config/hooks.json`
 fn apply_to_antigravity_settings(
@@ -3163,9 +3163,11 @@ fn apply_to_antigravity_settings(
 }
 
 const ANTIGRAVITY_FINALIZATION_GUIDANCE: &str = "\
-Antigravity `Stop` ends one execution loop, not the conversation. After the\n\
-final turn, run `ai-memory finalize-session --agent antigravity-cli` to create\n\
-the final summary and handoff and to queue opt-in SessionEnd consolidation.\n";
+Antigravity has no conversation-end event. Each finished turn refreshes the\n\
+session summary and its handoff, which a new session in this project picks up\n\
+once the conversation has been quiet for 10 minutes. To close a conversation\n\
+now, hand its baton over at once and queue opt-in SessionEnd consolidation,\n\
+run `ai-memory finalize-session --agent antigravity-cli`.\n";
 
 fn merge_antigravity_hooks(
     staged: &Path,
@@ -9727,7 +9729,10 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
     #[test]
     fn antigravity_manual_render_explains_explicit_finalization() {
         let temp = TempDir::new().unwrap();
-        stub_scripts(temp.path(), &["session-start.sh", "stop.sh"]);
+        stub_scripts(
+            temp.path(),
+            &["session-start.sh", "pre-invocation.sh", "stop.sh"],
+        );
         let output = render_agent_output(
             "antigravity-cli",
             temp.path(),
@@ -9737,7 +9742,8 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             &[&ANTIGRAVITY_LIFECYCLE_EVENTS],
         );
 
-        assert!(output.contains("`Stop` ends one execution loop, not the conversation"));
+        assert!(output.contains("Antigravity has no conversation-end event"));
+        assert!(output.contains("quiet for 10 minutes"));
         assert!(
             output.contains("ai-memory finalize-session --agent antigravity-cli"),
             "Antigravity install output must expose the supported finalizer: {output}"
@@ -14490,6 +14496,66 @@ process.exit(0);
             parsed["ai-memory"]["Stop"].is_array(),
             "Stop hook should be present"
         );
+        assert!(
+            parsed["ai-memory"]["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+    }
+
+    /// An install from before SessionStart was wired ran `session-start` on
+    /// PreInvocation. Re-installing moves PreInvocation to its own
+    /// `pre-invocation` handler and adds SessionStart, one entry each.
+    #[test]
+    fn antigravity_reinstall_rewires_pre_invocation_and_adds_session_start() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "pre-invocation.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "stop.sh",
+            ],
+        );
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "ai-memory": {
+                    "PreInvocation": [{
+                        "type": "command",
+                        "command": "'/old/bin/ai-memory' hook --event session-start --agent antigravity-cli --server-url 'http://127.0.0.1:49374'"
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        merge_antigravity_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        for (event, token) in [
+            ("SessionStart", "session-start"),
+            ("PreInvocation", "pre-invocation"),
+        ] {
+            let entries = parsed["ai-memory"][event].as_array().unwrap();
+            assert_eq!(entries.len(), 1, "{event}: {entries:?}");
+            let command = entries[0]["command"].as_str().unwrap();
+            assert!(command.contains(token), "{event}: {command}");
+            assert!(!command.contains("/old/bin"), "{event}: {command}");
+        }
     }
 
     #[test]

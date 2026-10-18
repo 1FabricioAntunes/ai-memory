@@ -103,6 +103,34 @@ version in [`docs/changelog/`](docs/changelog/):
   recently updated; the store applies that cap before loading nodes or their
   selected edges into the process. Expired pages stay hidden. An edge still
   requires both ends to be readable.
+- Added Antigravity hook parity with Claude Code and Codex for the `agy` CLI,
+  the desktop App and the IDE. `install-hooks --agent antigravity-cli` now
+  wires the native `SessionStart`, which injects the handoff as an
+  `injectSteps` system message that stays in the conversation, where the
+  ephemeral message it replaces was dropped after the first turn.
+  `PreInvocation` gets its own `pre-invocation` handler: on builds without
+  `SessionStart`, the first turn's call stands in for it, once per
+  conversation. The native hook now reads each turn's prompts from the
+  conversation's own transcript (`transcriptPath`, only under
+  `~/.gemini/<app>/brain/<conversationId>/`, no symlinks out of it, 8 MiB per
+  hook) and records them as user prompts, so summaries and handoffs carry
+  them. A `Stop` that finished the turn (`NO_TOOL_CALL` or `model_stop`) with
+  `fullyIdle: true` writes a turn checkpoint, the path OpenCode 2 uses: the
+  summary page and one handoff are refreshed and the conversation stays open,
+  so `finalize-session` is no longer needed for normal use. It remains the
+  explicit close, hands the baton over without the 10-minute quiet period,
+  queues opt-in consolidation, and skips its `history.jsonl` prompt replay
+  for a conversation whose prompts were already captured. Rerun
+  `install-hooks --agent antigravity-cli --apply` to add `SessionStart`;
+  existing native-hook installs get the prompts and checkpoints without it.
+  A turn checkpoint never ends a conversation, even a turn with no captured
+  prompt or tool call, so a handoff it claimed at start is never offered
+  again; the conversation start is claimed atomically, so a concurrent
+  `SessionStart` and first `PreInvocation` cannot both claim a handoff;
+  prompt ingest keys include the prompt's time and text, so a rewind that
+  reuses step numbers keeps its new prompts; and the transcript is opened
+  with `O_NOFOLLOW | O_NONBLOCK` and, on Linux, checked against the opened
+  descriptor's real path. (#1416)
 
 ### Fixed
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade

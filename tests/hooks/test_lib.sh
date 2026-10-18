@@ -200,14 +200,68 @@ AGY_INITIAL_OUTPUT=$(printf '%s' '{"invocationNum":0,"conversationId":"agy","wor
     | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
         AI_MEMORY_HOOK_URL='http://memory.test' sh hooks/antigravity-cli/session-start.sh)
 assert_eq "antigravity initial invocation injects handoff" \
-    '{"injectSteps":[{"ephemeralMessage":"next-session-context"}]}' "$AGY_INITIAL_OUTPUT"
+    '{"injectSteps":[{"systemMessage":{"systemMessage":"next-session-context"}}]}' "$AGY_INITIAL_OUTPUT"
 assert_eq "antigravity initial invocation posts then fetches" "2" \
     "$(wc -l <"$FAKE_CURL_LOG" | tr -d ' ')"
 assert_eq "antigravity handoff fetch carries conversation id" "yes" \
     "$(grep -q '/handoff?.*session_id=agy' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
 
-PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityInitialInvocation' hooks/lib/ai-memory-hook.ps1 \
-    && grep -q '\$AntigravityPreInvocationOutput -and -not' hooks/lib/ai-memory-hook.ps1 \
+# Native SessionStart: no invocationNum, so it is a start boundary.
+rm -f "$FAKE_CURL_LOG"
+AGY_SESSION_START_OUTPUT=$(printf '%s' '{"conversationId":"agy-native","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_DATA_DIR="$TMP/agy-native" AI_MEMORY_HOOK_URL='http://memory.test' \
+        sh hooks/antigravity-cli/session-start.sh)
+assert_eq "antigravity SessionStart injects a persistent handoff" \
+    '{"injectSteps":[{"systemMessage":{"systemMessage":"next-session-context"}}]}' "$AGY_SESSION_START_OUTPUT"
+assert_eq "antigravity SessionStart posts session-start" "yes" \
+    "$(grep -q '/hook?event=session-start&agent=antigravity-cli' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
+
+# PreInvocation: a later invocation, or one without its counter, does nothing.
+for agy_payload in '{"invocationNum":2,"conversationId":"agy-pre","workspacePaths":["/work"]}' \
+    '{"conversationId":"agy-pre","workspacePaths":["/work"]}'; do
+    rm -f "$FAKE_CURL_LOG"
+    AGY_PRE_OUTPUT=$(printf '%s' "$agy_payload" \
+        | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+            AI_MEMORY_DATA_DIR="$TMP/agy-pre" AI_MEMORY_HOOK_URL='http://memory.test' \
+            sh hooks/antigravity-cli/pre-invocation.sh)
+    assert_eq "antigravity PreInvocation outside invocation zero is empty: $agy_payload" "{}" "$AGY_PRE_OUTPUT"
+    assert_eq "antigravity PreInvocation outside invocation zero sends nothing: $agy_payload" "0" \
+        "$([ -f "$FAKE_CURL_LOG" ] && wc -l <"$FAKE_CURL_LOG" | tr -d ' ' || printf '0')"
+done
+# Without a SessionStart, the first turn's PreInvocation starts the
+# conversation; the conversation's second turn is a no-op.
+rm -f "$FAKE_CURL_LOG"
+AGY_PRE_FIRST=$(printf '%s' '{"invocationNum":0,"conversationId":"agy-pre","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_DATA_DIR="$TMP/agy-pre" AI_MEMORY_HOOK_URL='http://memory.test' \
+        sh hooks/antigravity-cli/pre-invocation.sh)
+assert_eq "antigravity first PreInvocation without SessionStart injects the handoff" \
+    '{"injectSteps":[{"systemMessage":{"systemMessage":"next-session-context"}}]}' "$AGY_PRE_FIRST"
+rm -f "$FAKE_CURL_LOG"
+AGY_PRE_SECOND=$(printf '%s' '{"invocationNum":0,"conversationId":"agy-pre","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_DATA_DIR="$TMP/agy-pre" AI_MEMORY_HOOK_URL='http://memory.test' \
+        sh hooks/antigravity-cli/pre-invocation.sh)
+assert_eq "antigravity later turn PreInvocation is empty" "{}" "$AGY_PRE_SECOND"
+assert_eq "antigravity later turn PreInvocation sends nothing" "0" \
+    "$([ -f "$FAKE_CURL_LOG" ] && wc -l <"$FAKE_CURL_LOG" | tr -d ' ' || printf '0')"
+# SessionStart then the first turn's PreInvocation: one start, one handoff.
+rm -f "$FAKE_CURL_LOG"
+for agy_step in 'session-start {"conversationId":"agy-once","workspacePaths":["/work"]}' \
+    'pre-invocation {"invocationNum":0,"conversationId":"agy-once","workspacePaths":["/work"]}'; do
+    printf '%s' "${agy_step#* }" \
+        | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+            AI_MEMORY_DATA_DIR="$TMP/agy-once" AI_MEMORY_HOOK_URL='http://memory.test' \
+            sh "hooks/antigravity-cli/${agy_step%% *}.sh" >/dev/null
+done
+assert_eq "antigravity SessionStart plus first PreInvocation claims one handoff" "1" \
+    "$(grep -c '/handoff?' "$FAKE_CURL_LOG")"
+
+PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityStartBoundary' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q '\$AntigravityStartOutput -and -not' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q 'systemMessage = @{ systemMessage =' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q -- '-AntigravityPreInvocation' hooks/antigravity-cli/pre-invocation.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell antigravity hook has invocation guard" "ok" "$PS_ANTIGRAVITY_STATIC"
 

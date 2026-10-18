@@ -169,6 +169,7 @@ dependencies = [
  "git2",
  "icu_normalizer",
  "jiff",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

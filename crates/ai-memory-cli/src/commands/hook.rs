@@ -504,24 +504,57 @@ fn parse_minutes(raw: Option<String>, default: Duration) -> Duration {
     }
 }
 
-fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_json::Value) -> bool {
-    if agent == AgentKind::AntigravityCli && event == HookEvent::SessionStart {
-        return raw.get("invocationNum").and_then(serde_json::Value::as_u64) == Some(0);
-    }
-    true
+/// The event token the Antigravity `PreInvocation` hook is rendered with.
+/// Earlier installs render it as `session-start`; both are read the same way.
+pub(crate) const ANTIGRAVITY_PRE_INVOCATION_EVENT: &str = "pre-invocation";
+
+/// What an Antigravity `session-start` or `pre-invocation` event marks
+/// (<https://antigravity.google/docs/hooks/>).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityBoundary {
+    /// Any other agent or event.
+    None,
+    /// A later model call inside a turn, or a malformed counter: nothing to do.
+    LaterInvocation,
+    /// The native `SessionStart`, the only start event without `invocationNum`.
+    ConversationStart,
+    /// `PreInvocation` with `invocationNum` 0. The counter restarts on every
+    /// user turn, so this marks a turn; it doubles as the conversation start
+    /// on builds that fire no `SessionStart`.
+    TurnStart,
 }
 
-/// `<data_dir>/briefed/agy-start-<conversationId>` for an Antigravity
-/// SessionStart that names its conversation; `None` for every other event.
+fn antigravity_boundary(
+    agent: AgentKind,
+    event: &str,
+    raw: &serde_json::Value,
+) -> AntigravityBoundary {
+    if agent != AgentKind::AntigravityCli {
+        return AntigravityBoundary::None;
+    }
+    let pre_invocation = event == ANTIGRAVITY_PRE_INVOCATION_EVENT;
+    if !pre_invocation && HookEvent::parse(event) != HookEvent::SessionStart {
+        return AntigravityBoundary::None;
+    }
+    match raw.get("invocationNum") {
+        None if !pre_invocation => AntigravityBoundary::ConversationStart,
+        Some(counter) if counter.as_u64() == Some(0) => AntigravityBoundary::TurnStart,
+        // A PreInvocation without its documented counter fails closed so a
+        // later invocation can never consume a handoff.
+        _ => AntigravityBoundary::LaterInvocation,
+    }
+}
+
+fn should_process_hook_event(agent: AgentKind, event: &str, raw: &serde_json::Value) -> bool {
+    antigravity_boundary(agent, event, raw) != AntigravityBoundary::LaterInvocation
+}
+
+/// `<data_dir>/briefed/agy-start-<conversationId>`, which records that an
+/// Antigravity conversation already started; `None` without a conversation id.
 fn antigravity_conversation_start_marker(
     data_dir: &Path,
-    agent: AgentKind,
-    event: HookEvent,
     raw: &serde_json::Value,
 ) -> Option<PathBuf> {
-    if agent != AgentKind::AntigravityCli || event != HookEvent::SessionStart {
-        return None;
-    }
     let conversation = raw
         .get("conversationId")
         .and_then(serde_json::Value::as_str)
@@ -532,6 +565,179 @@ fn antigravity_conversation_start_marker(
             .join("briefed")
             .join(format!("agy-start-{}", sanitize_briefed_key(conversation))),
     )
+}
+
+/// Claims an Antigravity conversation's start atomically. `create_new` lets
+/// exactly one of a concurrent native SessionStart and first-turn
+/// PreInvocation win, so only one of them posts session-start and claims a
+/// handoff. `false` means the conversation already started; any other
+/// failure counts as a win, as the best-effort marker always has (the worst
+/// case is a repeated start, never a lost one).
+fn claim_conversation_start(marker: &Path) -> bool {
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(_) => {
+            // Rewrites the empty marker and applies the bounded retention.
+            mark_briefed(marker);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => true,
+    }
+}
+
+/// Transcript read cursors kept at once. A cursor that falls out only makes
+/// the next read of its conversation start over, and the server's ingest
+/// keys drop the prompts it already has.
+const MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS: usize = 256;
+
+/// `<data_dir>/hook-state/antigravity-transcripts/<conversationId>.json`.
+fn antigravity_transcript_cursor_path(data_dir: &Path, conversation: &str) -> PathBuf {
+    data_dir
+        .join("hook-state")
+        .join("antigravity-transcripts")
+        .join(format!("{}.json", sanitize_briefed_key(conversation)))
+}
+
+fn load_antigravity_transcript_cursor(path: &Path) -> ai_memory_hooks::TranscriptCursor {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic (tmp + rename) and best effort, with bounded retention: a lost
+/// write only makes the next read repeat prompts the server drops by key.
+fn store_antigravity_transcript_cursor(path: &Path, cursor: &ai_memory_hooks::TranscriptCursor) {
+    let (Some(dir), Ok(bytes)) = (path.parent(), serde_json::to_vec(cursor)) else {
+        return;
+    };
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let written = fs::File::create(&tmp).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()
+    });
+    if written.is_err() || fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut others = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path() != path)
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect::<Vec<_>>();
+    others.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, stale) in others
+        .into_iter()
+        .skip(MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS.saturating_sub(1))
+    {
+        let _ = fs::remove_file(stale);
+    }
+}
+
+/// Whether the live hooks already captured prompts of this conversation
+/// from its transcript, so `finalize-session` must not replay them again
+/// from `history.jsonl`.
+pub(crate) fn antigravity_transcript_prompts_captured(data_dir: &Path, conversation: &str) -> bool {
+    load_antigravity_transcript_cursor(&antigravity_transcript_cursor_path(data_dir, conversation))
+        .prompts
+        > 0
+}
+
+/// Ingest key of a recovered prompt: stable per conversation, step, time and
+/// text, so a repeated read (a lost cursor, a crash before it was stored, a
+/// rewind that re-reads the file) is dropped by the server instead of stored
+/// twice, while a new prompt that reuses a rewound step number is not.
+fn antigravity_prompt_ingest_key(
+    conversation: &str,
+    prompt: &ai_memory_hooks::TranscriptPrompt,
+) -> String {
+    let step = prompt.step_index.map_or_else(
+        || format!("offset:{}", prompt.line_offset),
+        |step| format!("step:{step}"),
+    );
+    let text = format!("{:x}", Sha256::digest(prompt.text.as_bytes()));
+    let created_at = prompt.created_at.as_deref().unwrap_or("");
+    let mut hasher = Sha256::new();
+    for part in [
+        "antigravity-transcript-prompt",
+        conversation,
+        step.as_str(),
+        created_at,
+        text.as_str(),
+    ] {
+        hasher.update(part.len().to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("agy_{}", &digest[..60])
+}
+
+/// Recovered Antigravity prompts ready to spool, and the cursor to store
+/// once they are.
+struct AntigravityPromptEvents {
+    /// `(ingest key, body)` of each `user-prompt` event, in transcript order.
+    events: Vec<(String, String)>,
+    cursor_path: PathBuf,
+    cursor: ai_memory_hooks::TranscriptCursor,
+}
+
+/// The `user-prompt` events for the prompts Antigravity wrote to this
+/// conversation's transcript since the last read. Antigravity puts no
+/// prompt in any hook payload; `transcriptPath` names the transcript and is
+/// read only inside the conversation's own `brain/<conversationId>/`
+/// directory under `home` ([`ai_memory_hooks::antigravity_transcript_path`]).
+/// Each body keeps the event's conversation and workspace fields so the
+/// server scopes it like the event itself, and is capped and scrubbed like
+/// any client-side prompt; the server sanitizes it again on ingest.
+fn antigravity_transcript_prompt_events(
+    data_dir: &Path,
+    home: Option<&Path>,
+    raw: &serde_json::Value,
+) -> Option<AntigravityPromptEvents> {
+    let conversation = ai_memory_hooks::antigravity_conversation_id(raw)?;
+    let transcript = ai_memory_hooks::antigravity_transcript_path(raw, home?)?;
+    let cursor_path = antigravity_transcript_cursor_path(data_dir, conversation);
+    let read = ai_memory_hooks::read_transcript_prompts(
+        &transcript,
+        &load_antigravity_transcript_cursor(&cursor_path),
+    )?;
+    let mut events = Vec::with_capacity(read.prompts.len());
+    for prompt in &read.prompts {
+        let mut body = serde_json::Map::new();
+        for key in ["conversationId", "workspacePaths", "cwd", "modelName"] {
+            if let Some(value) = raw.get(key) {
+                body.insert(key.into(), value.clone());
+            }
+        }
+        body.insert("prompt".into(), prompt.text.clone().into());
+        if let Some(at) = &prompt.created_at {
+            body.insert("occurred_at".into(), at.clone().into());
+        }
+        let mut body = serde_json::Value::Object(body);
+        ai_memory_hooks::cap_lifecycle_body_for_client(&mut body, HookEvent::UserPrompt);
+        events.push((
+            antigravity_prompt_ingest_key(conversation, prompt),
+            serde_json::to_string(&body).ok()?,
+        ));
+    }
+    Some(AntigravityPromptEvents {
+        events,
+        cursor_path,
+        cursor: read.cursor,
+    })
 }
 
 /// A `--agent claude-code` hook invoked by Cursor (it runs Claude Code's
@@ -730,9 +936,11 @@ fn user_prompt_recap_envelope(recap: &str) -> serde_json::Value {
 
 fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
     if agent == AgentKind::AntigravityCli {
+        // A system message stays in the conversation for later turns; an
+        // `ephemeralMessage` would be dropped after the first one.
         serde_json::json!({
             "injectSteps": [{
-                "ephemeralMessage": handoff,
+                "systemMessage": { "systemMessage": handoff },
             }]
         })
     } else if agent == AgentKind::CopilotCli {
@@ -790,6 +998,31 @@ where
     W: std::io::Write,
     S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
+    run_with_payload_in_home(
+        data_dir,
+        args,
+        payload,
+        stdout,
+        spawn_background_drainer,
+        home_dir(),
+    )
+    .await
+}
+
+/// [`run_with_payload`] with the home directory given, the root that the
+/// Antigravity step output and transcript reads are confined to.
+async fn run_with_payload_in_home<W, S>(
+    data_dir: Option<PathBuf>,
+    args: HookArgs,
+    payload: String,
+    stdout: &mut W,
+    spawn_background_drainer: S,
+    home: Option<PathBuf>,
+) -> anyhow::Result<()>
+where
+    W: std::io::Write,
+    S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
+{
     let runtime_env = RuntimeEnv::from_process();
     let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     let spool_policy =
@@ -803,7 +1036,7 @@ where
         args.server_url.clone_from(&spool_policy.server_url);
     }
     let agent_kind = AgentKind::from_wire(&args.agent);
-    let hook_event = HookEvent::parse(&args.event);
+    let mut hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
     // than server configuration. Hooks deliberately bypass Config::load.
     let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
@@ -813,7 +1046,11 @@ where
         // Grok delivers the handoff on the first PostToolUse (its SessionStart /
         // UserPromptSubmit stdout is discarded); that path is context delivery
         // too, so external capture must not suppress it.
-        || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff());
+        || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff())
+        // On an Antigravity build without SessionStart, the first turn's
+        // PreInvocation delivers the handoff in its place.
+        || (agent_kind == AgentKind::AntigravityCli
+            && args.event == ANTIGRAVITY_PRE_INVOCATION_EVENT);
     if external_capture && !args.check_capture && !delivers_context {
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
@@ -840,11 +1077,10 @@ where
     let reload_requested = hook_event == HookEvent::UserPrompt
         && ai_memory_hooks::user_prompt_text(&json)
             .is_some_and(|prompt| ai_memory_core::compaction_recap::is_reload_request(&prompt));
-    // Antigravity exposes PreInvocation rather than a true SessionStart. It
-    // fires before every model call; invocation zero is the only startup
-    // boundary. Fail closed when the documented counter is absent so a later
-    // invocation can never consume a handoff intended for the next session.
-    let event_admits_capture = should_process_hook_event(agent_kind, hook_event, &json)
+    // Antigravity's PreInvocation fires before every model call; only
+    // invocation zero, the start of a user turn, is a boundary.
+    let antigravity = antigravity_boundary(agent_kind, &args.event, &json);
+    let event_admits_capture = should_process_hook_event(agent_kind, &args.event, &json)
         && !is_redundant_cursor_copy(
             agent_kind,
             &json,
@@ -855,22 +1091,39 @@ where
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
-    // `invocationNum` restarts at 0 on every user turn, so invocation zero
-    // marks a turn, not a conversation. Only the first turn of a conversation
-    // may post session-start and claim a handoff.
+    // Only a conversation's first start boundary posts session-start and
+    // claims a handoff: the native SessionStart, or on builds without it the
+    // first turn's PreInvocation. Every later turn start only recovers the
+    // turn's prompts from the transcript (below) and posts no event of its
+    // own. A turn start without a conversation id cannot be told from a new
+    // conversation, so it does nothing.
+    let mut antigravity_turn_only = false;
     if !args.check_capture
-        && let Some(marker) = antigravity_conversation_start_marker(
-            &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
-            agent_kind,
-            hook_event,
-            &json,
+        && matches!(
+            antigravity,
+            AntigravityBoundary::ConversationStart | AntigravityBoundary::TurnStart
         )
     {
-        if marker.exists() {
+        let marker = antigravity_conversation_start_marker(
+            &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+            &json,
+        );
+        let started = match &marker {
+            Some(marker) => !claim_conversation_start(marker),
+            None => antigravity == AntigravityBoundary::TurnStart,
+        };
+        if started && antigravity == AntigravityBoundary::ConversationStart {
             write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
         }
-        mark_briefed(&marker);
+        antigravity_turn_only = started;
+        args.event = if started {
+            ANTIGRAVITY_PRE_INVOCATION_EVENT
+        } else {
+            "session-start"
+        }
+        .into();
+        hook_event = HookEvent::parse(&args.event);
     }
     // Assistant/Stop capture (#196). On an opted-in install
     // (`install-hooks --capture-assistant`), extract the assistant message,
@@ -895,11 +1148,7 @@ where
         payload = serde_json::to_string(&json)?;
     }
     if agent_kind == AgentKind::AntigravityCli
-        && ai_memory_hooks::enrich_antigravity_step_output(
-            &mut json,
-            hook_event,
-            home_dir().as_deref(),
-        )
+        && ai_memory_hooks::enrich_antigravity_step_output(&mut json, hook_event, home.as_deref())
     {
         payload = serde_json::to_string(&json)?;
     }
@@ -1123,18 +1372,58 @@ where
     // delivery succeeded but whose response was lost — closing the
     // conservative-retry duplication vector. Older servers ignore the param.
     if !external_capture {
-        let ingest_key = uuid::Uuid::new_v4().simple().to_string();
-        let event_url = format!(
-            "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
-            args.event, args.agent, hook_qs, capture_qs
-        );
-        let entry =
-            hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present)
-                .routed_to(profile_name);
-        if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err() {
-            eprintln!(
-                "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+        // Antigravity's prompts exist only in its transcript. A Stop's go
+        // ahead of it, so the turn checkpoint it publishes includes them; a
+        // start's follow it. A later turn start spools only its prompts.
+        let mut antigravity_prompts = (agent_kind == AgentKind::AntigravityCli
+            && (antigravity_turn_only
+                || matches!(hook_event, HookEvent::SessionStart | HookEvent::Stop)))
+        .then(|| antigravity_transcript_prompt_events(&dd, home.as_deref(), &json))
+        .flatten();
+        let spool_prompts = |prompts: AntigravityPromptEvents| {
+            let mut spooled = true;
+            for (ingest_key, body) in prompts.events {
+                let url = format!(
+                    "{base}/hook?event=user-prompt&agent={}{hook_qs}&ingest_key={ingest_key}",
+                    args.agent
+                );
+                let entry = hook_spool::entry_for(url, body, effective_token, oidc_present)
+                    .routed_to(profile_name);
+                spooled &=
+                    hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_ok();
+            }
+            // Advance only past prompts that were all spooled; a re-read
+            // repeats the spooled ones under the same ingest keys.
+            if spooled {
+                store_antigravity_transcript_cursor(&prompts.cursor_path, &prompts.cursor);
+            } else {
+                eprintln!(
+                    "ai-memory hook warning: failed to spool an Antigravity prompt; it is retried on the next turn"
+                );
+            }
+        };
+        if hook_event == HookEvent::Stop
+            && let Some(prompts) = antigravity_prompts.take()
+        {
+            spool_prompts(prompts);
+        }
+        if !antigravity_turn_only {
+            let ingest_key = uuid::Uuid::new_v4().simple().to_string();
+            let event_url = format!(
+                "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
+                args.event, args.agent, hook_qs, capture_qs
             );
+            let entry =
+                hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present)
+                    .routed_to(profile_name);
+            if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err() {
+                eprintln!(
+                    "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+                );
+            }
+        }
+        if let Some(prompts) = antigravity_prompts {
+            spool_prompts(prompts);
         }
         // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
         // per turn, so its stored id is cleared by `finalize-session` (or
@@ -2317,31 +2606,64 @@ mod tests {
         }
     }
 
+    /// Each documented Antigravity start event, under both the current
+    /// rendering (SessionStart → `session-start`, PreInvocation →
+    /// `pre-invocation`) and the one earlier installs carry (PreInvocation →
+    /// `session-start`).
     #[test]
-    fn antigravity_preinvocation_only_maps_invocation_zero_to_session_start() {
-        for (raw, expected) in [
-            (serde_json::json!({"invocationNum": 0}), true),
-            (serde_json::json!({"invocationNum": 1}), false),
-            (serde_json::json!({"invocationNum": 0.5}), false),
-            (serde_json::json!({"invocationNum": "0"}), false),
-            (serde_json::json!({}), false),
-        ] {
-            assert_eq!(
-                should_process_hook_event(AgentKind::AntigravityCli, HookEvent::SessionStart, &raw,),
-                expected,
-                "{raw}"
-            );
+    fn antigravity_start_events_map_to_conversation_and_turn_boundaries() {
+        use AntigravityBoundary::{ConversationStart, LaterInvocation, TurnStart};
+        let agy = AgentKind::AntigravityCli;
+        for event in ["session-start", ANTIGRAVITY_PRE_INVOCATION_EVENT] {
+            for (raw, expected) in [
+                (
+                    serde_json::json!({"invocationNum": 0, "initialNumSteps": 4}),
+                    TurnStart,
+                ),
+                (serde_json::json!({"invocationNum": 1}), LaterInvocation),
+                (serde_json::json!({"invocationNum": 0.5}), LaterInvocation),
+                (serde_json::json!({"invocationNum": "0"}), LaterInvocation),
+                (serde_json::json!({"invocationNum": null}), LaterInvocation),
+                (serde_json::json!({"invocationNum": -1}), LaterInvocation),
+            ] {
+                assert_eq!(
+                    antigravity_boundary(agy, event, &raw),
+                    expected,
+                    "{event} {raw}"
+                );
+                assert_eq!(
+                    should_process_hook_event(agy, event, &raw),
+                    expected != LaterInvocation,
+                    "{event} {raw}"
+                );
+            }
         }
-        assert!(should_process_hook_event(
-            AgentKind::ClaudeCode,
-            HookEvent::SessionStart,
-            &serde_json::json!({})
-        ));
-        assert!(should_process_hook_event(
-            AgentKind::AntigravityCli,
-            HookEvent::PostToolUse,
-            &serde_json::json!({})
-        ));
+        // Only SessionStart omits the counter; a PreInvocation without it
+        // fails closed.
+        let session_start = serde_json::json!({"conversationId": "c", "workspacePaths": ["/w"]});
+        assert_eq!(
+            antigravity_boundary(agy, "session-start", &session_start),
+            ConversationStart
+        );
+        assert_eq!(
+            antigravity_boundary(agy, ANTIGRAVITY_PRE_INVOCATION_EVENT, &session_start),
+            LaterInvocation
+        );
+        for (agent, event) in [
+            (agy, "post-tool-use"),
+            (agy, "pre-tool-use"),
+            (agy, "stop"),
+            (AgentKind::ClaudeCode, "session-start"),
+            (AgentKind::ClaudeCode, ANTIGRAVITY_PRE_INVOCATION_EVENT),
+        ] {
+            let later = serde_json::json!({"invocationNum": 3});
+            assert_eq!(
+                antigravity_boundary(agent, event, &later),
+                AntigravityBoundary::None,
+                "{agent:?} {event}"
+            );
+            assert!(should_process_hook_event(agent, event, &later));
+        }
     }
 
     #[test]
@@ -5954,7 +6276,7 @@ mod tests {
         assert_eq!(
             output,
             serde_json::json!({
-                "injectSteps": [{"ephemeralMessage": "AGY-HANDOFF"}]
+                "injectSteps": [{"systemMessage": {"systemMessage": "AGY-HANDOFF"}}]
             })
         );
         let mut recorded = Vec::new();
@@ -6014,46 +6336,89 @@ mod tests {
         assert!(first_request(&mut requests).await.is_none());
     }
 
+    /// A re-read of the same prompt keeps its key (the server drops it), while
+    /// a rewind's new prompt that reuses the step number gets a new one.
     #[test]
-    fn antigravity_conversation_marker_only_for_named_antigravity_starts() {
+    fn antigravity_prompt_ingest_key_follows_step_time_and_text() {
+        let prompt = |text: &str, created_at: Option<&str>| ai_memory_hooks::TranscriptPrompt {
+            step_index: Some(4),
+            line_offset: 0,
+            text: text.into(),
+            created_at: created_at.map(Into::into),
+        };
+        let at = Some("2026-10-18T10:00:00Z");
+        let key = antigravity_prompt_ingest_key("conv", &prompt("fix the parser", at));
+        assert_eq!(
+            key,
+            antigravity_prompt_ingest_key("conv", &prompt("fix the parser", at)),
+            "a repeated read is deduplicated"
+        );
+        for other in [
+            antigravity_prompt_ingest_key("conv", &prompt("rewound prompt", at)),
+            antigravity_prompt_ingest_key(
+                "conv",
+                &prompt("fix the parser", Some("2026-10-18T11:00:00Z")),
+            ),
+            antigravity_prompt_ingest_key("other-conv", &prompt("fix the parser", at)),
+        ] {
+            assert_ne!(key, other);
+        }
+        assert!(key.starts_with("agy_") && key.len() == 64);
+    }
+
+    /// A concurrent native SessionStart and first-turn PreInvocation race
+    /// for the same marker: exactly one of them may claim the start (and so
+    /// the handoff); a later boundary of the same conversation never does.
+    #[test]
+    fn antigravity_conversation_start_is_claimed_exactly_once_under_races() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("briefed").join("agy-start-race");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let winners = (0..8)
+            .map(|_| {
+                let marker = marker.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_conversation_start(&marker)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "exactly one boundary claims the start");
+        assert!(marker.is_file());
+        assert!(
+            !claim_conversation_start(&marker),
+            "a later turn never re-claims"
+        );
+        // Control: another conversation still claims its own start.
+        let other = tmp.path().join("briefed").join("agy-start-other");
+        assert!(claim_conversation_start(&other));
+    }
+
+    #[test]
+    fn antigravity_conversation_marker_is_keyed_by_a_sanitized_conversation_id() {
         let dir = Path::new("/d");
-        let raw = serde_json::json!({"conversationId": "a/b"});
         assert_eq!(
             antigravity_conversation_start_marker(
                 dir,
-                AgentKind::AntigravityCli,
-                HookEvent::SessionStart,
-                &raw
+                &serde_json::json!({"conversationId": "a/b"})
             ),
             Some(dir.join("briefed").join("agy-start-a_b"))
         );
-        assert!(
-            antigravity_conversation_start_marker(
-                dir,
-                AgentKind::AntigravityCli,
-                HookEvent::SessionStart,
-                &serde_json::json!({})
-            )
-            .is_none()
-        );
-        assert!(
-            antigravity_conversation_start_marker(
-                dir,
-                AgentKind::AntigravityCli,
-                HookEvent::PostToolUse,
-                &raw
-            )
-            .is_none()
-        );
-        assert!(
-            antigravity_conversation_start_marker(
-                dir,
-                AgentKind::ClaudeCode,
-                HookEvent::SessionStart,
-                &raw
-            )
-            .is_none()
-        );
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"conversationId": "  "}),
+            serde_json::json!({"conversationId": 7}),
+        ] {
+            assert!(
+                antigravity_conversation_start_marker(dir, &raw).is_none(),
+                "{raw}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6081,6 +6446,487 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         assert!(first_request(&mut requests).await.is_none());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn antigravity_native_session_start_delivers_a_persistent_handoff_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "AGY-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("session-start", &base),
+            serde_json::json!({
+                "conversationId": "agy-native",
+                "workspacePaths": [tmp.path()],
+                "modelName": "gemini-3-pro"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "injectSteps": [{"systemMessage": {"systemMessage": "AGY-HANDOFF"}}]
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?") && request.contains("session_id=agy-native")
+            }),
+            "{recorded:?}"
+        );
+
+        // The first turn's PreInvocation follows at once, under the current
+        // rendering and under the one earlier installs carry; neither starts
+        // the conversation again nor claims a second handoff.
+        let spooled = hook_spool::spool_len(&hook_spool::spool_dir(&data_dir));
+        let (base, mut requests) = serve_requests("200 OK", "MUST-NOT-BE-CONSUMED").await;
+        for event in [ANTIGRAVITY_PRE_INVOCATION_EVENT, "session-start"] {
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                antigravity_hook_args(event, &base),
+                serde_json::json!({
+                    "invocationNum": 0,
+                    "initialNumSteps": 1,
+                    "conversationId": "agy-native",
+                    "workspacePaths": [tmp.path()]
+                })
+                .to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("must not spawn")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stdout, b"{}\n", "{event}");
+        }
+        assert!(first_request(&mut requests).await.is_none());
+        assert_eq!(
+            hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)),
+            spooled,
+            "a turn start posts no event of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_first_pre_invocation_starts_the_conversation_without_session_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "AGY-HANDOFF").await;
+        let turn = serde_json::json!({
+            "invocationNum": 0,
+            "initialNumSteps": 1,
+            "conversationId": "agy-old-build",
+            "workspacePaths": [tmp.path()]
+        })
+        .to_string();
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args(ANTIGRAVITY_PRE_INVOCATION_EVENT, &base),
+            turn.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "injectSteps": [{"systemMessage": {"systemMessage": "AGY-HANDOFF"}}]
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded
+                .iter()
+                .any(|request| request.contains("event=session-start")),
+            "the fallback posts a session-start: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?") && request.contains("session_id=agy-old-build")
+            }),
+            "{recorded:?}"
+        );
+
+        let (base, mut requests) = serve_requests("200 OK", "MUST-NOT-BE-CONSUMED").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            antigravity_hook_args(ANTIGRAVITY_PRE_INVOCATION_EVENT, &base),
+            turn,
+            &mut stdout,
+            |_, _| Err(std::io::Error::other("must not spawn")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert!(first_request(&mut requests).await.is_none());
+    }
+
+    /// `<home>/.gemini/antigravity/brain/<conversation>/.system_generated/logs/transcript.jsonl`.
+    fn agy_transcript(home: &Path, conversation: &str) -> PathBuf {
+        let logs = home
+            .join(".gemini/antigravity/brain")
+            .join(conversation)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        logs.join("transcript.jsonl")
+    }
+
+    fn append_user_input(transcript: &Path, step: u64, text: &str) {
+        use std::io::Write as _;
+        let line = serde_json::json!({
+            "step_index": step,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-10-18T10:00:00Z",
+            "content": text,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(transcript)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    fn agy_event_payload(
+        conversation: &str,
+        workspace: &Path,
+        transcript: &Path,
+        extra: serde_json::Value,
+    ) -> String {
+        let mut payload = serde_json::json!({
+            "conversationId": conversation,
+            "workspacePaths": [workspace],
+            "transcriptPath": transcript,
+            "artifactDirectoryPath": transcript.parent().unwrap().parent().unwrap().parent().unwrap(),
+            "modelName": "gemini-3-pro",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            payload[key] = value.clone();
+        }
+        payload.to_string()
+    }
+
+    async fn run_agy_hook(data_dir: &Path, home: &Path, event: &str, payload: String) {
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir.to_path_buf()),
+            antigravity_hook_args(event, &dead_server_url()),
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+            Some(home.to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The spooled entries, removed from the spool (whose test capacity is
+    /// three) so a longer sequence can keep spooling.
+    fn take_spooled_entries(data_dir: &Path) -> Vec<hook_spool::SpoolEntry> {
+        let spool = hook_spool::spool_dir(data_dir);
+        let entries = read_spooled_entries(&spool);
+        for entry in std::fs::read_dir(&spool).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        entries
+    }
+
+    fn event_names(entries: &[hook_spool::SpoolEntry]) -> Vec<(String, Option<String>)> {
+        entries
+            .iter()
+            .map(|entry| {
+                let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                (
+                    query_param(&entry.url, "event").unwrap().to_owned(),
+                    body.get("prompt")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    fn spooled_events(data_dir: &Path) -> Vec<(String, Option<String>)> {
+        event_names(&read_spooled_entries(&hook_spool::spool_dir(data_dir)))
+    }
+
+    /// No Antigravity event carries the prompt; the transcript does. Each is
+    /// spooled once as a `user-prompt`: after the start, at the start of its
+    /// turn, and ahead of a Stop that found it unread, so the turn
+    /// checkpoint the Stop publishes includes it.
+    #[tokio::test]
+    async fn antigravity_transcript_prompts_are_spooled_once_in_turn_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data_dir, home, workspace) = (
+            tmp.path().join("data"),
+            tmp.path().join("home"),
+            tmp.path().join("repo"),
+        );
+        std::fs::create_dir_all(&workspace).unwrap();
+        let conversation = "ec33ebf9-0cba-4100-8142-c61503f6c587";
+        let transcript = agy_transcript(&home, conversation);
+        let payload = |extra: serde_json::Value| {
+            agy_event_payload(conversation, &workspace, &transcript, extra)
+        };
+        append_user_input(&transcript, 0, "Fix the login redirect");
+
+        let mut entries = Vec::new();
+        run_agy_hook(
+            &data_dir,
+            &home,
+            "session-start",
+            payload(serde_json::json!({})),
+        )
+        .await;
+        entries.extend(take_spooled_entries(&data_dir));
+        let pre_invocation = ANTIGRAVITY_PRE_INVOCATION_EVENT;
+        for counter in [0, 1, 2] {
+            run_agy_hook(
+                &data_dir,
+                &home,
+                pre_invocation,
+                payload(serde_json::json!({"invocationNum": counter})),
+            )
+            .await;
+            entries.extend(take_spooled_entries(&data_dir));
+        }
+        append_user_input(&transcript, 4, "Add a regression test");
+        run_agy_hook(
+            &data_dir,
+            &home,
+            pre_invocation,
+            payload(serde_json::json!({"invocationNum": 0})),
+        )
+        .await;
+        entries.extend(take_spooled_entries(&data_dir));
+        append_user_input(&transcript, 9, "Also update the docs");
+        let stop = payload(serde_json::json!({
+            "executionNum": 0,
+            "terminationReason": "NO_TOOL_CALL",
+            "fullyIdle": true,
+        }));
+        run_agy_hook(&data_dir, &home, "stop", stop.clone()).await;
+        entries.extend(take_spooled_entries(&data_dir));
+        // A repeated Stop finds nothing new.
+        run_agy_hook(&data_dir, &home, "stop", stop).await;
+        entries.extend(take_spooled_entries(&data_dir));
+
+        let prompt = |text: &str| ("user-prompt".to_owned(), Some(text.to_owned()));
+        assert_eq!(
+            event_names(&entries),
+            [
+                ("session-start".to_owned(), None),
+                prompt("Fix the login redirect"),
+                prompt("Add a regression test"),
+                prompt("Also update the docs"),
+                ("stop".to_owned(), None),
+                ("stop".to_owned(), None),
+            ]
+        );
+
+        let first = &entries[1];
+        let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(body["conversationId"], conversation);
+        assert_eq!(body["workspacePaths"], serde_json::json!([workspace]));
+        assert_eq!(body["occurred_at"], "2026-10-18T10:00:00Z");
+        assert!(body.get("transcriptPath").is_none(), "{body}");
+        let key = query_param(&first.url, "ingest_key").unwrap();
+        assert!(key.starts_with("agy_") && key.len() == 64, "{key}");
+        let expected_key = antigravity_prompt_ingest_key(
+            conversation,
+            &ai_memory_hooks::TranscriptPrompt {
+                step_index: Some(0),
+                line_offset: 0,
+                text: "Fix the login redirect".into(),
+                created_at: Some("2026-10-18T10:00:00Z".into()),
+            },
+        );
+        assert_eq!(
+            key, expected_key,
+            "stable per conversation, step, time and text"
+        );
+        assert_eq!(query_param(&first.url, "agent"), Some("antigravity-cli"));
+        // The prompt is scoped exactly like the event it rode with.
+        let scope = |url: &str| {
+            url.split('?')
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .filter(|part| !part.starts_with("event=") && !part.starts_with("ingest_key="))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scope(&first.url), scope(&entries[4].url));
+        assert!(antigravity_transcript_prompts_captured(
+            &data_dir,
+            conversation
+        ));
+        assert!(!antigravity_transcript_prompts_captured(
+            &data_dir,
+            "agy-other"
+        ));
+    }
+
+    /// Adversarial: `transcriptPath` is payload input and the hook uploads
+    /// what it reads. Only the named conversation's own transcript under the
+    /// home's Antigravity data directories is read; a forged path outside
+    /// it, or another conversation's transcript, yields no prompt.
+    #[tokio::test]
+    async fn antigravity_transcript_reads_are_confined_to_the_conversations_own_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, workspace) = (tmp.path().join("home"), tmp.path().join("repo"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let foreign = agy_transcript(&tmp.path().join("elsewhere"), "agy-a");
+        append_user_input(&foreign, 0, "outside the home");
+        let other = agy_transcript(&home, "agy-b");
+        append_user_input(&other, 0, "another conversation");
+        let secret = home.join("notes.jsonl");
+        std::fs::write(
+            &secret,
+            "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"content\":\"secret\"}\n",
+        )
+        .unwrap();
+        let stop = serde_json::json!({"terminationReason": "NO_TOOL_CALL", "fullyIdle": true});
+        for (case, path) in [
+            ("foreign", &foreign),
+            ("other", &other),
+            ("secret", &secret),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{case}"));
+            run_agy_hook(
+                &data_dir,
+                &home,
+                "stop",
+                agy_event_payload("agy-a", &workspace, path, stop.clone()),
+            )
+            .await;
+            assert_eq!(
+                spooled_events(&data_dir),
+                [("stop".to_owned(), None)],
+                "{case}"
+            );
+            assert!(!antigravity_transcript_prompts_captured(&data_dir, "agy-a"));
+        }
+        // Control: the conversation's own transcript is read.
+        let own = agy_transcript(&home, "agy-a");
+        append_user_input(&own, 0, "own prompt");
+        let data_dir = tmp.path().join("data-own");
+        run_agy_hook(
+            &data_dir,
+            &home,
+            "stop",
+            agy_event_payload("agy-a", &workspace, &own, stop),
+        )
+        .await;
+        assert_eq!(
+            spooled_events(&data_dir),
+            [
+                ("user-prompt".to_owned(), Some("own prompt".to_owned())),
+                ("stop".to_owned(), None)
+            ]
+        );
+    }
+
+    /// A repository the allowlist leaves out emits nothing, prompts included,
+    /// and its transcript is not even read.
+    #[tokio::test]
+    async fn antigravity_transcript_prompts_follow_the_capture_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data_dir, home, workspace) = (
+            tmp.path().join("data"),
+            tmp.path().join("home"),
+            tmp.path().join("repo"),
+        );
+        std::fs::create_dir_all(&workspace).unwrap();
+        let transcript = agy_transcript(&home, "agy-a");
+        append_user_input(&transcript, 0, "unmarked repository");
+        let mut args = antigravity_hook_args("stop", &dead_server_url());
+        args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir.clone()),
+            args,
+            agy_event_payload(
+                "agy-a",
+                &workspace,
+                &transcript,
+                serde_json::json!({"terminationReason": "NO_TOOL_CALL", "fullyIdle": true}),
+            ),
+            &mut stdout,
+            |_, _| Ok(()),
+            Some(home),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+        assert!(!antigravity_transcript_prompts_captured(&data_dir, "agy-a"));
+    }
+
+    #[test]
+    fn antigravity_transcript_cursor_store_is_atomic_and_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("hook-state/antigravity-transcripts");
+        let cursor = ai_memory_hooks::TranscriptCursor {
+            file: Some("transcript.jsonl".into()),
+            head: Some("0123456789abcdef".into()),
+            offset: 42,
+            last_step: Some(3),
+            resync: false,
+            prompts: 2,
+        };
+        let path = antigravity_transcript_cursor_path(tmp.path(), "a/b");
+        assert_eq!(path, dir.join("a_b.json"));
+        store_antigravity_transcript_cursor(&path, &cursor);
+        assert_eq!(load_antigravity_transcript_cursor(&path), cursor);
+        assert!(antigravity_transcript_prompts_captured(tmp.path(), "a/b"));
+        // Corrupt state reads as a fresh cursor rather than failing the hook.
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(
+            load_antigravity_transcript_cursor(&path),
+            ai_memory_hooks::TranscriptCursor::default()
+        );
+        for n in 0..MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS + 5 {
+            store_antigravity_transcript_cursor(
+                &antigravity_transcript_cursor_path(tmp.path(), &format!("c{n}")),
+                &cursor,
+            );
+        }
+        let names = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            names.len() <= MAX_ANTIGRAVITY_TRANSCRIPT_CURSORS,
+            "{}",
+            names.len()
+        );
+        assert!(
+            names.iter().all(|name| name.ends_with(".json")),
+            "{names:?}"
+        );
     }
 
     #[tokio::test]

@@ -1362,15 +1362,52 @@ ai-memory finalize-session
 ai-memory finalize-session --session-id <uuid>
 ```
 
-Antigravity CLI also lacks a true session-end event. Its `Stop` hook marks the
-end of one execution loop, so ai-memory intentionally records it without
-closing the conversation. Its `PreInvocation` hook likewise runs before every
-model call; ai-memory treats only the documented `invocationNum = 0` call as
-SessionStart. Later invocations return an empty hook result without capturing
-another start or fetching the single-use handoff, so a handoff created while
-the current conversation winds down remains available to the next session.
-After the final turn, finalize the latest matching Antigravity session
-explicitly:
+### Antigravity lifecycle hooks
+
+Antigravity (the `agy` CLI, the desktop App and the IDE, which read the same
+global `~/.gemini/config/hooks.json`) has no conversation-end event, and none
+of its hook payloads carries the user's prompt. `install-hooks --agent
+antigravity-cli` wires five of its
+[documented hooks](https://antigravity.google/docs/hooks/):
+
+- `SessionStart` records the session start and injects a pending handoff as
+  an `injectSteps` system message, which stays in the conversation for later
+  turns.
+- `PreInvocation` runs before every model call. Only `invocationNum = 0`, the
+  start of a user turn, does anything: the native hook reads the turn's prompt
+  from the conversation's transcript (`transcriptPath`) and records it as a
+  user prompt. On a build that fires no `SessionStart`, the first turn's
+  `PreInvocation` records the start and claims the handoff instead. A
+  per-conversation marker keeps either start to once, so a handoff created
+  while the conversation winds down stays open for the next session.
+- `PreToolUse` and `PostToolUse` capture tool calls.
+- `Stop` ends one execution loop. When the model finished the turn
+  (`terminationReason` `NO_TOOL_CALL`, spelled `model_stop` on the web page)
+  and nothing is left running (`fullyIdle: true`), the server writes a turn
+  checkpoint: it refreshes the session's summary page and its one open
+  handoff and leaves the conversation open, the path OpenCode 2 uses. Prompts
+  the transcript gained since the turn started are recorded ahead of the
+  `Stop`, so the checkpoint includes them. A cancelled, failed or
+  budget-limited loop is not a checkpoint.
+
+The transcript is read only when `transcriptPath` names the conversation's own
+`~/.gemini/<app>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
+(or the `transcript_full.jsonl` beside it, which the CLI reports), with
+`<app>` one of `antigravity`, `antigravity-cli` or `antigravity-ide`. Another
+file, another conversation's transcript and a symlinked directory that leads
+out of the conversation are refused. One hook reads at most 8 MiB, and a
+cursor under `<data_dir>/hook-state/antigravity-transcripts/` resumes where
+the previous read stopped. Steps a hook injected are skipped, the text inside
+the CLI's `<USER_REQUEST>` wrapper is kept, and each prompt is capped and
+scrubbed like any other before the server sanitizes it again. Its ingest key
+comes from the conversation and step, so a repeated read stores it once. The
+shell and PowerShell fallback hooks do not parse the transcript, and a
+checkout the capture allowlist does not admit is not read at all.
+
+Nothing tells a closed Antigravity window from a conversation still in use,
+so a checkpoint's handoff goes to a new session in the same project only once
+the conversation has been quiet for 10 minutes. To hand it over at once, or
+to queue opt-in SessionEnd consolidation, close the conversation explicitly:
 
 ```bash
 ai-memory finalize-session --agent antigravity-cli
@@ -1381,16 +1418,23 @@ ai-memory finalize-session --agent antigravity-cli
 ai-memory finalize-session --agent antigravity-cli --reopen --session-id <uuid>
 ```
 
-Antigravity's hooks carry no prompt, so before the session-end
-`finalize-session` replays the session's typed prompts from `agy`'s
-`~/.gemini/antigravity-cli/history.jsonl` (only lines whose conversation and
-workspace match the session), and the summary page and handoff are built with
-them. Each prompt is keyed as `backfill` keys it, so a re-close stores it once
-and a prompt typed after the first finalize arrives with the next. A checkout
-the capture allowlist does not admit sends none, `--all-owners` replays none
-(other users' prompts are not in this machine's history), and a missing or
-unreadable `history.jsonl` only prints a warning. `agy -p` runs write no
-`history.jsonl` line, so they have no prompt to replay.
+For a session whose prompts the live hooks did not capture (the shell
+fallback hooks, or an install from before transcript capture),
+`finalize-session` replays its typed prompts from `agy`'s
+`~/.gemini/antigravity-cli/history.jsonl` before the session-end (only lines
+whose conversation and workspace match the session), and the summary page and
+handoff are built with them. Each prompt is keyed as `backfill` keys it, so a
+re-close stores it once and a prompt typed after the first finalize arrives
+with the next. A checkout the capture allowlist does not admit sends none,
+`--all-owners` replays none (other users' prompts are not in this machine's
+history), and a missing or unreadable `history.jsonl` only prints a warning.
+`agy -p` runs write no `history.jsonl` line, so they have no prompt to replay.
+
+Rerun `ai-memory install-hooks --agent antigravity-cli --apply` after
+upgrading. An install from an earlier release runs its `session-start` handler
+on `PreInvocation` and has no `SessionStart` entry; the native hook reads that
+as the first-turn fallback, with transcript prompts and turn checkpoints, until
+the reinstall adds `SessionStart`.
 
 ### Devin CLI
 
@@ -2335,7 +2379,8 @@ token, so export that variable where you launch `prime-agent`.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
 for Zero's no-stdout SessionStart behavior. Grok delivers on the first
-`PostToolUse` instead (Antigravity CLI uses `PreInvocation`).
+`PostToolUse` instead (Antigravity uses `SessionStart`, or the first turn's
+`PreInvocation` on builds without it).
 
 #### Cline CLI and FreeBuff
 

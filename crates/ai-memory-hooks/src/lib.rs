@@ -36,7 +36,9 @@ pub mod synth;
 pub mod workstream;
 
 pub use antigravity::{
-    MAX_ANTIGRAVITY_OUTPUT_BYTES, enrich_antigravity_step_output, is_output_eligible,
+    MAX_ANTIGRAVITY_OUTPUT_BYTES, TranscriptCursor, TranscriptPrompt, TranscriptRead,
+    antigravity_conversation_id, antigravity_transcript_path, enrich_antigravity_step_output,
+    is_output_eligible, read_transcript_prompts,
 };
 
 // Re-export the sanitizer types from core so callers that grew up
