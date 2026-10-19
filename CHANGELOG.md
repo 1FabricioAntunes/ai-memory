@@ -124,6 +124,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `_lint/report.md` as a knowledge page, which could recycle stale findings or
   displace a real page from the bounded prompt. ([#1455](https://github.com/akitaonrails/ai-memory/pull/1455))
 - Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+- Counted a latest page whose only stored vector belongs to another provider,
+  model, or dimension as missing an embedding in `ai-memory status` and the
+  web `/health` page, so the count no longer reads zero after an
+  embedding-model switch.
+  ([#1431](https://github.com/akitaonrails/ai-memory/pull/1431))
 - Bounded free-text search before the FTS5 parser sees it. A query of 100k
   distinct terms spent ~17.5 s in query preparation alone (and a ~500 KB
   document ~59 s end to end), and a NUL byte reached the phrase parser as

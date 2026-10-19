@@ -1306,8 +1306,20 @@ async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl Into
 }
 
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    // Count "missing" against the configured embedder's stored triple, so
+    // a model swap cannot read as a fully covered index; with no embedder
+    // configured the historical "no vector at all" count is kept.
+    let configured_embedding = state.embedder.as_deref().map(stored_embedding_identity);
     match state.reader.status_counts().await {
-        Ok(counts) => match state.reader.derived_index_status().await {
+        Ok(counts) => match match configured_embedding {
+            Some(identity) => {
+                state
+                    .reader
+                    .derived_index_status_for_embedding(identity)
+                    .await
+            }
+            None => state.reader.derived_index_status().await,
+        } {
             Ok(derived) => {
                 // Three pragma reads; a failure here must not take down the
                 // whole status response, which is also the health probe.
@@ -4093,6 +4105,21 @@ async fn embed_project_pages(
     .map_err(|e| internal_err(e.to_string()))
 }
 
+/// The `(provider, model, dim)` triple rows are stored under for one
+/// embedder: `model_identity()` (which folds in a configured document
+/// prefix), never the bare wire model name. `handle_embed`'s stale-row
+/// purge and `handle_status`'s missing-vector count must both match rows
+/// the way they are written, so they share this instead of each spelling
+/// the triple (a vector counts as covering a page only when this very
+/// identity would store one for it).
+fn stored_embedding_identity(embedder: &dyn Embedder) -> (String, String, u32) {
+    (
+        embedder.provider().to_string(),
+        embedder.model_identity(),
+        embedder.dim(),
+    )
+}
+
 async fn handle_embed(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<EmbedRequest>,
@@ -4109,12 +4136,7 @@ async fn handle_embed(
         }
     };
 
-    let provider = embedder.provider().to_string();
-    // Not `.model()`: the purge below must match the identity rows were
-    // actually stored under (a document-prefix change), not the wire
-    // model name. See `Embedder::model_identity`.
-    let model = embedder.model_identity();
-    let dim = embedder.dim();
+    let (provider, model, dim) = stored_embedding_identity(&*embedder);
 
     let mut totals = EmbedBackfillCounts::default();
 
