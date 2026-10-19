@@ -120,6 +120,9 @@ version in [`docs/changelog/`](docs/changelog/):
   ranking. `contradiction_sql` now applies the `not_expired` guard on the target
   page, aligning belief input aggregation with the lint's resolved/stale split.
   ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
+- Stopped the LLM contradiction pass from auditing its previous
+  `_lint/report.md` as a knowledge page, which could recycle stale findings or
+  displace a real page from the bounded prompt. ([#1455](https://github.com/akitaonrails/ai-memory/pull/1455))
 - Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
 - Bounded free-text search before the FTS5 parser sees it. A query of 100k
   distinct terms spent ~17.5 s in query preparation alone (and a ~500 KB
