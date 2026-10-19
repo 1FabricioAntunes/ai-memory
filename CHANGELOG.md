@@ -24,7 +24,7 @@ version in [`docs/changelog/`](docs/changelog/):
   events are dropped. When the
   community memory-provider plugin is installed, only the tool events are
   printed. `install-mcp --client hermes` prints an `mcp_servers:` entry for the
-  session-less stdio bridge with no token in it, and refuses `--apply`.
+  session-less stdio bridge with no token in it, and refuses `--apply` ([#1454](https://github.com/akitaonrails/ai-memory/pull/1454)).
 - Added bounded local document extraction to the optional
   `ai-memory-importer` companion. Its dry-run-first `document` command accepts
   UTF-8 text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, VTT, and
