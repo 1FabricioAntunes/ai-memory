@@ -46,11 +46,15 @@ pub(crate) async fn handler(
             embedder.dim(),
         )
     });
-    let derived = match state
-        .reader
-        .derived_index_status(configured_embedding.clone())
-        .await
-    {
+    let derived = match match configured_embedding.clone() {
+        Some(identity) => {
+            state
+                .reader
+                .derived_index_status_for_embedding(identity)
+                .await
+        }
+        None => state.reader.derived_index_status().await,
+    } {
         Ok(derived) => derived,
         Err(error) => return internal(error),
     };

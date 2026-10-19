@@ -8742,7 +8742,7 @@ mod tests {
             .upsert_page(sample_page(ws, proj, "notes/empty.md", "   "))
             .await
             .unwrap();
-        let derived = store.reader.derived_index_status(None).await.unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
         assert_eq!(derived.latest_pages_unembeddable, 1, "{derived:?}");
     }
@@ -8804,13 +8804,13 @@ mod tests {
 
         // Historical behaviour: the page carries a vector, so nothing is
         // missing.
-        let derived = store.reader.derived_index_status(None).await.unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
 
         // Configured triple A: the page is covered by its own vector.
         let derived = store
             .reader
-            .derived_index_status(Some(triple_a.clone()))
+            .derived_index_status_for_embedding(triple_a.clone())
             .await
             .unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
@@ -8819,7 +8819,7 @@ mod tests {
         // only vector is stale for the model in use.
         let derived = store
             .reader
-            .derived_index_status(Some(triple_b.clone()))
+            .derived_index_status_for_embedding(triple_b.clone())
             .await
             .unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
@@ -8835,17 +8835,17 @@ mod tests {
         insert_embedding("notes/fresh.md", "prov-b", "model-b", 16);
         let derived = store
             .reader
-            .derived_index_status(Some(triple_a.clone()))
+            .derived_index_status_for_embedding(triple_a.clone())
             .await
             .unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
         let derived = store
             .reader
-            .derived_index_status(Some(triple_b.clone()))
+            .derived_index_status_for_embedding(triple_b.clone())
             .await
             .unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
-        let derived = store.reader.derived_index_status(None).await.unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
     }
 
@@ -8880,7 +8880,7 @@ mod tests {
             },
         ];
         store.writer.upsert_page(page).await.unwrap();
-        let derived = store.reader.derived_index_status(None).await.unwrap();
+        let derived = store.reader.derived_index_status().await.unwrap();
         assert_eq!(
             derived.typed_links_from_latest_pages,
             vec![("fixes".to_string(), 1)],

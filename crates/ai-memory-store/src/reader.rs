@@ -11418,14 +11418,10 @@ impl ReaderPool {
 
     /// Return health counters for derived indexes and link/embedding state.
     ///
-    /// `configured_embedding` is the `(provider, model, dim)` triple the
-    /// configured embedder stores rows under (`model_identity`, not the
-    /// wire model name), or `None` when no embedder is configured. With a
-    /// triple, a latest page counts as missing an embedding when it has no
-    /// vector under *that* triple: a vector from an old model is stale and
-    /// ignored by retrieval, so it must not hide the gap a backfill has to
-    /// fill. With `None`, "missing" keeps its historical meaning: no vector
-    /// at all.
+    /// "Missing" keeps its historical meaning here: a latest page has no
+    /// vector at all. Server health surfaces with a configured embedder use
+    /// [`Self::derived_index_status_for_embedding`] so vectors from an old
+    /// model do not hide the current backfill gap.
     ///
     /// These checks are intentionally read-only and derived-index-safe: they
     /// report drift but do not repair it. Rebuild/backfill paths stay behind
@@ -11433,7 +11429,24 @@ impl ReaderPool {
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn derived_index_status(
+    pub async fn derived_index_status(&self) -> StoreResult<DerivedIndexStatus> {
+        self.derived_index_status_inner(None).await
+    }
+
+    /// Return derived-index health while judging embedding coverage against
+    /// the configured `(provider, model, dim)` identity.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn derived_index_status_for_embedding(
+        &self,
+        configured_embedding: (String, String, u32),
+    ) -> StoreResult<DerivedIndexStatus> {
+        self.derived_index_status_inner(Some(configured_embedding))
+            .await
+    }
+
+    async fn derived_index_status_inner(
         &self,
         configured_embedding: Option<(String, String, u32)>,
     ) -> StoreResult<DerivedIndexStatus> {

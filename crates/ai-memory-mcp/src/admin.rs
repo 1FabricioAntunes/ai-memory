@@ -1314,11 +1314,15 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
     // configured the historical "no vector at all" count is kept.
     let configured_embedding = state.embedder.as_deref().map(stored_embedding_identity);
     match state.reader.status_counts().await {
-        Ok(counts) => match state
-            .reader
-            .derived_index_status(configured_embedding)
-            .await
-        {
+        Ok(counts) => match match configured_embedding {
+            Some(identity) => {
+                state
+                    .reader
+                    .derived_index_status_for_embedding(identity)
+                    .await
+            }
+            None => state.reader.derived_index_status().await,
+        } {
             Ok(derived) => {
                 // Three pragma reads; a failure here must not take down the
                 // whole status response, which is also the health probe.
