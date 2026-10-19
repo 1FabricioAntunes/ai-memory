@@ -102,10 +102,11 @@ mod tests {
     use ai_memory_core::ids::PagePath;
 
     #[test]
-    fn slugify_page_path_output_passes_ensure_portable() {
-        // Each of these is a shape `ensure_portable` refuses; the helper's
-        // contract is that its output survives it, so one bad model path
-        // cannot abort a whole `apply_batch`.
+    fn slugify_page_path_repairs_trailing_and_dos_device_components() {
+        // Each of these is one of the component shapes repaired here. Other
+        // portability checks (for example the 255-byte component limit) stay
+        // fail-closed in `ensure_portable` instead of silently rewriting a
+        // model path beyond recognition.
         for (raw, expected) in [
             ("notes/v2./roadmap.md", "notes/v2/roadmap.md"),
             ("notes/q3 plan /roadmap.md", "notes/q3 plan/roadmap.md"),
