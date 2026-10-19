@@ -1590,7 +1590,9 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         // Muse reads `mcpServers` or the legacy `mcp_servers`;
         // `strip_mcp_json` sweeps both.
         McpClient::Muse => Some(&["mcpServers"]),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh | McpClient::Hermes => {
+            None
+        }
     }
 }
 

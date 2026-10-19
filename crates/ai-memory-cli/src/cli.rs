@@ -2852,6 +2852,14 @@ pub enum McpClient {
     /// installed separately with `install-hooks --agent dsh`.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
+    /// Hermes Agent (Nous Research) — the `mcp_servers:` map of
+    /// `~/.hermes/config.yaml`. Print-only (--apply is refused): ai-memory has
+    /// no YAML editor for that file, which the operator also edits. The entry
+    /// is a stdio `ai-memory mcp-bridge --no-session-id`, so it carries no
+    /// token. Lifecycle capture is installed separately with `install-hooks
+    /// --agent hermes`.
+    #[value(alias = "hermes-agent")]
+    Hermes,
     /// Cline CLI — `~/.cline/data/settings/cline_mcp_settings.json` (or
     /// `CLINE_MCP_SETTINGS_PATH`) with an explicit Streamable HTTP transport.
     #[value(alias = "cline-cli")]
@@ -4815,6 +4823,14 @@ mod tests {
             panic!("expected finalize-session for hermes");
         };
         assert_eq!(args.agent, ai_memory_core::AgentKind::Hermes);
+        for alias in ["hermes", "hermes-agent"] {
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp for Hermes alias {alias}");
+            };
+            assert_eq!(args.client, McpClient::Hermes);
+        }
     }
 
     #[test]

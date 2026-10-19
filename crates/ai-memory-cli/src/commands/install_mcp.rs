@@ -126,10 +126,15 @@ pub(crate) fn run_with_opencode_dialect(
     // Muse starts stdio servers with a cleared environment (`HOME`, `PATH`
     // and its own `MUSE_SESSION_ID`), so the bridge it launches finds this
     // install's config and token only through an explicit `--data-dir`, as
-    // the Muse hooks do. Not from inside the Docker helper, whose data dir is
-    // a container path the host-side bridge cannot open.
-    if matches!(args.client, McpClient::Muse | McpClient::Freebuff)
-        && config.runtime_env.host_cwd().is_none()
+    // the Muse hooks do. Hermes keeps only a short allowlist (`PATH`, `HOME`,
+    // `XDG_*`, ...; `_build_safe_env` in `tools/mcp_tool_config.py`), which
+    // drops `AI_MEMORY_DATA_DIR` the same way. Not from inside the Docker
+    // helper, whose data dir is a container path the host-side bridge cannot
+    // open.
+    if matches!(
+        args.client,
+        McpClient::Muse | McpClient::Freebuff | McpClient::Hermes
+    ) && config.runtime_env.host_cwd().is_none()
     {
         args.bridge_data_dir = Some(config.data_dir.clone());
     }
@@ -169,6 +174,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::Zed => render_zed(&args)?,
         McpClient::Muse => render_muse(&args)?,
         McpClient::Dsh => render_dsh(&args)?,
+        McpClient::Hermes => render_hermes(&args),
         McpClient::PrimeAgent => render_prime_agent(&args)?,
         McpClient::Cline => render_json_mcp_fragment(&args)?,
         McpClient::Freebuff => render_json_mcp_fragment(&args)?,
@@ -656,6 +662,7 @@ pub(crate) fn mcp_config_path_with(
         McpClient::Dsh => bail!(
             "DeepSeek Harness has no fixed MCP config file; merge the printed snippet into $DSH_HOME/profiles/<profile>/cordis.patch.yml."
         ),
+        McpClient::Hermes => bail!(HERMES_MCP_APPLY_GUIDANCE),
         // OMP reads mcp.json from its agent dir, the one its extensions live
         // in, so a profile, PI_CODING_AGENT_DIR or PI_CONFIG_DIR moves it too.
         McpClient::Omp => {
@@ -1036,6 +1043,9 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
     if matches!(args.client, McpClient::Dsh) {
         bail!(dsh_mcp_apply_guidance(args));
     }
+    if matches!(args.client, McpClient::Hermes) {
+        bail!(HERMES_MCP_APPLY_GUIDANCE);
+    }
     let path = resolve_config_file(args)?;
     let outcome = match args.client {
         McpClient::Codex => apply_atomic(&path, |existing| {
@@ -1148,7 +1158,9 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
         McpClient::Muse => Some(JsonMcpLocation::MuseServers),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh | McpClient::Hermes => {
+            None
+        }
     }
 }
 
@@ -1177,6 +1189,9 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         }
         McpClient::Dsh => {
             bail!("internal: DeepSeek Harness MCP config is a Cordis YAML patch, not JSON")
+        }
+        McpClient::Hermes => {
+            bail!("internal: Hermes Agent MCP config is ~/.hermes/config.yaml, not JSON")
         }
         _ => build_mcp_entry(args),
     }
@@ -2468,6 +2483,61 @@ fn dsh_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
     )
 }
 
+/// Hermes Agent reads MCP servers from the `mcp_servers:` map of
+/// `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml`), keyed by server name
+/// with `command`/`args` for a stdio server
+/// (<https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp>,
+/// v0.22.2). Print the entry to merge by hand; --apply is refused.
+///
+/// The entry is always the session-less stdio bridge. Hermes passes an MCP
+/// server a filtered environment with no session id in it, so the client is
+/// static, and a bridge keeps the bearer out of the file: it authenticates
+/// with this install's own token.
+fn render_hermes(args: &InstallMcpArgs) -> String {
+    let token_note = if args.auth_token.is_some() {
+        "#\n\
+         # The token is not written here. The bridge sends this install's\n\
+         # [auth].bearer_token or [auth].bearer_token_file; Hermes does not\n\
+         # pass AI_MEMORY_AUTH_TOKEN from its own environment to MCP servers.\n"
+    } else {
+        ""
+    };
+    format!(
+        "# Hermes Agent - merge the entry below into the `mcp_servers:` map of\n\
+         # ~/.hermes/config.yaml ($HERMES_HOME/config.yaml), then restart\n\
+         # Hermes; a running gateway reloads MCP servers within about a minute.\n\
+         #\n\
+         # Hermes does not read an MCP server's instructions, so the routing\n\
+         # rules reach the model through the ai-memory skills\n\
+         # (`ai-memory install-skills --scope global --agent hermes`, into\n\
+         # ~/.hermes/skills) and the handoff `install-hooks --agent hermes`\n\
+         # brings into a session's first turn.\n\
+         {token_note}\
+         {snippet}\n",
+        snippet = render_hermes_snippet(args),
+    )
+}
+
+fn render_hermes_snippet(args: &InstallMcpArgs) -> String {
+    // Single-quote every scalar, as for DSH: a plain `--name 123` would key
+    // the map with an integer, and a path with ` #` would be cut at the
+    // comment.
+    let mut out = String::from("mcp_servers:\n");
+    out.push_str(&format!("  {}:\n", yaml_single_quote(&args.name)));
+    out.push_str(&format!(
+        "    command: {}\n",
+        yaml_single_quote(&bridge_command())
+    ));
+    out.push_str("    args:");
+    for arg in session_less_bridge_args(args) {
+        out.push_str(&format!("\n      - {}", yaml_single_quote(&arg)));
+    }
+    out
+}
+
+/// Why `install-mcp --client hermes --apply` writes nothing, and what to do.
+const HERMES_MCP_APPLY_GUIDANCE: &str = "Hermes Agent keeps MCP servers in ~/.hermes/config.yaml, a YAML file ai-memory does not edit; refusing to write MCP config. Re-run without --apply to print the mcp_servers entry, then merge it into ~/.hermes/config.yaml ($HERMES_HOME/config.yaml).";
+
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
     Ok(pi_mcp_render_guidance(args))
 }
@@ -3544,6 +3614,56 @@ mod tests {
         validate_args(&args).expect("valid name");
     }
 
+    /// Hermes' entry is the session-less stdio bridge under `mcp_servers:`,
+    /// every scalar a single-quoted YAML string.
+    #[test]
+    fn hermes_render_is_a_quoted_stdio_bridge_entry() {
+        let mut args = args_for(McpClient::Hermes);
+        args.name = "123".into();
+        args.server_url = Some("http://h:1/mcp?a=\"b\" #c".into());
+        args.bridge_data_dir = Some(PathBuf::from("/data dir/it's"));
+        let rendered = render_hermes(&args);
+        let command = yaml_single_quote(&bridge_command());
+        let expected = format!(
+            "mcp_servers:\n  '123':\n    command: {command}\n    args:\n      \
+             - 'mcp-bridge'\n      - '--no-session-id'\n      - '--server-url'\n      \
+             - 'http://h:1/mcp?a=\"b\" #c'\n      - '--data-dir'\n      - '/data dir/it''s'\n"
+        );
+        assert!(rendered.ends_with(&expected), "{rendered}");
+        // The model never sees ai-memory's MCP instructions in Hermes, so the
+        // header points at what carries them instead.
+        assert!(rendered.contains("does not read an MCP server's instructions"));
+        assert!(rendered.contains("~/.hermes/skills"));
+        assert!(rendered.contains("first turn"));
+    }
+
+    /// No bearer reaches Hermes' config: the bridge authenticates with the
+    /// install's own token.
+    #[test]
+    fn hermes_render_never_embeds_the_token() {
+        let rendered = render_hermes(&args_with_token(McpClient::Hermes));
+        assert!(!rendered.contains("test-token-deadbeef"), "{rendered}");
+        assert!(!rendered.contains("Bearer"), "{rendered}");
+        assert!(!rendered.contains("headers"), "{rendered}");
+        assert!(rendered.contains("The token is not written here"));
+        assert!(!render_hermes(&args_for(McpClient::Hermes)).contains("The token is not"));
+    }
+
+    #[test]
+    fn hermes_apply_and_config_path_are_refused_with_guidance() {
+        let mut args = args_with_token(McpClient::Hermes);
+        args.apply = true;
+        let error = apply_to_config_file(&args).expect_err("apply must be refused");
+        let message = format!("{error}");
+        assert!(message.contains("~/.hermes/config.yaml"), "{message}");
+        assert!(message.contains("without --apply"), "{message}");
+        assert!(!message.contains("test-token-deadbeef"), "{message}");
+        let error = mcp_config_path(McpClient::Hermes).expect_err("no writable config");
+        assert!(format!("{error}").contains("~/.hermes/config.yaml"));
+        assert!(json_mcp_location(McpClient::Hermes).is_none());
+        assert!(build_json_mcp_entry(&args_for(McpClient::Hermes)).is_err());
+    }
+
     #[test]
     fn dsh_apply_is_refused_with_the_patch_pointer() {
         let mut args = args_for(McpClient::Dsh);
@@ -4186,6 +4306,7 @@ mod tests {
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::Hermes => render_hermes(&args),
             McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
             McpClient::Cline => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Freebuff => {
@@ -4272,6 +4393,7 @@ mod tests {
             McpClient::Zed,
             McpClient::Muse,
             McpClient::Dsh,
+            McpClient::Hermes,
             McpClient::PrimeAgent,
             McpClient::Cline,
             McpClient::Freebuff,
@@ -4315,6 +4437,7 @@ mod tests {
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::Hermes => render_hermes(&args),
             McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
             McpClient::Cline => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Freebuff => {
@@ -4362,7 +4485,7 @@ mod tests {
         let config = file_token_config(tmp.path());
         let url = DEFAULT_MCP_URL;
         for &client in <McpClient as clap::ValueEnum>::value_variants() {
-            if matches!(client, McpClient::Pi | McpClient::Dsh) {
+            if matches!(client, McpClient::Pi | McpClient::Dsh | McpClient::Hermes) {
                 continue; // no config file: an extension, and print-only
             }
             let ext = if matches!(client, McpClient::Codex | McpClient::Grok) {

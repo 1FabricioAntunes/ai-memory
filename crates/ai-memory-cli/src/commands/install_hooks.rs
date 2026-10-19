@@ -1717,9 +1717,10 @@ fn infer_installed_mcp_config(
             "url",
         )),
         McpClient::Pi => Ok(None),
-        // DeepSeek Harness has no fixed MCP config file; no AgentChoice
-        // counterpart routes here, so this arm only satisfies exhaustiveness.
-        McpClient::Dsh => Ok(None),
+        // DeepSeek Harness has no fixed MCP config file, and Hermes' is YAML
+        // ai-memory never writes; no AgentChoice counterpart routes either
+        // here, so this arm only satisfies exhaustiveness.
+        McpClient::Dsh | McpClient::Hermes => Ok(None),
         McpClient::AntigravityCli => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1832,8 +1833,9 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // no `McpClient::Zcode` whose config the installer could scrape a
         // server URL or token from.
         AgentChoice::Zcode => None,
-        // No first-party Hermes MCP installer ships yet, so there is no config
-        // file to infer a server URL or token from.
+        // `install-mcp --client hermes` is print-only: ai-memory never writes
+        // `~/.hermes/config.yaml`, so there is no entry of its own to infer a
+        // server URL or token from.
         AgentChoice::Hermes => None,
         AgentChoice::CopilotCli => Some(McpClient::CopilotCli),
         AgentChoice::Droid => Some(McpClient::Droid),
