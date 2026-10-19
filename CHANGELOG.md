@@ -210,6 +210,11 @@ version in [`docs/changelog/`](docs/changelog/):
   pages, inline page embeds or query vectors. Voyage previously did not retry
   at all.
   ([#1466](https://github.com/akitaonrails/ai-memory/issues/1466))
+- Returned MCP `invalid_params` from `memory_query` for conflicting
+  `global`, `scopes`, `workspace`/`project` and `as_of` arguments and for an
+  `as_of` that is not an ISO-8601 instant, instead of misreporting them as
+  internal server errors.
+  ([#1468](https://github.com/akitaonrails/ai-memory/issues/1468))
 
 ## [3.1.1] - 2026-10-17
 
