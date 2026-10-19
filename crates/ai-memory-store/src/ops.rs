@@ -16693,6 +16693,29 @@ pub(crate) mod tests {
         assert_eq!(hits, vec!["notes/titled.md".to_string()]);
     }
 
+    #[test]
+    fn grouped_title_filter_searches_only_titles() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &NewPage {
+                title: "handoff protocol".into(),
+                ..page(ws, proj, "notes/titled.md", "unrelated body")
+            },
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "notes/mention.md", "a body about the handoff"),
+        )
+        .unwrap();
+
+        for raw in ["(title:handoff)", "(title:handoff OR title:deploy)"] {
+            let hits = fts_match_paths(&conn, raw).unwrap();
+            assert_eq!(hits, vec!["notes/titled.md".to_string()], "{raw}");
+        }
+    }
+
     /// Regression for the live-found hyphen bug: searching `ui-refresh`
     /// returned nothing in prod even though
     /// `follow-ups/ui-refresh-scroll-restoration.md` exists. The first fix

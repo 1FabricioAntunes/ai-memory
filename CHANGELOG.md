@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Preserved FTS5 column filters inside parenthesized groups, so queries such
+  as `(title:handoff)` no longer broaden into a search for the literal word
+  `title` across every indexed field. ([#1442](https://github.com/akitaonrails/ai-memory/pull/1442))
 - Revalidated session-purge tombstones inside the reindex write transaction,
   preventing a queued watcher update from recreating a deleted summary after
   file cleanup failed. Kept surviving manual replacements at the same path
