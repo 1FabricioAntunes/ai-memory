@@ -4823,7 +4823,7 @@ fn is_acknowledgment(text: &str) -> bool {
     }
     let mut rest = trimmed;
     loop {
-        rest = rest.trim_start_matches([',', '.', ' ', '，', '。']);
+        rest = rest.trim_start_matches([',', '.', '!', ' ', '，', '。', '！']);
         if rest.is_empty() {
             return true;
         }
@@ -20453,6 +20453,25 @@ pub(crate) mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// An exclamation mark is punctuation like a period: "thanks!" is the
+    /// same acknowledgment as "thanks.", not a prompt to continue from.
+    #[test]
+    fn is_acknowledgment_accepts_exclamation_marks() {
+        for ack in [
+            "thanks!",
+            "great!",
+            "ok, thanks!",
+            "perfect!!",
+            "好的！",
+            "谢谢!",
+        ] {
+            assert!(is_acknowledgment(ack), "{ack:?} is an acknowledgment");
+        }
+        for request in ["ok? now run it", "thanks! now run the tests"] {
+            assert!(!is_acknowledgment(request), "{request:?} is a request");
+        }
     }
 
     /// A compound acknowledgment is acknowledgment phrases and separators

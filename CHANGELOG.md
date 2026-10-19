@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Recognized exclamation-mark punctuation in short automatic-handoff
+  acknowledgments such as `thanks!` and `perfect!`.
+  ([#1448](https://github.com/akitaonrails/ai-memory/pull/1448))
 - Treated a blank `session_id` as omitted when starting an automatic
   improvement review, matching the other session-scoped MCP tools.
   ([#1447](https://github.com/akitaonrails/ai-memory/pull/1447))
