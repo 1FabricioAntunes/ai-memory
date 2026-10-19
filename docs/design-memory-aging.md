@@ -424,11 +424,11 @@ phase, and encodes the lessons from that incident.
 New migrations start at **V65** and are additive. A2's `compacted_at` is an
 `ADD COLUMN` (nullable): instant, no table rewrite, no lock on a large store.
 No shipped migration's SQL is ever edited in place: doing so trips refinery's
-divergence check, which is exactly why `migrations.rs:33-34` sets
-`set_abort_divergent(false)` (a hash mismatch on an already-applied migration is
-tolerated) while keeping `set_abort_missing(true)` (a store *ahead* of the binary
-fails closed). Any change to a shipped migration must preserve that
-divergence-tolerance handling.
+divergence check. V62 is the historical exception. Its exact v2.2.1 checksum is
+repaired to the embedded checksum before the runner starts (#1443), after which
+`set_abort_divergent(true)` keeps every unknown edit fatal. `set_abort_missing(true)`
+also keeps a store *ahead* of the binary fail-closed. Future changes must never
+edit a shipped migration in place or broaden the narrow V62 repair.
 
 **Any data backfill runs on the boot path, not inside the migration
 transaction**: chunked, resumable, and WAL-checkpointed, mirroring the #776
