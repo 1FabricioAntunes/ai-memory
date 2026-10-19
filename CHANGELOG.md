@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Skipped H1-like comment lines inside fenced code when the importer derives
+  page titles, including AgentMemory vault imports.
+  ([#1451](https://github.com/akitaonrails/ai-memory/pull/1451))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
