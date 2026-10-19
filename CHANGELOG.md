@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Sent `response_format=json_schema` for structured OpenCode Chat Completions
+  calls, with the existing tolerant fallback for models that reject it, so
+  `memory_query answer=true` no longer receives unstructured prose by default.
+  ([#1441](https://github.com/akitaonrails/ai-memory/issues/1441))
 - Revalidated session-purge tombstones inside the reindex write transaction,
   preventing a queued watcher update from recreating a deleted summary after
   file cleanup failed. Kept surviving manual replacements at the same path
