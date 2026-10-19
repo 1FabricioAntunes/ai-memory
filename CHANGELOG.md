@@ -14,6 +14,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 - Corrected Pi MCP setup guidance to name `ai-memory-pi.ts` and describe its
   location when `PI_CODING_AGENT_DIR` is set.
+  ([#1446](https://github.com/akitaonrails/ai-memory/pull/1446))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
