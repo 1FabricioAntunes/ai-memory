@@ -12,7 +12,7 @@
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 mod api_credentials;
 mod auto_improve;
@@ -170,6 +170,14 @@ impl Store {
         conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+        // Writer transactions start IMMEDIATE: a deferred transaction that
+        // has already read cannot wait through the busy handler when it
+        // upgrades to write, so another process holding the write lock (an
+        // external `wal_checkpoint(TRUNCATE)`, a sqlite3 shell) failed hook
+        // admission at once with "database is locked". IMMEDIATE takes the
+        // lock at BEGIN, where `busy_timeout` applies. Refinery's
+        // per-migration transactions below inherit it unchanged otherwise.
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
 
         // SQLite cannot disable FK enforcement inside refinery's per-migration
         // transaction. Keep it off while migrations rebuild tables, then enable
