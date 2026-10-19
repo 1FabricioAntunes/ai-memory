@@ -2511,7 +2511,7 @@ fn render_hermes(args: &InstallMcpArgs) -> String {
          # rules reach the model through the ai-memory skills\n\
          # (`ai-memory install-skills --scope global --agent hermes`, into\n\
          # ~/.hermes/skills) and the handoff `install-hooks --agent hermes`\n\
-         # brings into a session's first turn.\n\
+         # brings into the next primary-session turn.\n\
          {token_note}\
          {snippet}\n",
         snippet = render_hermes_snippet(args),
@@ -3634,7 +3634,7 @@ mod tests {
         // header points at what carries them instead.
         assert!(rendered.contains("does not read an MCP server's instructions"));
         assert!(rendered.contains("~/.hermes/skills"));
-        assert!(rendered.contains("first turn"));
+        assert!(rendered.contains("next primary-session turn"));
     }
 
     /// No bearer reaches Hermes' config: the bridge authenticates with the

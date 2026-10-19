@@ -17,8 +17,9 @@ version in [`docs/changelog/`](docs/changelog/):
   hermes` client. The `hooks:` block `install-hooks --agent hermes` prints now
   also wires `on_session_start`, `pre_llm_call` (the prompt, never the
   conversation history), `on_session_end` as a turn boundary and
-  `on_session_finalize` as the session end, and the first turn's
-  `pre_llm_call` brings the pending handoff in as `{"context": ...}`. Hermes
+  `on_session_finalize` as the session end, and each primary-session
+  `pre_llm_call` checks for a pending handoff and brings it into that turn as
+  `{"context": ...}`. This includes a resumed native Hermes session. Hermes
   events route by `TERMINAL_CWD` when it names an existing directory (in a
   gateway, for the default profile only), and a delegated child's lifecycle
   events are dropped. When the

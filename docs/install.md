@@ -2029,7 +2029,7 @@ Six events are wired, each with a 20-second timeout:
 | --- | --- | --- |
 | `pre_tool_call`, `post_tool_call` | `pre-tool-use`, `post-tool-use` | Tool observations, tool-family titles and `[capture] ignore_paths` enforcement. |
 | `on_session_start` | `session-start` | Records the start. Hermes ignores this hook's output, so no handoff is fetched here. |
-| `pre_llm_call` | `user-prompt-submit` | Captures the prompt from `extra.user_message` (text parts only, never the conversation history). On the session's first turn it claims the pending handoff and prints `{"context": "..."}`, which Hermes adds to that turn. |
+| `pre_llm_call` | `user-prompt-submit` | Captures the prompt from `extra.user_message` (text parts only, never the conversation history). On every primary-session turn it checks for a pending handoff and prints it as `{"context": "..."}`, which Hermes adds to that turn. This also works after a native Hermes session resumes. |
 | `on_session_end` | `stop` | A turn boundary: Hermes fires it after every turn, not at session end. |
 | `on_session_finalize` | `session-end` | Ends the session on CLI exit, `/new` or gateway shutdown. After a gateway `/new` only the ending session is closed. |
 

@@ -1040,8 +1040,8 @@ pub(crate) const HERMES_TOOL_EVENTS: [(&str, &str); 2] = [
 ///   its stdout, so it only records the start; the handoff is never fetched
 ///   there, because that fetch claims it.
 /// - `pre_llm_call` fires before every turn with the prompt in
-///   `extra.user_message`. On the session's first turn its
-///   `{"context": ...}` stdout carries the handoff into the turn.
+///   `extra.user_message`. Its `{"context": ...}` stdout carries any pending
+///   handoff into the turn, including after a native Hermes session resumes.
 /// - `on_session_end` fires at the end of **every turn**, not of the session,
 ///   so it is a turn boundary (`stop`).
 /// - `on_session_finalize` is the real end: CLI exit, `/new`, gateway
@@ -1070,7 +1070,7 @@ pub(crate) enum HermesHookSet {
 }
 
 /// Wall-clock bound written into each Hermes hook entry. Capture POSTs are
-/// fire-and-forget and the first-turn handoff fetch has its own short
+/// fire-and-forget and the prompt-time handoff fetch has its own short
 /// timeout, so this only bounds a hung `hook` invocation. Hermes bounds a
 /// blocking hook's callback at 30 s by default, and `pre_llm_call` holds
 /// the turn while it runs, so the entry stays well under that.

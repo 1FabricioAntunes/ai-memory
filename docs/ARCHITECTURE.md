@@ -420,9 +420,11 @@ only records the start (Hermes ignores its stdout), `pre_llm_call` is
 `user-prompt` with the text of `extra.user_message` and never the conversation
 history, `on_session_end` is `stop` because Hermes fires it after every turn,
 and `on_session_finalize` is `session-end` for the ending session only. The
-handoff is claimed on a session's first `pre_llm_call`
-(`extra.is_first_turn`) and printed as `{"context": ...}`, the one stdout shape
-Hermes adds to a turn. A `delegate_task` child (`extra.platform` `subagent`;
+handoff is checked on every primary-session `pre_llm_call` and printed as
+`{"context": ...}`, the one stdout shape Hermes adds to a turn. This lets a
+resumed native Hermes session receive a handoff produced by another harness;
+`extra.is_first_turn` only gates startup briefing/profile composition. A
+`delegate_task` child (`extra.platform` `subagent`;
 Hermes never sends its `parent_session_id`) also starts with an empty history,
 so its lifecycle events are dropped before any spool or handoff request.
 

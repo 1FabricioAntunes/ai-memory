@@ -518,18 +518,17 @@ impl AgentKind {
         matches!(self, Self::KimiCode)
     }
 
-    /// Whether this agent adds the native `user-prompt` hook's stdout to the
-    /// turn only on the first prompt of a session, which the payload itself
-    /// marks.
+    /// Whether this agent adds a JSON `context` from the native `user-prompt`
+    /// hook's stdout to the upcoming turn.
     ///
     /// Hermes Agent ignores `on_session_start` stdout but adds a
     /// `pre_llm_call` hook's `{"context": "..."}` to the user message, and
-    /// flags the session's first turn with `extra.is_first_turn`
-    /// (`agent/turn_context.py`, `agent/shell_hooks.py`, v0.22.2). The
-    /// handoff is claimed on that turn alone: `pre_llm_call` holds every turn
-    /// while it runs, so later turns skip the round-trip.
+    /// (`agent/turn_context.py`, `agent/shell_hooks.py`, v0.22.2). The hook
+    /// checks every primary-session prompt: a resumed Hermes session reports
+    /// `extra.is_first_turn = false`, but still needs to receive a handoff
+    /// produced while another harness was active.
     #[must_use]
-    pub fn first_user_prompt_injects_handoff(self) -> bool {
+    pub fn json_context_user_prompt_injects_handoff(self) -> bool {
         matches!(self, Self::Hermes)
     }
 
@@ -699,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_kind_hermes_round_trips_and_claims_the_handoff_on_the_first_prompt_only() {
+    fn agent_kind_hermes_round_trips_and_claims_handoffs_on_user_prompts() {
         assert_eq!(AgentKind::Hermes.as_str(), "hermes");
         assert_eq!(AgentKind::from_wire("hermes"), AgentKind::Hermes);
         assert_eq!(AgentKind::from_wire("hermes-agent"), AgentKind::Hermes);
@@ -712,13 +711,16 @@ mod tests {
             "\"hermes\""
         );
         // `on_session_start` stdout is ignored, so the destructive fetch must
-        // not run there; the first `pre_llm_call` carries it instead.
+        // not run there; a primary-session `pre_llm_call` carries it instead.
         assert!(!AgentKind::Hermes.session_start_injects_handoff());
         assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
-        assert!(AgentKind::Hermes.first_user_prompt_injects_handoff());
+        assert!(AgentKind::Hermes.json_context_user_prompt_injects_handoff());
         for other in AgentKind::ALL {
             if other != AgentKind::Hermes {
-                assert!(!other.first_user_prompt_injects_handoff(), "{other:?}");
+                assert!(
+                    !other.json_context_user_prompt_injects_handoff(),
+                    "{other:?}"
+                );
             }
         }
     }

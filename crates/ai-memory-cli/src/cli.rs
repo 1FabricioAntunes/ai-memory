@@ -2459,8 +2459,9 @@ pub enum AgentChoice {
     /// ai-memory's native `hook` subcommand is invoked directly (exec form,
     /// like Zero and ZCode). ai-memory wires the tool events and the session
     /// lifecycle (`on_session_start`, `pre_llm_call`, `on_session_end` as a
-    /// turn boundary, `on_session_finalize`); the first turn's `pre_llm_call`
-    /// brings the pending handoff in as context. When the community
+    /// turn boundary, `on_session_finalize`); each primary-session
+    /// `pre_llm_call` can bring a pending handoff into the upcoming turn,
+    /// including after resuming an old native session. When the community
     /// memory-provider plugin is installed under `$HERMES_HOME/plugins`, only
     /// the tool events are wired, since the plugin owns the rest.
     /// `~/.hermes/config.yaml` is NOT written: it is YAML the installer would

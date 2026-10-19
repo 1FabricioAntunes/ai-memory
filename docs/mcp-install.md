@@ -124,8 +124,9 @@ ai-memory install-skills --scope global --agent hermes
 The hooks block runs the native `ai-memory hook` command in exec form, since
 Hermes splits each `command` with `shlex.split` and runs it with no shell. It
 wires the tool events and the session lifecycle: `on_session_start`,
-`pre_llm_call` (the prompt, plus the pending handoff as `{"context": ...}` on a
-session's first turn), `on_session_end` (a turn boundary, because Hermes fires
+`pre_llm_call` (the prompt, plus any pending handoff as `{"context": ...}` on
+the next primary-session turn, including after a native resume),
+`on_session_end` (a turn boundary, because Hermes fires
 it after every turn) and `on_session_finalize` (the session end). Hermes gates
 user hooks behind its own acceptance prompt (`hooks_auto_accept`), so paste the
 block and let Hermes accept it. [install.md](install.md#hermes-agent-nous-research)
@@ -140,7 +141,7 @@ environment without `AI_MEMORY_AUTH_TOKEN`. Hermes is a static client, so the
 model passes `workspace` and `project` on project-scoped calls. `--apply` is
 refused. Hermes does not read MCP server instructions, so the routing rules
 reach the model only through the skills in `~/.hermes/skills` and the handoff
-in the first turn.
+in the next primary-session turn.
 
 The community-maintained
 [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)

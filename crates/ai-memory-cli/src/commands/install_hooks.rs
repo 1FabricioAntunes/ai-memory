@@ -7167,7 +7167,8 @@ pub(crate) fn hermes_hook_set_notes(hook_set: HermesHookSet, plugin_dir: Option<
         HermesHookSet::Full => format!(
             "# NOTE: tool events plus the session lifecycle. pre_llm_call\n\
              #       captures each prompt and brings the pending handoff into\n\
-             #       the session's first turn; on_session_end marks a turn\n\
+             #       the next turn, including after a resumed native session;\n\
+             #       on_session_end marks a turn\n\
              #       (Hermes fires it after every turn) and on_session_finalize\n\
              #       ends the session.\n\
              # NOTE: a gateway session that expires idle is never finalized;\n\

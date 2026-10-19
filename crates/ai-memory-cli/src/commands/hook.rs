@@ -992,7 +992,7 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
 /// Hermes adds a hook's stdout to the turn only as a JSON object whose
 /// `context` is a non-blank string (`_parse_context` in
 /// `agent/shell_hooks.py`); plain text and every other key are dropped.
-fn first_prompt_context_envelope(handoff: String) -> serde_json::Value {
+fn hermes_prompt_context_envelope(handoff: String) -> serde_json::Value {
     serde_json::json!({ "context": handoff })
 }
 
@@ -1117,10 +1117,10 @@ where
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
         || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
-        // Hermes takes the handoff on a session's first prompt; which prompt
-        // that is shows only in the payload, read below.
+        // Hermes adds a JSON `context` response from every primary-session
+        // pre_llm_call to the upcoming turn.
         || (hook_event == HookEvent::UserPrompt
-            && agent_kind.first_user_prompt_injects_handoff())
+            && agent_kind.json_context_user_prompt_injects_handoff())
         // Grok delivers the handoff on the first PostToolUse (its SessionStart /
         // UserPromptSubmit stdout is discarded); that path is context delivery
         // too, so external capture must not suppress it.
@@ -1168,10 +1168,10 @@ where
         .then(|| json.get("profile").and_then(serde_json::Value::as_str))
         .flatten()
         .map(str::to_owned);
-    let first_prompt_of_session = hook_event == HookEvent::UserPrompt
-        && agent_kind.first_user_prompt_injects_handoff()
-        && !hermes_delegated_child
-        && ai_memory_hooks::hermes_is_first_turn(&json);
+    let hermes_user_prompt = hook_event == HookEvent::UserPrompt
+        && agent_kind.json_context_user_prompt_injects_handoff()
+        && !hermes_delegated_child;
+    let hermes_first_prompt = hermes_user_prompt && ai_memory_hooks::hermes_is_first_turn(&json);
     if agent_kind == AgentKind::Hermes
         && ai_memory_hooks::shape_hermes_lifecycle_body(&mut json, hook_event)
     {
@@ -1787,11 +1787,13 @@ where
         return Ok(());
     }
 
-    // user-prompt: Hermes ignores `on_session_start` stdout, so the handoff
-    // rides the session's first `pre_llm_call` instead, the only turn that
-    // claims one. Later turns print `{}` without a fetch, so the turn is never
-    // held for it, and a handoff written mid-session stays for the next one.
-    if first_prompt_of_session && handoff_scoped {
+    // user-prompt: Hermes ignores `on_session_start` stdout, but adds a
+    // `pre_llm_call` JSON `context` to the upcoming turn. Check every primary
+    // prompt so a resumed native session can receive a handoff produced while
+    // another harness was active. Only a genuinely new session asks for the
+    // startup briefing/profile digest; later or resumed prompts request an
+    // already-open handoff only.
+    if hermes_user_prompt && handoff_scoped {
         let client = build_client();
         let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
         let native_session_qs = canonical_session_id
@@ -1799,14 +1801,32 @@ where
             .map_or_else(String::new, |session_id| {
                 format!("&session_id={}", url_encode(session_id))
             });
+        let handoff_qs = if hermes_first_prompt {
+            qs.clone()
+        } else {
+            policy_cwd
+                .as_deref()
+                .map(|cwd| {
+                    marker_query_suffix_without_briefing(
+                        cwd,
+                        args.project_strategy.and_then(|s| s.baked()),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let profile_qs = if hermes_first_prompt {
+            ""
+        } else {
+            "&profile_digest=0"
+        };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
             args.agent
         );
         if let Some(handoff) =
             get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
         {
-            writeln!(stdout, "{}", first_prompt_context_envelope(handoff))?;
+            writeln!(stdout, "{}", hermes_prompt_context_envelope(handoff))?;
             return Ok(());
         }
     }
@@ -8240,10 +8260,10 @@ mod tests {
         }
     }
 
-    /// The first `pre_llm_call` of a session claims the handoff and prints the
-    /// one shape Hermes adds to the turn: `{"context": "..."}`.
+    /// A `pre_llm_call` claims the handoff and prints the one shape Hermes
+    /// adds to the turn: `{"context": "..."}`.
     #[tokio::test]
-    async fn hermes_first_prompt_prints_the_handoff_as_context() {
+    async fn hermes_prompt_prints_the_handoff_as_context() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
@@ -8283,10 +8303,10 @@ mod tests {
         assert!(!entries[0].body.contains("conversation_history"));
     }
 
-    /// No pending handoff on the first prompt: `{}`, which Hermes reads as
-    /// "no context", never a bare body or an empty `context`.
+    /// No pending handoff: `{}`, which Hermes reads as "no context", never a
+    /// bare body or an empty `context`.
     #[tokio::test]
-    async fn hermes_first_prompt_without_a_handoff_prints_an_empty_object() {
+    async fn hermes_prompt_without_a_handoff_prints_an_empty_object() {
         let tmp = tempfile::tempdir().unwrap();
         let (base, mut requests) = serve_requests("404 Not Found", "").await;
         let stdout = run_hermes(
@@ -8301,19 +8321,38 @@ mod tests {
         assert!(request.starts_with("GET /handoff?"), "{request}");
     }
 
-    /// `GET /handoff` claims the baton. A later turn, `on_session_start`
-    /// (whose stdout Hermes ignores) and the turn and session ends must never
-    /// send it, or the handoff would be consumed where nobody sees it.
+    /// A resumed Hermes session has history, so `is_first_turn` is false. It
+    /// still checks for a handoff produced by the harness that ran in between,
+    /// but suppresses first-turn briefing and profile composition.
     #[tokio::test]
-    async fn hermes_never_claims_the_handoff_outside_the_first_prompt() {
+    async fn hermes_resumed_prompt_claims_a_handoff_without_startup_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        write_briefing_marker(tmp.path());
+        let stdout = run_hermes(
+            &data_dir,
+            hermes_args("user-prompt-submit", &base),
+            hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(false)),
+            RuntimeEnv::default(),
+        )
+        .await;
+        assert_eq!(stdout, b"{\"context\":\"HERMES-HANDOFF\"}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(request.contains("session_id=hermes-session"), "{request}");
+        assert!(request.contains("profile_digest=0"), "{request}");
+        assert!(!request.contains("briefing"), "{request}");
+    }
+
+    /// `on_session_start` stdout is ignored, while the turn and session ends
+    /// are not context channels. None may claim a handoff.
+    #[tokio::test]
+    async fn hermes_never_claims_the_handoff_outside_a_primary_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
         for (event, payload) in [
-            (
-                "user-prompt-submit",
-                hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(false)),
-            ),
             (
                 "session-start",
                 hermes_payload(
