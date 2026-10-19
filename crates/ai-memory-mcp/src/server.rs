@@ -2693,6 +2693,9 @@ impl AiMemoryServer {
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
+        Query text is folded (a NUL becomes a space) and bounded to the \
+        first 4 KiB before parsing, so pasting a whole document searches \
+        only its opening. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
         project/scopes hits; it also returns `streams_active` and per-stream \
@@ -4415,9 +4418,9 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let precondition = page_precondition(args.expected_page_id.as_deref(), args.create_only)?;
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         path.ensure_portable()
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let scope = args.scope.as_deref().map(str::trim);
         let profile_scope = scope == Some("profile");
@@ -4448,7 +4451,7 @@ impl AiMemoryServer {
                 .unwrap_or(if session_page { "episodic" } else { "semantic" });
         let tier: Tier = tier_name
             .parse()
-            .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+            .map_err(|_| McpError::invalid_params(format!("unknown tier '{tier_name}'"), None))?;
         if let Some(expires_at) = args
             .expires_at
             .as_deref()
@@ -4489,7 +4492,7 @@ impl AiMemoryServer {
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
                     {
-                        return Err(McpError::internal_error(
+                        return Err(McpError::invalid_params(
                             "scope: \"global\" cannot be combined with workspace/project",
                             None,
                         ));
@@ -4514,7 +4517,7 @@ impl AiMemoryServer {
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
                     {
-                        return Err(McpError::internal_error(
+                        return Err(McpError::invalid_params(
                             "scope: \"profile\" cannot be combined with workspace/project",
                             None,
                         ));
@@ -4530,7 +4533,7 @@ impl AiMemoryServer {
                     }
                 }
                 Some(other) => {
-                    return Err(McpError::internal_error(
+                    return Err(McpError::invalid_params(
                         format!(
                             "unknown scope '{other}': the supported values are \"global\" and \"profile\""
                         ),
@@ -4762,7 +4765,7 @@ impl AiMemoryServer {
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
-                .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?
+                .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?
         } else if let Some(query) = args.query {
             let hits = self
                 .reader
@@ -5295,7 +5298,7 @@ impl AiMemoryServer {
             _ => None,
         };
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let (path, (ws, proj)) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => (
                 self.place_slot_delete(path, &parts).await?,
@@ -15182,6 +15185,91 @@ mod tests {
                 "expected invalid path error for {bad:?}, got: {err}"
             );
         }
+    }
+
+    /// A malformed path, tier or scope is the caller's mistake, so the page
+    /// tools answer `invalid params` like their siblings, not an internal
+    /// error a client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn page_tools_answer_bad_path_tier_and_scope_with_invalid_params() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let write = |path: &str, tier: Option<&str>, scope: Option<&str>, project: Option<&str>| {
+            WritePageArgs {
+                metadata: Default::default(),
+                path: path.into(),
+                body: "# Page\n".into(),
+                title: None,
+                tier: tier.map(Into::into),
+                tags: vec![],
+                pinned: false,
+                project: project.map(Into::into),
+                workspace: None,
+                scope: scope.map(Into::into),
+                expires_at: None,
+                session_id: None,
+                create_only: false,
+                expected_page_id: None,
+            }
+        };
+        for args in [
+            write("notes/a|b.md", None, None, None),
+            write("../x.md", None, None, None),
+            write("notes/ok.md", Some("bogus"), None, None),
+            write("notes/ok.md", None, Some("global"), Some("x")),
+            write("notes/ok.md", None, Some("profile"), Some("x")),
+            write("notes/ok.md", None, Some("elsewhere"), None),
+        ] {
+            let what = format!("{:?} {:?} {:?}", args.path, args.tier, args.scope);
+            let err = server
+                .memory_write_page(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("../x.md".into()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "read: {err:?}"
+        );
+
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "../x.md".into(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "delete: {err:?}"
+        );
     }
 
     #[tokio::test]
