@@ -213,14 +213,6 @@ interface QueryBase {
   includeExpired?: boolean;
   /** Attach score provenance to hits (diagnostics). */
   explain?: boolean;
-  /** Keep only pages of this kind (ASCII case-insensitive; custom kinds allowed). */
-  kind?: string;
-  /** Keep only pages in this memory tier. */
-  tier?: Tier;
-  /** Keep only pages whose project-relative path starts with this literal prefix. */
-  pathPrefix?: string;
-  /** Keep only pages whose frontmatter `tags` contain this exact tag (ASCII case-insensitive). */
-  tag?: string;
 }
 
 /** Search one project: the call's `scope` or the client default. */

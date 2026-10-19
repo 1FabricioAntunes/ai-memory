@@ -586,22 +586,10 @@
           "null"
         ]
       },
-      "kind": {
-        "type": [
-          "null",
-          "string"
-        ]
-      },
       "limit": {
         "type": [
           "integer",
           "null"
-        ]
-      },
-      "path_prefix": {
-        "type": [
-          "null",
-          "string"
         ]
       },
       "pin_first": {
@@ -649,18 +637,6 @@
           "type": "object"
         },
         "type": "array"
-      },
-      "tag": {
-        "type": [
-          "null",
-          "string"
-        ]
-      },
-      "tier": {
-        "type": [
-          "null",
-          "string"
-        ]
       },
       "workspace": {
         "type": [
