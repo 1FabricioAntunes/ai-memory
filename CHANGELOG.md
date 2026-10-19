@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Accepted a UTF-8 byte-order mark before imported page frontmatter in the
+  wiki sync companion.
+  ([#1452](https://github.com/akitaonrails/ai-memory/pull/1452))
 - Skipped H1-like comment lines inside fenced code when the importer derives
   page titles, including AgentMemory vault imports.
   ([#1451](https://github.com/akitaonrails/ai-memory/pull/1451))
