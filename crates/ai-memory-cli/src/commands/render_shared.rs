@@ -2659,7 +2659,7 @@ fn copilot_cli_windows_command_invokes_rather_than_quotes() {
 fn copilot_cli_windows_command_executes_in_powershell() {
     let temp = tempfile::tempdir().unwrap();
     let script = temp.path().join("hook target.ps1");
-    fs::write(
+    std::fs::write(
         &script,
         r#"$expected = '--data-dir|C:\data dir|hook|--event|pre-tool-use|--agent|copilot-cli|--server-url|http://127.0.0.1:49374'
 if (($args -join '|') -ne $expected) { exit 9 }
@@ -2678,7 +2678,7 @@ if (($args -join '|') -ne $expected) { exit 9 }
             None,
         ),
     );
-    let output = Command::new(ai_memory_test_support::powershell_exe())
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
         .args([
             "-NoLogo",
             "-NoProfile",
