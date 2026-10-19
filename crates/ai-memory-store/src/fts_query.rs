@@ -211,6 +211,21 @@ fn fts5_query_parses(query: &str) -> bool {
 }
 
 fn prepare_fts5_token(token: &str) -> Vec<String> {
+    // Group parens hug the token (`(title:handoff`, `body:deploy)`), so peel
+    // them before the column checks below, which look at the token's start.
+    let open = token.len() - token.trim_start_matches('(').len();
+    let close = token.len() - token.trim_end_matches(')').len();
+    if (open > 0 || close > 0) && open + close < token.len() {
+        let mut parts = prepare_fts5_token(&token[open..token.len() - close]);
+        if let Some(first) = parts.first_mut() {
+            first.insert_str(0, &token[..open]);
+        }
+        if let Some(last) = parts.last_mut() {
+            last.push_str(&token[token.len() - close..]);
+        }
+        return parts;
+    }
+
     if has_unknown_bare_column(token) {
         return token
             .replace(':', " ")
@@ -571,6 +586,34 @@ mod tests {
             r#"body:("current.md" OR "current md") OR title:handoff"#
         );
         for raw in ["title:ai-memory", "body:a.b c", "title:-", "title:a:b"] {
+            let prepared = prepare_fts5_query(raw);
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
+    }
+
+    /// A column filter inside a group keeps its column: the paren attached
+    /// to `title:` must not turn it into an unknown column whose name is
+    /// then searched as the literal word "title".
+    #[test]
+    fn grouped_known_column_filter_keeps_its_column() {
+        assert_eq!(prepare_fts5_query("(title:handoff)"), "(title:handoff)");
+        assert_eq!(
+            prepare_fts5_query("(title:handoff OR body:deploy)"),
+            "(title:handoff OR body:deploy)"
+        );
+        assert_eq!(
+            prepare_fts5_query("(title:ai-memory) AND deploy"),
+            r#"(title:("ai-memory" OR "ai memory")) AND deploy"#
+        );
+        for raw in [
+            "(title:handoff)",
+            "((title:a)",
+            "(pick: handoff)",
+            "(",
+            "(title:)",
+        ] {
             let prepared = prepare_fts5_query(raw);
             if !prepared.is_empty() {
                 assert_parses(&prepared);
