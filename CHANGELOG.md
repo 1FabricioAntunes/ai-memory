@@ -143,6 +143,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Made the SQLite writer wait out the 5-second busy timeout when another
   process holds the database, such as an external `wal_checkpoint`, instead
   of failing hook ingestion at once with "database is locked".
+  ([#1460](https://github.com/akitaonrails/ai-memory/pull/1460))
 
 ## [3.1.1] - 2026-10-17
 
