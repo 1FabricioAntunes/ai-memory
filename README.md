@@ -741,6 +741,13 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 
+Dated `design-*`, `research-*`, `issues-*`, `desktop/`, and `benchmarks/`
+files are evidence and design records, not current operating instructions.
+Their status or snapshot banner says whether work shipped, remains proposed,
+or has been superseded. Use the user guides and `ARCHITECTURE.md` for current
+behavior; the older records remain only when current design rationale links to
+them.
+
 ### Community articles
 
 Written by users; not maintained here, so check them against the version you run.

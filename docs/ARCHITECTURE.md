@@ -280,7 +280,9 @@ Four or more unpinned excerpts of one family share a heading. Pages that do not
 fit are listed by path for `memory_read_page`, and the count of them is
 reserved before any page is deepened. The security notice, the
 untrusted-history fence (with fence markers inside page text escaped) and the
-closing footer are never traded for content.
+closing footer are never traded for content. The accepted algorithm and its
+budget invariants are recorded in
+[`design-tiered-session-brief.md`](design-tiered-session-brief.md).
 
 **Cross-project profile:** after the project brief, SessionStart appends a
 fenced, byte-budgeted, byte-stable digest of the user's usual choices from other
@@ -333,6 +335,8 @@ the complete startup response has been assembled. With server-wide
 `[handoff].claim_on_session_start = false`, SessionStart instead emits a
 metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.
+The non-destructive offer-mode rationale is recorded in
+[`design-handoff-offer-not-claim.md`](design-handoff-offer-not-claim.md).
 With server-wide `[handoff].create_on_session_end = false`, session end writes
 the summary page and enqueues consolidation but skips creating an automatic
 baton, and an OpenCode or Antigravity turn checkpoint refreshes the page
@@ -1187,6 +1191,7 @@ llm = true                        # use the configured provider when there is on
 verbatim_residue = false           # opt in to bounded literal diagnostics from
                                    # omitted/truncated observations; this widens
                                    # the captured text sent to the LLM provider
+                                   # design: docs/design-verbatim-residue.md
 max_input_tokens = 100000          # approximate whole-input target; min 8350 at the default margin (scales with it)
                                    # a flat chars-per-token heuristic, so it
                                    # UNDER-budgets denser corpora: pt-BR prose
@@ -1374,6 +1379,10 @@ drop_events = []                  # whole hook event kinds to drop (e.g. ["pre-t
                                   # content. Empty by default. Env:
                                   # AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use
 ```
+
+The privacy and fidelity tradeoff behind `[consolidation].verbatim_residue`,
+including its measured opt-in result, is recorded in
+[`design-verbatim-residue.md`](design-verbatim-residue.md).
 
 The zero-LLM `query_intent` router also recognizes explicit Brazilian Portuguese
 history phrases: "o que fizemos na última sessão", "onde paramos ontem", and

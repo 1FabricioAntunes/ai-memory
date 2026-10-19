@@ -314,7 +314,8 @@ See open question 4.
   plugin update themselves (documented in `docs/install.md`).
 - **`uninstall`:** offer `claude plugin uninstall ai-memory@ai-memory`.
 
-None of this touches the MCP tool surface, so the tool count stays at 23.
+None of this touched the MCP tool surface, so that implementation kept the
+then-current count at 23.
 
 ### 4. Configuration surface
 

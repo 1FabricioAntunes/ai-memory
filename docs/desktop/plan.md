@@ -1,8 +1,9 @@
 # Desktop support — phased plan (research output, reconciled with RFC #878)
 
-> This file reconciles RFC #878 (github.com/akitaonrails/ai-memory#878) with
-> the findings in this directory (2026-10-07). Nothing here is scheduled
-> work; each phase lists what would need to change and where the risk sits.
+> This dated rollout record reconciles RFC #878
+> (github.com/akitaonrails/ai-memory#878) with the findings in this directory
+> (2026-10-07). Nothing remaining here is scheduled work; each phase records
+> what shipped or what would still need to change and where the risk sits.
 
 ## What the research changed vs the RFC
 
@@ -64,7 +65,9 @@ The research's best new target, ahead of the RFC's `.mcpb`:
 - Tests: payload-mapping unit tests against the documented schema
   (camelCase fields; `<app_data_dir>` variants per surface).
 
-Status (3.2, #TBD): the premise above that Antigravity has no SessionStart is
+Status (3.2, [#1415](https://github.com/akitaonrails/ai-memory/issues/1415),
+implemented by [#1416](https://github.com/akitaonrails/ai-memory/pull/1416)):
+the premise above that Antigravity has no SessionStart is
 out of date. The hook reference bundled with `agy` 1.4.0 and App 2.24.0 (and
 <https://antigravity.google/docs/hooks/>) documents `SessionStart`, fired once
 per new conversation before the first model call; `agy` 1.3.0, verified here
@@ -106,7 +109,7 @@ payload. What shipped, under the existing `antigravity-cli` agent kind:
 
 ## Phase 3 — explicit capture for hookless surfaces (RFC Phase 1, adjusted)
 
-- Tool-surface change (23-tool count, MEMORY_INSTRUCTIONS/SNIPPET_BODY,
+- Tool-surface change (current 24-tool count, MEMORY_INSTRUCTIONS/SNIPPET_BODY,
   prompt-surface regression tests, adversarial boundary test) for an
   explicit capture tool the model calls on apps without hooks (Claude Chat
   tab, Grok Bot, hosted ChatGPT chat). Scoping per RFC: fixed

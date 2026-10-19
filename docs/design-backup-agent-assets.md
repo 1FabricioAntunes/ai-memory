@@ -1,5 +1,9 @@
 # Backup and Restore of AI Agent Assets (Skills, MCP, Plugins)
 
+**Status: implemented.** The shipped commands are `ai-memory backup-agents`
+and `ai-memory restore-agents`; the README is the current operator guide. This
+document retains the design and threat-model rationale.
+
 ## 1. Context and Motivation
 
 `ai-memory` coordinates memory and context across AI coding agents (Claude Code, OpenAI Codex, Antigravity CLI, Gemini CLI, Cursor, OpenCode, Devin, Grok, Kiro, etc.).

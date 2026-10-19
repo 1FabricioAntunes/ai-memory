@@ -71,7 +71,9 @@ handle: no `SessionEnd` event (a finished `Stop` is a turn checkpoint
 instead), no prompt in any payload (read from the transcript), older builds
 without `SessionStart` (the first turn's `PreInvocation` stands in), and `cwd`
 comes as `workspacePaths[]` rather than a single `cwd`. Needs a live
-verification pass on the IDE. Implemented in 3.2 (#TBD); see
+verification pass on the IDE. Implemented in 3.2
+([#1415](https://github.com/akitaonrails/ai-memory/issues/1415),
+[#1416](https://github.com/akitaonrails/ai-memory/pull/1416)); see
 [`plan.md`](plan.md#phase-1--antigravity-ide-capture-parity-smallest-new-code-step).
 
 **Verified with the CLI (`agy` 1.3.0, 2026-10-08; see
