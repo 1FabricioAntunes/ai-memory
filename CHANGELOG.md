@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Encoded spaces as `%20` instead of `+` in importer URL path segments,
+  preserving workspace, project, and page names that contain spaces.
+  ([#1449](https://github.com/akitaonrails/ai-memory/pull/1449))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
