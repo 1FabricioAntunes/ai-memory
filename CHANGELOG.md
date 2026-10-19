@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Parsed an empty Markdown frontmatter block (`---` followed immediately by
+  its closing fence) as frontmatter instead of folding it and later thematic
+  breaks into the page body. ([#1444](https://github.com/akitaonrails/ai-memory/pull/1444))
 - Kept hook events whose JSON payload contains half of a UTF-16 surrogate pair
   as a `\u` escape, such as tool output cut in the middle of an emoji. Native,
   shell, PowerShell and direct hook clients now share the bounded server-side
