@@ -2693,6 +2693,9 @@ impl AiMemoryServer {
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
+        Query text is folded (a NUL becomes a space) and bounded to the \
+        first 4 KiB before parsing, so pasting a whole document searches \
+        only its opening. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
         project/scopes hits; it also returns `streams_active` and per-stream \

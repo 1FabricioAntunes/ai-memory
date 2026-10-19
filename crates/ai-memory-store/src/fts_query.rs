@@ -6,6 +6,7 @@
 //! exist on the FTS tables. Unknown bare column syntax is neutralised without
 //! discarding deliberate FTS operators such as `OR`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -113,8 +114,14 @@ impl Default for FtsStopwords {
 ///
 /// `stopwords` is the operator-configured set (default: [`FtsStopwords::default`],
 /// the built-in English list; `FtsStopwords::none()` disables filtering).
+///
+/// The input is bounded first: a NUL byte is folded to a space, and anything
+/// past the 4 KiB cap is dropped, because FTS5's parser is superlinear in the
+/// expression it is handed (see `bounded_query_text`).
 #[must_use]
 pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
+    let bounded = bounded_query_text(raw);
+    let raw = bounded.as_ref();
     let explicit_syntax = raw.contains('"')
         || raw.contains('(')
         || raw.contains(')')
@@ -176,6 +183,34 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         })
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+/// Upper bound (bytes) on the untrusted search text this module tokenises.
+///
+/// FTS5's query parser is superlinear in the expression it is handed:
+/// measured here, 10k distinct terms spent ~60 ms inside
+/// [`prepare_fts5_query`], 40k ~1.9 s and 100k ~17.5 s — before the real
+/// `MATCH` ran. Search text is a phrase, not a document, so the tail of
+/// anything longer is dropped instead of parsed.
+const MAX_FTS_QUERY_BYTES: usize = 4_096;
+
+/// Bound untrusted search text before anything parses it.
+///
+/// A NUL cannot appear in indexed text, but it used to reach the FTS5 parser,
+/// which reads a quoted phrase as a C string: `"\0"` fails as an unterminated
+/// string, so `memory_query` surfaced `sqlite: unterminated string` as an
+/// internal error instead of a result. Folding NUL to a space keeps the rest
+/// of the token searchable. Past [`MAX_FTS_QUERY_BYTES`] the text is cut on a
+/// UTF-8 boundary; a cut that lands inside a phrase or paren leaves invalid
+/// FTS5 syntax, which [`fts5_query_parses`] already degrades to the quoted
+/// bag of words. Borrows when neither applies, so the common query path
+/// allocates nothing.
+fn bounded_query_text(raw: &str) -> Cow<'_, str> {
+    let bounded = &raw[..raw.floor_char_boundary(MAX_FTS_QUERY_BYTES)];
+    if !bounded.contains('\0') {
+        return Cow::Borrowed(bounded);
+    }
+    Cow::Owned(bounded.replace('\0', " "))
 }
 
 /// Whether FTS5's own parser accepts `query`. Uses a throwaway in-memory
@@ -342,6 +377,70 @@ mod tests {
         // and the degraded form still carries the searchable words
         assert!(prepared.contains("MoMA"));
         assert!(prepared.contains("Civilizations"));
+    }
+
+    /// A NUL byte cannot appear in indexed text, but it used to reach the
+    /// FTS5 query parser: a token that starts with one is quoted (`"\0x"`),
+    /// and the parser reads the phrase as end-of-input — `sqlite:
+    /// unterminated string` came back from `memory_query` as an internal
+    /// error. This module's contract is that MATCH never errors on user text.
+    #[test]
+    fn nul_bytes_never_reach_the_match_expression() {
+        for raw in ["\0", "\0x", "x\0", "\0 \0", "(\0)", "a\0b", "title:\0x"] {
+            let prepared = prepare_fts5_query(raw);
+            assert!(!prepared.contains('\0'), "NUL survived into {prepared:?}");
+            if !prepared.is_empty() {
+                assert_parses(&prepared);
+            }
+        }
+    }
+
+    /// The FTS5 query parser is superlinear in the number of terms: 100k
+    /// distinct terms spent ~17 s inside `prepare_fts5_query` alone, before
+    /// the real MATCH ran. Search text is a phrase, not a document, so the
+    /// tail of an oversized query must be dropped before the parser sees it.
+    #[test]
+    fn oversized_query_text_is_bounded_before_parsing() {
+        let raw = (0..100_000)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let prepared = prepare_fts5_query(&raw);
+        assert!(
+            prepared.len() <= 32 * 1024,
+            "prepared expression is not bounded: {} bytes",
+            prepared.len()
+        );
+        assert_parses(&prepared);
+    }
+
+    /// The bound must not touch an ordinary query: this is the exact
+    /// expression every search has produced since the OR-join landed.
+    #[test]
+    fn ordinary_query_text_is_untouched_by_the_bound() {
+        assert_eq!(
+            prepare_fts5_query("cross project search strategy"),
+            "cross OR project OR search OR strategy"
+        );
+    }
+
+    /// 4 KiB lands mid-character for a 3-byte code point (4096 % 3 != 0); the
+    /// cut has to move back to a UTF-8 boundary instead of panicking.
+    #[test]
+    fn the_bound_cuts_on_a_character_boundary() {
+        let raw = "日".repeat(2_000);
+        assert!(raw.len() > MAX_FTS_QUERY_BYTES);
+        let prepared = prepare_fts5_query(&raw);
+        assert_parses(&prepared);
+    }
+
+    /// Truncation can land inside a quoted phrase; whatever the cut leaves,
+    /// the prepared expression must still parse and MATCH without error.
+    #[test]
+    fn truncated_explicit_syntax_stays_parseable() {
+        let raw = format!("\"unclosed {}", "w ".repeat(3_000));
+        let prepared = prepare_fts5_query(&raw);
+        assert_parses(&prepared);
     }
 
     #[test]
