@@ -125,6 +125,10 @@ version in [`docs/changelog/`](docs/changelog/):
   instead of a result. Query text is now folded (NUL becomes a space) and cut
   to the first 4 KiB on a UTF-8 boundary; ordinary queries are unchanged.
   ([#1434](https://github.com/akitaonrails/ai-memory/issues/1434))
+- Fixed generated OKF directory indexes so names containing spaces, Markdown
+  punctuation, literal URL delimiters, or Unicode remain readable, clickable
+  links in exports and newly generated migration indexes.
+  ([#1438](https://github.com/akitaonrails/ai-memory/pull/1438))
 
 ## [3.1.1] - 2026-10-17
 

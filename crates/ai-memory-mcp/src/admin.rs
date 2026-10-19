@@ -1027,10 +1027,7 @@ async fn build_okf_bundle_file(
         // prose outside the list structure (some strict OKF validators
         // read §11.3 as rejecting a stray sentence — issue #960 item 1).
         families.sort();
-        let listing: String = families
-            .iter()
-            .map(|f| format!("- [{f}/]({f}/)\n"))
-            .collect();
+        let listing = ai_memory_wiki::okf_directory_listing(&families);
         let index = format!(
             "---\nokf_version: \"0.2\"\n---\n\n# Bundle index — concept files by directory\n\n{listing}"
         );
@@ -10340,6 +10337,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
             .unwrap()
             .with_store_reader(store.reader.clone());
+        let web = ai_memory_web::router(store.reader.clone(), wiki.clone());
         let router = admin_router(AdminState {
             ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             mcp_metrics: std::sync::Arc::new(crate::McpMetrics::default()),
@@ -10364,7 +10362,7 @@ mod tests {
             scope_invalidator: None,
             trusted_proxy_identity: false,
         });
-        (tmp, router)
+        (tmp, router.nest("/web", web))
     }
 
     /// The exported tarball is a valid OKF v0.2 bundle: fresh index.md
@@ -10422,6 +10420,87 @@ mod tests {
         let fm = ai_memory_wiki::parse(&page_body).unwrap().frontmatter;
         assert!(ai_memory_core::okf::is_conformant(&fm));
         assert_eq!(fm["type"], "Gotcha");
+    }
+
+    #[tokio::test]
+    async fn export_okf_directory_index_links_are_clickable() {
+        let (_tmp, router) = read_page_test_router();
+        let cases = [
+            ("notes", "notes", "notes/"),
+            ("team notes", "team%20notes", "team notes/"),
+            ("notes [draft", "notes%20%5Bdraft", "notes [draft/"),
+            ("c# 50%", "c%23%2050%25", "c# 50%/"),
+            ("日本語", "%E6%97%A5%E6%9C%AC%E8%AA%9E", "日本語/"),
+            ("&copy;", "%26copy%3B", "&amp;copy;/"),
+            ("`draft`", "%60draft%60", "`draft`/"),
+            ("_draft_", "_draft_", "_draft_/"),
+        ];
+        for (family, _, _) in cases {
+            post_write_page(
+                &router,
+                "default",
+                "scratch",
+                &format!("{family}/seed.md"),
+                "# Seed",
+            )
+            .await;
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)));
+        let mut index = String::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == std::path::Path::new("index.md") {
+                use std::io::Read as _;
+                entry.read_to_string(&mut index).unwrap();
+            }
+        }
+        assert!(
+            index.contains("- [notes/](notes/)\n"),
+            "ordinary listing changed: {index}"
+        );
+        let body = ai_memory_wiki::parse(&index).unwrap().body;
+        post_write_page(&router, "default", "scratch", "export-index.md", &body).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/web/w/default/scratch/p/export-index.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for (family, encoded, label) in cases {
+            assert!(
+                html.contains(&format!(
+                    "<a href=\"w/default/scratch/p/{encoded}\">{label}</a>"
+                )),
+                "rendered directory link missing or changed: {family}: {html}"
+            );
+        }
     }
 
     /// Issue #960 item 1: strict OKF validators read §11.3 ("follows the
