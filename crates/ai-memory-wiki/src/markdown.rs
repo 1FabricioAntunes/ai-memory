@@ -74,6 +74,14 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
     // ending after it: a frontmatter-only file (a `_meta.md` scope manifest,
     // a stub page) saved by an editor that does not add a final newline.
     let split = rest.and_then(|rest| {
+        // An empty block puts the closing fence first, with no line before
+        // it to supply the newline `close` starts with.
+        if let Some(body) = rest.strip_prefix(&close[1..]) {
+            return Some(("", body));
+        }
+        if rest == "---" {
+            return Some(("", ""));
+        }
         rest.find(&close)
             .map(|end| (&rest[..end], &rest[end + close.len()..]))
             .or_else(|| rest.strip_suffix("\n---").map(|fm| (fm, "")))
@@ -1340,6 +1348,29 @@ mod tests {
         let crlf = parse("\u{FEFF}---\r\ntitle: Hello\r\n---").unwrap();
         assert_eq!(crlf.frontmatter["title"], "Hello");
         assert_eq!(crlf.body, "");
+    }
+
+    /// An empty block (`---` straight after `---`, the Jekyll idiom) is
+    /// frontmatter. Its closing fence has no newline in front of it, so it
+    /// was missed: the page body was read as YAML up to the next `---` rule,
+    /// or the whole file was kept as body.
+    #[test]
+    fn parses_empty_frontmatter_block() {
+        let md = parse("---\n---\n# Title\n\nIntro.\n\n---\n\nMore.\n").unwrap();
+        assert!(md.frontmatter.is_null(), "{:?}", md.frontmatter);
+        assert_eq!(md.body, "# Title\n\nIntro.\n\n---\n\nMore.\n");
+
+        let md = parse("---\n---\nbody").unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "body");
+
+        let crlf = parse("\u{FEFF}---\r\n---\r\nbody\r\n").unwrap();
+        assert!(crlf.frontmatter.is_null());
+        assert_eq!(crlf.body, "body\r\n");
+
+        let only = parse("---\n---").unwrap();
+        assert!(only.frontmatter.is_null());
+        assert_eq!(only.body, "");
     }
 
     /// A body line that merely starts with `---` at the end of the file is
