@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Preserved third-party commands that share an event matcher group with an
+  ai-memory hook when `install-hooks` reapplies or removes its own entry.
+  ([#1453](https://github.com/akitaonrails/ai-memory/pull/1453))
 - Accepted a UTF-8 byte-order mark before imported page frontmatter in the
   wiki sync companion.
   ([#1452](https://github.com/akitaonrails/ai-memory/pull/1452))
