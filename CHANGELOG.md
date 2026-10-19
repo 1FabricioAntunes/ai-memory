@@ -15,6 +15,10 @@ version in [`docs/changelog/`](docs/changelog/):
 - Returned MCP `invalid_params` for caller-supplied invalid page paths, tiers,
   and scopes instead of misreporting them as internal server errors.
   ([#1445](https://github.com/akitaonrails/ai-memory/pull/1445))
+- Revalidated session-purge tombstones inside the reindex write transaction,
+  preventing a queued watcher update from recreating a deleted summary after
+  file cleanup failed. Kept surviving manual replacements at the same path
+  editable through the watcher (#1439).
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
@@ -117,6 +121,13 @@ version in [`docs/changelog/`](docs/changelog/):
   page, aligning belief input aggregation with the lint's resolved/stale split.
   ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
 - Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+- Bounded free-text search before the FTS5 parser sees it. A query of 100k
+  distinct terms spent ~17.5 s in query preparation alone (and a ~500 KB
+  document ~59 s end to end), and a NUL byte reached the phrase parser as
+  end-of-input, surfacing `sqlite: unterminated string` as an internal error
+  instead of a result. Query text is now folded (NUL becomes a space) and cut
+  to the first 4 KiB on a UTF-8 boundary; ordinary queries are unchanged.
+  ([#1434](https://github.com/akitaonrails/ai-memory/issues/1434))
 
 ## [3.1.1] - 2026-10-17
 
