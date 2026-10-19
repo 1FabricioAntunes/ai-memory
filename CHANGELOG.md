@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Model-produced page paths are now cleaned of the remaining shapes `ensure_portable`
+  refuses, a component ending in a dot or space and a DOS device name like `aux.md`,
+  so one such path no longer aborts every page in a consolidation or bootstrap batch.
+  ([#1430](https://github.com/akitaonrails/ai-memory/pull/1430))
 - Preserved FTS5 column filters inside parenthesized groups, so queries such
   as `(title:handoff)` no longer broaden into a search for the literal word
   `title` across every indexed field. ([#1442](https://github.com/akitaonrails/ai-memory/pull/1442))
