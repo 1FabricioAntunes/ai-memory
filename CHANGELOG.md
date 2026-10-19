@@ -185,6 +185,9 @@ version in [`docs/changelog/`](docs/changelog/):
   actually ends. An opt-in real-model contention probe records idle,
   unbounded-load, and bounded-load p50/p95 query latency; hosted embedding
   providers are unchanged.
+- Ignored a UTF-8 byte-order mark at the start of `run --env-file` input so
+  the first environment variable keeps its intended name.
+  ([#1465](https://github.com/akitaonrails/ai-memory/pull/1465))
 - Invoked GitHub Copilot CLI's native Windows lifecycle commands with
   PowerShell's call operator. Quoted `ai-memory.exe` paths now execute instead
   of producing a parser error that made fail-closed pre-tool hooks deny every
