@@ -1394,7 +1394,11 @@ impl ImportClient {
 }
 
 fn enc(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+    // Form encoding writes a space as `+`, which a URL path keeps literally;
+    // a literal `+` is already `%2B`, so every `+` left is a space.
+    url::form_urlencoded::byte_serialize(s.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 fn enc_path(s: &str) -> String {
     s.split('/').map(enc).collect::<Vec<_>>().join("/")
@@ -1403,6 +1407,16 @@ fn enc_path(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Path segments are percent-encoded: a space is `%20`. Form encoding's
+    /// `+` reaches the server as a literal `+`, so a project named "My App"
+    /// was looked up as "My+App".
+    #[test]
+    fn path_segments_encode_a_space_as_percent_20() {
+        assert_eq!(enc("My App"), "My%20App");
+        assert_eq!(enc("a+b"), "a%2Bb");
+        assert_eq!(enc_path("omc/my notes.md"), "omc/my%20notes.md");
+    }
     use crate::test_http::{read_http_request, respond_json};
     use std::net::TcpListener;
     use std::thread;
