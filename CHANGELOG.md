@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Returned MCP `invalid_params` for caller-supplied invalid page paths, tiers,
+  and scopes instead of misreporting them as internal server errors.
+  ([#1445](https://github.com/akitaonrails/ai-memory/pull/1445))
 - Parsed an empty Markdown frontmatter block (`---` followed immediately by
   its closing fence) as frontmatter instead of folding it and later thematic
   breaks into the page body. ([#1444](https://github.com/akitaonrails/ai-memory/pull/1444))
