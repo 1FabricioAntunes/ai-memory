@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Preserved third-party commands that share an event matcher group with an
+  ai-memory hook when `install-hooks` reapplies or removes its own entry.
+  ([#1453](https://github.com/akitaonrails/ai-memory/pull/1453))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
