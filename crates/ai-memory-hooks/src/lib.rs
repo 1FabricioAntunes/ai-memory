@@ -58,7 +58,7 @@ pub use capture_policy::{
     glob_segment_matches, glob_walk, repository_admits_capture, tool_call_payload, valid_call_id,
 };
 pub use drop_list::IngestDropList;
-pub use hermes::{hermes_is_first_turn, shape_hermes_lifecycle_body};
+pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_lifecycle_body};
 pub use idle_end::{
     IDLE_END_BATCH, IDLE_END_INTERVAL_SECS, IdleEndTickInput, IdleEndTickOutcome, run_idle_end_tick,
 };

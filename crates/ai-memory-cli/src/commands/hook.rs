@@ -1000,11 +1000,30 @@ fn first_prompt_context_envelope(handoff: String) -> serde_json::Value {
 /// every hook process (`hermes_cli/cli_config_load.py`, `gateway/run.py`).
 const HERMES_TERMINAL_CWD_ENV: &str = "TERMINAL_CWD";
 
+/// Set to "1" in a Hermes gateway process (`gateway/run.py`); hooks inherit it.
+const HERMES_GATEWAY_ENV: &str = "_HERMES_GATEWAY";
+
+/// The profile a multiplexing Hermes gateway runs as (`profiles_to_serve`).
+const HERMES_GATEWAY_HOST_PROFILE: &str = "default";
+
 /// The Hermes session's working directory, when the hook process carries one
 /// that exists here. A container backend can export a path that exists only
 /// inside the sandbox, and a relative value names nothing, so either falls
 /// back to the payload cwd.
-fn hermes_terminal_cwd(runtime_env: &RuntimeEnv) -> Option<String> {
+///
+/// A multiplexing gateway serves every profile from the default profile's
+/// process. Its environment holds the default profile's `terminal.cwd`, while
+/// each other profile's lives in a per-turn scope its hooks never see, so in
+/// a gateway the variable is trusted only for an event the default profile
+/// fired. A standalone gateway of another profile loses it too: nothing in
+/// the hook's environment tells it apart from a multiplexed one.
+fn hermes_terminal_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
+    let in_gateway = runtime_env
+        .var_os(HERMES_GATEWAY_ENV)
+        .is_some_and(|value| value == "1");
+    if in_gateway && profile != Some(HERMES_GATEWAY_HOST_PROFILE) {
+        return None;
+    }
     let path = PathBuf::from(runtime_env.var_os(HERMES_TERMINAL_CWD_ENV)?);
     if !path.is_absolute() || !path.is_dir() {
         return None;
@@ -1132,9 +1151,26 @@ where
             return Ok(());
         }
     };
-    // Read before the Hermes shaping below drops `extra`, where it lives.
+    // Read before the Hermes shaping below drops `extra` and `profile`.
+    // A delegated child's lifecycle belongs to the parent's session: storing
+    // it would open a session nothing ever finalizes, and its first turn
+    // would claim a handoff meant for the user's next session.
+    let hermes_delegated_child = agent_kind == AgentKind::Hermes
+        && matches!(
+            hook_event,
+            HookEvent::SessionStart
+                | HookEvent::UserPrompt
+                | HookEvent::Stop
+                | HookEvent::SessionEnd
+        )
+        && ai_memory_hooks::hermes_is_delegated_child(&json);
+    let hermes_profile = (agent_kind == AgentKind::Hermes)
+        .then(|| json.get("profile").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_owned);
     let first_prompt_of_session = hook_event == HookEvent::UserPrompt
         && agent_kind.first_user_prompt_injects_handoff()
+        && !hermes_delegated_child
         && ai_memory_hooks::hermes_is_first_turn(&json);
     if agent_kind == AgentKind::Hermes
         && ai_memory_hooks::shape_hermes_lifecycle_body(&mut json, hook_event)
@@ -1154,7 +1190,8 @@ where
             &json,
             super::install_hooks::cursor_native_hooks_installed,
         )
-        && !is_dropped_plugin_copy(&args, &json, env_lookup);
+        && !is_dropped_plugin_copy(&args, &json, env_lookup)
+        && !hermes_delegated_child;
     if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -1227,7 +1264,7 @@ where
     // replaces the reported cwd. A tool event can still move to another
     // checkout its own absolute locations prove (below).
     let payload_cwd = match (agent_kind == AgentKind::Hermes)
-        .then(|| hermes_terminal_cwd(&runtime_env))
+        .then(|| hermes_terminal_cwd(&runtime_env, hermes_profile.as_deref()))
         .flatten()
     {
         Some(cwd) => {
@@ -4112,12 +4149,16 @@ mod tests {
         let mut args = devin_hook_args("post-tool-use");
         args.agent = agent.into();
         args.capture_mode = capture_mode;
-        run_with_payload(
+        // An empty environment: a suite run from a Hermes terminal inherits
+        // its TERMINAL_CWD, which would reroute the Hermes cases.
+        run_with_payload_in_home(
             Some(data_dir.to_path_buf()),
             args,
             raw.to_string(),
             &mut Vec::new(),
             |_, _| panic!("a tool event below the threshold must only spool"),
+            home_dir(),
+            RuntimeEnv::default(),
         )
         .await
         .unwrap();
@@ -5641,7 +5682,7 @@ mod tests {
             "cwd": tmp.path(),
             "extra": {"tool_call_id": "call-42", "status": "ok"}
         });
-        run_with_payload(
+        run_with_payload_in_home(
             Some(data_dir.clone()),
             args,
             raw.to_string(),
@@ -5650,6 +5691,8 @@ mod tests {
                 called.set(true);
                 Ok(())
             },
+            home_dir(),
+            RuntimeEnv::default(),
         )
         .await
         .unwrap();
@@ -8161,7 +8204,6 @@ mod tests {
             "is_first_turn": is_first_turn,
             "model": "hermes-4",
             "platform": "cli",
-            "parent_session_id": "",
             "sender_id": ""
         })
     }
@@ -8313,6 +8355,53 @@ mod tests {
         }
     }
 
+    /// A `delegate_task` child runs as its own Hermes session with an empty
+    /// history, so its first `pre_llm_call` reports `is_first_turn` too. It
+    /// must not claim the handoff, and none of its lifecycle events may be
+    /// stored as a session of its own.
+    #[tokio::test]
+    async fn hermes_delegated_child_lifecycle_is_neither_stored_nor_handed_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        let mut first_turn = pre_llm_call_extra(true);
+        first_turn["platform"] = "subagent".into();
+        first_turn["user_message"] = "CHILD_GOAL_SENTINEL".into();
+        let child = serde_json::json!({"model": "hermes-4", "platform": "subagent"});
+        for (event, payload) in [
+            (
+                "user-prompt-submit",
+                hermes_payload("pre_llm_call", tmp.path(), first_turn),
+            ),
+            (
+                "session-start",
+                hermes_payload("on_session_start", tmp.path(), child.clone()),
+            ),
+            (
+                "stop",
+                hermes_payload("on_session_end", tmp.path(), child.clone()),
+            ),
+            (
+                "session-end",
+                hermes_payload("on_session_finalize", tmp.path(), child),
+            ),
+        ] {
+            let stdout = run_hermes(
+                &data_dir,
+                hermes_args(event, &base),
+                payload,
+                RuntimeEnv::default(),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{event}");
+        }
+        assert!(spooled_entries(&data_dir).is_empty());
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+            assert!(!request.contains("CHILD_GOAL_SENTINEL"), "{request}");
+        }
+    }
+
     /// `on_session_finalize` after a gateway `/new` names both sessions; only
     /// the ending one may be closed.
     #[tokio::test]
@@ -8362,14 +8451,46 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         let dir = tmp.path().to_str().unwrap();
         let env = |value: &str| RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", value)]);
-        assert_eq!(hermes_terminal_cwd(&env(dir)).as_deref(), Some(dir));
-        assert_eq!(hermes_terminal_cwd(&env("relative/dir")), None);
+        let cwd = |env: &RuntimeEnv| hermes_terminal_cwd(env, Some("work"));
+        assert_eq!(cwd(&env(dir)).as_deref(), Some(dir));
+        assert_eq!(cwd(&env("relative/dir")), None);
         assert_eq!(
-            hermes_terminal_cwd(&env(&tmp.path().join("missing").to_string_lossy())),
+            cwd(&env(&tmp.path().join("missing").to_string_lossy())),
             None
         );
-        assert_eq!(hermes_terminal_cwd(&env(&file.to_string_lossy())), None);
-        assert_eq!(hermes_terminal_cwd(&RuntimeEnv::default()), None);
+        assert_eq!(cwd(&env(&file.to_string_lossy())), None);
+        assert_eq!(cwd(&RuntimeEnv::default()), None);
+        // Outside a gateway one process serves one profile, so its variable
+        // holds whatever profile fired, named or not.
+        assert_eq!(hermes_terminal_cwd(&env(dir), None).as_deref(), Some(dir));
+    }
+
+    /// A multiplexing gateway exports the default profile's `terminal.cwd`
+    /// to every hook, whichever profile fired it. Only the default profile's
+    /// events may use it there.
+    #[test]
+    fn hermes_gateway_terminal_cwd_belongs_to_the_default_profile_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", dir),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        assert_eq!(
+            hermes_terminal_cwd(&gateway, Some("default")).as_deref(),
+            Some(dir)
+        );
+        assert_eq!(hermes_terminal_cwd(&gateway, Some("work")), None);
+        assert_eq!(hermes_terminal_cwd(&gateway, Some("custom")), None);
+        assert_eq!(hermes_terminal_cwd(&gateway, None), None);
+        let other_marker = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", dir),
+            ("_HERMES_GATEWAY", "0"),
+        ]);
+        assert_eq!(
+            hermes_terminal_cwd(&other_marker, Some("work")).as_deref(),
+            Some(dir)
+        );
     }
 
     /// A gateway reports its own process cwd (here an unmarked home); the
@@ -8432,6 +8553,45 @@ mod tests {
             )
             .await;
             assert!(spooled_entries(&data_dir).is_empty(), "{name}");
+        }
+    }
+
+    /// In a multiplexing gateway the variable is the default profile's, so an
+    /// event another profile fired keeps the gateway's own cwd, which
+    /// allowlist mode drops, while the default profile's event is routed.
+    #[tokio::test]
+    async fn hermes_gateway_terminal_cwd_routes_only_the_default_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = repo_with_marker(tmp.path(), "default-repo", "project = \"default-repo\"\n");
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", repo.to_str().unwrap()),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        let payload = |profile: &str| {
+            let mut payload: serde_json::Value = serde_json::from_str(&hermes_payload(
+                "pre_llm_call",
+                &home,
+                pre_llm_call_extra(false),
+            ))
+            .unwrap();
+            payload["profile"] = profile.into();
+            payload.to_string()
+        };
+        let args = || {
+            let mut args = hermes_args("user-prompt-submit", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+        for (profile, spooled) in [("default", 1), ("work", 0)] {
+            let data_dir = tmp.path().join(format!("data-{profile}"));
+            run_hermes(&data_dir, args(), payload(profile), gateway.clone()).await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), spooled, "{profile}");
+            if let Some(entry) = entries.first() {
+                assert_eq!(query_param(&entry.url, "project"), Some("default-repo"));
+            }
         }
     }
 

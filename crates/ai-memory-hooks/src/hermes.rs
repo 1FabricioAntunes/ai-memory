@@ -18,6 +18,11 @@
 //!   every turn rather than at session end, carry nothing stored beyond the
 //!   session id.
 //!
+//! A `delegate_task` child is its own Hermes agent with its own session, and
+//! it fires the same lifecycle events (`tools/delegate_tool.py`). Its
+//! `parent_session_id` never reaches the payload: Hermes keeps it at the top
+//! level only as a `session_id` fallback. `extra.platform` is the one marker.
+//!
 //! Hook reference: <https://hermes-agent.nousresearch.com/docs/user-guide/features/hooks>.
 
 use serde_json::{Map, Value};
@@ -37,6 +42,20 @@ const TEXT_PART_KEYS: [&str; 5] = [
     "output_text",
     "summary_text",
 ];
+
+/// The `platform` Hermes gives a delegated child agent.
+const DELEGATED_CHILD_PLATFORM: &str = "subagent";
+
+/// Whether a Hermes lifecycle payload comes from a delegated child agent. A
+/// child starts with no history, so its first `pre_llm_call` also reports
+/// `is_first_turn`, and its `user_message` is the goal the parent model
+/// wrote, not a user prompt.
+#[must_use]
+pub fn hermes_is_delegated_child(raw: &Value) -> bool {
+    raw.pointer("/extra/platform")
+        .and_then(Value::as_str)
+        .is_some_and(|platform| platform.trim() == DELEGATED_CHILD_PLATFORM)
+}
 
 /// Whether a Hermes `pre_llm_call` payload is the first turn of its session.
 /// Hermes sets `extra.is_first_turn` when the turn starts with no prior
@@ -230,6 +249,26 @@ mod tests {
         raw["extra"]["is_first_turn"] = json!("true");
         assert!(!hermes_is_first_turn(&raw), "only a JSON boolean counts");
         assert!(!hermes_is_first_turn(&json!({"is_first_turn": true})));
+    }
+
+    /// Hermes sends `platform` "subagent" for a `delegate_task` child and the
+    /// session's own platform otherwise; `parent_session_id` never arrives.
+    #[test]
+    fn delegated_child_comes_only_from_the_subagent_platform() {
+        let mut raw = pre_llm_call(json!("hi"));
+        assert!(!hermes_is_delegated_child(&raw));
+        raw["extra"]["platform"] = json!("subagent");
+        assert!(hermes_is_delegated_child(&raw));
+        for platform in [
+            json!("telegram"),
+            json!(""),
+            json!(null),
+            json!(["subagent"]),
+        ] {
+            raw["extra"]["platform"] = platform.clone();
+            assert!(!hermes_is_delegated_child(&raw), "{platform}");
+        }
+        assert!(!hermes_is_delegated_child(&json!({"platform": "subagent"})));
     }
 
     #[test]
