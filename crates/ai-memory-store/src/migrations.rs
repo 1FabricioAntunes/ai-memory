@@ -1631,6 +1631,16 @@ mod tests {
             .checksum();
 
         assert_eq!(checksum, ORIGINAL_V62_CHECKSUM);
+        let embedded = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.version() == V62_VERSION)
+            .expect("V62 must remain embedded")
+            .checksum();
+        assert_ne!(
+            embedded, checksum,
+            "the V62 repair is unnecessary if the embedded SQL matches v2.2.1"
+        );
     }
 
     /// The one known V62 checksum is repaired before the strict runner sees
