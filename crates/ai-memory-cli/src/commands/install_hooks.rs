@@ -7159,7 +7159,10 @@ pub(crate) fn hermes_hook_set_notes(hook_set: HermesHookSet, plugin_dir: Option<
              #       memory-provider plugin is installed at {plugin}\n\
              #       and already captures prompts, ends sessions and claims\n\
              #       the handoff; wiring those here too would capture every\n\
-             #       prompt twice and race the plugin for the handoff.\n"
+             #       prompt twice and race the plugin for the handoff.\n\
+             # NOTE: only that directory is checked. A plugin disabled with\n\
+             #       `hermes plugins disable` but left there still selects\n\
+             #       this block; wire the lifecycle by hand in that case.\n"
         ),
         HermesHookSet::Full => format!(
             "# NOTE: tool events plus the session lifecycle. pre_llm_call\n\
@@ -7171,7 +7174,9 @@ pub(crate) fn hermes_hook_set_notes(hook_set: HermesHookSet, plugin_dir: Option<
              #       close it with `ai-memory finalize-session --agent hermes`.\n\
              # NOTE: if you install the ai-memory memory-provider plugin\n\
              #       ({plugin}), keep only pre_tool_call and\n\
-             #       post_tool_call: the plugin covers the rest.\n"
+             #       post_tool_call: the plugin covers the rest. A plugin\n\
+             #       under another profile's HERMES_HOME is not seen here;\n\
+             #       run this with that HERMES_HOME set to check it.\n"
         ),
     }
 }
@@ -10313,6 +10318,8 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(out.contains("finalize-session --agent hermes"));
         // The operator learns what to drop if the plugin arrives later.
         assert!(out.contains(&plugin.display().to_string()));
+        // The check cannot see a plugin installed under another profile.
+        assert!(out.contains("another profile's HERMES_HOME"));
         // No token was passed, so the auth caution line stays out.
         assert!(!out.contains("chmod 600"));
     }
@@ -10346,6 +10353,8 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(!out.contains("--event user-prompt-submit"));
         assert!(out.contains("memory-provider plugin is installed at"));
         assert!(out.contains(&plugin.display().to_string()));
+        // A disabled plugin left in place cannot be told apart.
+        assert!(out.contains("hermes plugins disable"));
     }
 
     #[test]
