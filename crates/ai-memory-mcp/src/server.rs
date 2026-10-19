@@ -10738,6 +10738,10 @@ mod tests {
         let base = || QueryArgs {
             query: "karpathy".into(),
             limit: Some(5),
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
             project: None,
             workspace: None,
             scopes: Vec::new(),
