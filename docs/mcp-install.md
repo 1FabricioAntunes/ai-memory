@@ -152,7 +152,10 @@ and endpoint settings should stay in environment or local config references
 rather than generated plugin source files. Run only one lifecycle path: when the
 plugin is installed in `$HERMES_HOME/plugins/ai-memory`, `install-hooks --agent
 hermes` prints only `pre_tool_call` and `post_tool_call`, so prompts are not
-captured twice and the handoff is not claimed twice.
+captured twice and the handoff is not claimed twice. The check is the
+directory alone, as seen with the command's own `HERMES_HOME`; see
+[install.md](install.md#hermes-agent-nous-research) for a disabled plugin or
+one installed under another profile.
 
 The hook router recognizes `agent=hermes` as a concrete session kind and
 accepts Hermes' shell-hook `tool_name` / `tool_input` envelope for tool-family

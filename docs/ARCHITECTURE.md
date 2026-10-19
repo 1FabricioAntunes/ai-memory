@@ -410,8 +410,10 @@ Hermes reports its process cwd and locates each tool by `workdir`/`path`).
 For Hermes the native hook first replaces that process cwd with
 `TERMINAL_CWD`, the variable Hermes exports `terminal.cwd` through, when it
 names an existing absolute directory; a gateway's process cwd is wherever the
-gateway started. Every Hermes event routes from there, and tool events can
-still move by their own locations.
+gateway started. A multiplexing gateway exports only the default profile's
+`terminal.cwd`, so in a gateway (`_HERMES_GATEWAY=1`) the variable applies only
+to events whose `profile` is `default`. Every Hermes event routes from there,
+and tool events can still move by their own locations.
 
 Hermes' lifecycle maps by meaning: `on_session_start` is `session-start` and
 only records the start (Hermes ignores its stdout), `pre_llm_call` is
@@ -420,7 +422,9 @@ history, `on_session_end` is `stop` because Hermes fires it after every turn,
 and `on_session_finalize` is `session-end` for the ending session only. The
 handoff is claimed on a session's first `pre_llm_call`
 (`extra.is_first_turn`) and printed as `{"context": ...}`, the one stdout shape
-Hermes adds to a turn.
+Hermes adds to a turn. A `delegate_task` child (`extra.platform` `subagent`;
+Hermes never sends its `parent_session_id`) also starts with an empty history,
+so its lifecycle events are dropped before any spool or handoff request.
 
 Antigravity's `SessionStart` maps to `session-start`. Its `PreInvocation` hook
 fires before every model call, so the bridge acts only on the documented

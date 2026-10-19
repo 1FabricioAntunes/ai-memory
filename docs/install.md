@@ -2033,6 +2033,11 @@ Six events are wired, each with a 20-second timeout:
 | `on_session_end` | `stop` | A turn boundary: Hermes fires it after every turn, not at session end. |
 | `on_session_finalize` | `session-end` | Ends the session on CLI exit, `/new` or gateway shutdown. After a gateway `/new` only the ending session is closed. |
 
+A `delegate_task` child runs as a Hermes session of its own (`platform`
+`subagent`). Its lifecycle events are dropped: its goal is not a user prompt,
+its first turn must not claim the handoff, and nothing would ever finalize it.
+Its tool events are still captured.
+
 A gateway session that expires idle is never finalized by Hermes. Close it
 from the session's project directory, or name it with `--session-id`:
 
@@ -2044,7 +2049,11 @@ ai-memory finalize-session --agent hermes --session-id <id>
 Hermes reports its own process directory as the payload `cwd`; for a gateway
 that is wherever the gateway started. The hook routes by `TERMINAL_CWD`
 instead, the variable Hermes exports `terminal.cwd` through, when it names an
-existing absolute directory. A tool call can still move to another checkout
+existing absolute directory. A multiplexing gateway serves every profile from
+the default profile's process and exports only the default profile's
+`terminal.cwd`, so inside a gateway the variable is used only for events the
+`default` profile fired; another profile's events keep the process directory.
+A tool call can still move to another checkout
 when its absolute location proves one: `terminal`'s `workdir`, a file tool's
 `path`, or `search_files`' `path`. With neither, an event stays with the
 process directory and, under `capture_mode = allowlist`, is captured only if
@@ -2056,7 +2065,11 @@ memory provider also posts prompts and session ends and claims the handoff.
 When it is installed in `$HERMES_HOME/plugins/ai-memory`, `install-hooks` and
 `setup-agent` print only the two tool events, so prompts are not captured twice
 and the handoff is not claimed twice. If you install the plugin later, delete
-the four lifecycle entries.
+the four lifecycle entries. The check only asks whether that directory exists
+where the command runs: a plugin disabled with `hermes plugins disable` but
+left in place still selects the tool events alone, and a plugin installed
+under a profile's `HERMES_HOME` is seen only when the command runs with that
+`HERMES_HOME`. Adjust the pasted block by hand in either case.
 
 For MCP, `ai-memory install-mcp --client hermes` prints an `mcp_servers:` entry
 for the same file (see [mcp-install.md](mcp-install.md#hermes-agent)). Hermes

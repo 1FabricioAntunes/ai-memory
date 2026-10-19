@@ -19,7 +19,9 @@ version in [`docs/changelog/`](docs/changelog/):
   conversation history), `on_session_end` as a turn boundary and
   `on_session_finalize` as the session end, and the first turn's
   `pre_llm_call` brings the pending handoff in as `{"context": ...}`. Hermes
-  events route by `TERMINAL_CWD` when it names an existing directory. When the
+  events route by `TERMINAL_CWD` when it names an existing directory (in a
+  gateway, for the default profile only), and a delegated child's lifecycle
+  events are dropped. When the
   community memory-provider plugin is installed, only the tool events are
   printed. `install-mcp --client hermes` prints an `mcp_servers:` entry for the
   session-less stdio bridge with no token in it, and refuses `--apply`.
