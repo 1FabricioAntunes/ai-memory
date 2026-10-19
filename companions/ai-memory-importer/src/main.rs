@@ -1165,9 +1165,51 @@ fn yaml_tags(map: &YamlMap) -> Vec<String> {
     }
 }
 fn first_h1(body: &str) -> Option<String> {
-    body.lines()
-        .find_map(|l| l.strip_prefix("# ").map(str::trim).map(str::to_owned))
+    first_h1_line(body)
+        .map(str::trim)
+        .map(str::to_owned)
         .filter(|s| !s.is_empty())
+}
+
+/// The text after `# ` on the first H1 line outside fenced code. Inside a
+/// fence a `# ` line is a shell or Python comment; fences follow CommonMark
+/// as the server's `derive_title` reads them (a run of 3+ backticks or
+/// tildes indented at most 3 spaces, closed by a bare run of the same glyph
+/// at least as long).
+fn first_h1_line(body: &str) -> Option<&str> {
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let marker = &line[indent..];
+        if let Some(glyph) = marker.chars().next().filter(|c| matches!(c, '`' | '~'))
+            && indent <= 3
+        {
+            let run = marker.chars().take_while(|&c| c == glyph).count();
+            let info = &marker[run..];
+            if run >= 3 {
+                match fence {
+                    // A backtick info string cannot hold a backtick: this is
+                    // an inline code span, not a fence.
+                    None if glyph == '`' && info.contains('`') => {}
+                    None => {
+                        fence = Some((glyph, run));
+                        continue;
+                    }
+                    Some((open, len)) if open == glyph && run >= len && info.trim().is_empty() => {
+                        fence = None;
+                        continue;
+                    }
+                    Some(_) => continue,
+                }
+            }
+        }
+        if fence.is_none()
+            && let Some(rest) = line.strip_prefix("# ")
+        {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 fn validate_source_rel(rel: &str) -> Result<()> {
@@ -1466,6 +1508,20 @@ mod tests {
         assert_eq!(parsed.tags, vec!["on"]);
 
         assert!(parse_markdown("---\ntitle: a\ntitle: b\n---\nbody").is_err());
+    }
+
+    /// A `# ` line inside fenced code is a shell or Python comment, not the
+    /// page's H1; the server's `derive_title` skips fences the same way.
+    #[test]
+    fn title_skips_comment_lines_inside_code_fences() {
+        let parsed = parse_markdown("```bash\n# install deps\nnpm i\n```\n# Real Title\n").unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("Real Title"));
+        let tilde = parse_markdown("~~~~\n# not it\n~~~\n# still code\n~~~~\n# Title\n").unwrap();
+        assert_eq!(tilde.title.as_deref(), Some("Title"));
+        let none = parse_markdown("```sh\n# just a comment\n```\nbody\n").unwrap();
+        assert_eq!(none.title, None);
+        let inline = parse_markdown("```code``` text\n# After\n").unwrap();
+        assert_eq!(inline.title.as_deref(), Some("After"));
     }
 
     /// A frontmatter-only page whose closing fence ends the file with no

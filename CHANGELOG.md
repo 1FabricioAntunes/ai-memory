@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Skipped H1-like comment lines inside fenced code when the importer derives
+  page titles, including AgentMemory vault imports.
+  ([#1451](https://github.com/akitaonrails/ai-memory/pull/1451))
 - Recognized importer frontmatter whose closing fence is the final line of a
   file without a trailing newline.
   ([#1450](https://github.com/akitaonrails/ai-memory/pull/1450))
