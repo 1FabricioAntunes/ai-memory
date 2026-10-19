@@ -13,6 +13,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a first-party Hermes Agent lifecycle and an `install-mcp --client
+  hermes` client. The `hooks:` block `install-hooks --agent hermes` prints now
+  also wires `on_session_start`, `pre_llm_call` (the prompt, never the
+  conversation history), `on_session_end` as a turn boundary and
+  `on_session_finalize` as the session end, and each primary-session
+  `pre_llm_call` checks for a pending handoff and brings it into that turn as
+  `{"context": ...}`. This includes a resumed native Hermes session. Hermes
+  events route by `TERMINAL_CWD` when it names an existing directory (in a
+  gateway, for the default profile only), and a delegated child's lifecycle
+  events are dropped. When the
+  community memory-provider plugin is installed, only the tool events are
+  printed. `install-mcp --client hermes` prints an `mcp_servers:` entry for the
+  session-less stdio bridge with no token in it, and refuses `--apply` ([#1454](https://github.com/akitaonrails/ai-memory/pull/1454)).
 - Added bounded local document extraction to the optional
   `ai-memory-importer` companion. Its dry-run-first `document` command accepts
   UTF-8 text/Markdown, text-layer PDF, DOCX, PPTX, XLSX, VTT, and

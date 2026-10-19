@@ -407,6 +407,26 @@ apply. Relative, mixed-project, unsupported, and non-project targets keep the
 harness cwd. Session identity and compiled-session ownership do not move; only
 the raw observations are attributed to the touched project (#932; #1199:
 Hermes reports its process cwd and locates each tool by `workdir`/`path`).
+For Hermes the native hook first replaces that process cwd with
+`TERMINAL_CWD`, the variable Hermes exports `terminal.cwd` through, when it
+names an existing absolute directory; a gateway's process cwd is wherever the
+gateway started. A multiplexing gateway exports only the default profile's
+`terminal.cwd`, so in a gateway (`_HERMES_GATEWAY=1`) the variable applies only
+to events whose `profile` is `default`. Every Hermes event routes from there,
+and tool events can still move by their own locations.
+
+Hermes' lifecycle maps by meaning: `on_session_start` is `session-start` and
+only records the start (Hermes ignores its stdout), `pre_llm_call` is
+`user-prompt` with the text of `extra.user_message` and never the conversation
+history, `on_session_end` is `stop` because Hermes fires it after every turn,
+and `on_session_finalize` is `session-end` for the ending session only. The
+handoff is checked on every primary-session `pre_llm_call` and printed as
+`{"context": ...}`, the one stdout shape Hermes adds to a turn. This lets a
+resumed native Hermes session receive a handoff produced by another harness;
+`extra.is_first_turn` only gates startup briefing/profile composition. A
+`delegate_task` child (`extra.platform` `subagent`;
+Hermes never sends its `parent_session_id`) also starts with an empty history,
+so its lifecycle events are dropped before any spool or handoff request.
 
 Antigravity's `SessionStart` maps to `session-start`. Its `PreInvocation` hook
 fires before every model call, so the bridge acts only on the documented

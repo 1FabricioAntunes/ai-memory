@@ -989,6 +989,48 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
     }
 }
 
+/// Hermes adds a hook's stdout to the turn only as a JSON object whose
+/// `context` is a non-blank string (`_parse_context` in
+/// `agent/shell_hooks.py`); plain text and every other key are dropped.
+fn hermes_prompt_context_envelope(handoff: String) -> serde_json::Value {
+    serde_json::json!({ "context": handoff })
+}
+
+/// The variable Hermes exports `terminal.cwd` through, to its tools and to
+/// every hook process (`hermes_cli/cli_config_load.py`, `gateway/run.py`).
+const HERMES_TERMINAL_CWD_ENV: &str = "TERMINAL_CWD";
+
+/// Set to "1" in a Hermes gateway process (`gateway/run.py`); hooks inherit it.
+const HERMES_GATEWAY_ENV: &str = "_HERMES_GATEWAY";
+
+/// The profile a multiplexing Hermes gateway runs as (`profiles_to_serve`).
+const HERMES_GATEWAY_HOST_PROFILE: &str = "default";
+
+/// The Hermes session's working directory, when the hook process carries one
+/// that exists here. A container backend can export a path that exists only
+/// inside the sandbox, and a relative value names nothing, so either falls
+/// back to the payload cwd.
+///
+/// A multiplexing gateway serves every profile from the default profile's
+/// process. Its environment holds the default profile's `terminal.cwd`, while
+/// each other profile's lives in a per-turn scope its hooks never see, so in
+/// a gateway the variable is trusted only for an event the default profile
+/// fired. A standalone gateway of another profile loses it too: nothing in
+/// the hook's environment tells it apart from a multiplexed one.
+fn hermes_terminal_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
+    let in_gateway = runtime_env
+        .var_os(HERMES_GATEWAY_ENV)
+        .is_some_and(|value| value == "1");
+    if in_gateway && profile != Some(HERMES_GATEWAY_HOST_PROFILE) {
+        return None;
+    }
+    let path = PathBuf::from(runtime_env.var_os(HERMES_TERMINAL_CWD_ENV)?);
+    if !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    path.to_str().map(str::to_owned)
+}
+
 /// Run a single hook end-to-end. Always returns Ok and always writes a JSON
 /// object to stdout — a hook must never fail the agent.
 ///
@@ -1035,12 +1077,14 @@ where
         stdout,
         spawn_background_drainer,
         home_dir(),
+        RuntimeEnv::from_process(),
     )
     .await
 }
 
 /// [`run_with_payload`] with the home directory given, the root that the
-/// Antigravity step output and transcript reads are confined to.
+/// Antigravity step output and transcript reads are confined to, and the
+/// process environment captured by the caller.
 async fn run_with_payload_in_home<W, S>(
     data_dir: Option<PathBuf>,
     args: HookArgs,
@@ -1048,12 +1092,12 @@ async fn run_with_payload_in_home<W, S>(
     stdout: &mut W,
     spawn_background_drainer: S,
     home: Option<PathBuf>,
+    runtime_env: RuntimeEnv,
 ) -> anyhow::Result<()>
 where
     W: std::io::Write,
     S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
-    let runtime_env = RuntimeEnv::from_process();
     let dd = resolve_data_dir_with(data_dir.as_deref(), &runtime_env);
     let spool_policy =
         Config::load_with_runtime_env(Some(&dd.join("config.toml")), Some(dd), runtime_env.clone())
@@ -1073,6 +1117,10 @@ where
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
         || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
+        // Hermes adds a JSON `context` response from every primary-session
+        // pre_llm_call to the upcoming turn.
+        || (hook_event == HookEvent::UserPrompt
+            && agent_kind.json_context_user_prompt_injects_handoff())
         // Grok delivers the handoff on the first PostToolUse (its SessionStart /
         // UserPromptSubmit stdout is discarded); that path is context delivery
         // too, so external capture must not suppress it.
@@ -1103,6 +1151,32 @@ where
             return Ok(());
         }
     };
+    // Read before the Hermes shaping below drops `extra` and `profile`.
+    // A delegated child's lifecycle belongs to the parent's session: storing
+    // it would open a session nothing ever finalizes, and its first turn
+    // would claim a handoff meant for the user's next session.
+    let hermes_delegated_child = agent_kind == AgentKind::Hermes
+        && matches!(
+            hook_event,
+            HookEvent::SessionStart
+                | HookEvent::UserPrompt
+                | HookEvent::Stop
+                | HookEvent::SessionEnd
+        )
+        && ai_memory_hooks::hermes_is_delegated_child(&json);
+    let hermes_profile = (agent_kind == AgentKind::Hermes)
+        .then(|| json.get("profile").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_owned);
+    let hermes_user_prompt = hook_event == HookEvent::UserPrompt
+        && agent_kind.json_context_user_prompt_injects_handoff()
+        && !hermes_delegated_child;
+    let hermes_first_prompt = hermes_user_prompt && ai_memory_hooks::hermes_is_first_turn(&json);
+    if agent_kind == AgentKind::Hermes
+        && ai_memory_hooks::shape_hermes_lifecycle_body(&mut json, hook_event)
+    {
+        payload = serde_json::to_string(&json)?;
+    }
     // Read before any capture rewrite can drop the prompt text.
     let reload_requested = hook_event == HookEvent::UserPrompt
         && ai_memory_hooks::user_prompt_text(&json)
@@ -1116,7 +1190,8 @@ where
             &json,
             super::install_hooks::cursor_native_hooks_installed,
         )
-        && !is_dropped_plugin_copy(&args, &json, env_lookup);
+        && !is_dropped_plugin_copy(&args, &json, env_lookup)
+        && !hermes_delegated_child;
     if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -1183,6 +1258,24 @@ where
         payload = serde_json::to_string(&json)?;
     }
     let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    // Hermes reports its own process cwd on every event, which for a gateway
+    // is wherever the gateway started. The session's working directory is
+    // `terminal.cwd`, which Hermes exports to hooks as `TERMINAL_CWD`, so that
+    // replaces the reported cwd. A tool event can still move to another
+    // checkout its own absolute locations prove (below).
+    let payload_cwd = match (agent_kind == AgentKind::Hermes)
+        .then(|| hermes_terminal_cwd(&runtime_env, hermes_profile.as_deref()))
+        .flatten()
+    {
+        Some(cwd) => {
+            if let Some(object) = json.as_object_mut() {
+                object.insert("cwd".into(), cwd.clone().into());
+                payload = serde_json::to_string(&json)?;
+            }
+            Some(cwd)
+        }
+        None => payload_cwd,
+    };
     let tool_event = is_tool_event(&args.event);
     // Some harnesses report a cwd other than where the tool ran: a subagent's
     // parent session (#932), or Hermes' own process cwd while its tools take
@@ -1692,6 +1785,50 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // user-prompt: Hermes ignores `on_session_start` stdout, but adds a
+    // `pre_llm_call` JSON `context` to the upcoming turn. Check every primary
+    // prompt so a resumed native session can receive a handoff produced while
+    // another harness was active. Only a genuinely new session asks for the
+    // startup briefing/profile digest; later or resumed prompts request an
+    // already-open handoff only.
+    if hermes_user_prompt && handoff_scoped {
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+        let native_session_qs = canonical_session_id
+            .as_deref()
+            .map_or_else(String::new, |session_id| {
+                format!("&session_id={}", url_encode(session_id))
+            });
+        let handoff_qs = if hermes_first_prompt {
+            qs.clone()
+        } else {
+            policy_cwd
+                .as_deref()
+                .map(|cwd| {
+                    marker_query_suffix_without_briefing(
+                        cwd,
+                        args.project_strategy.and_then(|s| s.baked()),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let profile_qs = if hermes_first_prompt {
+            ""
+        } else {
+            "&profile_digest=0"
+        };
+        let handoff_url = format!(
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            args.agent
+        );
+        if let Some(handoff) =
+            get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
+        {
+            writeln!(stdout, "{}", hermes_prompt_context_envelope(handoff))?;
+            return Ok(());
+        }
     }
 
     // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the
@@ -4041,12 +4178,16 @@ mod tests {
         let mut args = devin_hook_args("post-tool-use");
         args.agent = agent.into();
         args.capture_mode = capture_mode;
-        run_with_payload(
+        // An empty environment: a suite run from a Hermes terminal inherits
+        // its TERMINAL_CWD, which would reroute the Hermes cases.
+        run_with_payload_in_home(
             Some(data_dir.to_path_buf()),
             args,
             raw.to_string(),
             &mut Vec::new(),
             |_, _| panic!("a tool event below the threshold must only spool"),
+            home_dir(),
+            RuntimeEnv::default(),
         )
         .await
         .unwrap();
@@ -5570,7 +5711,7 @@ mod tests {
             "cwd": tmp.path(),
             "extra": {"tool_call_id": "call-42", "status": "ok"}
         });
-        run_with_payload(
+        run_with_payload_in_home(
             Some(data_dir.clone()),
             args,
             raw.to_string(),
@@ -5579,6 +5720,8 @@ mod tests {
                 called.set(true);
                 Ok(())
             },
+            home_dir(),
+            RuntimeEnv::default(),
         )
         .await
         .unwrap();
@@ -6674,6 +6817,7 @@ mod tests {
             &mut stdout,
             |_, _| Ok(()),
             Some(home.to_path_buf()),
+            RuntimeEnv::from_process(),
         )
         .await
         .unwrap();
@@ -6917,6 +7061,7 @@ mod tests {
             &mut stdout,
             |_, _| Ok(()),
             Some(home),
+            RuntimeEnv::from_process(),
         )
         .await
         .unwrap();
@@ -8053,6 +8198,556 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         while let Some(request) = first_request(&mut requests).await {
             assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    fn hermes_args(event: &str, server_url: &str) -> HookArgs {
+        let mut args = kimi_hook_args(event, server_url);
+        args.agent = "hermes".into();
+        args
+    }
+
+    /// The stdin envelope Hermes gives every shell hook
+    /// (`_payload_fields` in `agent/shell_hooks.py`, v0.22.2).
+    fn hermes_payload(hook_event_name: &str, cwd: &Path, extra: serde_json::Value) -> String {
+        serde_json::json!({
+            "hook_event_name": hook_event_name,
+            "tool_name": null,
+            "tool_input": null,
+            "session_id": "hermes-session",
+            "cwd": cwd,
+            "profile": "default",
+            "extra": extra,
+        })
+        .to_string()
+    }
+
+    fn pre_llm_call_extra(is_first_turn: bool) -> serde_json::Value {
+        serde_json::json!({
+            "task_id": "task-1",
+            "turn_id": "turn-1",
+            "user_message": "refactor the parser",
+            "conversation_history": [
+                {"role": "user", "content": "HISTORY_SENTINEL"}
+            ],
+            "is_first_turn": is_first_turn,
+            "model": "hermes-4",
+            "platform": "cli",
+            "sender_id": ""
+        })
+    }
+
+    /// Run one Hermes hook with an injected environment, so a test never
+    /// inherits a `TERMINAL_CWD` from the shell running the suite.
+    async fn run_hermes(
+        data_dir: &Path,
+        args: HookArgs,
+        payload: String,
+        runtime_env: RuntimeEnv,
+    ) -> Vec<u8> {
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data_dir.to_path_buf()),
+            args,
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+            None,
+            runtime_env,
+        )
+        .await
+        .unwrap();
+        stdout
+    }
+
+    fn spooled_entries(data_dir: &Path) -> Vec<hook_spool::SpoolEntry> {
+        let spool = hook_spool::spool_dir(data_dir);
+        if spool.exists() {
+            read_spooled_entries(&spool)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A `pre_llm_call` claims the handoff and prints the one shape Hermes
+    /// adds to the turn: `{"context": "..."}`.
+    #[tokio::test]
+    async fn hermes_prompt_prints_the_handoff_as_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        let stdout = run_hermes(
+            &data_dir,
+            hermes_args("user-prompt-submit", &base),
+            hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(true)),
+            RuntimeEnv::default(),
+        )
+        .await;
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "{\"context\":\"HERMES-HANDOFF\"}\n"
+        );
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(request.contains("agent=hermes"), "{request}");
+        assert!(request.contains("session_id=hermes-session"), "{request}");
+
+        // The prompt was captured too, without the conversation history.
+        let entries = spooled_entries(&data_dir);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .url
+                .contains("event=user-prompt-submit&agent=hermes")
+        );
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["prompt"], "refactor the parser");
+        assert_eq!(body["session_id"], "hermes-session");
+        assert!(
+            !entries[0].body.contains("HISTORY_SENTINEL"),
+            "{}",
+            entries[0].body
+        );
+        assert!(!entries[0].body.contains("conversation_history"));
+    }
+
+    /// No pending handoff: `{}`, which Hermes reads as "no context", never a
+    /// bare body or an empty `context`.
+    #[tokio::test]
+    async fn hermes_prompt_without_a_handoff_prints_an_empty_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let stdout = run_hermes(
+            &tmp.path().join("data"),
+            hermes_args("user-prompt-submit", &base),
+            hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(true)),
+            RuntimeEnv::default(),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+    }
+
+    /// A resumed Hermes session has history, so `is_first_turn` is false. It
+    /// still checks for a handoff produced by the harness that ran in between,
+    /// but suppresses first-turn briefing and profile composition.
+    #[tokio::test]
+    async fn hermes_resumed_prompt_claims_a_handoff_without_startup_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        write_briefing_marker(tmp.path());
+        let stdout = run_hermes(
+            &data_dir,
+            hermes_args("user-prompt-submit", &base),
+            hermes_payload("pre_llm_call", tmp.path(), pre_llm_call_extra(false)),
+            RuntimeEnv::default(),
+        )
+        .await;
+        assert_eq!(stdout, b"{\"context\":\"HERMES-HANDOFF\"}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(request.contains("session_id=hermes-session"), "{request}");
+        assert!(request.contains("profile_digest=0"), "{request}");
+        assert!(!request.contains("briefing"), "{request}");
+    }
+
+    /// `on_session_start` stdout is ignored, while the turn and session ends
+    /// are not context channels. None may claim a handoff.
+    #[tokio::test]
+    async fn hermes_never_claims_the_handoff_outside_a_primary_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        for (event, payload) in [
+            (
+                "session-start",
+                hermes_payload(
+                    "on_session_start",
+                    tmp.path(),
+                    serde_json::json!({"model": "hermes-4", "platform": "cli"}),
+                ),
+            ),
+            (
+                "stop",
+                hermes_payload(
+                    "on_session_end",
+                    tmp.path(),
+                    serde_json::json!({"completed": true, "turn_exit_reason": "done"}),
+                ),
+            ),
+            (
+                "session-end",
+                hermes_payload(
+                    "on_session_finalize",
+                    tmp.path(),
+                    serde_json::json!({"platform": "cli", "reason": "shutdown"}),
+                ),
+            ),
+        ] {
+            let stdout = run_hermes(
+                &data_dir,
+                hermes_args(event, &base),
+                payload,
+                RuntimeEnv::default(),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{event}");
+        }
+        // The session-start backlog drain may POST spooled events; none of
+        // the requests may touch /handoff.
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    /// A `delegate_task` child runs as its own Hermes session with an empty
+    /// history, so its first `pre_llm_call` reports `is_first_turn` too. It
+    /// must not claim the handoff, and none of its lifecycle events may be
+    /// stored as a session of its own.
+    #[tokio::test]
+    async fn hermes_delegated_child_lifecycle_is_neither_stored_nor_handed_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "HERMES-HANDOFF").await;
+        let mut first_turn = pre_llm_call_extra(true);
+        first_turn["platform"] = "subagent".into();
+        first_turn["user_message"] = "CHILD_GOAL_SENTINEL".into();
+        let child = serde_json::json!({"model": "hermes-4", "platform": "subagent"});
+        for (event, payload) in [
+            (
+                "user-prompt-submit",
+                hermes_payload("pre_llm_call", tmp.path(), first_turn),
+            ),
+            (
+                "session-start",
+                hermes_payload("on_session_start", tmp.path(), child.clone()),
+            ),
+            (
+                "stop",
+                hermes_payload("on_session_end", tmp.path(), child.clone()),
+            ),
+            (
+                "session-end",
+                hermes_payload("on_session_finalize", tmp.path(), child),
+            ),
+        ] {
+            let stdout = run_hermes(
+                &data_dir,
+                hermes_args(event, &base),
+                payload,
+                RuntimeEnv::default(),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{event}");
+        }
+        assert!(spooled_entries(&data_dir).is_empty());
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+            assert!(!request.contains("CHILD_GOAL_SENTINEL"), "{request}");
+        }
+    }
+
+    /// `on_session_finalize` after a gateway `/new` names both sessions; only
+    /// the ending one may be closed.
+    #[tokio::test]
+    async fn hermes_finalize_spools_the_ending_session_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let payload = serde_json::json!({
+            "hook_event_name": "on_session_finalize",
+            "tool_name": null,
+            "tool_input": null,
+            "session_id": "old-session",
+            "cwd": tmp.path(),
+            "profile": "default",
+            "extra": {
+                "platform": "telegram",
+                "reason": "new_session",
+                "old_session_id": "old-session",
+                "new_session_id": "new-session"
+            }
+        })
+        .to_string();
+        let stdout = run_hermes(
+            &data_dir,
+            hermes_args("session-end", &dead_server_url()),
+            payload,
+            RuntimeEnv::default(),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let entries = spooled_entries(&data_dir);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].url.contains("event=session-end&agent=hermes"));
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["session_id"], "old-session");
+        assert_eq!(body["reason"], "new_session");
+        assert!(
+            !entries[0].body.contains("new-session"),
+            "{}",
+            entries[0].body
+        );
+    }
+
+    #[test]
+    fn hermes_terminal_cwd_takes_only_an_existing_absolute_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let env = |value: &str| RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", value)]);
+        let cwd = |env: &RuntimeEnv| hermes_terminal_cwd(env, Some("work"));
+        assert_eq!(cwd(&env(dir)).as_deref(), Some(dir));
+        assert_eq!(cwd(&env("relative/dir")), None);
+        assert_eq!(
+            cwd(&env(&tmp.path().join("missing").to_string_lossy())),
+            None
+        );
+        assert_eq!(cwd(&env(&file.to_string_lossy())), None);
+        assert_eq!(cwd(&RuntimeEnv::default()), None);
+        // Outside a gateway one process serves one profile, so its variable
+        // holds whatever profile fired, named or not.
+        assert_eq!(hermes_terminal_cwd(&env(dir), None).as_deref(), Some(dir));
+    }
+
+    /// A multiplexing gateway exports the default profile's `terminal.cwd`
+    /// to every hook, whichever profile fired it. Only the default profile's
+    /// events may use it there.
+    #[test]
+    fn hermes_gateway_terminal_cwd_belongs_to_the_default_profile_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", dir),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        assert_eq!(
+            hermes_terminal_cwd(&gateway, Some("default")).as_deref(),
+            Some(dir)
+        );
+        assert_eq!(hermes_terminal_cwd(&gateway, Some("work")), None);
+        assert_eq!(hermes_terminal_cwd(&gateway, Some("custom")), None);
+        assert_eq!(hermes_terminal_cwd(&gateway, None), None);
+        let other_marker = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", dir),
+            ("_HERMES_GATEWAY", "0"),
+        ]);
+        assert_eq!(
+            hermes_terminal_cwd(&other_marker, Some("work")).as_deref(),
+            Some(dir)
+        );
+    }
+
+    /// A gateway reports its own process cwd (here an unmarked home); the
+    /// session's project arrives as `TERMINAL_CWD`. Under allowlist mode the
+    /// prompt is captured only because that variable selected the marked
+    /// repository, and the body's cwd says so.
+    #[tokio::test]
+    async fn hermes_terminal_cwd_routes_lifecycle_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = repo_with_marker(
+            tmp.path(),
+            "some-repo",
+            "workspace = \"w\"\nproject = \"some-repo\"\n",
+        );
+        let repo_str = repo.to_str().unwrap();
+        let args = || {
+            let mut args = hermes_args("user-prompt-submit", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+
+        let data_dir = tmp.path().join("data-routed");
+        run_hermes(
+            &data_dir,
+            args(),
+            hermes_payload("pre_llm_call", &home, pre_llm_call_extra(false)),
+            RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", repo_str)]),
+        )
+        .await;
+        let entries = spooled_entries(&data_dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(query_param(&entries[0].url, "project"), Some("some-repo"));
+        let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+        assert_eq!(body["cwd"], repo_str);
+
+        // Controls: no variable, or one that names nothing usable, leaves the
+        // unmarked process cwd in charge, which allowlist mode drops.
+        for (name, env) in [
+            ("unset", RuntimeEnv::default()),
+            (
+                "relative",
+                RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", "some-repo")]),
+            ),
+            (
+                "missing",
+                RuntimeEnv::with_process_env_for_tests(&[(
+                    "TERMINAL_CWD",
+                    &tmp.path().join("gone").to_string_lossy(),
+                )]),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{name}"));
+            run_hermes(
+                &data_dir,
+                args(),
+                hermes_payload("pre_llm_call", &home, pre_llm_call_extra(false)),
+                env,
+            )
+            .await;
+            assert!(spooled_entries(&data_dir).is_empty(), "{name}");
+        }
+    }
+
+    /// In a multiplexing gateway the variable is the default profile's, so an
+    /// event another profile fired keeps the gateway's own cwd, which
+    /// allowlist mode drops, while the default profile's event is routed.
+    #[tokio::test]
+    async fn hermes_gateway_terminal_cwd_routes_only_the_default_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = repo_with_marker(tmp.path(), "default-repo", "project = \"default-repo\"\n");
+        let gateway = RuntimeEnv::with_process_env_for_tests(&[
+            ("TERMINAL_CWD", repo.to_str().unwrap()),
+            ("_HERMES_GATEWAY", "1"),
+        ]);
+        let payload = |profile: &str| {
+            let mut payload: serde_json::Value = serde_json::from_str(&hermes_payload(
+                "pre_llm_call",
+                &home,
+                pre_llm_call_extra(false),
+            ))
+            .unwrap();
+            payload["profile"] = profile.into();
+            payload.to_string()
+        };
+        let args = || {
+            let mut args = hermes_args("user-prompt-submit", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+        for (profile, spooled) in [("default", 1), ("work", 0)] {
+            let data_dir = tmp.path().join(format!("data-{profile}"));
+            run_hermes(&data_dir, args(), payload(profile), gateway.clone()).await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), spooled, "{profile}");
+            if let Some(entry) = entries.first() {
+                assert_eq!(query_param(&entry.url, "project"), Some("default-repo"));
+            }
+        }
+    }
+
+    /// Adversarial: `TERMINAL_CWD` selects a checkout, so that checkout's
+    /// exclusions and server profile apply to what lands there. A relative
+    /// read of an excluded path is dropped before the spool, a public read is
+    /// kept, and a marker naming an unregistered server profile drops the
+    /// event instead of delivering it to the install default.
+    #[tokio::test]
+    async fn hermes_terminal_cwd_applies_the_selected_checkout_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let guarded = repo_with_marker(
+            tmp.path(),
+            "guarded",
+            "project = \"guarded\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        );
+        let routed_away = repo_with_marker(tmp.path(), "routed", "server = \"nobody\"\n");
+        let read = |path: &str| {
+            serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": "read_file",
+                "tool_input": {"path": path},
+                "session_id": "hermes-session",
+                "cwd": home,
+                "extra": {"tool_call_id": "call-1", "status": "ok", "result": "SENTINEL_CONTENT"}
+            })
+            .to_string()
+        };
+        let env = |dir: &Path| {
+            RuntimeEnv::with_process_env_for_tests(&[("TERMINAL_CWD", dir.to_str().unwrap())])
+        };
+        for (name, dir, path, spooled) in [
+            ("excluded read", &guarded, "secret/token.txt", 0),
+            ("public read", &guarded, "README.md", 1),
+            ("refused profile", &routed_away, "README.md", 0),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            run_hermes(
+                &data_dir,
+                hermes_args("post-tool-use", &dead_server_url()),
+                read(path),
+                env(dir),
+            )
+            .await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), spooled, "{name}");
+            assert!(
+                entries.iter().all(|e| !e.body.contains("secret/token")),
+                "{name}"
+            );
+        }
+    }
+
+    /// Tool events fall back to `TERMINAL_CWD` when their own locations prove
+    /// nothing, and an absolute location in another checkout still wins
+    /// (#1199).
+    #[tokio::test]
+    async fn hermes_tool_events_prefer_their_locations_then_terminal_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let session_repo =
+            repo_with_marker(tmp.path(), "session-repo", "project = \"session-repo\"\n");
+        let other_repo = repo_with_marker(tmp.path(), "other-repo", "project = \"other-repo\"\n");
+        let env = RuntimeEnv::with_process_env_for_tests(&[(
+            "TERMINAL_CWD",
+            session_repo.to_str().unwrap(),
+        )]);
+        let tool = |input: serde_json::Value| {
+            serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": "terminal",
+                "tool_input": input,
+                "session_id": "hermes-session",
+                "cwd": home,
+                "extra": {"tool_call_id": "call-1", "status": "ok", "result": "ok"}
+            })
+            .to_string()
+        };
+        let args = || {
+            let mut args = hermes_args("post-tool-use", &dead_server_url());
+            args.capture_mode = Some(crate::cli::CaptureModeArg::Allowlist);
+            args
+        };
+
+        for (name, input, project) in [
+            (
+                "no location",
+                serde_json::json!({"command": "ls"}),
+                "session-repo",
+            ),
+            (
+                "other workdir",
+                serde_json::json!({"command": "ls", "workdir": other_repo}),
+                "other-repo",
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            run_hermes(&data_dir, args(), tool(input), env.clone()).await;
+            let entries = spooled_entries(&data_dir);
+            assert_eq!(entries.len(), 1, "{name}");
+            assert_eq!(
+                query_param(&entries[0].url, "project"),
+                Some(project),
+                "{name}"
+            );
         }
     }
 

@@ -2457,13 +2457,17 @@ pub enum AgentChoice {
     /// block of `~/.hermes/config.yaml`. Hermes runs each `command` through
     /// `shlex.split` with the event JSON on stdin and **no shell**, so
     /// ai-memory's native `hook` subcommand is invoked directly (exec form,
-    /// like Zero and ZCode). ai-memory wires the two events that give Hermes
-    /// tool observations — `pre_tool_call` / `post_tool_call`, whose payload
-    /// carries `tool_name` / `tool_input`, the envelope the router already
-    /// recognises for `agent=hermes`. `~/.hermes/config.yaml` is NOT written:
-    /// it is YAML the installer would have to splice, and Hermes gates user
-    /// hooks behind its own acceptance prompt (`hooks_auto_accept`), so
-    /// `install-hooks --agent hermes` prints the ready-to-paste block.
+    /// like Zero and ZCode). ai-memory wires the tool events and the session
+    /// lifecycle (`on_session_start`, `pre_llm_call`, `on_session_end` as a
+    /// turn boundary, `on_session_finalize`); each primary-session
+    /// `pre_llm_call` can bring a pending handoff into the upcoming turn,
+    /// including after resuming an old native session. When the community
+    /// memory-provider plugin is installed under `$HERMES_HOME/plugins`, only
+    /// the tool events are wired, since the plugin owns the rest.
+    /// `~/.hermes/config.yaml` is NOT written: it is YAML the installer would
+    /// have to splice, and Hermes gates user hooks behind its own acceptance
+    /// prompt (`hooks_auto_accept`), so `install-hooks --agent hermes` prints
+    /// the ready-to-paste block.
     #[value(alias = "hermes-agent")]
     Hermes,
     /// GitHub Copilot CLI — JSON-config lifecycle hooks in
@@ -2849,6 +2853,14 @@ pub enum McpClient {
     /// installed separately with `install-hooks --agent dsh`.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
+    /// Hermes Agent (Nous Research) — the `mcp_servers:` map of
+    /// `~/.hermes/config.yaml`. Print-only (--apply is refused): ai-memory has
+    /// no YAML editor for that file, which the operator also edits. The entry
+    /// is a stdio `ai-memory mcp-bridge --no-session-id`, so it carries no
+    /// token. Lifecycle capture is installed separately with `install-hooks
+    /// --agent hermes`.
+    #[value(alias = "hermes-agent")]
+    Hermes,
     /// Cline CLI — `~/.cline/data/settings/cline_mcp_settings.json` (or
     /// `CLINE_MCP_SETTINGS_PATH`) with an explicit Streamable HTTP transport.
     #[value(alias = "cline-cli")]
@@ -4812,6 +4824,14 @@ mod tests {
             panic!("expected finalize-session for hermes");
         };
         assert_eq!(args.agent, ai_memory_core::AgentKind::Hermes);
+        for alias in ["hermes", "hermes-agent"] {
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp for Hermes alias {alias}");
+            };
+            assert_eq!(args.client, McpClient::Hermes);
+        }
     }
 
     #[test]
