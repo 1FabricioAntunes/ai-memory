@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Treated a blank `session_id` as omitted when starting an automatic
+  improvement review, matching the other session-scoped MCP tools.
+  ([#1447](https://github.com/akitaonrails/ai-memory/pull/1447))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
