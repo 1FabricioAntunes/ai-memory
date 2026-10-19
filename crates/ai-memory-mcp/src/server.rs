@@ -10579,6 +10579,76 @@ mod tests {
         assert!(bad.is_err());
     }
 
+    /// Conflicting scope arguments and a malformed `as_of` are decided from
+    /// the request alone, so they are the caller's mistake: `memory_query`
+    /// answers `invalid params` like the page tools, not an internal error a
+    /// client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn memory_query_answers_bad_arguments_with_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let base = || QueryArgs {
+            query: "karpathy".into(),
+            limit: Some(5),
+            project: None,
+            workspace: None,
+            scopes: Vec::new(),
+            global: None,
+            include_expired: None,
+            include_superseded: None,
+            pin_first: None,
+            explain: None,
+            as_of: None,
+            answer: None,
+            reasoning: None,
+        };
+        let scope = |project: &str| MemoryScopeArg {
+            workspace: "default".into(),
+            project: project.into(),
+        };
+
+        let mut global_project = base();
+        global_project.global = Some(true);
+        global_project.project = Some("scratch".into());
+
+        let mut global_scopes = base();
+        global_scopes.global = Some(true);
+        global_scopes.scopes = vec![scope("scratch")];
+
+        let mut scopes_project = base();
+        scopes_project.scopes = vec![scope("scratch")];
+        scopes_project.project = Some("scratch".into());
+
+        let mut as_of_scopes = base();
+        as_of_scopes.scopes = vec![scope("scratch")];
+        as_of_scopes.as_of = Some("2026-06-01T00:00:00Z".into());
+
+        let mut malformed_as_of = base();
+        malformed_as_of.as_of = Some("not-a-time".into());
+
+        for (what, args) in [
+            ("global + project", global_project),
+            ("global + scopes", global_scopes),
+            ("scopes + project", scopes_project),
+            ("as_of + scopes", as_of_scopes),
+            ("malformed as_of", malformed_as_of),
+        ] {
+            let err = server
+                .memory_query(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        server
+            .memory_query(Parameters(base()), OptionalParts(test_parts_default()))
+            .await
+            .expect("a well-formed query is not rejected");
+    }
+
     #[tokio::test]
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
