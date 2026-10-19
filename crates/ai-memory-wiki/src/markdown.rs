@@ -1884,10 +1884,14 @@ mod tests {
     #[test]
     fn rewrite_local_wikilinks_keeps_a_literal_percent_in_the_target() {
         let page = PagePath::new("notes/here.md").unwrap();
-        for body in ["See [[notes/a%20b]].\n", "See [[notes/cpu-95%cap]].\n"] {
+        for (body, href) in [
+            ("See [[notes/a%20b]].\n", "a%2520b.md"),
+            ("See [[notes/cpu-95%cap]].\n", "cpu-95%25cap.md"),
+        ] {
             let before = extract_links(body, &page);
             assert_eq!(before.len(), 1, "{body}");
             let exported = rewrite_local_wikilinks(body, &page, "proj");
+            assert!(exported.contains(&format!("]({href})")), "{exported}");
             assert_eq!(extract_links(&exported, &page), before, "{exported}");
         }
     }
