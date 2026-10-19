@@ -558,7 +558,7 @@ ai_memory_aliases_json_value() {
 
 ai_memory_aliases_json() {
     [ -f "$1" ] || return 0
-    _ai_alias_body=$(LC_ALL=C awk '
+    _ai_alias_body=$(ai_memory_strip_utf8_bom <"$1" | LC_ALL=C awk '
         BEGIN { table = 0; count = 0; bad = 0 }
         {
             line = $0
@@ -581,7 +581,7 @@ ai_memory_aliases_json() {
             if (bad) print "invalid"
             else if (count == 1) print body
         }
-    ' "$1")
+    ')
     [ "$_ai_alias_body" = "invalid" ] && { printf 'invalid'; return 0; }
     [ -n "$_ai_alias_body" ] || return 0
     _ai_alias_trimmed=$(printf '%s' "$_ai_alias_body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')

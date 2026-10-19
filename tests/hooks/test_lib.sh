@@ -73,6 +73,8 @@ printf '\357\273\277aliases = ["former-name"]\n' >"$TMP/bom-aliases.toml"
 bom_aliases_declared=no
 ai_memory_marker_declares_settings "$TMP/bom-aliases.toml" && bom_aliases_declared=yes
 assert_eq "BOM does not hide first-line aliases boundary" "yes" "$bom_aliases_declared"
+assert_eq "BOM does not hide first-line aliases value" '["former-name"]' \
+    "$(ai_memory_aliases_json "$TMP/bom-aliases.toml")"
 
 # --- find_marker ------------------------------------------------------
 mkdir -p "$TMP/a/b/c/d"
