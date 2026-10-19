@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Routed OpenCode's `claude-haiku-5-5` through the Anthropic Messages API for
+  both Go and Zen instead of the unsupported Chat Completions protocol.
+  ([#1470](https://github.com/akitaonrails/ai-memory/issues/1470))
 - Ignored a UTF-8 byte-order mark at the start of `run --env-file` input so
   the first environment variable keeps its intended name.
   ([#1465](https://github.com/akitaonrails/ai-memory/pull/1465))
