@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Accepted a UTF-8 byte-order mark before imported page frontmatter in the
+  wiki sync companion.
+  ([#1452](https://github.com/akitaonrails/ai-memory/pull/1452))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
