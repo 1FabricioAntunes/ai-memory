@@ -224,6 +224,14 @@ impl Store {
                 "project coordinate keys backfilled"
             );
         }
+        let cjk_backfill = ops::backfill_cjk_indexes(&mut conn)?;
+        if cjk_backfill.pages > 0 || cjk_backfill.observations > 0 {
+            tracing::info!(
+                pages = cjk_backfill.pages,
+                observations = cjk_backfill.observations,
+                "CJK search indexes backfilled"
+            );
+        }
 
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;

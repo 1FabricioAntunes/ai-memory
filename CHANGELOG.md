@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added zero-LLM substring retrieval for unspaced Han, Kana, and Hangul text.
+  Pages and observations gain transactionally maintained derived unigram/bigram
+  FTS indexes; existing unicode61 search and ranking remain unchanged for
+  Latin-only queries, while CJK matches participate in project, scoped,
+  global, temporal, raw-observation, and observation-evidence retrieval.
+  Upgraded stores backfill missing derived rows before accepting traffic, and
+  compaction rebuilds the auxiliary indexes with the existing FTS set.
+  ([#1433](https://github.com/akitaonrails/ai-memory/issues/1433))
 - Added a first-party Hermes Agent lifecycle and an `install-mcp --client
   hermes` client. The `hooks:` block `install-hooks --agent hermes` prints now
   also wires `on_session_start`, `pre_llm_call` (the prompt, never the

@@ -9,6 +9,7 @@ mod audit_contamination;
 mod audit_log;
 mod auto_improve_staging;
 mod belief_authority;
+mod cjk_search;
 mod client_activity;
 mod fts_drift_status;
 mod fts_stopwords_config;

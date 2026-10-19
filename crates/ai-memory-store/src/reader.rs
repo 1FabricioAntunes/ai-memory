@@ -33,7 +33,7 @@ use crate::auto_improve::{
     PendingAutoImproveScope, bytes32, opt_bytes32, summary_from_row, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
-use crate::fts_query::{FtsStopwords, prepare_fts5_query};
+use crate::fts_query::{FtsStopwords, prepare_cjk_fts5_query, prepare_fts5_query};
 use crate::maintenance::MaintenanceJob;
 use crate::retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 use crate::users::TOKEN_HASH_LEN;
@@ -629,6 +629,117 @@ fn rerank_page_hits_with_meta(
     });
     hits.truncate(limit);
     hits
+}
+
+/// Fuse the ordinary unicode61 and opt-in CJK lexical streams before the
+/// existing authority adjustment. The ordinary stream is returned untouched
+/// when no auxiliary hits exist, which keeps non-CJK ranking byte-identical.
+fn fuse_page_candidate_streams(
+    primary: Vec<(PageHit, PageAuthority)>,
+    auxiliary: Vec<(PageHit, PageAuthority)>,
+    limit: usize,
+) -> Vec<(PageHit, PageAuthority)> {
+    if auxiliary.is_empty() {
+        return primary;
+    }
+    let mut fused: std::collections::HashMap<PageId, (PageHit, PageAuthority, f64)> =
+        std::collections::HashMap::new();
+    for stream in [primary, auxiliary] {
+        for (rank, (hit, authority)) in stream.into_iter().enumerate() {
+            let contribution = 1.0 / (60.0 + (rank + 1) as f64);
+            fused
+                .entry(hit.id)
+                .and_modify(|entry| entry.2 += contribution)
+                .or_insert((hit, authority, contribution));
+        }
+    }
+    let mut out: Vec<_> = fused
+        .into_values()
+        .map(|(mut hit, authority, score)| {
+            hit.rank = -score;
+            (hit, authority)
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.0.rank
+            .partial_cmp(&b.0.rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
+    });
+    out.truncate(limit);
+    out
+}
+
+fn fuse_page_meta_candidate_streams(
+    primary: Vec<(PageHitWithMeta, PageAuthority)>,
+    auxiliary: Vec<(PageHitWithMeta, PageAuthority)>,
+    limit: usize,
+) -> Vec<(PageHitWithMeta, PageAuthority)> {
+    if auxiliary.is_empty() {
+        return primary;
+    }
+    let mut fused: std::collections::HashMap<PageId, (PageHitWithMeta, PageAuthority, f64)> =
+        std::collections::HashMap::new();
+    for stream in [primary, auxiliary] {
+        for (rank, (hit, authority)) in stream.into_iter().enumerate() {
+            let contribution = 1.0 / (60.0 + (rank + 1) as f64);
+            fused
+                .entry(hit.id)
+                .and_modify(|entry| entry.2 += contribution)
+                .or_insert((hit, authority, contribution));
+        }
+    }
+    let mut out: Vec<_> = fused
+        .into_values()
+        .map(|(mut hit, authority, score)| {
+            hit.rank = -score;
+            (hit, authority)
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.0.rank
+            .partial_cmp(&b.0.rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
+    });
+    out.truncate(limit);
+    out
+}
+
+fn fuse_observation_streams(
+    primary: Vec<ObservationHit>,
+    auxiliary: Vec<ObservationHit>,
+    limit: usize,
+) -> Vec<ObservationHit> {
+    if auxiliary.is_empty() {
+        return primary;
+    }
+    let mut fused: std::collections::HashMap<ObservationId, (ObservationHit, f64)> =
+        std::collections::HashMap::new();
+    for stream in [primary, auxiliary] {
+        for (rank, hit) in stream.into_iter().enumerate() {
+            let contribution = 1.0 / (60.0 + (rank + 1) as f64);
+            fused
+                .entry(hit.id)
+                .and_modify(|entry| entry.1 += contribution)
+                .or_insert((hit, contribution));
+        }
+    }
+    let mut out: Vec<_> = fused
+        .into_values()
+        .map(|(mut hit, score)| {
+            hit.rank = -score;
+            hit
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.rank
+            .partial_cmp(&b.rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    out.truncate(limit);
+    out
 }
 
 /// Rows keyed to one session (see [`ReaderPool::session_dependent_rows`]).
@@ -2734,6 +2845,7 @@ impl ReaderPool {
         viewer: Option<UserId>,
     ) -> StoreResult<Vec<PageHit>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
+        let cjk_query = prepare_cjk_fts5_query(&query);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -2760,7 +2872,7 @@ impl ReaderPool {
                 Value::Integer(authority_candidate_limit(limit) as i64),
                 Value::Integer(now_us()),
             ];
-            bound.extend(visible_params);
+            bound.extend(visible_params.iter().cloned());
             let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
@@ -2803,7 +2915,66 @@ impl ReaderPool {
                     authority,
                 ));
             }
-            Ok(rerank_page_hits(candidates, limit))
+            let mut cjk_candidates = Vec::new();
+            if let Some(cjk_query) = cjk_query {
+                let descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json");
+                let sql = format!(
+                    "SELECT pages.id, pages.path, pages.title, {descriptor}, \
+                            pages_cjk_fts.rank, pages.tier, pages.pinned, \
+                            pages.frontmatter_json, {kind_expr} AS kind \
+                     FROM pages_cjk_fts \
+                     JOIN pages ON pages.rowid = pages_cjk_fts.rowid \
+                     WHERE pages_cjk_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible} \
+                     ORDER BY pages_cjk_fts.rank LIMIT ?2",
+                    not_expired = not_expired("pages", "?3"),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                #[allow(clippy::cast_possible_wrap)]
+                let mut bound = vec![
+                    Value::Text(cjk_query),
+                    Value::Integer(authority_candidate_limit(limit) as i64),
+                    Value::Integer(now_us()),
+                ];
+                bound.extend(visible_params);
+                let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, path, title, descriptor, rank, tier, pinned, frontmatter, kind) = row?;
+                    let authority =
+                        PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter);
+                    cjk_candidates.push((
+                        PageHit {
+                            id: PageId::from_slice(&id)?,
+                            path: PagePath::new(path)?,
+                            snippet: page_descriptor(&descriptor, &title),
+                            title,
+                            rank,
+                            superseded: false,
+                            pinned: false,
+                        },
+                        authority,
+                    ));
+                }
+            }
+            Ok(rerank_page_hits(
+                fuse_page_candidate_streams(
+                    candidates,
+                    cjk_candidates,
+                    authority_candidate_limit(limit),
+                ),
+                limit,
+            ))
         })
         .await
     }
@@ -2829,6 +3000,7 @@ impl ReaderPool {
         filter: PageFilter<'_>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
+        let cjk_query = prepare_cjk_fts5_query(&query);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -2859,8 +3031,8 @@ impl ReaderPool {
                 Value::Integer(authority_candidate_limit(limit) as i64),
                 Value::Integer(cutoff),
             ];
-            bound.extend(visible_params);
-            bound.extend(kept_params);
+            bound.extend(visible_params.iter().cloned());
+            bound.extend(kept_params.iter().cloned());
             let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
@@ -2918,7 +3090,71 @@ impl ReaderPool {
                     authority,
                 ));
             }
-            Ok(rerank_page_hits_with_meta(candidates, limit))
+            let mut cjk_candidates = Vec::new();
+            if let Some(cjk_query) = cjk_query {
+                let descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json");
+                let sql = format!(
+                    "SELECT workspaces.name, projects.name, pages.path, pages.title, \
+                            {descriptor}, pages_cjk_fts.rank, pages.tier, pages.pinned, \
+                            pages.frontmatter_json, {kind_expr} AS kind, pages.id \
+                     FROM pages_cjk_fts \
+                     JOIN pages ON pages.rowid = pages_cjk_fts.rowid \
+                     JOIN projects ON projects.id = pages.project_id \
+                     JOIN workspaces ON workspaces.id = pages.workspace_id \
+                     WHERE pages_cjk_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible}{kept} \
+                     ORDER BY pages_cjk_fts.rank LIMIT ?2",
+                    not_expired = not_expired("pages", "?3"),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                #[allow(clippy::cast_possible_wrap)]
+                let mut bound = vec![
+                    Value::Text(cjk_query),
+                    Value::Integer(authority_candidate_limit(limit) as i64),
+                    Value::Integer(cutoff),
+                ];
+                bound.extend(visible_params);
+                bound.extend(kept_params);
+                let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, f64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)? != 0,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Vec<u8>>(10)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (workspace_name, project_name, path, title, descriptor, rank, tier, pinned, frontmatter, kind, id) = row?;
+                    let authority =
+                        PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter);
+                    cjk_candidates.push((
+                        PageHitWithMeta {
+                            id: PageId::from_slice(&id)?,
+                            workspace_name,
+                            project_name,
+                            path: PagePath::new(path)?,
+                            snippet: page_descriptor(&descriptor, &title),
+                            title,
+                            rank,
+                        },
+                        authority,
+                    ));
+                }
+            }
+            Ok(rerank_page_hits_with_meta(
+                fuse_page_meta_candidate_streams(
+                    candidates,
+                    cjk_candidates,
+                    authority_candidate_limit(limit),
+                ),
+                limit,
+            ))
         })
         .await
     }
@@ -2969,6 +3205,7 @@ impl ReaderPool {
         filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
+        let cjk_query = prepare_cjk_fts5_query(&query);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
@@ -3000,7 +3237,7 @@ impl ReaderPool {
                 Value::Integer(candidate_limit as i64),
                 Value::Integer(cutoff),
             ];
-            bound.extend(kept_params);
+            bound.extend(kept_params.iter().cloned());
             let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
@@ -3043,7 +3280,68 @@ impl ReaderPool {
                     authority,
                 ));
             }
-            Ok(candidates)
+            let mut cjk_candidates = Vec::new();
+            if let Some(cjk_query) = cjk_query {
+                let descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json");
+                let sql = format!(
+                    "SELECT pages.id, pages.path, pages.title, {descriptor}, \
+                            pages_cjk_fts.rank, pages.tier, pages.pinned, \
+                            pages.frontmatter_json, {kind_expr} AS kind \
+                     FROM pages_cjk_fts \
+                     JOIN pages ON pages.rowid = pages_cjk_fts.rowid \
+                     WHERE pages_cjk_fts MATCH ?1 \
+                       AND pages.workspace_id = ?2 AND pages.project_id = ?3 \
+                       {latest}{not_expired}{kept} \
+                     ORDER BY pages_cjk_fts.rank LIMIT ?4",
+                    latest = latest_only("pages", include_superseded),
+                    not_expired = not_expired("pages", "?5"),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                #[allow(clippy::cast_possible_wrap)]
+                let mut bound = vec![
+                    Value::Text(cjk_query),
+                    Value::Blob(workspace_id.as_bytes().to_vec()),
+                    Value::Blob(project_id.as_bytes().to_vec()),
+                    Value::Integer(candidate_limit as i64),
+                    Value::Integer(cutoff),
+                ];
+                bound.extend(kept_params);
+                let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, path, title, descriptor, rank, tier, pinned, frontmatter, kind) = row?;
+                    let authority =
+                        PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter);
+                    cjk_candidates.push((
+                        PageHit {
+                            id: PageId::from_slice(&id)?,
+                            path: PagePath::new(path)?,
+                            snippet: page_descriptor(&descriptor, &title),
+                            title,
+                            rank,
+                            superseded: false,
+                            pinned: false,
+                        },
+                        authority,
+                    ));
+                }
+            }
+            Ok(fuse_page_candidate_streams(
+                candidates,
+                cjk_candidates,
+                candidate_limit,
+            ))
         })
         .await
     }
@@ -3066,6 +3364,7 @@ impl ReaderPool {
         filter: PageFilter<'_>,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
+        let cjk_query = prepare_cjk_fts5_query(&query);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
@@ -3098,7 +3397,7 @@ impl ReaderPool {
                 Value::Integer(as_of_us),
                 Value::Integer(as_of_us),
             ];
-            sql_params.extend(kept_params);
+            sql_params.extend(kept_params.iter().cloned());
             #[allow(clippy::cast_possible_wrap)]
             sql_params.push(Value::Integer(candidate_limit as i64));
             let rows = stmt.query_map(params_from_iter(sql_params), |row| {
@@ -3143,7 +3442,70 @@ impl ReaderPool {
                     authority,
                 ));
             }
-            Ok(candidates)
+            let mut cjk_candidates = Vec::new();
+            if let Some(cjk_query) = cjk_query {
+                let descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json");
+                let sql = format!(
+                    "SELECT pages.id, pages.path, pages.title, {descriptor}, \
+                            pages_cjk_fts.rank, pages.tier, pages.pinned, \
+                            pages.frontmatter_json, {kind_expr} AS kind \
+                     FROM pages_cjk_fts \
+                     JOIN pages ON pages.rowid = pages_cjk_fts.rowid \
+                     WHERE pages_cjk_fts MATCH ?1 \
+                       AND pages.workspace_id = ?2 AND pages.project_id = ?3 \
+                       AND pages.valid_from <= ?4 \
+                       AND (pages.valid_to IS NULL OR pages.valid_to > ?5){not_expired}{kept} \
+                     ORDER BY pages_cjk_fts.rank LIMIT ?{limit_placeholder}",
+                    not_expired = not_expired("pages", "?6"),
+                );
+                let mut sql_params = vec![
+                    Value::Text(cjk_query),
+                    Value::Blob(workspace_id.as_bytes().to_vec()),
+                    Value::Blob(project_id.as_bytes().to_vec()),
+                    Value::Integer(as_of_us),
+                    Value::Integer(as_of_us),
+                    Value::Integer(as_of_us),
+                ];
+                sql_params.extend(kept_params);
+                #[allow(clippy::cast_possible_wrap)]
+                sql_params.push(Value::Integer(candidate_limit as i64));
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(sql_params), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, path, title, descriptor, rank, tier, pinned, frontmatter, kind) = row?;
+                    let authority =
+                        PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter);
+                    cjk_candidates.push((
+                        PageHit {
+                            id: PageId::from_slice(&id)?,
+                            path: PagePath::new(path)?,
+                            snippet: page_descriptor(&descriptor, &title),
+                            title,
+                            rank,
+                            superseded: false,
+                            pinned: false,
+                        },
+                        authority,
+                    ));
+                }
+            }
+            Ok(fuse_page_candidate_streams(
+                candidates,
+                cjk_candidates,
+                candidate_limit,
+            ))
         })
         .await
     }
@@ -3367,6 +3729,7 @@ impl ReaderPool {
         owner_filter: OwnerFilter,
     ) -> StoreResult<Vec<ObservationHit>> {
         let fts_query = normalize_fts_query(&query, &self.fts_stopwords);
+        let cjk_query = prepare_cjk_fts5_query(&query);
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -3446,7 +3809,55 @@ impl ReaderPool {
                     created_at,
                 });
             }
-            Ok(hits)
+            let mut cjk_hits = Vec::new();
+            if let Some(cjk_query) = cjk_query {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT observations.id, observations.session_id, observations.kind, \
+                            observations.title, substr(observations.body, 1, 240), \
+                            observations_cjk_fts.rank, observations.created_at \
+                     FROM observations_cjk_fts \
+                     JOIN observations ON observations.rowid = observations_cjk_fts.rowid \
+                     WHERE observations_cjk_fts MATCH ?1 \
+                       AND observations.workspace_id = ?2 \
+                       AND observations.project_id = ?3{owner_clause} \
+                     ORDER BY observations_cjk_fts.rank LIMIT ?4",
+                ))?;
+                let mut sql_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(5);
+                sql_params.push(&cjk_query);
+                sql_params.push(&ws_bytes);
+                sql_params.push(&proj_bytes);
+                sql_params.push(&limit);
+                if let Some(actor) = &actor {
+                    sql_params.push(actor);
+                }
+                let rows = stmt.query_map(sql_params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, f64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, session, kind, title, snippet, rank, created_us) = row?;
+                    let created_at = jiff::Timestamp::from_microsecond(created_us)
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_default();
+                    cjk_hits.push(ObservationHit {
+                        id: ObservationId::from_slice(&id)?,
+                        session_id: SessionId::from_slice(&session)?,
+                        kind,
+                        title,
+                        snippet,
+                        rank,
+                        created_at,
+                    });
+                }
+            }
+            Ok(fuse_observation_streams(hits, cjk_hits, limit as usize))
         })
         .await
     }
@@ -3474,6 +3885,7 @@ impl ReaderPool {
         filter: PageFilter<'_>,
     ) -> StoreResult<Vec<ObservationVote>> {
         let fts_query = normalize_fts_query(query, &self.fts_stopwords);
+        let cjk_query = prepare_cjk_fts5_query(query);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
@@ -3507,16 +3919,18 @@ impl ReaderPool {
             // Best-ranked observation first, grouped by session in first-seen
             // order: the session's stream rank is its best observation's.
             let mut sessions: Vec<(SessionId, String, Vec<ObservationId>)> = Vec::new();
+            let mut index: std::collections::HashMap<SessionId, usize> =
+                std::collections::HashMap::new();
+            let candidate_path =
+                "'sessions/' || substr(lower(hex(observations.session_id)), 1, 8) || '-' || \
+                 substr(lower(hex(observations.session_id)), 9, 4) || '-' || \
+                 substr(lower(hex(observations.session_id)), 13, 4) || '-' || \
+                 substr(lower(hex(observations.session_id)), 17, 4) || '-' || \
+                 substr(lower(hex(observations.session_id)), 21, 12) || '.md'";
             {
                 // CROSS JOIN pins the FTS table as the outer loop: left to
                 // itself the planner drives from the observations scope index
                 // and re-enters FTS once per row, which is far slower.
-                let candidate_path =
-                    "'sessions/' || substr(lower(hex(observations.session_id)), 1, 8) || '-' || \
-                     substr(lower(hex(observations.session_id)), 9, 4) || '-' || \
-                     substr(lower(hex(observations.session_id)), 13, 4) || '-' || \
-                     substr(lower(hex(observations.session_id)), 17, 4) || '-' || \
-                     substr(lower(hex(observations.session_id)), 21, 12) || '.md'";
                 let mut stmt = tx.prepare(&format!(
                     "SELECT observations.id, observations.session_id, \
                             snippet(observations_fts, 1, '<mark>', '</mark>', '…', \
@@ -3550,7 +3964,7 @@ impl ReaderPool {
                     Value::Integer(last_rowid),
                     Value::Integer(cutoff),
                 ];
-                candidate_params.extend(candidate_kept_params);
+                candidate_params.extend(candidate_kept_params.iter().cloned());
                 let rows = stmt.query_map(params_from_iter(candidate_params.iter()), |row| {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
@@ -3558,8 +3972,6 @@ impl ReaderPool {
                             row.get::<_, String>(2)?,
                         ))
                     })?;
-                let mut index: std::collections::HashMap<SessionId, usize> =
-                    std::collections::HashMap::new();
                 for row in rows {
                     let (id_bytes, session_bytes, snippet) = row?;
                     let id = ObservationId::from_slice(&id_bytes)?;
@@ -3568,6 +3980,64 @@ impl ReaderPool {
                         Some(&at) => {
                             let ids = &mut sessions[at].2;
                             if ids.len() < OBSERVATION_STREAM_IDS_PER_PAGE {
+                                ids.push(id);
+                            }
+                        }
+                        None => {
+                            index.insert(session_id, sessions.len());
+                            sessions.push((session_id, snippet, vec![id]));
+                        }
+                    }
+                }
+            }
+            if let Some(cjk_query) = cjk_query {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT observations.id, observations.session_id, \
+                            substr(observations.body, 1, 240) \
+                     FROM observations_cjk_fts \
+                     CROSS JOIN observations ON observations.rowid = observations_cjk_fts.rowid \
+                     WHERE observations_cjk_fts MATCH ?1 \
+                       AND observations_cjk_fts.rowid >= ?5 \
+                       AND observations_cjk_fts.rowid <= ?6 \
+                       AND observations.workspace_id = ?2 \
+                       AND observations.project_id = ?3 \
+                       AND EXISTS ( \
+                         SELECT 1 FROM pages AS candidate_page \
+                         WHERE candidate_page.workspace_id = observations.workspace_id \
+                           AND candidate_page.project_id = observations.project_id \
+                           AND candidate_page.is_latest = 1 \
+                           AND candidate_page.path = {candidate_path} \
+                           {candidate_not_expired}{candidate_kept} \
+                       ) \
+                     ORDER BY observations_cjk_fts.rank LIMIT ?4",
+                    candidate_not_expired = not_expired("candidate_page", "?7"),
+                ))?;
+                #[allow(clippy::cast_possible_wrap)]
+                let mut candidate_params = vec![
+                    Value::Text(cjk_query),
+                    Value::Blob(workspace_id.as_bytes().to_vec()),
+                    Value::Blob(project_id.as_bytes().to_vec()),
+                    Value::Integer(row_limit as i64),
+                    Value::Integer(first_rowid),
+                    Value::Integer(last_rowid),
+                    Value::Integer(cutoff),
+                ];
+                candidate_params.extend(candidate_kept_params);
+                let rows = stmt.query_map(params_from_iter(candidate_params.iter()), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id_bytes, session_bytes, snippet) = row?;
+                    let id = ObservationId::from_slice(&id_bytes)?;
+                    let session_id = SessionId::from_slice(&session_bytes)?;
+                    match index.get(&session_id) {
+                        Some(&at) => {
+                            let ids = &mut sessions[at].2;
+                            if ids.len() < OBSERVATION_STREAM_IDS_PER_PAGE && !ids.contains(&id) {
                                 ids.push(id);
                             }
                         }
@@ -4145,6 +4615,7 @@ impl ReaderPool {
         session_id: SessionId,
         page: ObservationPage,
     ) -> StoreResult<ObservationPageResult> {
+        let cjk_query = page.query.as_deref().and_then(prepare_cjk_fts5_query);
         let fts_query = page
             .query
             .as_deref()
@@ -4170,16 +4641,29 @@ impl ReaderPool {
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             let mut source = String::from("FROM observations");
             let mut predicate = String::from(
-                " WHERE observations.session_id = ? \
-                   AND observations.workspace_id = ? \
-                   AND observations.project_id = ?",
+                " WHERE observations.session_id = ?1 \
+                   AND observations.workspace_id = ?2 \
+                   AND observations.project_id = ?3",
             );
             if let Some(q) = fts_query {
-                source.push_str(
-                    " JOIN observations_fts ON observations_fts.rowid = observations.rowid",
-                );
-                predicate.push_str(" AND observations_fts MATCH ?");
-                sql_params.push(Value::Text(q));
+                if let Some(cjk_query) = cjk_query {
+                    source.push_str(
+                        " JOIN ( \
+                            SELECT rowid FROM observations_fts WHERE observations_fts MATCH ?4 \
+                            UNION \
+                            SELECT rowid FROM observations_cjk_fts \
+                              WHERE observations_cjk_fts MATCH ?5 \
+                         ) AS matched_fts ON matched_fts.rowid = observations.rowid",
+                    );
+                    sql_params.push(Value::Text(q));
+                    sql_params.push(Value::Text(cjk_query));
+                } else {
+                    source.push_str(
+                        " JOIN observations_fts ON observations_fts.rowid = observations.rowid",
+                    );
+                    predicate.push_str(" AND observations_fts MATCH ?");
+                    sql_params.push(Value::Text(q));
+                }
             }
             if !kinds.is_empty() {
                 predicate.push_str(" AND observations.kind IN (");

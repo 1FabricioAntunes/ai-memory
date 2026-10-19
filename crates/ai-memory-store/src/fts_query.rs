@@ -185,6 +185,94 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         .join(" OR ")
 }
 
+/// Terms stored in the auxiliary CJK index.
+///
+/// Each maximal Han/Kana/Hangul run contributes its scalar values and its
+/// overlapping bigrams. Splitting only those runs keeps punctuation and Latin
+/// text out of the derived index, while the bigrams retain enough adjacency
+/// to avoid the very broad matches a character-only index would produce.
+#[must_use]
+pub(crate) fn cjk_index_terms(raw: &str) -> String {
+    let mut terms = Vec::new();
+    let mut run = Vec::new();
+    for ch in raw.chars() {
+        if is_cjk(ch) {
+            run.push(ch);
+        } else {
+            append_cjk_terms(&mut terms, &mut run);
+        }
+    }
+    append_cjk_terms(&mut terms, &mut run);
+    terms.join(" ")
+}
+
+/// A MATCH expression for the CJK portion of a bounded user query.
+///
+/// `None` is the important common case: callers then execute the existing SQL
+/// byte-for-byte. A multi-scalar run becomes an exact phrase of overlapping
+/// bigrams; a single scalar uses the unigram fallback.
+#[must_use]
+pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
+    let bounded = bounded_query_text(raw);
+    let mut phrases = Vec::new();
+    let mut run = Vec::new();
+    for ch in bounded.chars() {
+        if is_cjk(ch) {
+            run.push(ch);
+        } else {
+            append_cjk_query(&mut phrases, &mut run);
+        }
+    }
+    append_cjk_query(&mut phrases, &mut run);
+    (!phrases.is_empty()).then(|| phrases.join(" OR "))
+}
+
+fn append_cjk_terms(terms: &mut Vec<String>, run: &mut Vec<char>) {
+    if run.is_empty() {
+        return;
+    }
+    terms.extend(run.iter().map(char::to_string));
+    terms.extend(run.windows(2).map(|pair| pair.iter().collect::<String>()));
+    run.clear();
+}
+
+fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>) {
+    if run.is_empty() {
+        return;
+    }
+    if run.len() == 1 {
+        phrases.push(format!("\"{}\"", run[0]));
+    } else {
+        let bigrams = run
+            .windows(2)
+            .map(|pair| pair.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
+        phrases.push(format!("\"{bigrams}\""));
+    }
+    run.clear();
+}
+
+fn is_cjk(ch: char) -> bool {
+    ch.is_alphanumeric()
+        && matches!(
+        ch as u32,
+        0x1100..=0x11ff
+            | 0x2e80..=0x2fff
+            | 0x3040..=0x30ff
+            | 0x3130..=0x318f
+            | 0x31f0..=0x31ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xa960..=0xa97f
+            | 0xac00..=0xd7af
+            | 0xd7b0..=0xd7ff
+            | 0xf900..=0xfaff
+            | 0xff66..=0xff9f
+            | 0x20000..=0x323af
+        )
+}
+
 /// Upper bound (bytes) on the untrusted search text this module tokenises.
 ///
 /// FTS5's query parser is superlinear in the expression it is handed:
@@ -362,6 +450,43 @@ mod tests {
     /// behaviour exactly).
     fn prepare_fts5_query(raw: &str) -> String {
         super::prepare_fts5_query(raw, &FtsStopwords::default())
+    }
+
+    #[test]
+    fn cjk_index_terms_are_bounded_to_cjk_runs() {
+        assert_eq!(
+            cjk_index_terms("pay 支付服务 now"),
+            "支 付 服 务 支付 付服 服务"
+        );
+        assert_eq!(
+            cjk_index_terms("日本語・テスト"),
+            "日 本 語 日本 本語 テ ス ト テス スト"
+        );
+        assert_eq!(cjk_index_terms("plain latin"), "");
+    }
+
+    #[test]
+    fn cjk_queries_require_adjacent_bigrams() {
+        assert_eq!(
+            prepare_cjk_fts5_query("支付服务 status"),
+            Some("\"支付 付服 服务\"".to_string())
+        );
+        assert_eq!(
+            prepare_cjk_fts5_query("支 / 韓"),
+            Some("\"支\" OR \"韓\"".to_string())
+        );
+        assert_eq!(prepare_cjk_fts5_query("latin only"), None);
+    }
+
+    #[test]
+    fn cjk_query_input_is_bounded_before_expansion() {
+        let query = prepare_cjk_fts5_query(&"日".repeat(10_000)).unwrap();
+        assert!(
+            query.len() < 12_500,
+            "expanded query was {} bytes",
+            query.len()
+        );
+        assert_parses(&query);
     }
 
     /// The engine, not this module, is the judge of validity: every
