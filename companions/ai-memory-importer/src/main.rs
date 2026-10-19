@@ -1104,10 +1104,15 @@ fn split_frontmatter(input: &str) -> Result<(Option<YamlMap>, String)> {
     let Some(rest) = rest else {
         return Ok((None, input.to_owned()));
     };
-    let Some(end) = rest.find(&close) else {
+    // The closing fence may also end the file with no line ending after it.
+    let split = rest
+        .find(&close)
+        .map(|end| (&rest[..end], &rest[end + close.len()..]))
+        .or_else(|| rest.strip_suffix("\n---").map(|yaml| (yaml, "")));
+    let Some((yaml, body)) = split else {
         return Ok((None, input.to_owned()));
     };
-    let yaml = rest[..end].trim_end_matches('\r');
+    let yaml = yaml.trim_end_matches('\r');
     let value: serde_json::Value =
         serde_saphyr::from_str_with_options(yaml, frontmatter_parse_options())
             .context("parse YAML frontmatter")?;
@@ -1115,7 +1120,7 @@ fn split_frontmatter(input: &str) -> Result<(Option<YamlMap>, String)> {
         serde_json::Value::Object(map) => Some(map),
         _ => None,
     };
-    Ok((map, rest[end + close.len()..].to_owned()))
+    Ok((map, body.to_owned()))
 }
 
 /// Read frontmatter the way `serde_yaml` 0.9 did, matching the server's
@@ -1448,6 +1453,24 @@ mod tests {
     /// there by an editor, has CRLF line endings; one saved as "UTF-8 with
     /// BOM" opens with U+FEFF. Either used to miss the fence, so kind, tier,
     /// tags and pin were dropped and the YAML block was imported as body.
+    /// A frontmatter-only page whose closing fence ends the file with no
+    /// final newline, which the server's parser has accepted since #1402.
+    #[test]
+    fn parses_omc_frontmatter_closed_at_end_of_file() {
+        let parsed = parse_markdown("---\ntitle: T\ntier: procedural\npinned: true\n---").unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("T"));
+        assert_eq!(parsed.tier.as_deref(), Some("procedural"));
+        assert!(parsed.pinned);
+        assert_eq!(parsed.body, "");
+
+        let crlf = parse_markdown("\u{feff}---\r\ntitle: T\r\n---").unwrap();
+        assert_eq!(crlf.title.as_deref(), Some("T"));
+        assert_eq!(crlf.body, "");
+
+        let not_a_fence = parse_markdown("---\ntitle: T\n----").unwrap();
+        assert_eq!(not_a_fence.title, None);
+    }
+
     #[test]
     fn parses_omc_frontmatter_with_crlf_or_a_bom() {
         let crlf = "---\r\ntitle: T\r\nkind: rule\r\ntier: procedural\r\ntags: [a, b]\r\npinned: true\r\n---\r\n# Body\r\ntext";
