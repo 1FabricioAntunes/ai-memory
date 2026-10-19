@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Encoded spaces as `%20` instead of `+` in importer URL path segments,
+  preserving workspace, project, and page names that contain spaces.
+  ([#1449](https://github.com/akitaonrails/ai-memory/pull/1449))
 - Recognized exclamation-mark punctuation in short automatic-handoff
   acknowledgments such as `thanks!` and `perfect!`.
   ([#1448](https://github.com/akitaonrails/ai-memory/pull/1448))
