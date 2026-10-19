@@ -46,21 +46,14 @@ async fn writer_hook_admission_survives_external_write_lock_held_during_read_the
     // lock while the server runs.
     let db_path = tmp.path().join("db").join("memory.sqlite");
     let external = Connection::open(&db_path).unwrap();
-    external
-        .execute_batch(
-            "BEGIN IMMEDIATE; CREATE TABLE external_lock_probe (x INTEGER); \
-             INSERT INTO external_lock_probe VALUES (1);",
-        )
-        .unwrap();
+    external.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
     // Hold the lock for ~300 ms — well inside the writer connection's
     // 5000 ms busy timeout — then release it while the writer
     // operation is in flight.
     let release = thread::spawn(move || {
         thread::sleep(Duration::from_millis(300));
-        external
-            .execute_batch("COMMIT; DROP TABLE external_lock_probe;")
-            .unwrap();
+        external.execute_batch("COMMIT;").unwrap();
     });
 
     let session_id = SessionId::new();
