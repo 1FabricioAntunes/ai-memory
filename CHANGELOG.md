@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Parsed an empty Markdown frontmatter block (`---` followed immediately by
+  its closing fence) as frontmatter instead of folding it and later thematic
+  breaks into the page body. ([#1444](https://github.com/akitaonrails/ai-memory/pull/1444))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
