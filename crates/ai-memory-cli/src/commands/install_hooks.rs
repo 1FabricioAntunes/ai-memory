@@ -31,15 +31,15 @@ use crate::commands::openclaw_plugin;
 use crate::commands::path_util::{home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
-    COPILOT_CLI_PROFILE, CURSOR_PROFILE, DSH_EVENTS, GEMINI_PROFILE, KIMI_CODE_EVENTS,
-    KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS, POOL_EVENTS, build_antigravity_payload_with_data_dir,
-    build_claude_code_payload_with_data_dir, build_devin_payload_with_data_dir,
-    build_dsh_hooks_payload, build_grok_payload_with_data_dir, build_kiro_cli_v2_hooks_value,
-    build_kiro_cli_v3_hooks_value, build_pool_settings_yaml_with_data_dir,
-    build_profile_payload_for_agent, hook_embedded_exe_path, hook_script_for_claude_code,
-    hook_script_for_current_platform, kimi_code_hook_commands, local_hook_policy_v1_supported,
-    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
-    yaml_single_quote,
+    COPILOT_CLI_PROFILE, CURSOR_PROFILE, DSH_EVENTS, GEMINI_PROFILE, HermesHookSet,
+    KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS, POOL_EVENTS,
+    build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
+    build_devin_payload_with_data_dir, build_dsh_hooks_payload, build_grok_payload_with_data_dir,
+    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
+    build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
+    hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
+    kimi_code_hook_commands, local_hook_policy_v1_supported, ts_auth_headers_fn,
+    ts_capture_policy_v1, ts_string_literal, ts_timeout_signal, yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -941,14 +941,18 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
-            AgentChoice::Hermes => {
-                // Nothing to write or stage: the block invokes the native
-                // `hook` subcommand, and `~/.hermes/config.yaml` is a YAML file
-                // the operator also edits (and Hermes itself gates hooks behind
-                // an acceptance prompt). The render step below prints the
-                // ready-to-paste block.
-                Ok(())
-            }
+            // Nothing to write or stage: the block invokes the native `hook`
+            // subcommand, and `~/.hermes/config.yaml` is a YAML file the
+            // operator also edits (and Hermes itself gates hooks behind an
+            // acceptance prompt). `--apply` prints the same ready-to-paste
+            // block a preview does.
+            AgentChoice::Hermes => render_hermes(
+                &server_url,
+                auth,
+                &config.data_dir,
+                args.project_strategy.and_then(ProjectStrategyArg::baked),
+                hermes_plugin_dir(&config.runtime_env).as_deref(),
+            ),
             AgentChoice::Devin => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -1136,7 +1140,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Zcode => render_zcode(&server_url, auth, &config.data_dir, strategy),
-        AgentChoice::Hermes => render_hermes(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::Hermes => render_hermes(
+            &server_url,
+            auth,
+            &config.data_dir,
+            strategy,
+            hermes_plugin_dir(&config.runtime_env).as_deref(),
+        ),
         AgentChoice::Devin => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -7042,6 +7052,34 @@ fn render_zcode(
     Ok(())
 }
 
+/// Where the community ai-memory memory-provider plugin for Hermes installs
+/// itself: `$HERMES_HOME/plugins/ai-memory`, with `HERMES_HOME` defaulting to
+/// `~/.hermes` as Hermes and the plugin's installer both resolve it. Both
+/// variables come from the captured environment (invariant #1).
+pub(crate) fn hermes_plugin_dir(env: &crate::config::RuntimeEnv) -> Option<PathBuf> {
+    hermes_plugin_dir_in(env.var_os("HERMES_HOME"), env.home_dir().map(PathBuf::from))
+}
+
+fn hermes_plugin_dir_in(
+    hermes_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    crate::commands::path_util::agent_config_home(hermes_home)
+        .or_else(|| home.map(|home| home.join(".hermes")))
+        .map(|hermes_home| hermes_home.join("plugins").join("ai-memory"))
+}
+
+/// The plugin posts prompts and session ends and claims the handoff itself,
+/// so where it is installed the hooks wire the tool events alone. A plain
+/// directory check, so the same machine always renders the same block.
+pub(crate) fn hermes_hook_set(plugin_dir: Option<&Path>) -> HermesHookSet {
+    if plugin_dir.is_some_and(Path::is_dir) {
+        HermesHookSet::ToolsOnly
+    } else {
+        HermesHookSet::Full
+    }
+}
+
 /// `install-hooks --agent hermes`: print the ready-to-paste `hooks:` block for
 /// `~/.hermes/config.yaml`.
 ///
@@ -7056,10 +7094,17 @@ fn render_hermes(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    plugin_dir: Option<&Path>,
 ) -> Result<()> {
     print!(
         "{}",
-        render_hermes_output(server_url, auth_token, data_dir, project_strategy)
+        render_hermes_output(
+            server_url,
+            auth_token,
+            data_dir,
+            project_strategy,
+            plugin_dir
+        )
     );
     Ok(())
 }
@@ -7069,34 +7114,64 @@ fn render_hermes_output(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    plugin_dir: Option<&Path>,
 ) -> String {
+    let hook_set = hermes_hook_set(plugin_dir);
     let block = super::render_shared::build_hermes_hooks_yaml(
         server_url,
         auth_token,
         Some(data_dir),
         project_strategy,
+        hook_set,
     );
     let mut out = String::new();
     out.push_str("# Hermes Agent hooks config — merge the `hooks:` block below\n");
     out.push_str("# into ~/.hermes/config.yaml and let Hermes accept it when it\n");
     out.push_str("# prompts (or set `hooks_auto_accept: true`). ai-memory does not\n");
     out.push_str("# write that file: it is YAML you also edit, and it would have to\n");
-    out.push_str("# be spliced.\n");
+    out.push_str("# be spliced. Restart Hermes (and its gateway) to load it.\n");
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
     if auth_token.is_some() {
         out.push_str("# Auth: this snippet embeds the token in each hook command —\n");
         out.push_str("#       treat ~/.hermes/config.yaml as sensitive (chmod 600).\n");
     }
-    out.push_str("# NOTE: only the two tool events are wired — that is what gives\n");
-    out.push_str("#       Hermes tool observations. Session lifecycle (prompts,\n");
-    out.push_str("#       session-end, the automatic handoff) is handled by the\n");
-    out.push_str("#       ai-memory memory-provider plugin, so nothing is duplicated.\n");
+    out.push_str(&hermes_hook_set_notes(hook_set, plugin_dir));
     out.push_str("# NOTE: each `command` is a bare argv line. Hermes splits it with\n");
     out.push_str("#       shlex.split and runs it without a shell, so the generated\n");
     out.push_str("#       command invokes the ai-memory binary directly.\n");
     out.push('\n');
     out.push_str(&block);
     out
+}
+
+/// The comment lines that say which Hermes events the block wires and why.
+/// Shared with `setup-agent`, which renders the same block.
+pub(crate) fn hermes_hook_set_notes(hook_set: HermesHookSet, plugin_dir: Option<&Path>) -> String {
+    let plugin = plugin_dir.map_or_else(
+        || "$HERMES_HOME/plugins/ai-memory".to_owned(),
+        |dir| dir.display().to_string(),
+    );
+    match hook_set {
+        HermesHookSet::ToolsOnly => format!(
+            "# NOTE: only the two tool events are wired. The ai-memory\n\
+             #       memory-provider plugin is installed at {plugin}\n\
+             #       and already captures prompts, ends sessions and claims\n\
+             #       the handoff; wiring those here too would capture every\n\
+             #       prompt twice and race the plugin for the handoff.\n"
+        ),
+        HermesHookSet::Full => format!(
+            "# NOTE: tool events plus the session lifecycle. pre_llm_call\n\
+             #       captures each prompt and brings the pending handoff into\n\
+             #       the session's first turn; on_session_end marks a turn\n\
+             #       (Hermes fires it after every turn) and on_session_finalize\n\
+             #       ends the session.\n\
+             # NOTE: a gateway session that expires idle is never finalized;\n\
+             #       close it with `ai-memory finalize-session --agent hermes`.\n\
+             # NOTE: if you install the ai-memory memory-provider plugin\n\
+             #       ({plugin}), keep only pre_tool_call and\n\
+             #       post_tool_call: the plugin covers the rest.\n"
+        ),
+    }
 }
 
 /// Merge ai-memory's entries into Droid's `hooks.json` (#1240), keeping
@@ -10202,26 +10277,103 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
     }
 
-    /// Hermes' output must state the manual paste step (ai-memory does not write
-    /// `~/.hermes/config.yaml`) and must not advertise a staged bundle or a
-    /// session-end hook — the memory-provider plugin owns session lifecycle.
+    /// Without the community plugin, Hermes' output wires the whole lifecycle
+    /// natively and still states the manual paste step (ai-memory does not
+    /// write `~/.hermes/config.yaml`).
     #[test]
-    fn render_hermes_output_states_manual_paste_and_plugin_owned_lifecycle() {
-        let out = render_hermes_output("http://127.0.0.1:49374", None, Path::new("/data"), None);
+    fn render_hermes_output_wires_the_lifecycle_without_the_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join(".hermes").join("plugins").join("ai-memory");
+        let out = render_hermes_output(
+            "http://127.0.0.1:49374",
+            None,
+            Path::new("/data"),
+            None,
+            Some(&plugin),
+        );
         assert!(out.contains("~/.hermes/config.yaml"));
         assert!(out.contains("ai-memory does not"));
         assert!(out.contains("hooks:\n"));
-        assert!(out.contains("pre_tool_call"));
-        assert!(out.contains("post_tool_call"));
         assert!(out.contains("--agent hermes"));
         assert!(out.contains("without a shell"));
-        assert!(out.contains("memory-provider plugin"));
-        // Tool events only: a hook-driven session-end would double-close a
-        // session the plugin already closes.
-        assert!(!out.contains("session_end"));
-        assert!(!out.contains("session-end:"));
+        for event in [
+            "pre_tool_call:",
+            "post_tool_call:",
+            "on_session_start:",
+            "pre_llm_call:",
+            "on_session_end:",
+            "on_session_finalize:",
+        ] {
+            assert!(out.contains(event), "missing {event}");
+        }
+        assert!(out.contains("--event session-end "));
+        assert!(out.contains("--event user-prompt-submit "));
+        assert!(out.contains("finalize-session --agent hermes"));
+        // The operator learns what to drop if the plugin arrives later.
+        assert!(out.contains(&plugin.display().to_string()));
         // No token was passed, so the auth caution line stays out.
         assert!(!out.contains("chmod 600"));
+    }
+
+    /// With the community plugin installed, only the tool events are wired:
+    /// the plugin already posts prompts and session ends and claims the
+    /// handoff, so a second lifecycle path would double both.
+    #[test]
+    fn render_hermes_output_keeps_tool_events_only_beside_the_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join(".hermes").join("plugins").join("ai-memory");
+        fs::create_dir_all(&plugin).unwrap();
+        let out = render_hermes_output(
+            "http://127.0.0.1:49374",
+            None,
+            Path::new("/data"),
+            None,
+            Some(&plugin),
+        );
+        assert!(out.contains("pre_tool_call:"));
+        assert!(out.contains("post_tool_call:"));
+        for event in [
+            "on_session_start:",
+            "pre_llm_call:",
+            "on_session_end:",
+            "on_session_finalize:",
+        ] {
+            assert!(!out.contains(event), "{event} belongs to the plugin");
+        }
+        assert!(!out.contains("--event session-end"));
+        assert!(!out.contains("--event user-prompt-submit"));
+        assert!(out.contains("memory-provider plugin is installed at"));
+        assert!(out.contains(&plugin.display().to_string()));
+    }
+
+    #[test]
+    fn hermes_plugin_dir_follows_hermes_home_then_the_home_default() {
+        let home = PathBuf::from("/home/alice");
+        assert_eq!(
+            hermes_plugin_dir_in(None, Some(home.clone())),
+            Some(home.join(".hermes").join("plugins").join("ai-memory"))
+        );
+        assert_eq!(
+            hermes_plugin_dir_in(Some("/srv/hermes".into()), Some(home.clone())),
+            Some(
+                PathBuf::from("/srv/hermes")
+                    .join("plugins")
+                    .join("ai-memory")
+            )
+        );
+        // A blank HERMES_HOME is an unset expansion, not the filesystem root.
+        assert_eq!(
+            hermes_plugin_dir_in(Some("  ".into()), Some(home.clone())),
+            Some(home.join(".hermes").join("plugins").join("ai-memory"))
+        );
+        assert_eq!(hermes_plugin_dir_in(None, None), None);
+        // A file of that name is not an installed plugin.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("ai-memory");
+        fs::write(&file, "").unwrap();
+        assert_eq!(hermes_hook_set(Some(&file)), HermesHookSet::Full);
+        assert_eq!(hermes_hook_set(None), HermesHookSet::Full);
+        assert_eq!(hermes_hook_set(Some(tmp.path())), HermesHookSet::ToolsOnly);
     }
 
     // Issue #156: Zero hook install writes exec-form entries into Zero's

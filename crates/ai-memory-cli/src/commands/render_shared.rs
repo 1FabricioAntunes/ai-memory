@@ -1019,25 +1019,61 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 /// (same reasoning as Kiro v2's `max_output_size`).
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Hermes Agent lifecycle events ai-memory hooks. Each pair is
+/// Hermes Agent tool events ai-memory hooks. Each pair is
 /// `(event-name-in-~/.hermes/config.yaml, native `hook --event` value)`.
 ///
-/// Verified against Hermes v0.21.4 (`agent/shell_hooks.py`): a configured
+/// Verified against Hermes v0.22.2 (`agent/shell_hooks.py`): a configured
 /// `command` is split into argv by `shlex.split` and executed **without a
 /// shell**, with the event JSON on stdin — so the generated block invokes the
 /// native `hook` subcommand, the same shape Zero and ZCode use, and no
-/// `.sh`/`.ps1` bundle is staged. Only the two tool events are wired: their
-/// payload carries `tool_name` / `tool_input`, the envelope the router already
-/// maps for `agent=hermes`. Session lifecycle stays with the memory-provider
-/// plugin (`on_session_end`), so a hook-driven `session-end` cannot
-/// double-close a Hermes session.
-pub(crate) const HERMES_EVENTS: [(&str, &str); 2] = [
+/// `.sh`/`.ps1` bundle is staged. Hermes fires a shell hook for every event it
+/// defines, with one stdin envelope (`hook_event_name`, `tool_name`,
+/// `tool_input`, `session_id`, `cwd`, `extra`).
+pub(crate) const HERMES_TOOL_EVENTS: [(&str, &str); 2] = [
     ("pre_tool_call", "pre-tool-use"),
     ("post_tool_call", "post-tool-use"),
 ];
 
+/// Hermes session lifecycle events, mapped by meaning rather than name:
+///
+/// - `on_session_start` fires on a new session's first turn. Hermes ignores
+///   its stdout, so it only records the start; the handoff is never fetched
+///   there, because that fetch claims it.
+/// - `pre_llm_call` fires before every turn with the prompt in
+///   `extra.user_message`. On the session's first turn its
+///   `{"context": ...}` stdout carries the handoff into the turn.
+/// - `on_session_end` fires at the end of **every turn**, not of the session,
+///   so it is a turn boundary (`stop`).
+/// - `on_session_finalize` is the real end: CLI exit, `/new`, gateway
+///   shutdown. A gateway session that expires idle is never finalized, which
+///   `ai-memory finalize-session --agent hermes` covers.
+///
+/// `post_llm_call` (assistant text) and `subagent_*` are not wired: assistant
+/// capture is native-only, and a delegated child is not a session of its own.
+pub(crate) const HERMES_LIFECYCLE_EVENTS: [(&str, &str); 4] = [
+    ("on_session_start", "session-start"),
+    ("pre_llm_call", "user-prompt-submit"),
+    ("on_session_end", "stop"),
+    ("on_session_finalize", "session-end"),
+];
+
+/// Which Hermes events the generated `hooks:` block wires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HermesHookSet {
+    /// Tool and lifecycle events: ai-memory owns the whole Hermes session.
+    Full,
+    /// Tool events only. The community ai-memory memory-provider plugin
+    /// already posts prompts and session ends and claims the handoff, so a
+    /// second lifecycle path would capture each prompt twice and race it for
+    /// the handoff.
+    ToolsOnly,
+}
+
 /// Wall-clock bound written into each Hermes hook entry. Capture POSTs are
-/// fire-and-forget, so this only bounds a hung `hook` invocation.
+/// fire-and-forget and the first-turn handoff fetch has its own short
+/// timeout, so this only bounds a hung `hook` invocation. Hermes bounds a
+/// blocking hook's callback at 30 s by default, and `pre_llm_call` holds
+/// the turn while it runs, so the entry stays well under that.
 pub(crate) const HERMES_HOOK_TIMEOUT_SECONDS: u64 = 20;
 
 /// The ready-to-paste `hooks:` block for `~/.hermes/config.yaml`.
@@ -1055,6 +1091,7 @@ pub(crate) fn build_hermes_hooks_yaml(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    hook_set: HermesHookSet,
 ) -> String {
     build_hermes_hooks_yaml_for_platform(
         server_url,
@@ -1065,7 +1102,18 @@ pub(crate) fn build_hermes_hooks_yaml(
             data_dir,
             project_strategy,
         ),
+        hook_set,
     )
+}
+
+/// The events [`build_hermes_hooks_yaml`] wires for `hook_set`, tool events
+/// first.
+pub(crate) fn hermes_events(hook_set: HermesHookSet) -> Vec<(&'static str, &'static str)> {
+    let mut events = HERMES_TOOL_EVENTS.to_vec();
+    if hook_set == HermesHookSet::Full {
+        events.extend(HERMES_LIFECYCLE_EVENTS);
+    }
+    events
 }
 
 /// Platform-forced variant, so a test can pin POSIX/Windows instead of
@@ -1074,9 +1122,10 @@ fn build_hermes_hooks_yaml_for_platform(
     server_url: &str,
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
+    hook_set: HermesHookSet,
 ) -> String {
     let mut out = String::from("hooks:\n");
-    for (hermes_event, our_event) in HERMES_EVENTS {
+    for (hermes_event, our_event) in hermes_events(hook_set) {
         // The native platforms derive the event token from the script stem, so
         // the synthetic filename carries the ai-memory event name.
         let command = hook_command(
@@ -4057,24 +4106,53 @@ if (inheritOnly) {
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
     }
 
-    /// The public entry point must emit a complete `hooks:` map with both tool
-    /// events, whatever platform it renders for (the suite runs on Windows too).
+    /// The public entry point must emit a complete `hooks:` map, whatever
+    /// platform it renders for (the suite runs on Windows too): every tool and
+    /// lifecycle event in full, the tool events alone beside the plugin.
     #[test]
-    fn hermes_hooks_yaml_covers_both_tool_events() {
-        let yaml = build_hermes_hooks_yaml("http://127.0.0.1:49374", None, None, None);
-        assert!(yaml.starts_with("hooks:\n"));
-        for (event, _) in HERMES_EVENTS {
-            assert!(yaml.contains(&format!("  {event}:\n")), "missing {event}");
-            assert!(
-                yaml.contains("    - command: '"),
-                "command must be a single-quoted YAML scalar"
+    fn hermes_hooks_yaml_wires_the_full_lifecycle_or_the_tool_events_only() {
+        let full = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::Full,
+        );
+        let tools = build_hermes_hooks_yaml(
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            HermesHookSet::ToolsOnly,
+        );
+        for (yaml, events) in [
+            (&full, hermes_events(HermesHookSet::Full)),
+            (&tools, hermes_events(HermesHookSet::ToolsOnly)),
+        ] {
+            assert!(yaml.starts_with("hooks:\n"));
+            for (event, _) in &events {
+                assert!(yaml.contains(&format!("\n  {event}:\n")), "missing {event}");
+            }
+            assert_eq!(yaml.matches("    - command: '").count(), events.len());
+            assert_eq!(
+                yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
+                    .count(),
+                events.len()
             );
         }
+        assert_eq!(hermes_events(HermesHookSet::Full).len(), 6);
         assert_eq!(
-            yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
-                .count(),
-            HERMES_EVENTS.len()
+            hermes_events(HermesHookSet::ToolsOnly),
+            HERMES_TOOL_EVENTS.to_vec()
         );
+        for (event, our_event) in HERMES_LIFECYCLE_EVENTS {
+            assert!(!tools.contains(event), "{event} must stay with the plugin");
+            assert!(!tools.contains(&format!("--event {our_event} ")));
+        }
+        // Assistant text is native-only, and subagents are not sessions.
+        for unwired in ["post_llm_call", "subagent_start", "subagent_stop"] {
+            assert!(!full.contains(unwired), "{unwired}");
+        }
     }
 
     /// Hermes splits `command` with `shlex.split` and runs it with no shell, so
@@ -4091,8 +4169,9 @@ if (inheritOnly) {
                 Some(Path::new("/data")),
                 Some("repo-root"),
             ),
+            HermesHookSet::Full,
         );
-        for (_, our_event) in HERMES_EVENTS {
+        for (_, our_event) in hermes_events(HermesHookSet::Full) {
             assert!(
                 yaml.contains(&format!("hook --event {our_event} --agent hermes")),
                 "missing the native command for {our_event}"

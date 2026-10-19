@@ -111,7 +111,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     // Hermes also runs the native `hook` command directly (no shell), so there
     // are no scripts to stage — setup-agent prints the YAML block instead.
     if matches!(args.agent, AgentChoice::Hermes) {
-        emit_hermes(&args)?;
+        let plugin_dir = install_hooks::hermes_plugin_dir(&config.runtime_env);
+        print!("{}", hermes_setup_output(&args, plugin_dir.as_deref()));
         return Ok(());
     }
     // Droid has no script bundle either: its hooks.json runs the native
@@ -317,27 +318,34 @@ fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
 /// runs the ai-memory binary directly with the JSON payload on stdin. The
 /// binary must be reachable on the host that runs Hermes — for docker-wrapper
 /// setups install the native binary or point `command` at the wrapper.
-fn emit_hermes(args: &SetupAgentArgs) -> Result<()> {
+///
+/// The community memory-provider plugin is looked for where this command
+/// runs. Inside a container that is not the host's Hermes home, which is why
+/// the full block also says which entries to drop beside the plugin.
+fn hermes_setup_output(args: &SetupAgentArgs, plugin_dir: Option<&Path>) -> String {
+    let hook_set = install_hooks::hermes_hook_set(plugin_dir);
     let block = crate::commands::render_shared::build_hermes_hooks_yaml(
         &args.server_url,
         args.auth_token.as_deref(),
         None,
         None,
+        hook_set,
     );
-    println!("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml");
-    println!("# The `command` must be an ai-memory binary reachable on the host that");
-    println!("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from");
-    println!("# that host so the path is resolved for you.");
+    let mut out = String::new();
+    out.push_str("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml\n");
+    out.push_str("# The `command` must be an ai-memory binary reachable on the host that\n");
+    out.push_str("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from\n");
+    out.push_str("# that host so the path is resolved for you.\n");
     if args.auth_token.is_some() {
-        println!("#       Treat the config as sensitive (chmod 600).");
+        out.push_str("#       Treat the config as sensitive (chmod 600).\n");
     }
-    println!("# NOTE: Hermes splits each `command` with shlex.split and runs it with");
-    println!("#       no shell, so the generated line is argv, not a shell command.");
-    println!("# NOTE: tool observations only — session lifecycle stays with the");
-    println!("#       ai-memory memory-provider plugin.");
-    println!();
-    println!("{block}");
-    Ok(())
+    out.push_str("# NOTE: Hermes splits each `command` with shlex.split and runs it with\n");
+    out.push_str("#       no shell, so the generated line is argv, not a shell command.\n");
+    out.push_str(&install_hooks::hermes_hook_set_notes(hook_set, plugin_dir));
+    out.push('\n');
+    out.push_str(&block);
+    out.push('\n');
+    out
 }
 
 /// Print the event map for `~/.factory/hooks.json` (#1240). No scripts are
@@ -853,6 +861,49 @@ fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hermes_setup_args() -> SetupAgentArgs {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from([
+            "ai-memory",
+            "setup-agent",
+            "--agent",
+            "hermes",
+            "--to",
+            "/host/hooks",
+        ])
+        .unwrap();
+        let crate::cli::Command::SetupAgent(args) = cli.command else {
+            panic!("expected setup-agent");
+        };
+        args
+    }
+
+    /// `setup-agent --agent hermes` renders the same two blocks as
+    /// `install-hooks`: the whole lifecycle, or the tool events alone when the
+    /// community plugin is installed.
+    #[test]
+    fn hermes_setup_output_follows_the_plugin_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("plugins").join("ai-memory");
+        let full = hermes_setup_output(&hermes_setup_args(), Some(&plugin));
+        assert!(full.contains("pre_llm_call:") && full.contains("on_session_finalize:"));
+        assert!(full.contains("pre_tool_call:") && full.contains("post_tool_call:"));
+        assert!(full.contains("keep only pre_tool_call"));
+
+        std::fs::create_dir_all(&plugin).unwrap();
+        let tools = hermes_setup_output(&hermes_setup_args(), Some(&plugin));
+        assert!(tools.contains("pre_tool_call:") && tools.contains("post_tool_call:"));
+        for event in [
+            "on_session_start:",
+            "pre_llm_call:",
+            "on_session_end:",
+            "on_session_finalize:",
+        ] {
+            assert!(!tools.contains(event), "{event}");
+        }
+        assert!(tools.contains("memory-provider plugin is installed at"));
+    }
 
     #[test]
     fn source_candidates_include_binary_sibling_for_flat_tarball() {

@@ -2457,13 +2457,16 @@ pub enum AgentChoice {
     /// block of `~/.hermes/config.yaml`. Hermes runs each `command` through
     /// `shlex.split` with the event JSON on stdin and **no shell**, so
     /// ai-memory's native `hook` subcommand is invoked directly (exec form,
-    /// like Zero and ZCode). ai-memory wires the two events that give Hermes
-    /// tool observations — `pre_tool_call` / `post_tool_call`, whose payload
-    /// carries `tool_name` / `tool_input`, the envelope the router already
-    /// recognises for `agent=hermes`. `~/.hermes/config.yaml` is NOT written:
-    /// it is YAML the installer would have to splice, and Hermes gates user
-    /// hooks behind its own acceptance prompt (`hooks_auto_accept`), so
-    /// `install-hooks --agent hermes` prints the ready-to-paste block.
+    /// like Zero and ZCode). ai-memory wires the tool events and the session
+    /// lifecycle (`on_session_start`, `pre_llm_call`, `on_session_end` as a
+    /// turn boundary, `on_session_finalize`); the first turn's `pre_llm_call`
+    /// brings the pending handoff in as context. When the community
+    /// memory-provider plugin is installed under `$HERMES_HOME/plugins`, only
+    /// the tool events are wired, since the plugin owns the rest.
+    /// `~/.hermes/config.yaml` is NOT written: it is YAML the installer would
+    /// have to splice, and Hermes gates user hooks behind its own acceptance
+    /// prompt (`hooks_auto_accept`), so `install-hooks --agent hermes` prints
+    /// the ready-to-paste block.
     #[value(alias = "hermes-agent")]
     Hermes,
     /// GitHub Copilot CLI — JSON-config lifecycle hooks in
