@@ -1486,10 +1486,6 @@ mod tests {
         assert!(parse_markdown("---\ntitle: a\ntitle: b\n---\nbody").is_err());
     }
 
-    /// A wiki checked out on Windows with `core.autocrlf=true`, or saved
-    /// there by an editor, has CRLF line endings; one saved as "UTF-8 with
-    /// BOM" opens with U+FEFF. Either used to miss the fence, so kind, tier,
-    /// tags and pin were dropped and the YAML block was imported as body.
     /// A `# ` line inside fenced code is a shell or Python comment, not the
     /// page's H1; the server's `derive_title` skips fences the same way.
     #[test]
@@ -1504,6 +1500,10 @@ mod tests {
         assert_eq!(inline.title.as_deref(), Some("After"));
     }
 
+    /// A wiki checked out on Windows with `core.autocrlf=true`, or saved
+    /// there by an editor, has CRLF line endings; one saved as "UTF-8 with
+    /// BOM" opens with U+FEFF. Either used to miss the fence, so kind, tier,
+    /// tags and pin were dropped and the YAML block was imported as body.
     #[test]
     fn parses_omc_frontmatter_with_crlf_or_a_bom() {
         let crlf = "---\r\ntitle: T\r\nkind: rule\r\ntier: procedural\r\ntags: [a, b]\r\npinned: true\r\n---\r\n# Body\r\ntext";
