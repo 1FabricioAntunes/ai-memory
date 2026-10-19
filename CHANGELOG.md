@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Revalidated session-purge tombstones inside the reindex write transaction,
+  preventing a queued watcher update from recreating a deleted summary after
+  file cleanup failed. Kept surviving manual replacements at the same path
+  editable through the watcher (#1439).
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
