@@ -18,6 +18,13 @@ version in [`docs/changelog/`](docs/changelog/):
   repair, replacing the unpaired escape with U+FFFD instead of dropping the
   whole event.
   ([#1432](https://github.com/akitaonrails/ai-memory/pull/1432))
+- Model-produced page paths are now cleaned of the remaining shapes `ensure_portable`
+  refuses, a component ending in a dot or space and a DOS device name like `aux.md`,
+  so one such path no longer aborts every page in a consolidation or bootstrap batch.
+  ([#1430](https://github.com/akitaonrails/ai-memory/pull/1430))
+- Preserved FTS5 column filters inside parenthesized groups, so queries such
+  as `(title:handoff)` no longer broaden into a search for the literal word
+  `title` across every indexed field. ([#1442](https://github.com/akitaonrails/ai-memory/pull/1442))
 - Revalidated session-purge tombstones inside the reindex write transaction,
   preventing a queued watcher update from recreating a deleted summary after
   file cleanup failed. Kept surviving manual replacements at the same path
@@ -105,6 +112,9 @@ version in [`docs/changelog/`](docs/changelog/):
   when evaluating slot staleness and title uniqueness.
   ([#1389](https://github.com/akitaonrails/ai-memory/pull/1389))
 - Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope. ([#1382](https://github.com/akitaonrails/ai-memory/pull/1382))
+- Encoded a literal `%` in an exported wikilink target as `%25`, so an OKF
+  bundle's Markdown link still resolves to the same literal page path.
+  ([#1456](https://github.com/akitaonrails/ai-memory/pull/1456))
 - Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import. ([#1380](https://github.com/akitaonrails/ai-memory/pull/1380))
 - Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
   pages. The store query now filters out expired page targets against the
@@ -123,7 +133,15 @@ version in [`docs/changelog/`](docs/changelog/):
   ranking. `contradiction_sql` now applies the `not_expired` guard on the target
   page, aligning belief input aggregation with the lint's resolved/stale split.
   ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
+- Stopped the LLM contradiction pass from auditing its previous
+  `_lint/report.md` as a knowledge page, which could recycle stale findings or
+  displace a real page from the bounded prompt. ([#1455](https://github.com/akitaonrails/ai-memory/pull/1455))
 - Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+- Counted a latest page whose only stored vector belongs to another provider,
+  model, or dimension as missing an embedding in `ai-memory status` and the
+  web `/health` page, so the count no longer reads zero after an
+  embedding-model switch.
+  ([#1431](https://github.com/akitaonrails/ai-memory/pull/1431))
 - Bounded free-text search before the FTS5 parser sees it. A query of 100k
   distinct terms spent ~17.5 s in query preparation alone (and a ~500 KB
   document ~59 s end to end), and a NUL byte reached the phrase parser as
@@ -131,6 +149,10 @@ version in [`docs/changelog/`](docs/changelog/):
   instead of a result. Query text is now folded (NUL becomes a space) and cut
   to the first 4 KiB on a UTF-8 boundary; ordinary queries are unchanged.
   ([#1434](https://github.com/akitaonrails/ai-memory/issues/1434))
+- Fixed generated OKF directory indexes so names containing spaces, Markdown
+  punctuation, literal URL delimiters, or Unicode remain readable, clickable
+  links in exports and newly generated migration indexes.
+  ([#1438](https://github.com/akitaonrails/ai-memory/pull/1438))
 
 ## [3.1.1] - 2026-10-17
 
