@@ -12,6 +12,12 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Repaired the exact migration checksum recorded by v2.2.1 for the original
+  V62 page-window migration before running strict migration validation. This
+  removes the false divergence error on every upgraded-server start while
+  keeping unknown migration edits fatal. CI now rejects changes to migration
+  files already present on a PR's base branch.
+  ([#1443](https://github.com/akitaonrails/ai-memory/issues/1443))
 - Sent `response_format=json_schema` for structured OpenCode Chat Completions
   calls, with the existing tolerant fallback for models that reject it, so
   `memory_query answer=true` no longer receives unstructured prose by default.
