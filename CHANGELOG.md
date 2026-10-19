@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Recognized importer frontmatter whose closing fence is the final line of a
+  file without a trailing newline.
+  ([#1450](https://github.com/akitaonrails/ai-memory/pull/1450))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
