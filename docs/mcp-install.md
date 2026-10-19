@@ -26,7 +26,8 @@ Warp, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > `workspace` and `project` like any static client. Stdio entries name the
 > `ai-memory` binary by its absolute path, so the client does not need it on
 > its `PATH`; the Docker wrapper keeps the bare `ai-memory`. ZCode keeps
-> HTTP entries only and is refused. Passing `--auth-token` explicitly (or
+> HTTP entries only and is refused. Hermes Agent gets the bridge entry
+> whatever the token source, so its config never holds a token. Passing `--auth-token` explicitly (or
 > `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
 
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
@@ -110,39 +111,57 @@ ai-memory's canonical events when possible:
 
 ### Hermes Agent
 
-ai-memory ships a first-party hook installer for Hermes Agent:
+ai-memory ships a first-party Hermes integration: lifecycle hooks and an MCP
+entry, both printed for you to merge into `~/.hermes/config.yaml`
+(`$HERMES_HOME/config.yaml`), which ai-memory never writes.
 
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
+ai-memory install-mcp --client hermes
+ai-memory install-skills --scope global --agent hermes
 ```
 
-Because Hermes splits each configured `command` with `shlex.split` and runs it
-with **no shell**, the printed block invokes the native `ai-memory hook`
-command (exec form, the same shape Zero and ZCode use); no `.sh`/`.ps1` bundle
-is staged, and there is no `--apply` that writes your config. `~/.hermes/config.yaml`
-is a YAML file you also edit, and Hermes gates user hooks behind its own
-acceptance prompt (`hooks_auto_accept`), so paste the block and let Hermes
-accept it. Two tool events are wired (`pre_tool_call`, `post_tool_call`), which
-is what gives Hermes sessions tool observations.
+The hooks block runs the native `ai-memory hook` command in exec form, since
+Hermes splits each `command` with `shlex.split` and runs it with no shell. It
+wires the tool events and the session lifecycle: `on_session_start`,
+`pre_llm_call` (the prompt, plus the pending handoff as `{"context": ...}` on a
+session's first turn), `on_session_end` (a turn boundary, because Hermes fires
+it after every turn) and `on_session_finalize` (the session end). Hermes gates
+user hooks behind its own acceptance prompt (`hooks_auto_accept`), so paste the
+block and let Hermes accept it. [install.md](install.md#hermes-agent-nous-research)
+has the event table, the `TERMINAL_CWD` routing and the
+`finalize-session --agent hermes` step for idle gateway sessions.
 
-The memory provider remains a community-maintained project: a
+`install-mcp --client hermes` (alias `hermes-agent`) prints an entry for the
+`mcp_servers:` map that runs `ai-memory mcp-bridge --no-session-id` over stdio
+with the install's `--data-dir`. The file gets no token: the bridge sends the
+install's own, which matters because Hermes passes MCP servers a filtered
+environment without `AI_MEMORY_AUTH_TOKEN`. Hermes is a static client, so the
+model passes `workspace` and `project` on project-scoped calls. `--apply` is
+refused. Hermes does not read MCP server instructions, so the routing rules
+reach the model only through the skills in `~/.hermes/skills` and the handoff
+in the first turn.
+
+The community-maintained
 [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)
-is available, and it is what owns automatic recall, prompt capture, session-end
-and the automatic handoff for Hermes. Treat it as a third-party bridge: verify
-its documented Hermes and ai-memory version matrix, install/update/uninstall
-behavior, platform coverage, and secret handling before enabling it on a live
-ai-memory server. In particular, bearer tokens and endpoint settings should
-stay in environment or local config references rather than generated plugin
-source files.
+memory provider is an alternative for prompts, session ends, recall and the
+handoff. Treat it as a third-party bridge: verify its documented Hermes and
+ai-memory version matrix, install/update/uninstall behavior, platform coverage,
+and secret handling before enabling it on a live ai-memory server. Bearer tokens
+and endpoint settings should stay in environment or local config references
+rather than generated plugin source files. Run only one lifecycle path: when the
+plugin is installed in `$HERMES_HOME/plugins/ai-memory`, `install-hooks --agent
+hermes` prints only `pre_tool_call` and `post_tool_call`, so prompts are not
+captured twice and the handoff is not claimed twice.
 
 The hook router recognizes `agent=hermes` as a concrete session kind and
-accepts Hermes' documented shell-hook `tool_name` / `tool_input` envelope for
-tool-family metadata and capture-exclusion enforcement. A custom bridge should
-map `on_session_start`, `post_tool_call`, and `on_session_end` to ai-memory's
-canonical `session-start`, `post-tool-use`, and `session-end` event names while
-forwarding the original JSON object. This protocol recognition does not install
-or trust a third-party plugin. Hermes ignores session-start hook stdout, so it
-cannot consume an automatic handoff there; use MCP `memory_handoff_accept`.
+accepts Hermes' shell-hook `tool_name` / `tool_input` envelope for tool-family
+metadata and capture-exclusion enforcement. A custom bridge should map
+`pre_llm_call`, `post_tool_call`, `on_session_end` and `on_session_finalize` to
+ai-memory's canonical `user-prompt`, `post-tool-use`, `stop` and `session-end`
+events, sending the prompt text as `prompt` rather than Hermes' whole `extra`
+object, which carries the conversation history. This protocol recognition does
+not install or trust a third-party plugin.
 
 The same lifecycle guidance below applies to Hermes or any other external
 bridge: map known events onto ai-memory's canonical hook events where

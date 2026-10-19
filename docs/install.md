@@ -2008,45 +2008,61 @@ CodeBuddy session after installing so it loads the hooks.
 ### Hermes Agent (Nous Research)
 
 Hermes declares lifecycle hooks in the `hooks:` block of
-`~/.hermes/config.yaml`. `install-hooks --agent hermes` (alias `hermes-agent`)
-prints the block to paste there:
+`~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml`). `install-hooks --agent
+hermes` (alias `hermes-agent`) prints the block to paste there:
 
 ```bash
-ai-memory install-hooks --agent hermes \
-    --server-url "http://homelab:49374" \
-    --auth-token "$TOKEN"
+ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
 ```
 
 Hermes splits each configured `command` with `shlex.split` and runs it with
 **no shell**, passing the event JSON on stdin, so the generated entry invokes
 the native `ai-memory hook` command directly (the same exec-form shape Zero and
-ZCode use) and there is no script bundle to stage. There is also no `--apply`
-that writes the file: `~/.hermes/config.yaml` is YAML you also edit, and Hermes
-gates user hooks behind its own acceptance prompt (`hooks_auto_accept`). Paste
-the block and let Hermes accept it.
+ZCode use) and there is no script bundle to stage. ai-memory never writes the
+file, `--apply` included: `~/.hermes/config.yaml` is YAML you also edit, and
+Hermes gates user hooks behind its own acceptance prompt (`hooks_auto_accept`).
+Paste the block, let Hermes accept it, and restart Hermes and its gateway.
 
-Two events are wired: `pre_tool_call` → `pre-tool-use` and `post_tool_call` →
-`post-tool-use`. Their payload carries `tool_name` / `tool_input`, which is what
-gives Hermes sessions tool observations, tool-family titles, and
-`[capture] ignore_paths` exclusion enforcement. Hermes reports its own process
-directory (usually `~`) as the payload `cwd`, so the hook finds the project's
-`.ai-memory.toml` from each tool's absolute location instead: `terminal`'s
-`workdir`, a file tool's `path`, or `search_files`' `path`. A tool call with no
-absolute location (a relative `workdir`, the default `search_files` path)
-stays with the process directory and, under `capture_mode = allowlist`, is
-captured only if that directory carries a marker. See
-[marker-file.md](marker-file.md) for the routing rules.
+Six events are wired, each with a 20-second timeout:
 
-Session lifecycle is deliberately not wired here: automatic recall, prompt
-capture, session-end and the automatic handoff for Hermes belong to the memory
-provider, the community-maintained
-[`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin).
-A second, hook-driven `session-end` would close the same session twice. Hermes
-ignores session-start hook stdout, so a pending handoff is recovered through
-MCP: `memory_handoff_list` then `memory_handoff_accept`.
+| Hermes event | ai-memory event | What it does |
+| --- | --- | --- |
+| `pre_tool_call`, `post_tool_call` | `pre-tool-use`, `post-tool-use` | Tool observations, tool-family titles and `[capture] ignore_paths` enforcement. |
+| `on_session_start` | `session-start` | Records the start. Hermes ignores this hook's output, so no handoff is fetched here. |
+| `pre_llm_call` | `user-prompt-submit` | Captures the prompt from `extra.user_message` (text parts only, never the conversation history). On the session's first turn it claims the pending handoff and prints `{"context": "..."}`, which Hermes adds to that turn. |
+| `on_session_end` | `stop` | A turn boundary: Hermes fires it after every turn, not at session end. |
+| `on_session_finalize` | `session-end` | Ends the session on CLI exit, `/new` or gateway shutdown. After a gateway `/new` only the ending session is closed. |
 
-No first-party `install-mcp` client and no managed workstream
-(`ai-memory run hermes`) are claimed yet.
+A gateway session that expires idle is never finalized by Hermes. Close it
+from the session's project directory, or name it with `--session-id`:
+
+```bash
+ai-memory finalize-session --agent hermes
+ai-memory finalize-session --agent hermes --session-id <id>
+```
+
+Hermes reports its own process directory as the payload `cwd`; for a gateway
+that is wherever the gateway started. The hook routes by `TERMINAL_CWD`
+instead, the variable Hermes exports `terminal.cwd` through, when it names an
+existing absolute directory. A tool call can still move to another checkout
+when its absolute location proves one: `terminal`'s `workdir`, a file tool's
+`path`, or `search_files`' `path`. With neither, an event stays with the
+process directory and, under `capture_mode = allowlist`, is captured only if
+that directory carries a marker. See [marker-file.md](marker-file.md) for the
+routing rules.
+
+The community [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)
+memory provider also posts prompts and session ends and claims the handoff.
+When it is installed in `$HERMES_HOME/plugins/ai-memory`, `install-hooks` and
+`setup-agent` print only the two tool events, so prompts are not captured twice
+and the handoff is not claimed twice. If you install the plugin later, delete
+the four lifecycle entries.
+
+For MCP, `ai-memory install-mcp --client hermes` prints an `mcp_servers:` entry
+for the same file (see [mcp-install.md](mcp-install.md#hermes-agent)). Hermes
+does not read MCP server instructions, so also install the skills:
+`ai-memory install-skills --scope global --agent hermes` writes them to
+`~/.hermes/skills`. No managed workstream (`ai-memory run hermes`) is claimed.
 
 ### OpenCode
 
