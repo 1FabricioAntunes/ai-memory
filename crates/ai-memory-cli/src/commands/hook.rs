@@ -1482,8 +1482,54 @@ fn parse_hook_payload(mut payload: String) -> serde_json::Result<(String, serde_
     if payload.starts_with('\u{feff}') {
         payload.drain(..'\u{feff}'.len_utf8());
     }
-    let json = serde_json::from_str(&payload)?;
-    Ok((payload, json))
+    match serde_json::from_str(&payload) {
+        Ok(json) => Ok((payload, json)),
+        // The repaired text becomes the spooled body: the server parses it
+        // with `serde_json` too and would reject the original.
+        Err(error) => {
+            let repaired = replace_lone_surrogate_escapes(&payload).ok_or(error)?;
+            let json = serde_json::from_str(&repaired)?;
+            Ok((repaired, json))
+        }
+    }
+}
+
+/// Replace each `\u` escape that names half of a UTF-16 surrogate pair without
+/// its other half with U+FFFD. Harnesses that cut tool output mid-emoji send
+/// such escapes, and `serde_json` rejects the whole payload for one of them.
+/// An escaped backslash (`\\ud83d`) is text and stays as it is. Returns `None`
+/// when nothing was replaced.
+fn replace_lone_surrogate_escapes(text: &str) -> Option<String> {
+    let code_unit_at = |at: usize| {
+        let digits = text.as_bytes().get(at..at + 6)?.strip_prefix(b"\\u")?;
+        u16::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+    };
+    let (mut out, mut copied, mut at) = (String::new(), 0, 0);
+    // `get` ends the scan instead of panicking when invalid JSON puts a
+    // backslash before a multibyte character or at the very end.
+    while let Some(offset) = text.get(at..).and_then(|rest| rest.find('\\')) {
+        at += offset;
+        match code_unit_at(at) {
+            // `\\`, `\n`, `\"` and the like: skip the escaped character too.
+            None => at += 2,
+            Some(0xD800..=0xDBFF) if matches!(code_unit_at(at + 6), Some(0xDC00..=0xDFFF)) => {
+                at += 12;
+            }
+            Some(0xD800..=0xDFFF) => {
+                out.push_str(&text[copied..at]);
+                out.push(char::REPLACEMENT_CHARACTER);
+                at += 6;
+                copied = at;
+            }
+            Some(_) => at += 6,
+        }
+    }
+    // A replacement always moves `copied` past its escape.
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
 }
 
 fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option<String>) {
