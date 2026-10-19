@@ -698,6 +698,10 @@ export class AiMemoryClient {
       limit: a.limit,
       include_expired: a.includeExpired === true ? true : undefined,
       explain: a.explain === true ? true : undefined,
+      kind: a.kind,
+      tier: a.tier,
+      path_prefix: a.pathPrefix,
+      tag: a.tag,
     };
     let wireArgs: Record<string, unknown>;
     const isGlobal = a.global === true;
