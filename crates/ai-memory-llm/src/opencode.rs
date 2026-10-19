@@ -83,8 +83,7 @@ impl OpenCodeProvider {
         })
     }
 
-    #[cfg(test)]
-    fn with_strict(mut self, strict: bool) -> Self {
+    pub(crate) fn with_strict(mut self, strict: bool) -> Self {
         self.chat_completions = self.chat_completions.with_strict(strict);
         self
     }

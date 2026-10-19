@@ -29,6 +29,7 @@ pub mod drop_list;
 mod grants;
 pub mod hermes;
 pub mod idle_end;
+mod json_repair;
 pub mod log;
 pub mod payload;
 mod recap;
@@ -62,6 +63,7 @@ pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_l
 pub use idle_end::{
     IDLE_END_BATCH, IDLE_END_INTERVAL_SECS, IdleEndTickInput, IdleEndTickOutcome, run_idle_end_tick,
 };
+pub use json_repair::replace_lone_surrogate_escapes;
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
     USER_PROMPT_EXCERPT_MAX_BYTES, agent_from_payload, cap_lifecycle_body_for_client,
