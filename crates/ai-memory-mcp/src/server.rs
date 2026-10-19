@@ -2748,7 +2748,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty())
             {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "global cannot be combined with workspace/project/scopes",
                     None,
                 ));
@@ -2793,7 +2793,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty()))
         {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "scopes cannot be combined with workspace/project",
                 None,
             ));
@@ -2806,13 +2806,13 @@ impl AiMemoryServer {
         // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
             if args.global.unwrap_or(false) || !args.scopes.is_empty() {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "as_of cannot be combined with global or scopes",
                     None,
                 ));
             }
             let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
-                McpError::internal_error(format!("as_of must be an ISO-8601 instant: {e}"), None)
+                McpError::invalid_params(format!("as_of must be an ISO-8601 instant: {e}"), None)
             })?;
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
