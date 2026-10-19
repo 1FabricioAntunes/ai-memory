@@ -690,7 +690,9 @@ fn resolve_local_wikilink(
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let mut href = relative_href(&page_dir, &target);
+    // The wikilink names a literal path; a Markdown destination is a URL
+    // that `extract_links` decodes once, so a literal `%` leaves as `%25`.
+    let mut href = relative_href(&page_dir, &target).replace('%', "%25");
     href.push_str(suffix);
     let display = label
         .map(str::trim)
@@ -1873,6 +1875,25 @@ mod tests {
             rewrite_local_wikilinks("[[decisions/b|  ]]", &path, "proj"),
             "[decisions/b](../decisions/b.md)"
         );
+    }
+
+    /// A wikilink names a literal page path, but the exported Markdown link
+    /// is a URL that `extract_links` decodes once. A `%` in the filename has
+    /// to leave as `%25`, or the export points at another page (`a%20b.md`
+    /// read as `a b.md`) or at none (`95%cap.md` does not decode).
+    #[test]
+    fn rewrite_local_wikilinks_keeps_a_literal_percent_in_the_target() {
+        let page = PagePath::new("notes/here.md").unwrap();
+        for (body, href) in [
+            ("See [[notes/a%20b]].\n", "a%2520b.md"),
+            ("See [[notes/cpu-95%cap]].\n", "cpu-95%25cap.md"),
+        ] {
+            let before = extract_links(body, &page);
+            assert_eq!(before.len(), 1, "{body}");
+            let exported = rewrite_local_wikilinks(body, &page, "proj");
+            assert!(exported.contains(&format!("]({href})")), "{exported}");
+            assert_eq!(extract_links(&exported, &page), before, "{exported}");
+        }
     }
 
     #[test]

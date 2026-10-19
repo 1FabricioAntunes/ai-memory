@@ -106,6 +106,9 @@ version in [`docs/changelog/`](docs/changelog/):
   when evaluating slot staleness and title uniqueness.
   ([#1389](https://github.com/akitaonrails/ai-memory/pull/1389))
 - Resolved percent-encoded ordinary Markdown link paths before indexing and web-route encoding, preserving spaces and Unicode filenames without double decoding or changing project scope. ([#1382](https://github.com/akitaonrails/ai-memory/pull/1382))
+- Encoded a literal `%` in an exported wikilink target as `%25`, so an OKF
+  bundle's Markdown link still resolves to the same literal page path.
+  ([#1456](https://github.com/akitaonrails/ai-memory/pull/1456))
 - Preserved indexed Markdown links with escaped or nested brackets in their labels, including links exported in OKF bundles and reindexed after import. ([#1380](https://github.com/akitaonrails/ai-memory/pull/1380))
 - Fixed `open_feedback_findings` reporting feedback attached to TTL-expired
   pages. The store query now filters out expired page targets against the
