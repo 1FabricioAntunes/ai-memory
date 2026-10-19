@@ -12,6 +12,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Invoked GitHub Copilot CLI's native Windows lifecycle commands with
+  PowerShell's call operator. Quoted `ai-memory.exe` paths now execute instead
+  of producing a parser error that made fail-closed pre-tool hooks deny every
+  tool call. ([#1462](https://github.com/akitaonrails/ai-memory/issues/1462))
 - Repaired the exact migration checksum recorded by v2.2.1 for the original
   V62 page-window migration before running strict migration validation. This
   removes the false divergence error on every upgraded-server start while
