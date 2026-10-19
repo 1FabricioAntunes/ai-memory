@@ -204,6 +204,12 @@ version in [`docs/changelog/`](docs/changelog/):
   process holds the database, such as an external `wal_checkpoint`, instead
   of failing hook ingestion at once with "database is locked".
   ([#1460](https://github.com/akitaonrails/ai-memory/pull/1460))
+- Retried the Google, Copilot and Voyage embedders on HTTP 503 as well as 429,
+  with the bounded whole-second `Retry-After` policy the OpenAI-style
+  embedders already use. A brief provider overload no longer fails backfill
+  pages, inline page embeds or query vectors. Voyage previously did not retry
+  at all.
+  ([#1466](https://github.com/akitaonrails/ai-memory/issues/1466))
 
 ## [3.1.1] - 2026-10-17
 
