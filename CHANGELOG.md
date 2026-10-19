@@ -12,6 +12,8 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Corrected Pi MCP setup guidance to name `ai-memory-pi.ts` and describe its
+  location when `PI_CODING_AGENT_DIR` is set.
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
