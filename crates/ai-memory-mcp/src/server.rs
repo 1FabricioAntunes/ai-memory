@@ -4084,7 +4084,13 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = match args.session_id.as_deref() {
+        // Blank means omitted, as in `memory_consolidate`.
+        let session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
             Some(raw) => SessionId::from_str(raw)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
             None => self
@@ -19770,6 +19776,59 @@ mod tests {
             "an unknown session read as a refusal: {}",
             err.message
         );
+    }
+
+    /// A blank `session_id` means omitted and a padded one names the same
+    /// session, as in `memory_consolidate` and
+    /// `memory_read_session_observations`.
+    #[tokio::test]
+    async fn auto_improve_reads_blank_session_id_as_omitted_and_trims_padding() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let older = seed_short_completed_session(&store, ws, proj).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let latest = seed_short_completed_session(&store, ws, proj).await;
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        for (raw, expected) in [("  ".to_string(), latest), (format!("  {older}\n"), older)] {
+            let response = call_tool_json(
+                server
+                    .memory_auto_improve(
+                        Parameters(AutoImproveArgs {
+                            session_id: Some(raw.clone()),
+                            ..auto_improve_args(None)
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("session_id {raw:?}: {e:?}")),
+            );
+            assert_eq!(response["session_id"], expected.to_string(), "{raw:?}");
+        }
     }
 
     #[tokio::test]

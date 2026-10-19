@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Treated a blank `session_id` as omitted when starting an automatic
+  improvement review, matching the other session-scoped MCP tools.
+  ([#1447](https://github.com/akitaonrails/ai-memory/pull/1447))
 - Returned MCP `invalid_params` for caller-supplied invalid page paths, tiers,
   and scopes instead of misreporting them as internal server errors.
   ([#1445](https://github.com/akitaonrails/ai-memory/pull/1445))
