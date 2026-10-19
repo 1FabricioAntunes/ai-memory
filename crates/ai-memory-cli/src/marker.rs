@@ -1242,7 +1242,8 @@ fn declares_more_than_capture(text: &str) -> bool {
             .any(|key| parse_flag_in(text, key).is_some())
         || server_selection_in(text).is_some()
         || text.lines().any(|line| {
-            line.trim_start()
+            line.trim_start_matches('\u{feff}')
+                .trim_start()
                 .strip_prefix("aliases")
                 .is_some_and(|rest| rest.trim_start().starts_with('='))
         })

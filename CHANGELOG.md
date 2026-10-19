@@ -114,6 +114,9 @@ version in [`docs/changelog/`](docs/changelog/):
   page, aligning belief input aggregation with the lint's resolved/stale split.
   ([#1386](https://github.com/akitaonrails/ai-memory/pull/1386))
 - Kept the previous backup or OKF export intact when an archive download is interrupted, and publish completed downloads atomically. Successful downloads replace destination symlinks with private files rather than changing their targets or inheriting their permissions. ([#1381](https://github.com/akitaonrails/ai-memory/pull/1381))
+- Read a first-line `.ai-memory.toml` scope key, flag, or `aliases`
+  declaration when the marker starts with a UTF-8 BOM, in both native and
+  legacy POSIX hook routing. ([#1457](https://github.com/akitaonrails/ai-memory/pull/1457))
 
 ## [3.1.1] - 2026-10-17
 
