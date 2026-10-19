@@ -10610,6 +10610,10 @@ mod tests {
         global_project.global = Some(true);
         global_project.project = Some("scratch".into());
 
+        let mut global_workspace = base();
+        global_workspace.global = Some(true);
+        global_workspace.workspace = Some("default".into());
+
         let mut global_scopes = base();
         global_scopes.global = Some(true);
         global_scopes.scopes = vec![scope("scratch")];
@@ -10617,6 +10621,10 @@ mod tests {
         let mut scopes_project = base();
         scopes_project.scopes = vec![scope("scratch")];
         scopes_project.project = Some("scratch".into());
+
+        let mut scopes_workspace = base();
+        scopes_workspace.scopes = vec![scope("scratch")];
+        scopes_workspace.workspace = Some("default".into());
 
         let mut as_of_scopes = base();
         as_of_scopes.scopes = vec![scope("scratch")];
@@ -10627,8 +10635,10 @@ mod tests {
 
         for (what, args) in [
             ("global + project", global_project),
+            ("global + workspace", global_workspace),
             ("global + scopes", global_scopes),
             ("scopes + project", scopes_project),
+            ("scopes + workspace", scopes_workspace),
             ("as_of + scopes", as_of_scopes),
             ("malformed as_of", malformed_as_of),
         ] {
