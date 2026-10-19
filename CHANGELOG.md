@@ -12,11 +12,11 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
-- Kept native hook events whose JSON payload contains half of a UTF-16
-  surrogate pair as a `\u` escape, such as tool output cut in the middle of
-  an emoji. The hook could not parse the payload and dropped the whole event
-  with "nothing was captured"; the unpaired escape now becomes U+FFFD. The
-  shell and PowerShell hook scripts still post such a payload unchanged.
+- Kept hook events whose JSON payload contains half of a UTF-16 surrogate pair
+  as a `\u` escape, such as tool output cut in the middle of an emoji. Native,
+  shell, PowerShell and direct hook clients now share the bounded server-side
+  repair, replacing the unpaired escape with U+FFFD instead of dropping the
+  whole event.
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
