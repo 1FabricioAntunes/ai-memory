@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Recognized importer frontmatter whose closing fence is the final line of a
+  file without a trailing newline.
+  ([#1450](https://github.com/akitaonrails/ai-memory/pull/1450))
 - Encoded spaces as `%20` instead of `+` in importer URL path segments,
   preserving workspace, project, and page names that contain spaces.
   ([#1449](https://github.com/akitaonrails/ai-memory/pull/1449))
