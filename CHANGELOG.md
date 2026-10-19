@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Returned MCP `invalid_params` for caller-supplied invalid page paths, tiers,
+  and scopes instead of misreporting them as internal server errors.
+  ([#1445](https://github.com/akitaonrails/ai-memory/pull/1445))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
