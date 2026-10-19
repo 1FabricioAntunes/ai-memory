@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Recognized exclamation-mark punctuation in short automatic-handoff
+  acknowledgments such as `thanks!` and `perfect!`.
+  ([#1448](https://github.com/akitaonrails/ai-memory/pull/1448))
 - Added exact hover timestamps to `/web` page metadata, made the OKF upgrade
   dialog keyboard accessible, and added a labelled main-navigation landmark
   with current-page state and narrow-screen wrapping.
