@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Reported appended and removed lines in wiki sync conflict summaries, with
+  an explicit end-of-file marker instead of line 0 and matching previews.
+  ([#1477](https://github.com/akitaonrails/ai-memory/issues/1477))
 - Accepted ordinary absolute and relative Windows destination paths in the
   wiki sync companion while still refusing directory junctions and symlinks.
   ([#1476](https://github.com/akitaonrails/ai-memory/issues/1476))
