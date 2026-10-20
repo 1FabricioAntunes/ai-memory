@@ -2477,7 +2477,12 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // Copilot CLI selects the `command` fallback as its PowerShell command on
     // Windows; without `&`, its quoted executable is only a string expression
     // and every fail-closed PreToolUse hook denies the tool (#1462).
-    if matches!(agent, "codex" | "grok" | "copilot-cli") {
+    // Gemini CLI has run every hook command through PowerShell `-Command` on
+    // Windows since 0.23.0 (google-gemini/gemini-cli#15343: `HookRunner`
+    // spawns `getShellConfiguration()`). A command that fails to parse exits
+    // 1, which Gemini treats as a non-blocking error, so the session runs on
+    // and captures nothing (#1484).
+    if matches!(agent, "codex" | "grok" | "copilot-cli" | "gemini-cli") {
         "& "
     } else {
         ""
