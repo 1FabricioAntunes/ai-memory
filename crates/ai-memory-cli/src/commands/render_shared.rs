@@ -2594,6 +2594,75 @@ if (($args -join '|') -ne $expected) { exit 9 }
     );
 }
 
+/// Gemini CLI runs its Windows hook commands through PowerShell `-Command`,
+/// so a quoted executable needs the call operator, including when its path
+/// and data directory contain spaces.
+#[test]
+fn gemini_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = windows_native_hook_command_with_exe(
+        Path::new(r"C:\Program Files\ai-memory\ai-memory.exe"),
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\Users\Alice Smith\ai-memory")),
+            None,
+        ),
+    );
+    assert!(
+        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        "Gemini must invoke the quoted executable through PowerShell: {cmd}"
+    );
+}
+
+/// Runs the command the way Gemini CLI does: PowerShell `-Command`, with the
+/// exit-code check Gemini appends to every PowerShell hook command.
+#[cfg(windows)]
+#[test]
+fn gemini_cli_windows_command_executes_in_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\data dir|hook|--event|session-start|--agent|gemini-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { exit 9 }
+"#,
+    )
+    .unwrap();
+    let mut command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\data dir")),
+            None,
+        ),
+    );
+    command.push_str("; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Gemini hook command failed in PowerShell: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
     let cmd = hook_command(
