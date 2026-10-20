@@ -218,6 +218,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `as_of` that is not an ISO-8601 instant, instead of misreporting them as
   internal server errors.
   ([#1468](https://github.com/akitaonrails/ai-memory/issues/1468))
+- Copied the release into place in `install.ps1` instead of moving it, so an
+  antivirus scan that still holds the just-verified `ai-memory.exe` no longer
+  stops a Windows install with "the process cannot access the file because it
+  is being used by another process".
+  ([#1480](https://github.com/akitaonrails/ai-memory/issues/1480))
 
 ## [3.1.1] - 2026-10-17
 
