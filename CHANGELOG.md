@@ -21,8 +21,11 @@ version in [`docs/changelog/`](docs/changelog/):
   and subagent start/stop) as native `ai-memory hook` commands with no script
   bundle. `SessionStart` injects the prior handoff as
   `hookSpecificOutput.additionalContext`; Qwen's own `SessionEnd` closes the
-  session. Capture exclusions cover Qwen's Gemini-like tools. `setup` detects
-  `~/.qwen`. There is no `ai-memory run qwen` adapter.
+  session. User-prompt capture uses Qwen's provenance-bearing
+  `submitted_prompt`, never an automated continuation in `prompt`. Capture
+  exclusions cover Qwen's Gemini-like tools. Qwen-only agent backups include
+  its settings, both documented global skill roots, `QWEN.md`, and `AGENTS.md`.
+  `setup` detects `~/.qwen`. There is no `ai-memory run qwen` adapter.
 - Added zero-LLM substring retrieval for unspaced Han, Kana, and Hangul text.
   Pages and observations gain transactionally maintained derived unigram/bigram
   FTS indexes; existing unicode61 search and ranking remain unchanged for

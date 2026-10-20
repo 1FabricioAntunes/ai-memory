@@ -515,6 +515,21 @@ pub fn user_prompt_text(raw: &serde_json::Value) -> Option<String> {
     extract_content(raw, &["prompt", "message", "text"])
 }
 
+/// The submitted user prompt for a specific harness.
+///
+/// Qwen's `prompt` field can also contain a continuation or hook-generated
+/// prompt. Its optional `submitted_prompt` field is the provenance-bearing
+/// value for an actual user submission, so Qwen must never fall back to the
+/// generic field.
+#[must_use]
+pub fn user_prompt_text_for_agent(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent == AgentKind::QwenCode {
+        extract_content(raw, &["submitted_prompt"])
+    } else {
+        user_prompt_text(raw)
+    }
+}
+
 /// Identify the harness from the payload itself when it carries an
 /// unambiguous vendor marker, overriding the `?agent=` the hook command
 /// declared.
@@ -684,7 +699,7 @@ impl HookEnvelope {
         } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
             legacy_tool_title(event, agent, &raw)
         } else {
-            best_title_hint(event, &raw).or_else(|| {
+            best_title_hint(event, agent, &raw).or_else(|| {
                 source_event
                     .as_deref()
                     .map(|source| extension_title_hint(&raw, source))
@@ -699,7 +714,7 @@ impl HookEnvelope {
         } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
             legacy_tool_body(event, agent, &raw)
         } else {
-            best_body_excerpt(event, &raw).or_else(|| {
+            best_body_excerpt(event, agent, &raw).or_else(|| {
                 source_event
                     .as_deref()
                     .and_then(|_| extension_body_excerpt(&raw))
@@ -1100,17 +1115,21 @@ fn push_candidates<'a>(out: &mut Vec<&'a serde_json::Value>, value: &'a serde_js
     }
 }
 
-fn best_title_hint(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
+fn best_title_hint(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
     match event {
         HookEvent::SessionStart => extract_string(raw, &["model", "title"]).and_then(first_line),
         HookEvent::UserPrompt => {
             // Kimi Code sends `prompt` as content blocks
             // (`[{"type":"text","text":...}]`); `extract_content` flattens
             // them and returns identical values for plain-string agents.
-            extract_content(raw, &["prompt", "message", "text"])
+            user_prompt_text_for_agent(agent, raw)
                 .or_else(|| {
-                    raw.pointer("/userPromptSubmit/prompt")
-                        .and_then(value_to_text)
+                    (agent != AgentKind::QwenCode)
+                        .then(|| {
+                            raw.pointer("/userPromptSubmit/prompt")
+                                .and_then(value_to_text)
+                        })
+                        .flatten()
                 })
                 .and_then(first_line)
         }
@@ -1197,14 +1216,20 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
+fn best_body_excerpt(
+    event: HookEvent,
+    agent: AgentKind,
+    raw: &serde_json::Value,
+) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => {
-            extract_content(raw, &["prompt", "message", "text"]).or_else(|| {
-                raw.pointer("/userPromptSubmit/prompt")
-                    .and_then(value_to_text)
-            })
-        }
+        HookEvent::UserPrompt => user_prompt_text_for_agent(agent, raw).or_else(|| {
+            (agent != AgentKind::QwenCode)
+                .then(|| {
+                    raw.pointer("/userPromptSubmit/prompt")
+                        .and_then(value_to_text)
+                })
+                .flatten()
+        }),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -3368,6 +3393,41 @@ mod tests {
         );
         assert_eq!(env.event, HookEvent::UserPrompt);
         assert_eq!(env.body_excerpt.as_deref(), Some("MARKER_PROMPT_789"));
+    }
+
+    #[test]
+    fn qwen_user_prompt_uses_only_submission_provenance() {
+        let query = HookQuery {
+            event: "user-prompt-submit".into(),
+            agent: Some("qwen-code".into()),
+            ..Default::default()
+        };
+        let envelope = HookEnvelope::from_query_and_body(
+            query.clone(),
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "prompt": "AUTOMATED_CONTINUATION_MUST_NOT_BE_CAPTURED",
+                "submitted_prompt": "MARKER_QWEN_USER_PROMPT"
+            }),
+        );
+        assert_eq!(
+            envelope.title_hint.as_deref(),
+            Some("MARKER_QWEN_USER_PROMPT")
+        );
+        assert_eq!(
+            envelope.body_excerpt.as_deref(),
+            Some("MARKER_QWEN_USER_PROMPT")
+        );
+
+        let automated = HookEnvelope::from_query_and_body(
+            query,
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "prompt": "AUTOMATED_CONTINUATION_MUST_NOT_BE_CAPTURED"
+            }),
+        );
+        assert!(automated.title_hint.is_none());
+        assert!(automated.body_excerpt.is_none());
     }
 
     // Native fields and canonical tool names follow Codex rust-v0.154.0's

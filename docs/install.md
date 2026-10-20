@@ -1629,7 +1629,9 @@ there is no script bundle. Ten events are wired: `SessionStart`,
 fires it instead of `PostToolUse` when a tool throws), `PreCompact`, `Stop`,
 `SessionEnd`, `SubagentStart` and `SubagentStop`. Capture exclusions apply to
 Qwen's Gemini-like tools (`write_file`, `read_file`, `run_shell_command`,
-`grep_search`, `glob`).
+`grep_search`, `glob`). User-prompt capture uses only Qwen's
+provenance-bearing `submitted_prompt`; automated continuation or retry content
+that appears only in `prompt` is not stored or interpreted as a reload request.
 
 The `SessionStart` hook delivers the prior session's handoff through
 `hookSpecificOutput.additionalContext`. With nothing to deliver, `SessionStart`
@@ -1642,7 +1644,9 @@ handoff; the baton stays open for `memory_handoff_accept`. Qwen fires a real
 
 `ai-memory setup` wires Qwen Code when `~/.qwen` exists.
 `ai-memory uninstall` removes the entries. Qwen reads `AGENTS.md` and
-`QWEN.md`. Managed `ai-memory run qwen` resume is not supported because Qwen
+`QWEN.md`; a Qwen-only `backup-agents` run preserves both files,
+`~/.qwen/settings.json`, `~/.qwen/skills`, and shared `~/.agents/skills`.
+Managed `ai-memory run qwen` resume is not supported because Qwen
 does not document a stable native transcript store. Start a new Qwen session
 after installing so it reloads `settings.json`. See [the Qwen Code MCP and
 hook details](mcp-install.md#qwen-code).

@@ -67,7 +67,7 @@ pub use json_repair::replace_lone_surrogate_escapes;
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
     USER_PROMPT_EXCERPT_MAX_BYTES, agent_from_payload, cap_lifecycle_body_for_client,
-    hook_payload_context, user_prompt_text,
+    hook_payload_context, user_prompt_text, user_prompt_text_for_agent,
 };
 pub use recap::RECAP_BUDGET_MIN;
 pub use router::{

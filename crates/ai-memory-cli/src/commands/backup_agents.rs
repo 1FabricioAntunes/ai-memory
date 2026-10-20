@@ -464,6 +464,20 @@ pub fn discover_assets(
                 ".qwen/skills",
                 "qwen/skills",
             )?;
+            // `~/.agents/skills` is shared with Codex. Attribute it to Codex
+            // when both are selected; a Qwen-only backup must still preserve
+            // the shared skills Qwen documents and loads.
+            if !filter_agent(AgentKind::Codex) {
+                collect_dir_assets(
+                    &mut assets,
+                    AgentKind::QwenCode,
+                    AgentAssetKind::Skill,
+                    AgentAssetScope::Global,
+                    &home.join(".agents").join("skills"),
+                    ".agents/skills",
+                    "qwen/skills/agents",
+                )?;
+            }
         }
         if want_project {
             push_if_file(
@@ -475,6 +489,19 @@ pub fn discover_assets(
                 "QWEN.md",
                 "project/QWEN.md",
             );
+            // Qwen also reads AGENTS.md. Codex owns the shared file in a
+            // combined backup so the archive remains one-to-one.
+            if !filter_agent(AgentKind::Codex) {
+                push_if_file(
+                    &mut assets,
+                    AgentKind::QwenCode,
+                    AgentAssetKind::Instruction,
+                    AgentAssetScope::Project,
+                    cwd.join("AGENTS.md"),
+                    "AGENTS.md",
+                    "project/qwen/AGENTS.md",
+                );
+            }
         }
     }
 

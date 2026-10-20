@@ -1191,7 +1191,7 @@ where
     }
     // Read before any capture rewrite can drop the prompt text.
     let reload_requested = hook_event == HookEvent::UserPrompt
-        && ai_memory_hooks::user_prompt_text(&json)
+        && ai_memory_hooks::user_prompt_text_for_agent(agent_kind, &json)
             .is_some_and(|prompt| ai_memory_core::compaction_recap::is_reload_request(&prompt));
     // Antigravity's PreInvocation fires before every model call; only
     // invocation zero, the start of a user turn, is a boundary.
@@ -9343,6 +9343,54 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         let seen = all_requests(&mut requests).await;
         assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn qwen_ignores_unsubmitted_prompt_for_reload_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let mut args = claude_args("user-prompt-submit", &base);
+        args.agent = "qwen-code".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            args,
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "cwd": tmp.path(),
+                "prompt": "reload context",
+                "submitted_prompt": "keep working"
+            }),
+        )
+        .await;
+        assert!(stdout.is_empty());
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn qwen_submitted_reload_prompt_fetches_a_recap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "RECAP-BODY").await;
+        let mut args = claude_args("user-prompt-submit", &base);
+        args.agent = "qwen-code".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            args,
+            serde_json::json!({
+                "session_id": "qwen-session",
+                "cwd": tmp.path(),
+                "prompt": "automated continuation",
+                "submitted_prompt": "reload context"
+            }),
+        )
+        .await;
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "RECAP-BODY"
+        );
+        let seen = all_requests(&mut requests).await;
+        assert_eq!(recap_requests(&seen).len(), 1, "{seen:?}");
     }
 
     #[tokio::test]

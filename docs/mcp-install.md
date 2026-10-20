@@ -940,10 +940,13 @@ The hook installer registers ten events: `SessionStart`, `UserPromptSubmit`,
 `matcher`, which Qwen treats as match-all. Each command receives Qwen's
 Claude-shaped JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`,
 `tool_use_id`) and enforces capture exclusions over Qwen's Gemini-like
-tools. A pending handoff is printed as `hookSpecificOutput.additionalContext`
-on `SessionStart`. Capture-only `SessionStart` and `UserPromptSubmit` events
-stay silent so `{}` is never injected into the model context. When the payload
-has no `cwd`, the hook uses `QWEN_PROJECT_DIR`.
+tools. For `UserPromptSubmit`, ai-memory captures only Qwen's optional
+`submitted_prompt`, which identifies an actual user submission; it does not
+fall back to the generic `prompt` field used by continuation and retry paths.
+A pending handoff is printed as `hookSpecificOutput.additionalContext` on
+`SessionStart`. Capture-only `SessionStart` and `UserPromptSubmit` events stay
+silent so `{}` is never injected into the model context. When the payload has
+no `cwd`, the hook uses `QWEN_PROJECT_DIR`.
 
 Qwen fires a real `SessionEnd`, so finished sessions close without
 `finalize-session`. There is no `ai-memory run qwen` adapter: Qwen does not
