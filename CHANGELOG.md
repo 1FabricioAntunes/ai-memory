@@ -25,6 +25,12 @@ version in [`docs/changelog/`](docs/changelog/):
   its location when `PI_CODING_AGENT_DIR` is set, and corrected OMP's
   setup-agent hint to name `ai-memory-omp.ts`.
   ([#1446](https://github.com/akitaonrails/ai-memory/pull/1446))
+- Launched the wrapper executable named by a `claude*` harness spelling
+  (`ai-memory run claude-glm`) when it is on the launch `PATH` and no
+  `--executable` is given, instead of silently starting plain `claude` on the
+  wrong account. When no such executable exists, `run` now prints a warning
+  and still starts `claude`. An explicit `--executable` still wins.
+  ([#1486](https://github.com/akitaonrails/ai-memory/pull/1486))
 - Routed OpenCode's `claude-haiku-5-5` through the Anthropic Messages API for
   both Go and Zen instead of the unsupported Chat Completions protocol.
   ([#1470](https://github.com/akitaonrails/ai-memory/issues/1470))
