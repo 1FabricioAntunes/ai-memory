@@ -3369,9 +3369,10 @@ pub struct InstallMcpArgs {
     /// in `[auth].bearer_token_file`.
     #[arg(skip)]
     pub stdio_bridge: bool,
-    /// The data dir a bridge entry passes as `--data-dir`, for a client that
-    /// starts its MCP servers with a cleared environment (Muse Code), where
-    /// the bridge could not otherwise find this install's config and token.
+    /// The data dir a bridge entry passes as `--data-dir`: always for a client
+    /// that starts its MCP servers with a cleared environment (Muse Code), and
+    /// for any other bridge entry when the install was given a data dir, so
+    /// the bridge reads the same config and token as the install's hooks.
     /// Set by the installer, never a flag.
     #[arg(skip)]
     pub bridge_data_dir: Option<std::path::PathBuf>,

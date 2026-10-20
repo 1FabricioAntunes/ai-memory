@@ -274,6 +274,17 @@ pub struct FallbackProfile {
 pub struct Config {
     /// Root data directory holding `wiki/`, `raw/`, `db/`, `models/`, `logs/`.
     pub data_dir: PathBuf,
+    /// Whether `--data-dir`, `AI_MEMORY_DATA_DIR` or the config file's
+    /// `data_dir` key chose [`Self::data_dir`], including an explicit value
+    /// equal to the platform default.
+    ///
+    /// Loader provenance, like [`Self::server_url_explicit`]. `install-mcp`
+    /// names the data dir in the bridge entries it writes only when it was
+    /// chosen, so a bridge installed against a non-default data dir reads the
+    /// same config and token as the hooks of that install, while a default
+    /// install keeps resolving its data dir when the bridge starts.
+    #[serde(skip)]
+    pub data_dir_explicit: bool,
     /// HTTP bind address used by `ai-memory serve`.
     pub bind: String,
     /// Idle-time (seconds) before the OS starts probing an accepted `serve`
@@ -1348,6 +1359,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
+            data_dir_explicit: false,
             bind: DEFAULT_BIND.into(),
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
@@ -2346,6 +2358,14 @@ impl Config {
         // so the #103 catch-all guard is not inert there.
         config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
+        // As with `server_url`, the file is asked for the key: a chosen dir
+        // equal to the default still counts as chosen.
+        config.data_dir_explicit = cli_data_dir.is_some()
+            || runtime_env.data_dir.is_some()
+            || (resolved_config_path.exists()
+                && Figment::from(Toml::file(&resolved_config_path))
+                    .find_value("data_dir")
+                    .is_ok());
         // CLI override always wins (figment doesn't see it because clap has
         // already parsed the flag into `cli_data_dir`).
         if let Some(dir) = cli_data_dir {
@@ -3797,6 +3817,39 @@ mod tests {
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert!(!cfg.server_url_derived_from_bind);
         assert!(cfg.server_url_configured());
+    }
+
+    /// `data_dir_explicit` records whether the flag, the environment or the
+    /// file chose the data dir, never whether it differs from the default.
+    #[test]
+    fn data_dir_explicit_tracks_who_chose_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let load = |config_path: &Path, cli: Option<PathBuf>, env: Option<PathBuf>| {
+            Config::load_with_runtime_env(
+                Some(config_path),
+                cli,
+                RuntimeEnv {
+                    data_dir: env,
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap()
+        };
+
+        assert!(!load(&config_path, None, None).data_dir_explicit);
+        assert!(load(&config_path, Some(tmp.path().to_path_buf()), None).data_dir_explicit);
+        assert!(load(&config_path, None, Some(tmp.path().to_path_buf())).data_dir_explicit);
+
+        // The file's key counts even when it names the default dir itself.
+        let from_file = tmp.path().join("from-file.toml");
+        std::fs::write(
+            &from_file,
+            format!("data_dir = {:?}\n", default_data_dir().to_string_lossy()),
+        )
+        .unwrap();
+        assert!(load(&from_file, None, None).data_dir_explicit);
     }
 
     /// A bind that maps onto the default URL (an unspecified address on the

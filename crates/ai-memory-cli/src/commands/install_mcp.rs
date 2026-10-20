@@ -123,18 +123,25 @@ pub(crate) fn run_with_opencode_dialect(
         auth_token,
         ..args
     };
-    // Muse starts stdio servers with a cleared environment (`HOME`, `PATH`
-    // and its own `MUSE_SESSION_ID`), so the bridge it launches finds this
-    // install's config and token only through an explicit `--data-dir`, as
-    // the Muse hooks do. Not from inside the Docker helper, whose data dir is
-    // a container path the host-side bridge cannot open.
-    if args.client == McpClient::Muse && config.runtime_env.host_cwd().is_none() {
-        args.bridge_data_dir = Some(config.data_dir.clone());
-    }
     if args.auth_token.is_none()
         && let Some(token_file) = token_file
     {
         route_file_token(&mut args, token_file)?;
+    }
+    // The bridge loads its config and token from a data dir the way any CLI
+    // call does. Muse starts stdio servers with a cleared environment (`HOME`,
+    // `PATH` and its own `MUSE_SESSION_ID`), so its bridge finds this install
+    // only through an explicit `--data-dir`, as the Muse hooks do. Any other
+    // bridge needs it when this install was given a data dir: the hooks name
+    // that dir, and a bridge without it would read the default one, with its
+    // own config and bearer. Not from inside the Docker helper, whose data dir
+    // is a container path the host-side bridge cannot open.
+    let runs_bridge =
+        (args.client == McpClient::ClaudeCode && args.session_aware) || args.stdio_bridge;
+    if config.runtime_env.host_cwd().is_none()
+        && (args.client == McpClient::Muse || (runs_bridge && config.data_dir_explicit))
+    {
+        args.bridge_data_dir = Some(config.data_dir.clone());
     }
     validate_args(&args)?;
     if args.apply {
@@ -249,12 +256,27 @@ fn is_bridge_command(command: &str) -> bool {
 /// to it verbatim and the client is the one that needs the dialect.
 fn session_less_bridge_args(args: &InstallMcpArgs) -> Vec<String> {
     let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
-    vec![
+    let mut argv = vec![
         "mcp-bridge".to_owned(),
         "--no-session-id".to_owned(),
         "--server-url".to_owned(),
         flavored_url_for(args, base_url),
-    ]
+    ];
+    argv.extend(bridge_data_dir_args(args));
+    argv
+}
+
+/// `--data-dir <dir>` for a bridge entry when [`InstallMcpArgs::bridge_data_dir`]
+/// is set, else nothing.
+fn bridge_data_dir_args(args: &InstallMcpArgs) -> Vec<String> {
+    args.bridge_data_dir
+        .as_ref()
+        .map_or_else(Vec::new, |data_dir| {
+            vec![
+                "--data-dir".to_owned(),
+                data_dir.to_string_lossy().into_owned(),
+            ]
+        })
 }
 
 /// The upstream URL of an ai-memory bridge entry: an ai-memory `command` with
@@ -1575,10 +1597,13 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             if args.session_aware {
                 entry.insert("type".into(), json!("stdio"));
                 entry.insert("command".into(), json!(bridge_command()));
-                entry.insert(
-                    "args".into(),
-                    json!(["mcp-bridge", "--server-url", base_url]),
-                );
+                let mut argv = vec![
+                    "mcp-bridge".to_owned(),
+                    "--server-url".to_owned(),
+                    base_url.to_owned(),
+                ];
+                argv.extend(bridge_data_dir_args(args));
+                entry.insert("args".into(), json!(argv));
                 if let Some(token) = &args.auth_token {
                     entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
                 }
@@ -1845,10 +1870,7 @@ fn build_mcp_entry_muse(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         json!("--server-url"),
         json!(base_url),
     ];
-    if let Some(data_dir) = &args.bridge_data_dir {
-        argv.push(json!("--data-dir"));
-        argv.push(json!(data_dir.to_string_lossy()));
-    }
+    argv.extend(bridge_data_dir_args(args).into_iter().map(|arg| json!(arg)));
     entry.insert("args".into(), serde_json::Value::Array(argv));
     if let Some(token) = &args.auth_token {
         entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
@@ -4294,6 +4316,62 @@ mod tests {
         let text = std::fs::read_to_string(&explicit).unwrap();
         assert!(text.contains("Bearer explicit-token"), "{text}");
         assert!(!text.contains(FILE_TOKEN), "{text}");
+    }
+
+    /// Every bridge entry names a data dir the install was given, as the
+    /// install's hooks do, so the bridge reads that install's config and
+    /// bearer rather than the default data dir's. Controls: a default install
+    /// keeps its entries unchanged (only Muse, which clears the environment,
+    /// names the dir regardless), and the Docker helper, whose data dir is a
+    /// container path, names it for no client.
+    #[test]
+    fn bridge_entries_name_a_data_dir_the_install_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("client-data");
+        let marker = data_dir.to_string_lossy().into_owned();
+        let installed = |config: &Config, label: &str| {
+            let mut bridges = 0;
+            for &client in <McpClient as clap::ValueEnum>::value_variants() {
+                if matches!(client, McpClient::Pi | McpClient::Dsh | McpClient::Zcode) {
+                    continue; // no config file, print-only, and HTTP-only
+                }
+                let ext = if matches!(client, McpClient::Codex | McpClient::Grok) {
+                    "toml"
+                } else {
+                    "json"
+                };
+                let file = tmp.path().join(format!("{label}-{client:?}.{ext}"));
+                apply_with(config, client, &file).unwrap_or_else(|e| panic!("{client:?}: {e:#}"));
+                let text = std::fs::read_to_string(&file).unwrap();
+                if text.contains("mcp-bridge") {
+                    bridges += 1;
+                }
+                let names_dir = text.contains("--data-dir") && text.contains(marker.as_str());
+                let expected = match label {
+                    "explicit" => text.contains("mcp-bridge"),
+                    "default" => client == McpClient::Muse,
+                    _ => false,
+                };
+                assert_eq!(names_dir, expected, "{label} {client:?}: {text}");
+            }
+            assert!(
+                bridges > 2,
+                "{label}: too few bridge entries to prove anything"
+            );
+        };
+
+        let mut explicit = file_token_config(&data_dir);
+        explicit.data_dir = data_dir.clone();
+        explicit.data_dir_explicit = true;
+        installed(&explicit, "explicit");
+
+        let mut default = explicit.clone();
+        default.data_dir_explicit = false;
+        installed(&default, "default");
+
+        let mut docker = explicit.clone();
+        docker.runtime_env = crate::config::RuntimeEnv::with_host_cwd_for_tests("/host/repo");
+        installed(&docker, "docker");
     }
 
     #[test]
