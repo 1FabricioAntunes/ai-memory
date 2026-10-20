@@ -118,7 +118,18 @@ function Install-AiMemory {
             # An empty or leftover directory with no binary: replace it.
             Remove-Item -LiteralPath $dest -Recurse -Force
         }
-        Move-Item -LiteralPath $staged -Destination $dest
+        # Copy, not move (#1480): an antivirus scan of the binary that just ran
+        # can still hold it open, and Windows refuses to rename or delete a file
+        # in use, which Move-Item needs. Reading it is allowed, and the staged
+        # copy is then removed below on a best-effort basis.
+        try {
+            Copy-Item -LiteralPath $staged -Destination $dest -Recurse
+        } catch {
+            # A partial copy holding ai-memory.exe would pass for an install on
+            # the next run.
+            Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+            throw
+        }
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }

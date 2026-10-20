@@ -425,6 +425,10 @@ fn apply_after_run_action(
         AfterRunAction::Rerun => run_harness_choice(outcome.harness),
     };
     args.harness = Some(choice);
+    // A switch leaves the account the typed wrapper named; a rerun stays on it.
+    if action != AfterRunAction::Rerun {
+        args.claude_wrapper = None;
+    }
     args.native_args =
         if action == AfterRunAction::Rerun && outcome.harness == ManagedHarness::KiroV3 {
             vec![OsString::from("--v3")]
@@ -508,6 +512,12 @@ async fn run_once_with_wiring(
             "--executable requires an explicit harness; try `ai-memory run --executable <path> codex`"
         ));
     }
+    default_claude_wrapper(
+        &mut executable,
+        requested_harness,
+        args.claude_wrapper.as_deref(),
+        executable_search,
+    );
     let resolved_opencode =
         resolve_opencode_for_launch(requested_harness, executable.as_deref(), &child_env)?;
     if matches!(requested_harness, Some(RunHarnessChoice::OpenCode))
@@ -3381,6 +3391,42 @@ fn store_mismatch_error(
     ))
 }
 
+/// Points an unset `--executable` at the typed `claude*` wrapper, warning on
+/// stderr when none is installed. An explicit `--executable` is never touched.
+fn default_claude_wrapper(
+    executable: &mut Option<OsString>,
+    requested: Option<RunHarnessChoice>,
+    spelling: Option<&str>,
+    search: ExecutableSearch<'_>,
+) {
+    if executable.is_some() || requested != Some(RunHarnessChoice::Claude) {
+        return;
+    }
+    let Some(spelling) = spelling else { return };
+    match claude_wrapper_executable(spelling, search) {
+        Ok(wrapper) => *executable = Some(wrapper),
+        Err(warning) => eprintln!("{warning}"),
+    }
+}
+
+/// The executable a `claude*` harness spelling selects when `--executable` is
+/// absent: the exact spelling when it resolves on the launch `PATH`, else a
+/// warning that plain `claude` runs instead, so a mistyped or missing wrapper
+/// cannot silently start the wrong account.
+fn claude_wrapper_executable(
+    spelling: &str,
+    search: ExecutableSearch<'_>,
+) -> std::result::Result<OsString, String> {
+    let bare_name = !spelling.contains(['/', '\\']);
+    if bare_name && executable_available(OsStr::new(spelling), search) {
+        return Ok(OsString::from(spelling));
+    }
+    Err(format!(
+        "ai-memory: no `{spelling}` executable found on PATH; running plain `claude`. \
+         To use a wrapper, put it on PATH or pass `--executable <path>`"
+    ))
+}
+
 fn ensure_executable_available(
     harness: ManagedHarness,
     executable: Option<&OsStr>,
@@ -3496,7 +3542,14 @@ fn resolve_candidate(
         extensions
             .split(';')
             .filter(|extension| !extension.is_empty())
-            .map(|extension| path.with_extension(extension.trim_start_matches('.')))
+            .map(|extension| {
+                // PATHEXT is appended to the full command name, including any
+                // dots in a wrapper name such as `agent.tool.cmd`.
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(".");
+                candidate.push(extension.trim_start_matches('.'));
+                PathBuf::from(candidate)
+            })
             .find(|candidate| executable_file(candidate))
     }
     #[cfg(not(windows))]
@@ -5114,6 +5167,7 @@ mod tests {
             env: vec![("MODEL_HOME".into(), "custom".into())],
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--model"), OsString::from("opus")],
         }
     }
@@ -5397,6 +5451,124 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn path_with_fake_executables(names: &[&str]) -> (tempfile::TempDir, EffectiveChildEnv) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in names {
+            let path = bin.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = EffectiveChildEnv::for_tests([("PATH", bin.as_os_str())]);
+        (temp, env)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_spelling_defaults_the_executable_to_the_matching_wrapper() {
+        let (_temp, env) = path_with_fake_executables(&["claude", "claude-glm"]);
+        let mut executable = None;
+        default_claude_wrapper(
+            &mut executable,
+            Some(RunHarnessChoice::Claude),
+            Some("claude-glm"),
+            env.executable_search(),
+        );
+        assert_eq!(executable, Some(OsString::from("claude-glm")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_spelling_without_a_wrapper_warns_and_keeps_plain_claude() {
+        let (_temp, env) = path_with_fake_executables(&["claude"]);
+        let search = env.executable_search();
+        let warning = claude_wrapper_executable("claude-glm", search).unwrap_err();
+        assert!(warning.contains("`claude-glm`"), "{warning}");
+        assert!(warning.contains("plain `claude`"), "{warning}");
+        assert!(warning.contains("--executable"), "{warning}");
+
+        let mut executable = None;
+        default_claude_wrapper(
+            &mut executable,
+            Some(RunHarnessChoice::Claude),
+            Some("claude-glm"),
+            search,
+        );
+        assert_eq!(executable, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_executable_beats_the_claude_spelling() {
+        let (_temp, env) = path_with_fake_executables(&["claude-glm", "claude-other"]);
+        let mut executable = Some(OsString::from("claude-other"));
+        default_claude_wrapper(
+            &mut executable,
+            Some(RunHarnessChoice::Claude),
+            Some("claude-glm"),
+            env.executable_search(),
+        );
+        assert_eq!(executable, Some(OsString::from("claude-other")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_wrapper_lookup_accepts_bare_names_only() {
+        let (_temp, env) = path_with_fake_executables(&["claude-glm"]);
+        let search = env.executable_search();
+        assert!(claude_wrapper_executable("claude-glm", search).is_ok());
+        assert!(claude_wrapper_executable("claude-glm2", search).is_err());
+        // A path-like spelling is never resolved relative to anything.
+        assert!(claude_wrapper_executable("./claude-glm", search).is_err());
+        assert!(claude_wrapper_executable("../bin/claude-glm", search).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_harnesses_and_bare_claude_never_get_a_wrapper() {
+        let (_temp, env) = path_with_fake_executables(&["claude-glm", "codex"]);
+        let search = env.executable_search();
+        for (requested, spelling) in [
+            (Some(RunHarnessChoice::Codex), Some("claude-glm")),
+            (Some(RunHarnessChoice::Claude), None),
+            (None, Some("claude-glm")),
+        ] {
+            let mut executable = None;
+            default_claude_wrapper(&mut executable, requested, spelling, search);
+            assert_eq!(executable, None, "{requested:?} {spelling:?}");
+        }
+    }
+
+    #[test]
+    fn switching_harness_drops_the_claude_wrapper_but_rerun_keeps_it() {
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "ws".into(),
+            degraded: false,
+        };
+        let mut args = run_args_for_after_run_test();
+        args.claude_wrapper = Some("claude-glm".into());
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Rerun
+        ));
+        assert_eq!(args.claude_wrapper.as_deref(), Some("claude-glm"));
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Switch(RunHarnessChoice::Codex)
+        ));
+        assert_eq!(args.claude_wrapper, None);
+    }
+
     #[test]
     fn resolved_run_env_overlays_windows_keys_case_insensitively() {
         let mut entries = vec![("Path".to_string(), "C:\\base".to_string())];
@@ -5506,6 +5678,54 @@ mod tests {
             .status()
             .expect("the resolved wrapper starts");
         assert!(status.success(), "the resolved wrapper exits successfully");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dotted_harness_name_launches_its_own_pathext_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(
+            dir.join("agent.tool.cmd"),
+            "@echo off\r\necho intended-harness\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("agent.cmd"), "@echo off\r\necho wrong-harness\r\n").unwrap();
+        let native = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "agent.tool"])
+            .env("PATH", dir)
+            .env("PATHEXT", ".EXE;.CMD")
+            .current_dir(dir)
+            .output()
+            .expect("native cmd lookup launches");
+        assert!(
+            native.status.success(),
+            "native cmd lookup must accept dotted basename: {:?}",
+            native
+        );
+        let native_stdout = String::from_utf8(native.stdout).unwrap();
+        assert_eq!(
+            native_stdout.trim(),
+            "intended-harness",
+            "independent Windows lookup appends PATHEXT to dotted basename"
+        );
+        println!("NATIVE_WINDOWS_CONTROL={}", native_stdout.trim());
+        let search = ExecutableSearch {
+            path: Some(dir.as_os_str()),
+            extensions: Some(OsStr::new(".EXE;.CMD")),
+        };
+        let path =
+            resolve_program(OsStr::new("agent.tool"), search).expect("dotted harness resolves");
+        let output = std::process::Command::new(path)
+            .output()
+            .expect("resolved harness launches");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            stdout.trim(),
+            "intended-harness",
+            "PATHEXT must preserve the complete dotted harness name"
+        );
     }
 
     /// Unix has no PATHEXT: the file itself is the answer.
@@ -6868,6 +7088,7 @@ mod tests {
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: Vec::new(),
         };
 
@@ -7214,6 +7435,7 @@ mod tests {
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--version")],
         };
 
@@ -7320,6 +7542,7 @@ mod tests {
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: Vec::new(),
         };
         (temp, config, args)
@@ -7816,6 +8039,7 @@ mod tests {
             )],
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: Vec::new(),
         };
 
@@ -8573,6 +8797,7 @@ mod tests {
             ],
             env_file: None,
             harness: Some(RunHarnessChoice::OpenCode),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--help")],
         };
 
@@ -8699,6 +8924,7 @@ mod tests {
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
+            claude_wrapper: None,
             native_args: vec![OsString::from("--version")],
         };
 
@@ -8983,6 +9209,7 @@ mod tests {
             env,
             env_file: None,
             harness: Some(harness),
+            claude_wrapper: None,
             native_args: native_args.iter().map(OsString::from).collect(),
         }
     }

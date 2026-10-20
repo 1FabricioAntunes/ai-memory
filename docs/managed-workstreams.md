@@ -75,21 +75,26 @@ ai-memory run --profile work omp --profile omp-work
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
 and always selects the Claude harness. The exact spelling never changes
 the agent kind, session store, or transcript import.
-Combine that wildcard with `--executable` to launch the right account's
-binary while keeping each account's managed workstream distinguishable in
-your shell history:
+A `claude*` name other than plain `claude` and `claude-code` also picks the
+binary: when no `--executable` is given and an executable with exactly that
+name is on the launch `PATH` (including a `PATH` set with `--env`), `run`
+launches it. Per-account wrapper scripts therefore work without repeating
+yourself:
 
 ```bash
 # ~/bin/claude-corp and ~/bin/claude-personal are wrapper scripts (earlier on
 # PATH than the bare `claude`) that each exec the real claude binary with
 # that account's config/credentials directory.
-ai-memory run claude-corp --executable claude-corp --model opus
-ai-memory run claude-personal --executable claude-personal
+ai-memory run claude-corp --model opus
+ai-memory run claude-personal
 ```
 
-Only the `--executable` value matters for which binary actually runs; the
-positional name is free-form as long as it starts with `claude`, so pick
-whatever reads clearly to you.
+If no executable with that name exists, `run` prints a warning on stderr and
+starts plain `claude`, so a mistyped or missing wrapper cannot silently put you
+on the wrong account. An explicit `--executable` always wins, and `claude` and
+`claude-code` always mean the plain `claude` binary. The name must be a bare
+command name found through `PATH` (a shell alias or function is invisible
+here); to use a binary elsewhere, pass `--executable <path>`.
 
 ```bash
 cd /path/to/project

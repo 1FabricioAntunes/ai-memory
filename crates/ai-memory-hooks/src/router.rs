@@ -18446,6 +18446,35 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn render_session_brief_omits_a2_footer_from_crlf_excerpts() {
+        let body = format!(
+            "Writes go through one actor.\n\n## Retained facts\n\n- `WriterHandle`\n\n_Extractively compacted from a cold episodic page (A2 tier-down). The full pre-compaction body is retained in git history._\n\n{}",
+            "Later material. ".repeat(BRIEF_BUDGET_MAX / 10)
+        );
+        for body in [
+            body.clone(),
+            body.replace('\n', "\r\n"),
+            body.replace("\n\n", "\n\r\n"),
+        ] {
+            let core = vec![brief_core_page(
+                "_rules/compacted.md",
+                &body,
+                true,
+                serde_json::json!({"compacted": true}),
+            )];
+            let out = render_session_brief(&core, &[], BRIEF_BUDGET_DEFAULT).unwrap();
+            assert!(
+                out.contains("`WriterHandle`"),
+                "retained facts stay in the excerpt: {out}"
+            );
+            assert!(
+                !out.contains("Extractively compacted"),
+                "SessionStart must not spend its excerpt budget on the A2 footer: {out}"
+            );
+        }
+    }
+
     /// #1360: a frontmatter excerpt longer than the body it describes no
     /// longer stands in for that body. The body costs less, so it shows
     /// whole, pinned or not. A page with no body keeps its excerpt rather

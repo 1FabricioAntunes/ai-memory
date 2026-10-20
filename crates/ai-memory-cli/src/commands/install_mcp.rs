@@ -2548,7 +2548,9 @@ fn pi_mcp_render_guidance(args: &InstallMcpArgs) -> String {
          # Install ai-memory's generated Pi extension instead; it includes\n\
          # lifecycle capture and an HTTP MCP bridge that registers tools in Pi.\n\
          ai-memory install-hooks --agent pi --apply --server-url {}{}\n\
-         # Restart Pi after installing ~/.pi/agent/extensions/ai-memory.ts.\n",
+         # The extension is installed at ~/.pi/agent/extensions/ai-memory-pi.ts by default.\n\
+         # If PI_CODING_AGENT_DIR is set, it is at $PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts instead.\n\
+         # Restart Pi after installing the extension.\n",
         hook_server_url_from_mcp_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL)),
         if args.auth_token.is_some() {
             " --auth-token <token>"
@@ -4786,7 +4788,9 @@ mod tests {
         let pi = render_pi(&args_for(McpClient::Pi)).unwrap();
         assert!(pi.contains("Pi has no native mcp.json"));
         assert!(pi.contains("install-hooks --agent pi --apply"));
-        assert!(pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
+        assert!(pi.contains("~/.pi/agent/extensions/ai-memory-pi.ts"));
+        assert!(pi.contains("$PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts"));
+        assert!(!pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
         assert!(!pi.contains("~/.omp"));
         assert!(render_for_test(McpClient::AntigravityCli).contains("\"serverUrl\""));
         // The snippet must point at the documented global config, not the
