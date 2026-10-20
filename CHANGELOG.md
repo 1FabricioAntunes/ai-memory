@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Preserved dotted Windows harness names when resolving PATHEXT wrappers, so a
+  command such as `agent.tool` launches `agent.tool.cmd` rather than `agent.cmd`.
+  ([#343](https://github.com/akitaonrails/ai-memory/pull/343))
 - Routed OpenCode's `claude-haiku-5-5` through the Anthropic Messages API for
   both Go and Zen instead of the unsupported Chat Completions protocol.
   ([#1470](https://github.com/akitaonrails/ai-memory/issues/1470))
