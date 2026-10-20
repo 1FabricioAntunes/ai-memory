@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.1.2] - 2026-10-20
+
 ### Fixed
 - Reported appended and removed lines in wiki sync conflict summaries, with
   an explicit end-of-file marker instead of line 0 and matching previews.
@@ -1522,7 +1524,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.2...HEAD
+[3.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.2
 [3.1.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.1
 [3.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.0
 [3.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.0.1
