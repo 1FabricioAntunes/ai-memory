@@ -218,6 +218,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `as_of` that is not an ISO-8601 instant, instead of misreporting them as
   internal server errors.
   ([#1468](https://github.com/akitaonrails/ai-memory/issues/1468))
+- Invoked Gemini CLI's native Windows lifecycle commands with PowerShell's
+  call operator. Gemini CLI 0.23.0 and later run hook commands through
+  PowerShell, where the quoted `ai-memory.exe` path failed to parse, so every
+  hook exited with an error and the session captured nothing.
+  ([#1484](https://github.com/akitaonrails/ai-memory/issues/1484))
 
 ## [3.1.1] - 2026-10-17
 
