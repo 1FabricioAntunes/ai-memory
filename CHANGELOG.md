@@ -218,6 +218,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `as_of` that is not an ISO-8601 instant, instead of misreporting them as
   internal server errors.
   ([#1468](https://github.com/akitaonrails/ai-memory/issues/1468))
+- Built the web UI's templates without askama's `config` feature, which only
+  reads an `askama.toml` that ai-memory does not have. The unmaintained
+  `basic-toml` (RUSTSEC-2026-0374) is no longer a dependency, and templates
+  render as before. ([#1482](https://github.com/akitaonrails/ai-memory/issues/1482))
 
 ## [3.1.1] - 2026-10-17
 
