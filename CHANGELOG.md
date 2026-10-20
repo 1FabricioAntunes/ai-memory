@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Reported appended and removed lines in wiki sync conflict summaries, with
+  an explicit end-of-file marker instead of line 0 and matching previews.
+  ([#1477](https://github.com/akitaonrails/ai-memory/issues/1477))
 - Routed OpenCode's `claude-haiku-5-5` through the Anthropic Messages API for
   both Go and Zen instead of the unsupported Chat Completions protocol.
   ([#1470](https://github.com/akitaonrails/ai-memory/issues/1470))

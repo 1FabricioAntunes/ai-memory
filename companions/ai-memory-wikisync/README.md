@@ -112,7 +112,9 @@ This section describes `plan` and `export`; `sync` adds the rules under
   are replaced atomically (tmp + rename + fsync).
 - **Local edits win until forced.** Each page is compared three ways:
   destination file, last exported state, server body. A file that
-  diverged from both is reported with a diff summary and refused; the
+  diverged from both is reported with a diff summary and refused. The summary
+  identifies the first differing line, including appended or removed lines;
+  a missing line is shown as `<end of file>`. The
   whole batch is then refused and nothing is written. `--force` overwrites the
   divergent files with server content.
 - **Never deletes.** `plan` and `export` never delete local files or server
