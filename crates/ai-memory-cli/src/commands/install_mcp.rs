@@ -156,6 +156,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::Cursor => render_cursor(&args)?,
         McpClient::ClaudeDesktop => render_claude_desktop(&args)?,
         McpClient::GeminiCli => render_gemini_cli(&args)?,
+        McpClient::QwenCode => render_qwen_code(&args)?,
         McpClient::Openclaw => render_openclaw(&args)?,
         McpClient::Pi => render_pi(&args)?,
         McpClient::Omp => render_omp(&args)?,
@@ -413,7 +414,7 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
         | McpClient::Openclaw
         | McpClient::IbmBob
         | McpClient::Cline => plain(),
-        McpClient::GeminiCli | McpClient::AntigravityCli => json!({
+        McpClient::GeminiCli | McpClient::AntigravityCli | McpClient::QwenCode => json!({
             "command": command,
             "args": bridge,
             "timeout": GEMINI_MCP_TIMEOUT_MS,
@@ -655,6 +656,7 @@ pub(crate) fn mcp_config_path_with(
             }
         }
         McpClient::GeminiCli => home()?.join(".gemini").join("settings.json"),
+        McpClient::QwenCode => home()?.join(".qwen").join("settings.json"),
         McpClient::Openclaw => home()?.join(".openclaw").join("config.json"),
         McpClient::Pi => bail!(
             "Pi has no native mcp.json; use `ai-memory install-hooks --agent pi --apply` to install the generated MCP bridge extension."
@@ -1134,6 +1136,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::ClaudeDesktop
         | McpClient::Cursor
         | McpClient::GeminiCli
+        | McpClient::QwenCode
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
@@ -1678,7 +1681,10 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
         }
-        McpClient::GeminiCli => {
+        McpClient::GeminiCli | McpClient::QwenCode => {
+            // Qwen Code uses the same `httpUrl` field as Gemini CLI for
+            // streamable HTTP; the plain `url` key is legacy SSE
+            // (<https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/>).
             entry.insert("httpUrl".into(), json!(server_url));
             entry.insert("timeout".into(), json!(GEMINI_MCP_TIMEOUT_MS));
             if let Some(b) = &bearer {
@@ -2312,6 +2318,19 @@ fn render_gemini_cli(args: &InstallMcpArgs) -> Result<String> {
          #\n\
          # Gemini CLI uses `httpUrl` (not `url`) for streamable-HTTP\n\
          # endpoints. The `timeout` is in milliseconds.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_qwen_code(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Qwen Code — merge into ~/.qwen/settings.json:\n\
+         #\n\
+         # Qwen Code uses `httpUrl` (not `url`) for streamable-HTTP\n\
+         # endpoints; `url` is the legacy SSE transport. The `timeout` is\n\
+         # in milliseconds. Pair with `ai-memory install-hooks --agent\n\
+         # qwen-code --apply` for lifecycle capture.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
@@ -2974,6 +2993,69 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn qwen_code_entry_uses_documented_http_url_shape() {
+        assert_eq!(
+            build_json_mcp_entry(&args_with_token(McpClient::QwenCode)).unwrap(),
+            json!({
+                "httpUrl": "http://127.0.0.1:49374/mcp",
+                "timeout": 5000,
+                "headers": {"Authorization": "Bearer test-token-deadbeef"},
+            })
+        );
+        assert_eq!(
+            build_json_mcp_entry(&args_for(McpClient::QwenCode)).unwrap(),
+            json!({
+                "httpUrl": "http://127.0.0.1:49374/mcp",
+                "timeout": 5000,
+            })
+        );
+        let path = mcp_config_path_with(McpClient::QwenCode, &|_| None).unwrap();
+        assert!(
+            path.ends_with(Path::new(".qwen/settings.json")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn qwen_code_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("settings.json");
+        fs::write(
+            &file,
+            json!({
+                "mcpServers": {"other": {"command": "other"}},
+                "hooks": {"PreToolUse": []},
+                "keep": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::QwenCode);
+        args.config_file = Some(file.clone());
+        args.server_url = Some("https://memory.example/mcp".into());
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(first, fs::read_to_string(&file).unwrap());
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["keep"], true);
+        assert_eq!(root["hooks"]["PreToolUse"], json!([]));
+        assert_eq!(root["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            root["mcpServers"]["ai-memory"],
+            json!({
+                "httpUrl": "https://memory.example/mcp",
+                "timeout": 5000,
+            })
+        );
+        assert_eq!(
+            existing_entry_endpoint(McpClient::QwenCode, &file, "ai-memory").unwrap(),
+            Some("https://memory.example/mcp".into())
+        );
     }
 
     #[test]
@@ -4290,6 +4372,7 @@ mod tests {
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
+            McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -4332,6 +4415,7 @@ mod tests {
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
+            McpClient::QwenCode,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4378,6 +4462,7 @@ mod tests {
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
+            McpClient::QwenCode,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4421,6 +4506,7 @@ mod tests {
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
+            McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -4758,6 +4844,7 @@ mod tests {
     fn client_specific_shape_keys() {
         assert!(render_for_test(McpClient::Cursor).contains("\"url\""));
         assert!(render_for_test(McpClient::GeminiCli).contains("\"httpUrl\""));
+        assert!(render_for_test(McpClient::QwenCode).contains("\"httpUrl\""));
         assert!(render_for_test(McpClient::ClaudeDesktop).contains("mcp-remote"));
         assert!(render_for_test(McpClient::Openclaw).contains("\"streamable-http\""));
         assert!(render_for_test(McpClient::Codex).contains("[mcp_servers.ai-memory]"));

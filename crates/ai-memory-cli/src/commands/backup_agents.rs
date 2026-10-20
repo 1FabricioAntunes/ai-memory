@@ -442,6 +442,42 @@ pub fn discover_assets(
         }
     }
 
+    // 4b. Qwen Code
+    if filter_agent(AgentKind::QwenCode) {
+        let qwen_dir = home.join(".qwen");
+        if want_global {
+            push_if_file(
+                &mut assets,
+                AgentKind::QwenCode,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                qwen_dir.join("settings.json"),
+                ".qwen/settings.json",
+                "qwen/settings.json",
+            );
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::QwenCode,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &qwen_dir.join("skills"),
+                ".qwen/skills",
+                "qwen/skills",
+            )?;
+        }
+        if want_project {
+            push_if_file(
+                &mut assets,
+                AgentKind::QwenCode,
+                AgentAssetKind::Instruction,
+                AgentAssetScope::Project,
+                cwd.join("QWEN.md"),
+                "QWEN.md",
+                "project/QWEN.md",
+            );
+        }
+    }
+
     // 4. Cursor
     if filter_agent(AgentKind::Cursor) {
         if want_global {

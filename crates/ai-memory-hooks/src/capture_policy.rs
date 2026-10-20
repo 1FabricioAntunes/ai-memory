@@ -205,7 +205,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::Muse
         | AgentKind::CodeBuddy
         | AgentKind::IbmBob
-        | AgentKind::Dsh => (
+        | AgentKind::Dsh
+        | AgentKind::QwenCode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -295,6 +296,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CodeBuddy
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
+                            | AgentKind::QwenCode
                     ) {
                         "tool_input"
                     } else {
@@ -351,7 +353,7 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Meta Muse Code's `PostToolUseFailure` has the same `error` string
         // (captured offline on Muse Code 1.4.7); its `PostToolUse` proves no
         // outcome.
-        AgentKind::Zcode | AgentKind::Muse
+        AgentKind::Zcode | AgentKind::Muse | AgentKind::QwenCode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -1135,6 +1137,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Codex
         | AgentKind::Cursor
         | AgentKind::GeminiCli
+        | AgentKind::QwenCode
         | AgentKind::Devin
         | AgentKind::Hermes
         | AgentKind::KiroCli
@@ -4656,6 +4659,7 @@ mod tests {
             AgentKind::Droid,
             AgentKind::Muse,
             AgentKind::CodeBuddy,
+            AgentKind::QwenCode,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -5664,6 +5668,29 @@ mod tests {
     }
 
     #[test]
+    fn qwen_code_tool_metadata_uses_documented_claude_shaped_fields() {
+        let pre = json!({
+            "tool_name": "write_file",
+            "tool_input": {"file_path": "src/lib.rs", "content": "x"},
+            "tool_use_id": "toolu_qwen",
+        });
+        let metadata = tool_observation_metadata(AgentKind::QwenCode, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("toolu_qwen"));
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::QwenCode,
+                &json!({"tool_name": "write_file", "error": "disk full"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::QwenCode, &json!({"tool_name": "write_file"})),
+            ToolOutcome::Unknown
+        );
+    }
+
+    #[test]
     fn command_code_official_tool_shape_is_closed_and_honors_exclusions() {
         let policy = CapturePolicy::resolve(
             CaptureSource::Parsed(&CaptureConfig {
@@ -6593,6 +6620,10 @@ mod tests {
             for (agent, raw) in [
                 (
                     AgentKind::GeminiCli,
+                    json!({"tool_name": "read_many_files", "tool_input": {"include": include}}),
+                ),
+                (
+                    AgentKind::QwenCode,
                     json!({"tool_name": "read_many_files", "tool_input": {"include": include}}),
                 ),
                 (

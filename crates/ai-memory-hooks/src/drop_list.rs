@@ -350,6 +350,19 @@ mod tests {
             serde_json::json!({ "session_id": "s", "tool_name": "Read", "tool_use_id": "toolu_4" }),
         );
         assert!(!list.matches(&codebuddy_kept));
+        // Qwen Code sends the same Claude-shaped `tool_name` / `tool_use_id`.
+        let qwen = agent_event(
+            "qwen-code",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "write_file", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-5" }),
+        );
+        assert!(list.matches(&qwen));
+        let qwen_kept = agent_event(
+            "qwen-code",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "write_file", "tool_use_id": "toolu_5" }),
+        );
+        assert!(!list.matches(&qwen_kept));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",

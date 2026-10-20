@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added first-party Qwen Code lifecycle and MCP support. `install-mcp --client
+  qwen-code` (aliases `qwen`, `qwencode`) writes a Streamable HTTP `httpUrl`
+  entry into `~/.qwen/settings.json`; a token-file install gets a stdio
+  `mcp-bridge` instead of embedding the bearer. `install-hooks --agent
+  qwen-code` merges ten Claude-shaped events (including `PostToolUseFailure`
+  and subagent start/stop) as native `ai-memory hook` commands with no script
+  bundle. `SessionStart` injects the prior handoff as
+  `hookSpecificOutput.additionalContext`; Qwen's own `SessionEnd` closes the
+  session. Capture exclusions cover Qwen's Gemini-like tools. `setup` detects
+  `~/.qwen`. There is no `ai-memory run qwen` adapter.
 - Added zero-LLM substring retrieval for unspaced Han, Kana, and Hangul text.
   Pages and observations gain transactionally maintained derived unigram/bigram
   FTS indexes; existing unicode61 search and ranking remain unchanged for

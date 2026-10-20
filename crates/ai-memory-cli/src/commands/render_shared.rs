@@ -204,6 +204,31 @@ pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Qwen Code lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.qwen/settings.json, native hook-event script stem)`;
+/// Qwen has no script bundle, so the `.sh` name only carries the event
+/// token the native command is rendered with.
+///
+/// Qwen Code's hook vocabulary is Claude Code's plus `PostToolUseFailure`
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+/// `PostToolUseFailure` fires instead of `PostToolUse` when a tool throws
+/// and is aliased to `post-tool-use`. Subagent events are included: Qwen
+/// documents `SubagentStart`/`SubagentStop` for user-spawned agents
+/// (`Bash`, `Explorer`, `Plan`). Qwen fires a real `SessionEnd`, so no
+/// `finalize-session` step is needed.
+pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
 /// Seconds Muse waits for one ai-memory hook. Muse reads `timeout` in
 /// seconds, like the Claude Code plugins it loads. The capture POST is
 /// fire-and-forget; `SessionStart` also fetches a handoff.
@@ -1338,6 +1363,35 @@ pub(crate) fn build_ibm_bob_hooks_payload(
         HookCommandContext::new(
             HookCommandPlatform::native(),
             "ibm-bob",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Qwen Code's `~/.qwen/settings.json`. The
+/// `hooks` key holds Claude Code's nested shape (`"Event": [{"matcher": "",
+/// "hooks": [{"type": "command", "command": …}]}]`). Qwen runs each
+/// `command` with the Claude Code-shaped event JSON on stdin
+/// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>),
+/// so every entry invokes the native `ai-memory hook` command; there is no
+/// script bundle. An empty matcher fires on every tool and every
+/// SessionStart source.
+pub(crate) fn build_qwen_code_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &QWEN_CODE_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "qwen-code",
             data_dir,
             project_strategy,
         ),
@@ -4601,6 +4655,35 @@ if (inheritOnly) {
             assert!(definition.get("matcher").is_none(), "event: {event}");
             let command = definition["hooks"][0]["command"].as_str().unwrap();
             assert!(command.contains("--agent command-code"), "{command}");
+        }
+    }
+
+    #[test]
+    fn qwen_code_profile_uses_nested_native_commands() {
+        let value = build_qwen_code_hooks_payload(
+            "http://memory:49374",
+            None,
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 10);
+        for (event, script) in QWEN_CODE_EVENTS {
+            let definition = &value["hooks"][event][0];
+            assert_eq!(definition["matcher"], "", "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            let event_name = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!("hook --event {event_name} --agent qwen-code")),
+                "{event}: {command}"
+            );
+            let expected_strategy = if cfg!(windows) {
+                r#"--project-strategy "repo-root""#
+            } else {
+                "--project-strategy repo-root"
+            };
+            assert!(command.contains(expected_strategy), "{command}");
+            assert!(!command.contains(".sh"), "{command}");
         }
     }
 

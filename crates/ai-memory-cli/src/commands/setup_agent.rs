@@ -141,6 +141,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
             "Cline discovers generated hook files in the host user's hook directory; run `ai-memory install-hooks --agent cline --apply` on that host"
         );
     }
+    // Qwen Code too: ~/.qwen/settings.json runs the native `hook` command.
+    if matches!(args.agent, AgentChoice::QwenCode) {
+        emit_qwen_code(&args)?;
+        return Ok(());
+    }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
         bail!("internal: generated integration should have returned before staging hooks")
     };
@@ -242,7 +247,8 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Muse
         | AgentChoice::CodeBuddy
         | AgentChoice::IbmBob
-        | AgentChoice::Cline => {
+        | AgentChoice::Cline
+        | AgentChoice::QwenCode => {
             bail!(
                 "internal: generated integration should have returned before emitting staged hooks"
             )
@@ -438,6 +444,29 @@ fn emit_ibm_bob(args: &SetupAgentArgs) -> Result<()> {
     println!("# ~/.bob/settings/settings.json. The `command` must be an ai-memory");
     println!("# binary reachable on the host that runs Bob; prefer");
     println!("# `ai-memory install-hooks --agent ibm-bob --apply` from that host.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print the `hooks` block for `~/.qwen/settings.json`. No scripts are
+/// staged: each entry runs the native `hook` command.
+fn emit_qwen_code(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_qwen_code_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing Qwen Code hook config")?;
+    println!("# Qwen Code — merge under the `hooks` key of");
+    println!("# ~/.qwen/settings.json. The `command` must be an ai-memory");
+    println!("# binary reachable on the host that runs Qwen Code; prefer");
+    println!("# `ai-memory install-hooks --agent qwen-code --apply` from that host.");
     if args.auth_token.is_some() {
         println!("#       Treat settings.json as sensitive (chmod 600).");
     }

@@ -459,6 +459,15 @@ pub(crate) fn ibm_bob_settings_path() -> anyhow::Result<std::path::PathBuf> {
         .join("settings.json"))
 }
 
+/// `~/.qwen/settings.json` — Qwen Code's user settings. MCP servers and
+/// lifecycle hooks share this file (`mcpServers` and `hooks`).
+pub(crate) fn qwen_code_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.qwen/settings.json")?
+        .join(".qwen")
+        .join("settings.json"))
+}
+
 /// `~/.config/zero/hooks.json` — Zero's user-level lifecycle hook config
 /// (issue #156). Zero resolves it under `$XDG_CONFIG_HOME` falling back to
 /// `~/.config`; like the OpenCode plugin path below we target the default
@@ -1028,6 +1037,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::Cline => {
                 apply_to_cline_hooks(&server_url, auth, &config.data_dir, &args, &capture_mode)
             }
+            AgentChoice::QwenCode => {
+                let path = match &args.config_file {
+                    Some(path) => path.clone(),
+                    None => qwen_code_settings_path()?,
+                };
+                apply_to_qwen_code_settings(&path, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -1204,6 +1220,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             &args,
             &preview_capture_mode,
         ),
+        AgentChoice::QwenCode => render_qwen_code(&server_url, auth, &config.data_dir, strategy),
     }
 }
 
@@ -1407,6 +1424,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             // Cline hook files are generated independently and carry no
             // shared settings document from which to recover a strategy.
             AgentChoice::Cline => return None,
+            AgentChoice::QwenCode => qwen_code_settings_path().ok()?,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -1691,7 +1709,7 @@ fn infer_installed_mcp_config(
             &["mcpServers", "ai-memory"],
             "url",
         )),
-        McpClient::GeminiCli => Ok(infer_json_mcp_config(
+        McpClient::GeminiCli | McpClient::QwenCode => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
             "httpUrl",
@@ -1848,6 +1866,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // --server-url / --auth-token instead.
         AgentChoice::Dsh => None,
         AgentChoice::Cline => Some(McpClient::Cline),
+        AgentChoice::QwenCode => Some(McpClient::QwenCode),
     }
 }
 
@@ -7494,6 +7513,91 @@ fn render_ibm_bob(
     Ok(())
 }
 
+/// Merge ai-memory's entries into the `hooks` key of Qwen Code's
+/// `settings.json`, keeping every other key and every other hook,
+/// idempotently.
+fn apply_to_qwen_code_settings(
+    path: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = super::render_shared::build_qwen_code_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: build_qwen_code_hooks_payload didn't return a hooks object")?;
+    let outcome = apply_atomic(path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in the Qwen Code settings.json but not an object")?;
+            for (event, value) in our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    print!("{QWEN_CODE_INSTALL_NOTES}");
+    Ok(())
+}
+
+const QWEN_CODE_INSTALL_NOTES: &str = "\
+# NOTE: Qwen Code injects SessionStart stdout (`hookSpecificOutput.additionalContext`)
+#       into the session, so the prior session's handoff is delivered automatically.
+# NOTE: start a new qwen session for it to load the new hooks.
+";
+
+/// Print the `hooks` block for `~/.qwen/settings.json` (dry-run counterpart
+/// of [`apply_to_qwen_code_settings`]).
+fn render_qwen_code(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_qwen_code_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing qwen-code hook config")?;
+    println!("# Qwen Code hook config — merge under the `hooks` key of");
+    println!("# ~/.qwen/settings.json, or re-run with --apply to merge it in");
+    println!("# place. MCP servers share this file under `mcpServers`.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
+    }
+    print!("{QWEN_CODE_INSTALL_NOTES}");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 /// Merge ai-memory's entries into the `hooks` key of Muse's `settings.json`,
 /// keeping `schema_version`, every unknown key and every other hook in it,
 /// idempotently, with a backup next to the file on change. Muse fails every
@@ -8937,6 +9041,73 @@ mod tests {
         }
         assert!(root["hooks"].get("SubagentStart").is_none());
         assert!(root["hooks"].get("PostToolUseFailure").is_none());
+        let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+    }
+
+    /// `install-hooks --agent qwen-code --apply` merges native `--agent
+    /// qwen-code` commands under the `hooks` key of `settings.json`, keeps
+    /// sibling keys and third-party hooks, and a re-apply changes nothing.
+    #[test]
+    fn qwen_code_apply_merges_native_hooks_under_the_settings_hooks_key() {
+        let home = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let settings = home.path().join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({
+                "model": "qwen3-coder-plus",
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "write_file",
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::QwenCode,
+            config_file: Some(settings.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_qwen_code_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        let first = fs::read_to_string(&settings).unwrap();
+        apply_to_qwen_code_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        assert_eq!(
+            first,
+            fs::read_to_string(&settings).unwrap(),
+            "re-apply is a no-op"
+        );
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["model"], "qwen3-coder-plus");
+        for (event, script) in super::super::render_shared::QWEN_CODE_EVENTS {
+            let entries = root["hooks"][event].as_array().unwrap();
+            let ours: Vec<_> = entries
+                .iter()
+                .filter(|entry| is_ai_memory_hook_entry(entry))
+                .collect();
+            assert_eq!(ours.len(), 1, "{event}: exactly one ai-memory entry");
+            assert_eq!(ours[0]["matcher"], "", "{event}");
+            let command = ours[0]["hooks"][0]["command"].as_str().unwrap();
+            let stem = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!(
+                    " hook --event {stem} --agent qwen-code --server-url "
+                )),
+                "{event}: {command}"
+            );
+            assert!(
+                !command.contains(".sh"),
+                "{event}: no script bundle: {command}"
+            );
+        }
         let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");

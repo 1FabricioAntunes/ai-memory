@@ -3,7 +3,7 @@
 For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
 It shows direct MCP writes, queries and handoffs without a native hook adapter.
 
-Warp, Kilo Code, Goose, Qwen Code and OpenHuman have no
+Warp, Kilo Code, Goose and OpenHuman have no
 `install-mcp` client; their hand-written recipes are in
 [`install.md`](install.md#clients-without-an-install-mcp-writer).
 
@@ -904,6 +904,57 @@ capture path; `SessionStart` also fetches pending handoffs.
 - Restart the CLI session after changing `~/.gemini/settings.json` so
   both MCP servers and hooks are reloaded.
 - Source: <https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md>
+
+---
+
+## Qwen Code
+
+**Status:** MCP and lifecycle hooks are supported. Managed workstreams and
+transcript backfill are not claimed.
+
+**Config file:** `~/.qwen/settings.json` (user). Qwen also accepts a
+project-level `.qwen/settings.json`; pass that path with `--config-file`
+when wanted. MCP servers live under the root `mcpServers` map; hooks live
+under the root `hooks` object of the same file.
+
+```bash
+ai-memory install-mcp --client qwen-code --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent qwen-code --apply \
+    --server-url "https://memory.example" --auth-token "$TOKEN"
+```
+
+The aliases `qwen` and `qwencode` are accepted by both commands. Qwen Code
+uses `httpUrl` (not `url`) for streamable-HTTP MCP endpoints, with `timeout`
+in milliseconds. The plain `url` key is the legacy SSE transport; do not mix
+them in one entry. Qwen expands `$NAME` and `${NAME}` in every string of
+`settings.json`. Existing servers, settings and third-party hooks are
+preserved, and applying either command again is a no-op. A token-file
+install (every fresh `init`) writes a stdio `ai-memory mcp-bridge
+--no-session-id` entry instead of embedding the bearer, so Qwen is a static
+client: project-scoped calls still need `workspace` and `project`.
+
+The hook installer registers ten events: `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`,
+`SessionEnd`, `SubagentStart` and `SubagentStop`. Definitions use an empty
+`matcher`, which Qwen treats as match-all. Each command receives Qwen's
+Claude-shaped JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`,
+`tool_use_id`) and enforces capture exclusions over Qwen's Gemini-like
+tools. A pending handoff is printed as `hookSpecificOutput.additionalContext`
+on `SessionStart`. Capture-only `SessionStart` and `UserPromptSubmit` events
+stay silent so `{}` is never injected into the model context. When the payload
+has no `cwd`, the hook uses `QWEN_PROJECT_DIR`.
+
+Qwen fires a real `SessionEnd`, so finished sessions close without
+`finalize-session`. There is no `ai-memory run qwen` adapter: Qwen does not
+document a stable transcript-store schema and path. Qwen reads `AGENTS.md`
+and `QWEN.md`, so the normal ai-memory routing snippet and Agent Skills need
+no Qwen-specific instruction file. Restart the CLI session after changing
+`~/.qwen/settings.json` so both MCP servers and hooks are reloaded.
+
+Sources: [Qwen Code MCP](https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/),
+[Qwen Code hooks](https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/),
+and [Qwen Code settings](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/).
 
 ---
 

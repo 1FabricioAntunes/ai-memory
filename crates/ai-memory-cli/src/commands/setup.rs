@@ -239,6 +239,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         if let Some(dir) = ibm_bob_detected(&home) {
             found.push((AgentChoice::IbmBob, Found::ConfigDir(dir)));
         }
+        if let Some(dir) = qwen_code_detected(&home) {
+            found.push((AgentChoice::QwenCode, Found::ConfigDir(dir)));
+        }
         found
             .into_iter()
             .map(|(agent, found)| (agent, Some(found)))
@@ -422,6 +425,13 @@ fn codebuddy_detected(home: &Path) -> Option<PathBuf> {
 /// IBM Bob's shared configuration directory, `~/.bob`, when it exists.
 fn ibm_bob_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".bob")).filter(|dir| dir.is_dir())
+}
+
+/// Qwen Code's directory, `~/.qwen`, when it exists. Qwen has no
+/// native-session adapter, so setup finds it by that directory rather than
+/// by [`detect_agents`].
+fn qwen_code_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".qwen")).filter(|dir| dir.is_dir())
 }
 
 /// The binary path the service unit runs. A package manager's versioned
@@ -1157,6 +1167,25 @@ mod tests {
             InstallSkillsAgent::Agents
         );
         assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy, None).mcp, None);
+    }
+
+    #[test]
+    fn qwen_code_is_detected_and_wires_hooks_mcp_and_shared_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(qwen_code_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".qwen")).unwrap();
+        assert_eq!(
+            qwen_code_detected(home.path()),
+            Some(home.path().join(".qwen"))
+        );
+        assert_eq!(
+            skills_for(AgentChoice::QwenCode),
+            InstallSkillsAgent::Agents
+        );
+        assert_eq!(
+            AgentPlan::new(AgentChoice::QwenCode, None).mcp,
+            Some(McpClient::QwenCode)
+        );
     }
 
     #[test]
