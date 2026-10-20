@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `--executable` is given, instead of silently starting plain `claude` on the
   wrong account. When no such executable exists, `run` now prints a warning
   and still starts `claude`. An explicit `--executable` still wins.
-  ([#NNN](https://github.com/akitaonrails/ai-memory/pull/NNN))
+  ([#1486](https://github.com/akitaonrails/ai-memory/pull/1486))
 - Ignored a UTF-8 byte-order mark at the start of `run --env-file` input so
   the first environment variable keeps its intended name.
   ([#1465](https://github.com/akitaonrails/ai-memory/pull/1465))
