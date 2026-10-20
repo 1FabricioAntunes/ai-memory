@@ -2493,6 +2493,17 @@ fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
 }
 
+#[test]
+fn powershell_call_operator_is_limited_to_known_powershell_runners() {
+    for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
+        assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
+    }
+
+    for agent in ["claude-code", "kiro-cli", "opencode", "qwen-code"] {
+        assert_eq!(powershell_call_operator(agent), "", "agent: {agent}");
+    }
+}
+
 /// #515: Codex evaluates its Windows hook command with PowerShell, where a
 /// quoted path in command position is a string expression rather than an
 /// invocation — every hook exited 1 with a ParserError. The call operator

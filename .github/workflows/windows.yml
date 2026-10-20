@@ -104,6 +104,7 @@ jobs:
               - 'crates/ai-memory-store/**'
               - 'crates/ai-memory-hooks/**'
               - 'crates/ai-memory-cli/src/commands/install_hooks.rs'
+              - 'crates/ai-memory-cli/src/commands/render_shared.rs'
               - 'crates/ai-memory-cli/src/commands/service_host.rs'
               - 'crates/ai-memory-cli/src/commands/user_service.rs'
               - 'hooks/**'
