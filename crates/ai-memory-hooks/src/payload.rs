@@ -859,6 +859,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // PostToolUse.
             | AgentKind::Dsh
             | AgentKind::Cline
+            | AgentKind::QwenCode
     )
 }
 
@@ -2243,6 +2244,9 @@ mod tests {
         assert_eq!(parse_agent("poolside"), AgentKind::Pool);
         assert_eq!(parse_agent("codebuddy"), AgentKind::CodeBuddy);
         assert_eq!(parse_agent("code-buddy"), AgentKind::CodeBuddy);
+        assert_eq!(parse_agent("qwen-code"), AgentKind::QwenCode);
+        assert_eq!(parse_agent("qwen"), AgentKind::QwenCode);
+        assert_eq!(parse_agent("qwencode"), AgentKind::QwenCode);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -2385,6 +2389,49 @@ mod tests {
             HookQuery {
                 event: "post-tool-use".into(),
                 agent: Some("ibm-bob-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
+    }
+
+    /// Qwen Code documents Claude Code's snake_case tool fields, including
+    /// `tool_use_id`. A recognized Qwen payload becomes a closed tool
+    /// observation while an unknown agent carrying identical JSON stays on
+    /// the capture-only path.
+    #[test]
+    fn qwen_code_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "write_file",
+            "tool_use_id": "toolu_qwen",
+            "tool_input": {"file_path": "src/lib.rs", "content": "x"},
+            "tool_response": "wrote file"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("qwen-code".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::QwenCode);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_qwen"), "{body}");
+        assert!(body.contains("\n---\nwrote file"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("qwen-code-2".into()),
                 ..Default::default()
             },
             raw,

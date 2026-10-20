@@ -308,6 +308,12 @@ pub enum AgentKind {
     /// Cline CLI, whose file hooks use `taskId` plus nested `tool_call` /
     /// `tool_result` payloads. Run-start hooks are detached by default.
     Cline,
+    /// Qwen Code (`qwen`), whose hooks send Claude Code-shaped payloads
+    /// (`session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id`) and
+    /// whose MCP servers use Gemini CLI's `httpUrl` field in
+    /// `~/.qwen/settings.json`.
+    #[serde(rename = "qwen-code", alias = "qwen")]
+    QwenCode,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -318,7 +324,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -347,6 +353,7 @@ impl AgentKind {
         Self::IbmBob,
         Self::Dsh,
         Self::Cline,
+        Self::QwenCode,
         Self::Other,
     ];
 
@@ -382,6 +389,7 @@ impl AgentKind {
             Self::IbmBob => "ibm-bob",
             Self::Dsh => "dsh",
             Self::Cline => "cline",
+            Self::QwenCode => "qwen-code",
             Self::Other => "other",
         }
     }
@@ -420,6 +428,7 @@ impl AgentKind {
             "ibm-bob" | "bob" => Self::IbmBob,
             "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
             "cline" | "cline-cli" => Self::Cline,
+            "qwen-code" | "qwen" | "qwencode" => Self::QwenCode,
             _ => Self::Other,
         }
     }
@@ -477,6 +486,10 @@ impl AgentKind {
     /// against v2.164.0–v2.167.0, #1299), so the native hook fetches the
     /// handoff for it. The fetch stays the built-in SessionStart path; a
     /// separate `GET /handoff` client is not part of the installer.
+    ///
+    /// Qwen Code injects `hookSpecificOutput.additionalContext` from
+    /// `SessionStart` stdout into the session (Qwen Code hooks reference:
+    /// <https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -536,13 +549,15 @@ impl AgentKind {
     /// `hookSpecificOutput.additionalContext` to the turn it belongs to.
     ///
     /// Claude Code places it alongside the submitted prompt and Codex adds it
-    /// as developer context (both hook references). The compaction recap uses
-    /// this channel. Grok discards an allowing `UserPromptSubmit`'s output,
-    /// and Kimi Code injects raw stdout rather than this envelope, so neither
-    /// is listed.
+    /// as developer context (both hook references). Qwen Code sends it as a
+    /// tagged text part
+    /// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+    /// The compaction recap uses this channel. Grok discards an allowing
+    /// `UserPromptSubmit`'s output, and Kimi Code injects raw stdout rather
+    /// than this envelope, so neither is listed.
     #[must_use]
     pub fn user_prompt_injects_context(self) -> bool {
-        matches!(self, Self::ClaudeCode | Self::Codex)
+        matches!(self, Self::ClaudeCode | Self::Codex | Self::QwenCode)
     }
 
     /// Whether `PostToolUse` stdout is model-visible context.
@@ -884,6 +899,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_kind_qwen_code_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::QwenCode.as_str(), "qwen-code");
+        for alias in ["qwen-code", "qwen", "qwencode"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::QwenCode, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::QwenCode).unwrap(),
+            "\"qwen-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"qwen-code\"").unwrap(),
+            AgentKind::QwenCode
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"qwen\"").unwrap(),
+            AgentKind::QwenCode
+        );
+        assert_eq!(AgentKind::from_wire("qwen-code-2"), AgentKind::Other);
+        assert!(AgentKind::QwenCode.session_start_injects_handoff());
+        assert!(!AgentKind::QwenCode.user_prompt_injects_handoff());
+        assert!(AgentKind::QwenCode.user_prompt_injects_context());
+        assert!(!AgentKind::QwenCode.post_tool_injects_handoff());
+        assert!(!AgentKind::QwenCode.reuses_session_id_after_end());
+    }
+
+    #[test]
     fn agent_kind_grizzybot_round_trips() {
         assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
         assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
@@ -986,11 +1027,14 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_context_injection_is_claude_code_and_codex() {
+    fn user_prompt_context_injection_is_claude_code_codex_and_qwen_code() {
         for agent in AgentKind::ALL {
             assert_eq!(
                 agent.user_prompt_injects_context(),
-                matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex),
+                matches!(
+                    agent,
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode
+                ),
                 "{}",
                 agent.as_str()
             );

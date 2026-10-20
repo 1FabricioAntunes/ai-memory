@@ -2532,6 +2532,14 @@ pub enum AgentChoice {
     /// handoff injection does not; accept the handoff through MCP instead.
     #[value(alias = "cline-cli")]
     Cline,
+    /// Qwen Code (`qwen`) — lifecycle hooks merged into the `hooks` key of
+    /// `~/.qwen/settings.json`. Qwen sends Claude Code-shaped hook payloads
+    /// on stdin, so each entry runs ai-memory's native `hook` command
+    /// directly; there is no script bundle. SessionStart stdout
+    /// (`hookSpecificOutput.additionalContext`) carries the handoff, and
+    /// Qwen's own `SessionEnd` closes the session.
+    #[value(name = "qwen-code", alias = "qwen", alias = "qwencode")]
+    QwenCode,
 }
 
 impl AgentChoice {
@@ -2569,6 +2577,7 @@ impl AgentChoice {
             Self::IbmBob => AgentKind::IbmBob,
             Self::Dsh => AgentKind::Dsh,
             Self::Cline => AgentKind::Cline,
+            Self::QwenCode => AgentKind::QwenCode,
         }
     }
 
@@ -2592,7 +2601,8 @@ impl AgentChoice {
             | Self::Muse
             | Self::CodeBuddy
             | Self::IbmBob
-            | Self::Cline => None,
+            | Self::Cline
+            | Self::QwenCode => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -2787,6 +2797,13 @@ pub enum McpClient {
     /// plain-text `SessionStart` handoff delivery.
     #[value(name = "ibm-bob", alias = "bob")]
     IbmBob,
+    /// Qwen Code — `~/.qwen/settings.json`, servers under the root
+    /// `mcpServers` map with `httpUrl` (streamable HTTP; the plain `url`
+    /// key is legacy SSE). Qwen expands `$NAME` and `${NAME}` in every
+    /// string. Pair with `install-hooks --agent qwen-code` for lifecycle
+    /// capture and `SessionStart` handoff delivery.
+    #[value(name = "qwen-code", alias = "qwen", alias = "qwencode")]
+    QwenCode,
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
@@ -4900,6 +4917,27 @@ mod tests {
             assert_eq!(args.agent, AgentChoice::CodeBuddy);
             assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
             assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+    }
+
+    #[test]
+    fn qwen_code_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["qwen-code", "qwen", "qwencode"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::QwenCode);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::QwenCode);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::QwenCode);
         }
     }
 

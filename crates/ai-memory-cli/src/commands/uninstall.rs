@@ -282,6 +282,10 @@ fn build_plan(
                 install_hooks::ibm_bob_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
+            (
+                install_hooks::qwen_code_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
         ]);
         for (path, shape) in hook_files {
             if !path.exists() {
@@ -461,6 +465,7 @@ fn build_plan(
             KiroCli,
             CommandCode,
             IbmBob,
+            QwenCode,
             CopilotCli,
             Droid,
             Swival,
@@ -1569,6 +1574,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::ClaudeDesktop
         | McpClient::Cursor
         | McpClient::GeminiCli
+        | McpClient::QwenCode
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode

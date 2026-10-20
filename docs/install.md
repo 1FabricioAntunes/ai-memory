@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose, Qwen Code and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -1603,6 +1603,50 @@ Managed `ai-memory run ibm-bob` resume is not supported because Bob does not
 document a stable native transcript store. See [the IBM Bob MCP and hook
 details](mcp-install.md#ibm-bob).
 
+### Qwen Code
+
+Qwen Code (`qwen`) keeps MCP servers and lifecycle hooks in the same user
+file, `~/.qwen/settings.json`. Install both together:
+
+```bash
+ai-memory install-mcp --client qwen-code --apply \
+    --server-url "https://memory.example/mcp" \
+    --auth-token "$TOKEN"
+ai-memory install-hooks --agent qwen-code --apply \
+    --server-url "https://memory.example" \
+    --auth-token "$TOKEN"
+```
+
+The `qwen` and `qwencode` aliases are accepted. MCP is merged under
+`mcpServers` as Qwen's `httpUrl` streamable-HTTP entry (`timeout` in
+milliseconds); the plain `url` key is the legacy SSE transport. A token-file
+install writes a stdio `ai-memory mcp-bridge --no-session-id` entry instead of
+putting the bearer in `headers`. Hooks are merged into the root `hooks`
+object, preserving other settings and handlers. Each entry runs the native
+`ai-memory hook --event … --agent qwen-code` command with an empty matcher;
+there is no script bundle. Ten events are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` (Qwen
+fires it instead of `PostToolUse` when a tool throws), `PreCompact`, `Stop`,
+`SessionEnd`, `SubagentStart` and `SubagentStop`. Capture exclusions apply to
+Qwen's Gemini-like tools (`write_file`, `read_file`, `run_shell_command`,
+`grep_search`, `glob`).
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`. With nothing to deliver, `SessionStart`
+and `UserPromptSubmit` print nothing, because Qwen injects that stdout into
+the session. An interactive `SessionStart` may arrive without `cwd`; the hook
+then uses `QWEN_PROJECT_DIR`, which Qwen exports on every command hook. When
+neither names a directory, the hook still records the event but fetches no
+handoff; the baton stays open for `memory_handoff_accept`. Qwen fires a real
+`SessionEnd`, so `finalize-session` is not needed.
+
+`ai-memory setup` wires Qwen Code when `~/.qwen` exists.
+`ai-memory uninstall` removes the entries. Qwen reads `AGENTS.md` and
+`QWEN.md`. Managed `ai-memory run qwen` resume is not supported because Qwen
+does not document a stable native transcript store. Start a new Qwen session
+after installing so it reloads `settings.json`. See [the Qwen Code MCP and
+hook details](mcp-install.md#qwen-code).
+
 ### Kiro CLI
 
 Kiro CLI has one MCP surface and two incompatible lifecycle-hook formats.
@@ -2320,6 +2364,14 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client qwen-code       --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent qwen-code      --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client antigravity-cli --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 
@@ -2380,7 +2432,7 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374/mcp"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
+Cursor, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
 `install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
@@ -2555,30 +2607,6 @@ for Goose 1.54.0.
 Sources: <https://goose-docs.ai/docs/guides/config-files>,
 <https://goose-docs.ai/docs/getting-started/using-extensions>,
 <https://goose-docs.ai/docs/guides/goose-cli-commands>.
-
-##### Qwen Code
-
-Qwen Code reads `mcpServers` from `~/.qwen/settings.json` (user) or
-`.qwen/settings.json` (project). A streamable-HTTP server uses `httpUrl`; the
-plain `url` key means the legacy SSE transport. Qwen Code expands `$NAME` and
-`${NAME}` in every string of `settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "ai-memory": {
-      "httpUrl": "http://127.0.0.1:49374/mcp",
-      "headers": { "Authorization": "Bearer ${AI_MEMORY_AUTH_TOKEN}" }
-    }
-  }
-}
-```
-
-Leave out `headers` when the server has no bearer token; in that case
-`qwen mcp add --scope user --transport http ai-memory http://127.0.0.1:49374/mcp`
-writes the entry. Documented for Qwen Code 0.25.1.
-Sources: <https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/>,
-<https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/>.
 
 ##### OpenHuman
 
