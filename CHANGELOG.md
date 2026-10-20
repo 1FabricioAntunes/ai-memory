@@ -238,6 +238,11 @@ version in [`docs/changelog/`](docs/changelog/):
   reads an `askama.toml` that ai-memory does not have. The unmaintained
   `basic-toml` (RUSTSEC-2026-0374) is no longer a dependency, and templates
   render as before. ([#1482](https://github.com/akitaonrails/ai-memory/issues/1482))
+- Copied the release into place in `install.ps1` instead of moving it, so an
+  antivirus scan that still holds the just-verified `ai-memory.exe` no longer
+  stops a Windows install with "the process cannot access the file because it
+  is being used by another process".
+  ([#1480](https://github.com/akitaonrails/ai-memory/issues/1480))
 
 ## [3.1.1] - 2026-10-17
 
