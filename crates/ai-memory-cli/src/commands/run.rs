@@ -3496,7 +3496,14 @@ fn resolve_candidate(
         extensions
             .split(';')
             .filter(|extension| !extension.is_empty())
-            .map(|extension| path.with_extension(extension.trim_start_matches('.')))
+            .map(|extension| {
+                // PATHEXT is appended to the full command name, including any
+                // dots in a wrapper name such as `agent.tool.cmd`.
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(".");
+                candidate.push(extension.trim_start_matches('.'));
+                PathBuf::from(candidate)
+            })
             .find(|candidate| executable_file(candidate))
     }
     #[cfg(not(windows))]
@@ -5506,6 +5513,54 @@ mod tests {
             .status()
             .expect("the resolved wrapper starts");
         assert!(status.success(), "the resolved wrapper exits successfully");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dotted_harness_name_launches_its_own_pathext_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(
+            dir.join("agent.tool.cmd"),
+            "@echo off\r\necho intended-harness\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("agent.cmd"), "@echo off\r\necho wrong-harness\r\n").unwrap();
+        let native = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "agent.tool"])
+            .env("PATH", dir)
+            .env("PATHEXT", ".EXE;.CMD")
+            .current_dir(dir)
+            .output()
+            .expect("native cmd lookup launches");
+        assert!(
+            native.status.success(),
+            "native cmd lookup must accept dotted basename: {:?}",
+            native
+        );
+        let native_stdout = String::from_utf8(native.stdout).unwrap();
+        assert_eq!(
+            native_stdout.trim(),
+            "intended-harness",
+            "independent Windows lookup appends PATHEXT to dotted basename"
+        );
+        println!("NATIVE_WINDOWS_CONTROL={}", native_stdout.trim());
+        let search = ExecutableSearch {
+            path: Some(dir.as_os_str()),
+            extensions: Some(OsStr::new(".EXE;.CMD")),
+        };
+        let path =
+            resolve_program(OsStr::new("agent.tool"), search).expect("dotted harness resolves");
+        let output = std::process::Command::new(path)
+            .output()
+            .expect("resolved harness launches");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            stdout.trim(),
+            "intended-harness",
+            "PATHEXT must preserve the complete dotted harness name"
+        );
     }
 
     /// Unix has no PATHEXT: the file itself is the answer.

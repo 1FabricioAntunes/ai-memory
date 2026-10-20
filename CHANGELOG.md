@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Preserved dotted Windows harness names when resolving PATHEXT wrappers, so a
+  command such as `agent.tool` launches `agent.tool.cmd` rather than `agent.cmd`.
+  ([#1475](https://github.com/akitaonrails/ai-memory/pull/1475))
 - Corrected Pi MCP/setup-agent guidance to name `ai-memory-pi.ts`, described
   its location when `PI_CODING_AGENT_DIR` is set, and corrected OMP's
   setup-agent hint to name `ai-memory-omp.ts`.
