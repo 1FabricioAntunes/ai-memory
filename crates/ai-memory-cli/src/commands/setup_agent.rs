@@ -435,8 +435,10 @@ fn normalise_hook_server_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<()> {
-    let (label, agent, restart_note, mcp_client) = match args.agent {
+fn extension_setup_metadata(
+    agent: AgentChoice,
+) -> Result<(&'static str, &'static str, &'static str, &'static str)> {
+    Ok(match agent {
         AgentChoice::OpenCode => (
             "OpenCode",
             "opencode",
@@ -452,13 +454,13 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
         AgentChoice::Omp => (
             "OMP",
             "omp",
-            "Then restart OMP so it loads ~/.omp/agent/extensions/ai-memory.ts.",
+            "Then restart OMP so it loads ~/.omp/agent/extensions/ai-memory-omp.ts.",
             "omp",
         ),
         AgentChoice::Pi => (
             "Pi",
             "pi",
-            "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts.",
+            "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory-pi.ts.",
             "pi",
         ),
         AgentChoice::Openclaw => (
@@ -468,7 +470,11 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
             "openclaw",
         ),
         other => bail!("internal: {other:?} is not a generated-integration agent"),
-    };
+    })
+}
+
+fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<()> {
+    let (label, agent, restart_note, mcp_client) = extension_setup_metadata(args.agent)?;
     println!("# {label} uses a TypeScript extension/plugin, not extracted shell scripts.");
     println!(
         "# Capture-policy capability v1 requires a freshly generated integration; re-run --apply after upgrades."
@@ -937,6 +943,17 @@ mod tests {
         run(&Config::default(), args).unwrap();
 
         assert!(!tmp.path().join("hooks").exists());
+    }
+
+    #[test]
+    fn pi_family_setup_hints_name_the_installed_extension_files() {
+        let (_, _, omp_note, _) = extension_setup_metadata(AgentChoice::Omp).unwrap();
+        let (_, _, pi_note, _) = extension_setup_metadata(AgentChoice::Pi).unwrap();
+
+        assert!(omp_note.ends_with("/.omp/agent/extensions/ai-memory-omp.ts."));
+        assert!(pi_note.ends_with("/.pi/agent/extensions/ai-memory-pi.ts."));
+        assert!(!omp_note.ends_with("/ai-memory.ts."));
+        assert!(!pi_note.ends_with("/ai-memory.ts."));
     }
 
     #[test]

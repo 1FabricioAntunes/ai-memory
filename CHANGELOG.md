@@ -12,8 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
-- Corrected Pi MCP setup guidance to name `ai-memory-pi.ts` and describe its
-  location when `PI_CODING_AGENT_DIR` is set.
+- Corrected Pi MCP/setup-agent guidance to name `ai-memory-pi.ts`, described
+  its location when `PI_CODING_AGENT_DIR` is set, and corrected OMP's
+  setup-agent hint to name `ai-memory-omp.ts`.
   ([#1446](https://github.com/akitaonrails/ai-memory/pull/1446))
 - Routed OpenCode's `claude-haiku-5-5` through the Anthropic Messages API for
   both Go and Zen instead of the unsupported Chat Completions protocol.
