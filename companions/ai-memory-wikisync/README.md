@@ -26,6 +26,10 @@ cargo fmt --check --manifest-path companions/ai-memory-wikisync/Cargo.toml
 cargo clippy --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targets -- -D warnings
 ```
 
+The [Windows workflow](../../.github/workflows/windows.yml) checks this
+companion separately when its files or that workflow change, when a PR has
+the `windows` or `full-ci` label, and on nightly or manual runs.
+
 ## Usage
 
 ```bash
@@ -110,6 +114,8 @@ This section describes `plan` and `export`; `sync` adds the rules under
   `--dest`; case-fold collisions are refused; symlinked destinations,
   symlinked components and symlinked state directories are refused; files
   are replaced atomically (tmp + rename + fsync).
+  On Windows, ordinary absolute and relative destinations are accepted;
+  directory junctions and paths through them are still refused.
 - **Local edits win until forced.** Each page is compared three ways:
   destination file, last exported state, server body. A file that
   diverged from both is reported with a diff summary and refused; the

@@ -12,6 +12,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Accepted ordinary absolute and relative Windows destination paths in the
+  wiki sync companion while still refusing directory junctions and symlinks.
+  ([#1476](https://github.com/akitaonrails/ai-memory/issues/1476))
 - Preserved dotted Windows harness names when resolving PATHEXT wrappers, so a
   command such as `agent.tool` launches `agent.tool.cmd` rather than `agent.cmd`.
   ([#1475](https://github.com/akitaonrails/ai-memory/pull/1475))
