@@ -243,6 +243,11 @@ version in [`docs/changelog/`](docs/changelog/):
   stops a Windows install with "the process cannot access the file because it
   is being used by another process".
   ([#1480](https://github.com/akitaonrails/ai-memory/issues/1480))
+- Invoked Gemini CLI's native Windows lifecycle commands with PowerShell's
+  call operator. Gemini CLI 0.23.0 and later run hook commands through
+  PowerShell, where the quoted `ai-memory.exe` path failed to parse, so every
+  hook exited with an error and the session captured nothing.
+  ([#1484](https://github.com/akitaonrails/ai-memory/issues/1484))
 
 ## [3.1.1] - 2026-10-17
 

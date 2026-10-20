@@ -2477,7 +2477,12 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // Copilot CLI selects the `command` fallback as its PowerShell command on
     // Windows; without `&`, its quoted executable is only a string expression
     // and every fail-closed PreToolUse hook denies the tool (#1462).
-    if matches!(agent, "codex" | "grok" | "copilot-cli") {
+    // Gemini CLI has run every hook command through PowerShell `-Command` on
+    // Windows since 0.23.0 (google-gemini/gemini-cli#15343: `HookRunner`
+    // spawns `getShellConfiguration()`). A command that fails to parse exits
+    // 1, which Gemini treats as a non-blocking error, so the session runs on
+    // and captures nothing (#1484).
+    if matches!(agent, "codex" | "grok" | "copilot-cli" | "gemini-cli") {
         "& "
     } else {
         ""
@@ -2585,6 +2590,75 @@ if (($args -join '|') -ne $expected) { exit 9 }
     assert!(
         output.status.success(),
         "Copilot hook command failed in PowerShell: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Gemini CLI runs its Windows hook commands through PowerShell `-Command`,
+/// so a quoted executable needs the call operator, including when its path
+/// and data directory contain spaces.
+#[test]
+fn gemini_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = windows_native_hook_command_with_exe(
+        Path::new(r"C:\Program Files\ai-memory\ai-memory.exe"),
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\Users\Alice Smith\ai-memory")),
+            None,
+        ),
+    );
+    assert!(
+        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        "Gemini must invoke the quoted executable through PowerShell: {cmd}"
+    );
+}
+
+/// Runs the command the way Gemini CLI does: PowerShell `-Command`, with the
+/// exit-code check Gemini appends to every PowerShell hook command.
+#[cfg(windows)]
+#[test]
+fn gemini_cli_windows_command_executes_in_powershell() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\data dir|hook|--event|session-start|--agent|gemini-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { exit 9 }
+"#,
+    )
+    .unwrap();
+    let mut command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("session-start.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "gemini-cli",
+            Some(Path::new(r"C:\data dir")),
+            None,
+        ),
+    );
+    command.push_str("; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Gemini hook command failed in PowerShell: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
