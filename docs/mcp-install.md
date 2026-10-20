@@ -28,6 +28,17 @@ Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > its `PATH`; the Docker wrapper keeps the bare `ai-memory`. ZCode keeps
 > HTTP entries only and is refused. Passing `--auth-token` explicitly (or
 > `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
+> The two entries that run the bridge with an explicit key are the
+> exception: `install-mcp --apply --auth-token <key>` for Claude Code with
+> `--session-aware`, and for Muse, stores the key in `<data_dir>/auth-token`,
+> the file `install-hooks --apply --auth-token` writes, and writes the entry
+> with `--data-dir` and no key. The bridge reads that file whenever no
+> bearer is configured, ahead of the root token it discovers on a loopback
+> install, so a client whose hooks already hold a key needs no
+> `--auth-token` here at all, and rotating the key with `install-hooks` also
+> rotates the bridge's. The key stays in the entry, as before, when the
+> config already resolves a bearer, a different key is stored, the hooks
+> sign in with OIDC, or the snippet is only printed.
 
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`

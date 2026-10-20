@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Let `ai-memory mcp-bridge` send the key `install-hooks --apply --auth-token`
+  stored in `<data_dir>/auth-token` when no bearer is configured, ahead of the
+  loopback root token discovery, so a remote
+  client whose hooks hold a native API key wires the MCP bridge without
+  copying the key. `install-mcp --apply --auth-token` now stores the key there
+  for the Claude Code (`--session-aware`) and Muse bridge entries and leaves
+  it out of the harness config, where it outlived a key rotation; existing
+  entries keep working. `uninstall --only hooks` keeps the stored key while
+  such a bridge entry remains. ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed
