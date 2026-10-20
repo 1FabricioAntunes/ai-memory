@@ -32,6 +32,9 @@ version in [`docs/changelog/`](docs/changelog/):
   keeping unknown migration edits fatal. CI now rejects changes to migration
   files already present on a PR's base branch.
   ([#1443](https://github.com/akitaonrails/ai-memory/issues/1443))
+- Kept the A2 compaction footer out of SessionStart excerpts for pages with
+  CRLF line endings, matching the existing LF behavior.
+  ([#1264](https://github.com/akitaonrails/ai-memory/pull/1264))
 - Sent `response_format=json_schema` for structured OpenCode Chat Completions
   calls, with the existing tolerant fallback for models that reject it, so
   `memory_query answer=true` no longer receives unstructured prose by default.
