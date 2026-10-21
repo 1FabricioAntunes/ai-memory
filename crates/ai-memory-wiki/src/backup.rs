@@ -10,7 +10,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -202,7 +202,15 @@ fn create_pre_migration_backup_inner(
                 }
             }
         }
-        tar.into_inner()?.finish()?;
+        // `finish` hands back the `BufWriter`. Dropping it would flush on
+        // `Drop`, which discards the error, and nothing would fsync — so the
+        // verify pass below re-reads the page cache and calls an archive good
+        // that is not yet on stable storage. This archive is the gate for a
+        // destructive in-place migration, so it has to survive a crash; the
+        // admin backup endpoints sync after `finish` for the same reason.
+        let mut out = tar.into_inner()?.finish()?;
+        out.flush()?;
+        out.get_ref().sync_all()?;
     }
 
     // Verify: re-open and count entries; a torn or unreadable archive
