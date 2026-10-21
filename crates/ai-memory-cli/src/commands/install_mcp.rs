@@ -1952,7 +1952,11 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 
 fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    // `--flavor` is a `tools/list` concern, so it rides on the URL OpenCode
+    // fetches schemas from — the same place `build_mcp_entry` puts it. The
+    // flag's own documentation names an OpenCode install routed to Vertex.
+    let server_url = flavored_url_for(args, base_url);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("remote"));
     entry.insert("url".into(), json!(server_url));
@@ -1987,7 +1991,8 @@ fn build_mcp_entry_cline(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 /// (https://opencode.ai/v2/docs/mcp-servers).
 fn build_mcp_entry_opencode2(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let base_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let server_url = flavored_url_for(args, base_url);
     let mut entry = serde_json::Map::new();
     entry.insert("type".into(), json!("remote"));
     entry.insert("url".into(), json!(server_url));
@@ -5420,6 +5425,50 @@ mod tests {
             entry["url"].as_str().unwrap(),
             "https://memory.example/mcp?flavor=gemini"
         );
+    }
+
+    /// OpenCode is the other client `--flavor`'s documentation names, and it
+    /// has its own entry builders. They read `server_url` directly, so the
+    /// flag was silently dropped and Vertex 400'd every `tools/list`.
+    #[test]
+    fn an_explicit_flavor_reaches_the_opencode_entry_builders() {
+        for client in [McpClient::OpenCode, McpClient::OpenCode2] {
+            let mut args = args_for(client);
+            args.server_url = Some("https://memory.example/mcp".into());
+            args.flavor = Some(SchemaFlavor::Gemini);
+
+            let entry = match client {
+                McpClient::OpenCode => build_mcp_entry_opencode(&args).unwrap(),
+                _ => build_mcp_entry_opencode2(&args).unwrap(),
+            };
+
+            assert_eq!(
+                entry["url"].as_str().unwrap(),
+                "https://memory.example/mcp?flavor=gemini",
+                "{client:?}"
+            );
+        }
+    }
+
+    /// Control: OpenCode has no built-in dialect, so an install that did not
+    /// ask for one must still get the bare endpoint.
+    #[test]
+    fn opencode_stays_unflavored_without_the_flag() {
+        for client in [McpClient::OpenCode, McpClient::OpenCode2] {
+            let mut args = args_for(client);
+            args.server_url = Some("https://memory.example/mcp".into());
+
+            let entry = match client {
+                McpClient::OpenCode => build_mcp_entry_opencode(&args).unwrap(),
+                _ => build_mcp_entry_opencode2(&args).unwrap(),
+            };
+
+            assert_eq!(
+                entry["url"].as_str().unwrap(),
+                "https://memory.example/mcp",
+                "{client:?}"
+            );
+        }
     }
 
     #[test]
