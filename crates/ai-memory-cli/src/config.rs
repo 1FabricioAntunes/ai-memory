@@ -3832,6 +3832,56 @@ mod tests {
         );
     }
 
+    /// #1506: an example table in the shipped config must not capture the
+    /// top-level examples below it.
+    ///
+    /// A TOML table header owns every key after it. The commented
+    /// `[run.profiles.work.env]` and `[ingest]` examples sat above top-level
+    /// examples such as `reranker` and `capture_assistant`, so an operator who
+    /// uncommented both put the top-level key inside the table: `[ingest]`
+    /// dropped it without a warning, and the profile's string-only env map
+    /// refused it or exported it to the harness. Top-level keys end at the
+    /// first real table, so the example tables belong below it, and
+    /// uncommenting every example must still set the keys they document.
+    #[test]
+    fn the_shipped_default_config_examples_keep_their_tables() {
+        const TEMPLATE: &str = include_str!("../templates/config.default.toml");
+        // A one-line example is `# ` followed by a line that parses as TOML on
+        // its own. Indented examples stay commented: some are alternatives
+        // for the same key, others span several lines.
+        fn example(line: &str) -> Option<&str> {
+            line.strip_prefix("# ")
+                .filter(|code| !code.starts_with(' '))
+                .filter(|code| code.parse::<toml_edit::DocumentMut>().is_ok())
+        }
+
+        let first_table = TEMPLATE
+            .lines()
+            .position(|line| line.trim_start().starts_with('['))
+            .expect("the template declares tables");
+        for line in TEMPLATE.lines().take(first_table) {
+            let example_table = example(line).is_some_and(|code| code.starts_with('['));
+            assert!(
+                !example_table,
+                "{line:?} is above the first table and would capture top-level keys"
+            );
+        }
+
+        let uncommented = TEMPLATE
+            .lines()
+            .map(|line| example(line).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = load_with_toml(&uncommented).expect("the uncommented template must load");
+        assert_eq!(cfg.reranker.as_deref(), Some("llm"));
+        assert_eq!(
+            cfg.run.profiles["work"].env.keys().collect::<Vec<_>>(),
+            ["ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR"]
+        );
+        assert_eq!(cfg.ingest.drop_tool_use_id_prefixes, ["toolu_plugin_"]);
+        assert_eq!(cfg.ingest.drop_tool_names, ["mcp__noisy__poll"]);
+    }
+
     /// #1269: a thin client must reach the server the SAME config starts.
     ///
     /// `server_url` defaulted to a constant and was never derived from `bind`,
