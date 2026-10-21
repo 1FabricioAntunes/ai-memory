@@ -4923,7 +4923,10 @@ impl AiMemoryServer {
             match hits.into_iter().next() {
                 Some(h) => h.path,
                 None => {
-                    return Err(McpError::internal_error(
+                    // A query that matched nothing is caller-fixable input, not
+                    // a server fault: the search itself succeeded. -32603 reads
+                    // as "retry" to a client, which re-runs the same miss.
+                    return Err(McpError::invalid_params(
                         format!("no pages found for query {query:?}"),
                         None,
                     ));
@@ -5070,7 +5073,12 @@ impl AiMemoryServer {
                         } else {
                             ""
                         };
-                        Err(McpError::internal_error(
+                        // Not-found under the resolved scope is caller-fixable
+                        // too, as `memory_status` and
+                        // `memory_read_session_observations` already answer for
+                        // an unknown project or session. The `hint` below only
+                        // helps if the client treats this as its own mistake.
+                        Err(McpError::invalid_params(
                             format!(
                                 "page {} not found in resolved scope {scope}{hint}",
                                 page_path.as_str()
@@ -13647,6 +13655,92 @@ mod tests {
                 "{path}: {text}"
             );
         }
+    }
+
+    /// A page that is absent under the resolved scope, and a query that
+    /// matched nothing, are caller input: the request is wrong, not the
+    /// server. They must answer `invalid params` (-32602), as `memory_status`
+    /// does for an unknown project, instead of the -32603 a client reads as
+    /// "retry". A real disk failure on the same path stays internal.
+    #[tokio::test]
+    async fn memory_read_page_reports_a_missing_target_as_invalid_params() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // Captured before the move: the control below needs the real wiki root
+        // rather than a second guess at the on-disk layout.
+        let wiki_root = wiki.root().to_path_buf();
+        let server = server.with_wiki(wiki);
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/does-not-exist.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a missing page must error");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("not found in resolved scope"),
+            "the not-found message must not change; got {err}"
+        );
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("zzzz-no-such-term".into()),
+                    path: None,
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a query that matches nothing must error");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("no pages found for query"),
+            "the query-miss message must not change; got {err}"
+        );
+
+        // Control: a disk error that is NOT a missing file is a server fault
+        // the caller cannot fix by changing the request, so it stays -32603.
+        // A directory where the markdown belongs reads back as IsADirectory,
+        // which `is_missing_wiki_file` rejects, so no DB fallback runs either.
+        std::fs::create_dir_all(
+            wiki_root
+                .join(ws.to_string())
+                .join(proj.to_string())
+                .join("blocked.md"),
+        )
+        .unwrap();
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("blocked.md".into()),
+                    project: Some("scratch".into()),
+                    workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("an unreadable page must error");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
+            "a genuine disk failure must stay internal; got {err}"
+        );
     }
 
     #[tokio::test]
