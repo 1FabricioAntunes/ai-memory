@@ -4233,7 +4233,7 @@ impl AiMemoryServer {
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 .ok_or_else(|| {
-                    McpError::internal_error(
+                    McpError::invalid_params(
                         "no completed session without an auto-improvement run found for the resolved project; pass session_id to rerun a specific session",
                         None,
                     )
@@ -20943,6 +20943,11 @@ mod tests {
         assert!(
             err.to_string().contains("no completed session without"),
             "the exhausted queue should explain how to rerun: {err}"
+        );
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "an exhausted implicit queue is the caller's to fix, as in memory_consolidate: {err}"
         );
 
         let explicit = call_tool_json(
