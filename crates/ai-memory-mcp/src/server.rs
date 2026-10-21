@@ -2861,8 +2861,22 @@ impl AiMemoryServer {
         // this only fires when the caller passed none of them.
         let explicit_scoping = !args.scopes.is_empty()
             || named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
+        // A non-blank `as_of` is explicit intent to read one project as of an
+        // instant. The global branch below returns its own response, so the
+        // `as_of` conflict check further down never sees a global query: an
+        // explicit `global` has to be refused here, and an implicit
+        // `default_global` broadening must yield to `as_of` the way the
+        // precedence note above says an explicit arg does.
+        let as_of_present = args.as_of.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if as_of_present && args.global.unwrap_or(false) {
+            return Err(McpError::invalid_params(
+                "as_of cannot be combined with global or scopes",
+                None,
+            ));
+        }
         let recall_global = !explicit_scoping
             && !args.global.unwrap_or(false)
+            && !as_of_present
             && self.active_project.default_global_for(&aps_actor);
         if args.global.unwrap_or(false) || recall_global {
             if !args.scopes.is_empty()
@@ -10889,6 +10903,10 @@ mod tests {
         as_of_scopes.scopes = vec![scope("scratch")];
         as_of_scopes.as_of = Some("2026-06-01T00:00:00Z".into());
 
+        let mut as_of_global = base();
+        as_of_global.global = Some(true);
+        as_of_global.as_of = Some("2026-06-01T00:00:00Z".into());
+
         let mut malformed_as_of = base();
         malformed_as_of.as_of = Some("not-a-time".into());
 
@@ -10899,6 +10917,7 @@ mod tests {
             ("scopes + project", scopes_project),
             ("scopes + workspace", scopes_workspace),
             ("as_of + scopes", as_of_scopes),
+            ("as_of + global", as_of_global),
             ("malformed as_of", malformed_as_of),
         ] {
             let err = server
