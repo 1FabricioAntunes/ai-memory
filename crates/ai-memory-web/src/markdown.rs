@@ -711,11 +711,38 @@ fn has_external_or_unsafe_scheme(target: &str) -> bool {
 
 /// Escape text for insertion into an HTML template while preserving the
 /// fixed `<mark>` tags emitted by SQLite FTS snippets.
+///
+/// Only a balanced, non-nested `<mark>…</mark>` pair is kept as markup,
+/// which is all SQLite's highlighter ever emits. A marker from the page's
+/// own body does not form one, and escaping it keeps an unbalanced tag out
+/// of the template's `|safe` slot, where it would highlight the rest of the
+/// excerpt as if it were a query match.
 #[must_use]
 pub fn escape_snippet(snippet: &str) -> String {
-    escape_html(snippet)
-        .replace("&lt;mark&gt;", "<mark>")
-        .replace("&lt;/mark&gt;", "</mark>")
+    const OPEN: &str = "<mark>";
+    const CLOSE: &str = "</mark>";
+    let mut out = String::with_capacity(snippet.len());
+    let mut rest = snippet;
+    while let Some(at) = rest.find(OPEN) {
+        let after = &rest[at + OPEN.len()..];
+        let Some(close) = after.find(CLOSE) else {
+            break;
+        };
+        if after[..close].contains(OPEN) {
+            // A second opening marker intervenes, so this one closes
+            // nothing: emit it as the text it is and look on from there.
+            out.push_str(&escape_html(&rest[..at + OPEN.len()]));
+            rest = after;
+            continue;
+        }
+        out.push_str(&escape_html(&rest[..at]));
+        out.push_str(OPEN);
+        out.push_str(&escape_html(&after[..close]));
+        out.push_str(CLOSE);
+        rest = &after[close + CLOSE.len()..];
+    }
+    out.push_str(&escape_html(rest));
+    out
 }
 
 fn escape_html(input: &str) -> String {
@@ -914,6 +941,28 @@ mod tests {
         let out = escape_snippet("<script>x</script> <mark>hit</mark>");
         assert!(out.contains("&lt;script&gt;x&lt;/script&gt;"));
         assert!(out.contains("<mark>hit</mark>"));
+    }
+
+    #[test]
+    fn a_literal_mark_tag_in_page_text_stays_text() {
+        assert_eq!(
+            escape_snippet("use <mark> here <mark>hit</mark>"),
+            "use &lt;mark&gt; here <mark>hit</mark>"
+        );
+        // An opening marker the highlighter never closed, and a stray
+        // closing one, are both page text.
+        assert_eq!(escape_snippet("see <mark> here"), "see &lt;mark&gt; here");
+        assert_eq!(escape_snippet("a </mark> b"), "a &lt;/mark&gt; b");
+        // Controls: the highlighter's own pairs survive, and text between
+        // and inside them is still escaped.
+        assert_eq!(
+            escape_snippet("<mark>a</mark> x <mark>b</mark>"),
+            "<mark>a</mark> x <mark>b</mark>"
+        );
+        assert_eq!(
+            escape_snippet("<mark>a&b</mark> <script>"),
+            "<mark>a&amp;b</mark> &lt;script&gt;"
+        );
     }
 
     #[test]
