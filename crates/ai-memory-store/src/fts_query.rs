@@ -51,6 +51,9 @@ pub const DEFAULT_STOPWORDS: &[&str] = &[
 /// punctuation handling — an entry never matches a token with attached
 /// punctuation (`"de,"`, `"que?"`), the same limitation the built-in English
 /// list has always had (`"the,"` was never filtered either).
+/// The bag-of-words fallback for syntax that does not parse strips quotes
+/// and parens first, so `(the` is filtered there, while a word the user put
+/// in quotes is always kept.
 ///
 /// Cheap to clone (an `Arc`-shared set) so it can be threaded through a
 /// `'static` closure (e.g. `ReaderPool::with_conn`) without re-hashing the
@@ -135,7 +138,7 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         // match nearly every page and BM25 term frequency lets a page
         // with five "the"s outrank the page whose CONTENT matches (seen
         // live: a release-procedure page beaten for a deploy question).
-        // Explicit-syntax queries and quoted phrases are untouched, and
+        // Explicit syntax that parses and quoted phrases are untouched, and
         // a query that is ONLY stopwords keeps them all — returning the
         // user's literal terms beats returning nothing. The active list is
         // operator-configured (`[search.fts] stopwords`, issue #953): the
@@ -168,19 +171,38 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
     if fts5_query_parses(&candidate) {
         return candidate;
     }
-    raw.split_whitespace()
-        .flat_map(|token| {
-            // Re-tokenize with every operator neutralised: strip quotes and
-            // parens, then quote what remains.
-            let cleaned: String = token
-                .chars()
-                .map(|c| if matches!(c, '"' | '(' | ')') { ' ' } else { c })
-                .collect();
-            cleaned
-                .split_whitespace()
-                .map(quote_fts5_token)
-                .collect::<Vec<_>>()
+    // Re-tokenize with every operator neutralised: strip quotes and parens,
+    // then quote what remains. The result is a bare OR-join, so it drops
+    // stopwords like the bare path above, keeping the words the user put in
+    // quotes, and keeping every word when nothing else is left.
+    let segments: Vec<&str> = raw.split('"').collect();
+    // An unclosed quote leaves an even number of segments; the text after
+    // it was never quoted, so it is filtered like the rest.
+    let unclosed = segments.len().is_multiple_of(2);
+    let last = segments.len() - 1;
+    let words: Vec<(&str, bool)> = segments
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, segment)| {
+            let quoted = index % 2 == 1 && !(unclosed && index == last);
+            segment
+                .split(['(', ')'])
+                .flat_map(str::split_whitespace)
+                .map(move |word| (word, quoted))
         })
+        .collect();
+    let content: Vec<&str> = words
+        .iter()
+        .filter(|(word, quoted)| *quoted || !stopwords.contains(&word.to_lowercase()))
+        .map(|(word, _)| *word)
+        .collect();
+    let kept = if content.is_empty() {
+        words.iter().map(|(word, _)| *word).collect()
+    } else {
+        content
+    };
+    kept.into_iter()
+        .map(quote_fts5_token)
         .collect::<Vec<_>>()
         .join(" OR ")
 }
@@ -769,6 +791,61 @@ mod tests {
     fn explicit_syntax_bypasses_custom_list_too() {
         let pt = FtsStopwords::new(["o", "de"]);
         assert_eq!(super::prepare_fts5_query("o AND de", &pt), "o AND de");
+    }
+
+    /// Text that trips the explicit-syntax path but does not parse degrades
+    /// to the quoted bag of words. That bag is a bare OR-join, so it drops
+    /// stopwords the way the bare path does, folding case: `What is the
+    /// cause of the stuck deploy` must not OR-in `What`/`is`/`the`/`of` just
+    /// because the sentence ends in `(prod)`.
+    #[test]
+    fn unparseable_syntax_fallback_drops_stopwords() {
+        let prepared = prepare_fts5_query("What is the cause of the stuck deploy (prod)");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"cause\" OR \"stuck\" OR \"deploy\" OR \"prod\"");
+    }
+
+    /// The fallback filters through the configured list, not the built-in
+    /// English one, and `FtsStopwords::none()` keeps every word.
+    #[test]
+    fn unparseable_syntax_fallback_uses_configured_list() {
+        let pt = FtsStopwords::new(["o", "de"]);
+        assert_eq!(
+            super::prepare_fts5_query("the cause de o deploy (prod)", &pt),
+            "\"the\" OR \"cause\" OR \"deploy\" OR \"prod\""
+        );
+        assert_eq!(
+            super::prepare_fts5_query("the cause of the deploy (prod)", &FtsStopwords::none()),
+            "\"the\" OR \"cause\" OR \"of\" OR \"the\" OR \"deploy\" OR \"prod\""
+        );
+    }
+
+    /// A word the user quoted is kept in the fallback even when it is a
+    /// stopword, as a quoted phrase is on the explicit-syntax path; the same
+    /// word outside quotes is still dropped.
+    #[test]
+    fn unparseable_syntax_fallback_keeps_quoted_stopwords() {
+        let prepared = prepare_fts5_query("\"the\" deploy (prod of the");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"the\" OR \"deploy\" OR \"prod\"");
+    }
+
+    /// An unclosed quote does not protect the words after it: they were never
+    /// quoted, so their stopwords are dropped like any others.
+    #[test]
+    fn unparseable_syntax_fallback_filters_after_an_unclosed_quote() {
+        let prepared = prepare_fts5_query("the 12\" (rack) of the server");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"12\" OR \"rack\" OR \"server\"");
+    }
+
+    /// A fallback query made only of stopwords keeps them all, as the bare
+    /// path does: the user's literal words beat an empty search.
+    #[test]
+    fn unparseable_syntax_fallback_of_only_stopwords_keeps_its_terms() {
+        let prepared = prepare_fts5_query("what is (the)");
+        assert_parses(&prepared);
+        assert_eq!(prepared, "\"what\" OR \"is\" OR \"the\"");
     }
 
     /// Worked example from the issue / docs: a Portuguese natural-language

@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+- Dropped stopwords from the quoted bag of words a search falls back to when
+  its text looks like FTS5 syntax but does not parse, such as a question
+  ending in `(prod)`. The fallback OR-joined `what`, `is`, `the` and `of`
+  with the content words; it now filters through the configured
+  `[search.fts] stopwords` list like a bare query, keeps the words the user
+  quoted, and keeps every word when all of them are stopwords.
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed
