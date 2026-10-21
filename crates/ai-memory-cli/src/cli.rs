@@ -628,6 +628,16 @@ pub(crate) fn parse_env_kv(value: &str) -> Result<(String, String), String> {
             "invalid value '{key}={value}' for --env; KEY must not be empty"
         ));
     }
+    // Dotenv files are commonly written `KEY = value`. The caller trims the
+    // line, not the halves, so that spelling yields a key with a trailing
+    // space: nothing the harness or a shell can read, and the override
+    // silently does nothing. Refuse it rather than guess, and leave the value
+    // literal as documented above.
+    if key.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "invalid value '{key}={value}' for --env; KEY must not contain whitespace"
+        ));
+    }
     Ok((key.to_string(), value.to_string()))
 }
 
@@ -3688,6 +3698,49 @@ pub struct WritePageArgs {
 
 #[cfg(test)]
 mod tests {
+    /// `--env-file` lines are trimmed as a whole, not per half, so the common
+    /// dotenv spelling `KEY = value` used to produce a key with a trailing
+    /// space — an entry no shell and no harness can read, so the override
+    /// silently did nothing.
+    #[test]
+    fn env_entries_with_a_whitespace_key_are_refused() {
+        for raw in [
+            "CLAUDE_CONFIG_DIR = /accounts/work",
+            "CLAUDE_CONFIG_DIR =/accounts/work",
+            " CLAUDE_CONFIG_DIR=/accounts/work",
+            "TWO WORDS=value",
+        ] {
+            let err = super::parse_env_kv(raw).expect_err(raw);
+            assert!(
+                err.contains("KEY must not contain whitespace"),
+                "{raw}: {err}"
+            );
+        }
+    }
+
+    /// The controls: a well-formed entry still parses, the value stays
+    /// literal (inner and trailing spaces preserved), and an empty key keeps
+    /// its own distinct error.
+    #[test]
+    fn env_entries_keep_their_value_literal() {
+        assert_eq!(
+            super::parse_env_kv("KEY=VALUE").unwrap(),
+            ("KEY".to_string(), "VALUE".to_string())
+        );
+        assert_eq!(
+            super::parse_env_kv("KEY= two words ").unwrap(),
+            ("KEY".to_string(), " two words ".to_string())
+        );
+        assert_eq!(
+            super::parse_env_kv("KEY=").unwrap(),
+            ("KEY".to_string(), String::new())
+        );
+        let err = super::parse_env_kv("=VALUE").expect_err("empty key");
+        assert!(err.contains("KEY must not be empty"), "{err}");
+        let err = super::parse_env_kv("NOVALUE").expect_err("no separator");
+        assert!(err.contains("expected KEY=VALUE"), "{err}");
+    }
+
     #[test]
     fn session_management_is_runtime_opt_in() {
         let parsed = Cli::try_parse_from(["ai-memory", "serve"]).unwrap();
