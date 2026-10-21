@@ -559,6 +559,16 @@ public hostname**, not just `localhost`. The host-allowlist middleware
 runs before any header rewriting, so it sees the proxy's forwarded
 `Host: memory.example.com` and would reject it otherwise.
 
+### Clients connect directly, never through a forward proxy
+
+The hooks (native, shell, PowerShell 7 and the TypeScript integrations) and
+`ai-memory mcp-bridge` ignore `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so a
+sandbox that exports a filtering proxy cannot swallow their requests. A
+server that a client machine can reach only through an outbound forward proxy
+is therefore out of reach for them. Give the server an address the client can
+reach directly, such as a reverse proxy on the network edge or a tunnel like
+Path 3.
+
 ## Don't paper over the security gap
 
 Three things to actively avoid:

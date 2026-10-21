@@ -1290,17 +1290,76 @@ assert_eq "client marker: no request went out without it" "0" \
     "$(grep -c UNMARKED "$MARKER_LOG")"
 unset AI_MEMORY_DATA_DIR
 
+# --- no environment proxy on any request --------------------------------
+# A sandbox that exports a proxy with an empty NO_PROXY (ai-jail) otherwise
+# sends the loopback POST and the handoff GET to that proxy, which answers
+# 4xx. `ai_memory_post_hook` treats a 4xx as a permanent rejection, so the
+# observation is dropped outright rather than spooled. The native client
+# (`hook_capture::build_client`) and the MCP bridge both build with
+# `no_proxy()`; every curl branch in the shell bundle must match them.
+curl() {
+    _tnp=PROXYABLE
+    _tdata=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --noproxy) shift; [ "$#" -gt 0 ] || break
+                [ "$1" = '*' ] && _tnp=noproxy ;;
+            -H|-X|-w|-o) shift ;;
+            --data-binary) shift; [ "$#" -gt 0 ] || break; _tdata="$1" ;;
+        esac
+        shift
+    done
+    [ "$_tdata" = "@-" ] && cat >/dev/null
+    printf '%s\n' "$_tnp" >>"$NOPROXY_LOG"
+    printf '200'
+    return 0
+}
+AI_MEMORY_DATA_DIR="$TMP/noproxy"
+export AI_MEMORY_DATA_DIR
+mkdir -p "$AI_MEMORY_DATA_DIR"
+NOPROXY_LOG="$AI_MEMORY_DATA_DIR/noproxy.log"
+: >"$NOPROXY_LOG"
+noproxy_round() {
+    ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork" >/dev/null 2>&1 || true
+    printf '%s' '{"e":"noproxy"}' \
+        | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=stop&agent=cursor" >/dev/null 2>&1
+}
+noproxy_round                                  # no auth
+(umask 077; printf 'Authorization: Bearer file-token\n' >"$AI_MEMORY_DATA_DIR/auth-header")
+noproxy_round                                  # header file
+rm -f "$AI_MEMORY_DATA_DIR/auth-header"
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"n1"}'
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain without a token
+AI_MEMORY_AUTH_TOKEN=env-token
+export AI_MEMORY_AUTH_TOKEN
+noproxy_round                                  # env token
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"n2"}'
+unset AI_MEMORY_AUTH_TOKEN
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain with the spooled token
+unset -f curl
+assert_eq "no proxy: every curl branch was exercised" "yes" \
+    "$([ "$(awk 'END { print NR + 0 }' "$NOPROXY_LOG")" -ge 8 ] && printf 'yes' || printf 'no')"
+assert_eq "no proxy: no request could reach an environment proxy" "0" \
+    "$(grep -c PROXYABLE "$NOPROXY_LOG")"
+unset AI_MEMORY_DATA_DIR
+
 # The PowerShell helper builds its request headers in one hashtable per call
 # site; each must carry the marker, and every Invoke-WebRequest must pass one.
 PS_HELPER=hooks/lib/ai-memory-hook.ps1
 PS_HEADER_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders = @\{\}' "$PS_HELPER")
 PS_MARKED_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders\["X-AI-Memory-Client"\] = "hook-ps"' "$PS_HELPER")
-PS_REQUESTS=$(grep -c 'Invoke-WebRequest `' "$PS_HELPER")
-PS_REQUESTS_WITH_HEADERS=$(grep -A6 'Invoke-WebRequest `' "$PS_HELPER" | grep -Ec -- '-Headers \$[Hh]eaders')
+PS_REQUESTS=$(grep -Ec '^[^#]*Invoke-WebRequest( @NoProxy)? `$' "$PS_HELPER")
+PS_REQUESTS_WITH_HEADERS=$(grep -E -A6 '^[^#]*Invoke-WebRequest( @NoProxy)? `$' "$PS_HELPER" | grep -Ec -- '-Headers \$[Hh]eaders')
+PS_REQUESTS_NO_PROXY=$(grep -Ec '^[^#]*Invoke-WebRequest @NoProxy `$' "$PS_HELPER")
 assert_eq "powershell: header tables found" "yes" \
     "$([ "$PS_HEADER_TABLES" -ge 2 ] && printf 'yes' || printf 'no (%s)' "$PS_HEADER_TABLES")"
 assert_eq "powershell: every header table carries the client marker" "$PS_HEADER_TABLES" "$PS_MARKED_TABLES"
 assert_eq "powershell: every request passes the header table" "$PS_REQUESTS" "$PS_REQUESTS_WITH_HEADERS"
+assert_eq "powershell: every request call site found" "yes" \
+    "$([ "$PS_REQUESTS" -ge 3 ] && [ "$PS_REQUESTS" -eq "$(grep -Ec '^[^#]*Invoke-WebRequest' "$PS_HELPER")" ] && printf 'yes' || printf 'no (%s)' "$PS_REQUESTS")"
+# PowerShell 7 reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY for Invoke-WebRequest;
+# `Get-AiMemoryNoProxy` supplies -NoProxy there, like the curl branches above.
+assert_eq "powershell: every request skips environment proxies" "$PS_REQUESTS" "$PS_REQUESTS_NO_PROXY"
 
 # A spooled fixture event names this run's temp tree or targets the fake
 # `memory.test` host. Live sessions share the spool and may mention that host

@@ -4903,6 +4903,7 @@ function gitRepoProject(cwd: string): string | undefined {
 fn add_hook_spooling(source: String) -> Result<String> {
     const FETCH_BLOCK: &str = r#"      try {
         await fetch(item.url, {
+          proxy: false,
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify(item.payload),
@@ -4913,6 +4914,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
       }"#;
     const FETCH_REPLACEMENT: &str = r#"      try {
         const resp = await fetch(item.url, {
+          proxy: false,
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify(item.payload),
@@ -5070,6 +5072,7 @@ async function drainHookQueue(): Promise<void> {{
       if (!item) break;
       try {{
         await fetch(item.url, {{
+          proxy: false,
           method: "POST",
           headers: {{ "Content-Type": "application/json", ...authHeaders() }},
           body: JSON.stringify(item.payload),
@@ -5220,6 +5223,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     const response = await fetch(url, {{
+      proxy: false,
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
@@ -5239,6 +5243,7 @@ async function fetchRecap(cwd: string, id: string): Promise<string | undefined> 
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     const response = await fetch(url, {{
+      proxy: false,
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
@@ -5693,6 +5698,7 @@ function mcpHeaders(ctx?: any): Record<string, string> {
 async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
   const id = ++mcpRequestId;
   const response = await fetch(MCP_SERVER, {
+    proxy: false,
     method: "POST",
     headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
@@ -5707,6 +5713,7 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
 
 async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void> {
   const response = await fetch(MCP_SERVER, {
+    proxy: false,
     method: "POST",
     headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", method, params: params ?? {} }),
@@ -5853,6 +5860,7 @@ async function drainHookQueue(): Promise<void> {{
       if (!item) break;
       try {{
         await fetch(item.url, {{
+          proxy: false,
           method: "POST",
           headers: {{ "Content-Type": "application/json", ...authHeaders() }},
           body: JSON.stringify(item.payload),
@@ -6004,6 +6012,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     const response = await fetch(url, {{
+      proxy: false,
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
