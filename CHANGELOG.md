@@ -223,6 +223,13 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- The Japanese iteration mark 々 (and the other letters of CJK Symbols and
+  Punctuation) now stay inside a CJK run. They terminated one, so a word like
+  日々 was indexed as two single characters and searching it emitted a bare
+  `"日"` that matched every page containing 日 while 日々 itself was unfindable
+  as a unit. Indexing changes with this, so existing rows keep their old terms
+  until they are rewritten or the index is rebuilt by a compaction.
+  ([#1552](https://github.com/akitaonrails/ai-memory/pull/1552))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
