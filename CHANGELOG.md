@@ -11,6 +11,32 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+- A malformed OAuth entry in `auth.json` no longer prints the stored value in
+  its error. When a field held a value of the wrong type, such as a token
+  written into `expires` by a hand edit or a provisioning script, the parse
+  error quoted the token, and from there it reached terminals, CI logs and
+  captured hook output. The error now names the type it found with the value
+  replaced by `<redacted>`.
+  ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
+
+### Fixed
+- Every command except `hook` and `mcp-bridge` now warns, naming the variable
+  but not its value, when `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (or a
+  lower-case spelling) is set to something the HTTP client cannot use: bytes
+  that are not UTF-8, such as a Latin-1 password, a URI with an unencoded
+  space or non-ASCII character, or an unsupported scheme. The client skips
+  such a value and connects directly, so provider and login requests used to
+  time out on a network that blocks direct egress, or bypass a required proxy
+  where it does not, with nothing pointing at the proxy setting.
+  ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
+- `init`, `auth` and `auth enable` print paths on Windows without the `\\?\`
+  verbatim prefix of the canonical data dir, in their output and their errors,
+  as the hook and service commands already did, and so does the
+  `ai-memory starting` line every command logs. A path copied from those
+  messages now works in `cmd` and in scripts that look for it.
+  ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
