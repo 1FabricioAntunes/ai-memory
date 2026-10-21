@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- A `title:` or `body:` filter on an unspaced-CJK search now narrows the
+  auxiliary CJK stream too. The stream read `:` as a plain run separator and
+  dropped the qualifier, so its MATCH searched every indexed column including
+  the path, and because that stream is unioned into the primary one,
+  `title:支付服务` returned pages holding the term only in their body or path.
+  ([#1548](https://github.com/akitaonrails/ai-memory/pull/1548))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
