@@ -75,9 +75,12 @@ impl GoogleEmbedder {
         } else {
             text.to_string()
         };
-        // Gemini rejects an over-long `embedContent` input with 400
-        // INVALID_ARGUMENT, and `embed_page_version` only logs that failure, so
-        // an unbounded body would leave the page with no vector at all.
+        // `gemini-embedding-001`, the default, takes at most 2,048 input tokens
+        // and the API does not document whether a longer input is cut or
+        // refused; `embed_page_version` only logs a refusal, which would leave
+        // the page with no vector. The 8 KB head cut stays near that limit for
+        // prose. Applied after the embedding-2 prefix so it bounds the whole
+        // input. <https://ai.google.dev/gemini-api/docs/embeddings>
         let prepared = truncate_for_embedding(&prepared, OPENAI_EMBED_MAX_TOKENS);
 
         let url = embed_url(&self.base_url, &self.model);

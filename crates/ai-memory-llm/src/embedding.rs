@@ -645,6 +645,10 @@ impl VoyageEmbedder {
     }
 }
 
+/// Sent without a client-side cut: Voyage's `truncation` defaults to true and
+/// shortens an over-long input to the model's own context (4k-32k tokens), so
+/// the shared 8 KB head cut would only discard text the model can embed.
+/// <https://docs.voyageai.com/docs/embeddings>
 #[derive(Debug, Serialize)]
 struct VoyageRequest<'a> {
     input: [&'a str; 1],
@@ -677,9 +681,8 @@ impl Embedder for VoyageEmbedder {
 
     async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
         let url = normalize_openai_base(&self.base_url, "embeddings");
-        let input = truncate_for_embedding(text, OPENAI_EMBED_MAX_TOKENS);
         let req = VoyageRequest {
-            input: [input.as_str()],
+            input: [text],
             model: &self.model,
         };
         let mut attempt = 0u32;
@@ -1126,6 +1129,36 @@ mod tests {
         e.embed_query("find the runbook")
             .await
             .expect("embed_query succeeds");
+    }
+
+    /// Voyage truncates server side by default, so a long page goes out whole
+    /// rather than through the 8 KB head cut the other HTTP embedders need.
+    #[tokio::test]
+    async fn voyage_embedder_sends_a_long_input_whole() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let page = "word ".repeat(8_000);
+        let expected = page.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(move |req: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(body["input"][0], expected.as_str());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{ "embedding": [0.6_f32, 0.8] }],
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let e = VoyageEmbedder::new(SecretString::from("test-key"), "voyage-3-large", 2)
+            .unwrap()
+            .with_base_url(server.uri());
+
+        e.embed(&page).await.expect("voyage embed succeeds");
     }
 
     #[tokio::test]
