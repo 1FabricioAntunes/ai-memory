@@ -1027,7 +1027,11 @@ that touch the relevant area.
    in every domain row from day one. (basic-memory #783 / #834.)
 5. **Hooks are fire-and-forget.** Hook scripts hard-timeout at
    ≤200 ms; server returns 202 immediately or 429 when saturated.
-   (agentmemory #221 / #143.)
+   (agentmemory #221 / #143.) The router's filesystem probes of an event's
+   cwd (git discovery, canonicalization) never run on an async worker: they
+   go through `CwdProbes`, a blocking-pool path with four permits and a
+   2-second deadline, so a stuck `open()` (macOS privacy controls, a dead
+   network mount) fails that event instead of stalling the server (#1514).
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>`
    has no other constructor than `sanitize()`. (design-decisions §14.)
    The opt-in assistant/Stop excerpt (#196) enters through this same
