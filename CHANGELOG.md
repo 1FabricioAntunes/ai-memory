@@ -240,6 +240,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- The `user grants` and `project grants` tables no longer misalign on a
+  workspace, project or user name outside ASCII. Column widths were measured
+  in bytes while the formatter pads in characters, so a row such as
+  `default/café` was padded one column too far and its `USERNAME` and
+  `LEVEL` cells sat right of every other row's.
+  ([#1564](https://github.com/akitaonrails/ai-memory/pull/1564))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
