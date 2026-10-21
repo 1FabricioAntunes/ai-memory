@@ -223,6 +223,13 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Omitted TTL-expired pages from the page count in `memory_briefing` and
+  `memory_explore`. Every page list in a briefing already hid them, and the
+  project cards have since 3.1.x, so a project with an expired page reported
+  more latest pages than any list in the same response could show. The
+  all-versions total is unchanged, as is `ai-memory status`.
+  ([#1535](https://github.com/akitaonrails/ai-memory/pull/1535))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
