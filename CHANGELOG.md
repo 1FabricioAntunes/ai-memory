@@ -223,6 +223,14 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- `memory_read_session_observations` without a `session_id` now reads the
+  session with the newest captured work instead of the newest one that ended.
+  A harness cut off without ending (a quota limit, an aborted turn, a crash)
+  never ends its session, so the agent taking its work over used to get some
+  older session, often from another checkout. The default now skips the
+  caller's own session, prefers a session in the caller's cwd, and falls back
+  to the latest completed session only when nothing worked in the last 30
+  days. It stays owner-filtered and bound to the resolved project. (#1512)
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a

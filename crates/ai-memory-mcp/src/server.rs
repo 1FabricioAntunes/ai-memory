@@ -390,7 +390,8 @@ should be proposed from a completed session, or at explicit wrap-up \
   ended (a harness cut off by a quota limit or a crash): read it with \
   `order: \"desc\"` before relying on an older handoff or page. Pass \
   `session_id` (the UUID or the harness's native id), or omit it for the \
-  latest completed session in the current project; page with \
+  newest other session with work in the current project (your cwd first, \
+  ended or not); page with \
   `limit`/`offset`, narrow with `kinds` or `query`. Read-only, no LLM call.\n\
 - `memory_delete_page` — when the user explicitly asks to delete or \
   remove a specific page (by exact path). Idempotent; fires the \
@@ -1711,6 +1712,9 @@ const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
 const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
 const SESSION_OBSERVATIONS_MIN_BODY_CHARS: usize = 200;
 const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
+/// Sessions with recent work the default read scans for one in the caller's
+/// cwd. The list is ordered by activity, so it stays small.
+const SESSION_OBSERVATIONS_DEFAULT_SCAN: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ReadSessionObservationsArgs {
@@ -1718,9 +1722,10 @@ struct ReadSessionObservationsArgs {
     /// `memory_briefing`'s `recent_sessions`, a session-start notice or an
     /// admin session listing, or the harness's own native id (an OpenCode
     /// `ses_…` id, for example), which maps to the same session. Omit to
-    /// read the most recent COMPLETED session visible to you in the
-    /// resolved project; a session cut off without ending is not completed,
-    /// so name it.
+    /// read the session with the newest captured work visible to you in the
+    /// resolved project, ended or cut off, other than your own: one in your
+    /// own cwd first, then any. With no work in the last 30 days, the latest
+    /// completed session.
     #[serde(default)]
     session_id: Option<String>,
     /// Maximum observations per call (default 50, max 200).
@@ -2182,20 +2187,22 @@ impl AiMemoryServer {
         ai_memory_core::ActorKey { user, session_id }
     }
 
-    /// The sessions with the newest captured work in one scope, for
-    /// `memory_briefing`'s `recent_sessions` and `memory_handoff_list`'s
-    /// `newer_unended_session`.
+    /// The `limit` sessions with the newest captured work in one scope, for
+    /// `memory_briefing`'s `recent_sessions`, `memory_handoff_list`'s
+    /// `newer_unended_session` and `memory_read_session_observations`'
+    /// default session.
     async fn recent_sessions(
         &self,
         ws: WorkspaceId,
         proj: ProjectId,
         owner_filter: ai_memory_core::OwnerFilter,
+        limit: usize,
     ) -> Result<Vec<ai_memory_store::SessionActivity>, McpError> {
         let since = jiff::Timestamp::now()
             .saturating_sub(BRIEFING_RECENT_SESSIONS_WINDOW)
             .unwrap_or(jiff::Timestamp::MIN);
         self.reader
-            .recent_session_activity(ws, proj, owner_filter, since, BRIEFING_RECENT_SESSIONS)
+            .recent_session_activity(ws, proj, owner_filter, since, limit)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
@@ -5093,8 +5100,10 @@ impl AiMemoryServer {
         (a session-start notice, `memory_briefing` `recent_sessions` or \
         `memory_handoff_list` `newer_unended_session` names it; read it with \
         `order: \"desc\"`). Pass `session_id` (the UUID, or the harness's \
-        native id); omit it to read the most recent completed session \
-        visible to you in the resolved project. Pages with \
+        native id); omit it to read the session with the newest captured \
+        work visible to you in the resolved project, other than your own \
+        (one in your own cwd first; ended or not), or the latest completed \
+        one when nothing worked in the last 30 days. Pages with \
         `limit`/`offset` (default 50, max 200) and returns `total`, so loop on \
         `offset` to read more. `order` is `asc` (capture order) or `desc`; \
         `kinds` and `query` narrow the rows; `body_max_chars` (default 4000) \
@@ -5199,19 +5208,54 @@ impl AiMemoryServer {
                 }
             }
             _ => {
-                let mut latest = self
-                    .reader
-                    .sessions_for_scope(ws, proj, owner_filter, false, 1, 0)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                match latest.pop() {
+                // The default follows the newest work, not the newest clean
+                // end: a harness cut off by a quota limit or a crash never
+                // ends, and the session taking its work over usually starts
+                // in the same checkout. So: the newest other session in the
+                // caller's cwd, then the newest other session in the scope,
+                // then (no other session worked inside the 30-day window)
+                // the latest completed one. The caller's own session is never the
+                // default; it knows its own work.
+                let caller = aps_actor.session_id.as_deref().map(SessionId::from_native);
+                let recent = self
+                    .recent_sessions(
+                        ws,
+                        proj,
+                        owner_filter.clone(),
+                        SESSION_OBSERVATIONS_DEFAULT_SCAN,
+                    )
+                    .await?;
+                let caller_cwd = recent
+                    .iter()
+                    .find(|activity| Some(activity.session_id) == caller)
+                    .and_then(|activity| activity.cwd.as_deref());
+                let others = || {
+                    recent
+                        .iter()
+                        .filter(|activity| Some(activity.session_id) != caller)
+                };
+                let newest = caller_cwd
+                    .and_then(|cwd| others().find(|activity| activity.cwd.as_deref() == Some(cwd)))
+                    .or_else(|| others().next());
+                let summary = match newest {
+                    Some(activity) => self
+                        .reader
+                        .session_summary_scoped(ws, proj, activity.session_id, owner_filter)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                    None => self
+                        .reader
+                        .sessions_for_scope(ws, proj, owner_filter, false, 1, 0)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .pop(),
+                };
+                match summary {
                     Some(summary) => summary,
                     None => {
                         let scope = self.scope_label(ws, proj).await;
                         return Err(McpError::invalid_params(
-                            format!(
-                                "no completed session in {scope}; pass session_id to read an open one"
-                            ),
+                            format!("no other session in {scope}; pass session_id to read one"),
                             None,
                         ));
                     }
@@ -5754,7 +5798,7 @@ impl AiMemoryServer {
         // can all predate where the work actually stopped. Name that session.
         let caller = aps_actor.session_id.as_deref().map(SessionId::from_native);
         let newest = self
-            .recent_sessions(ws, proj, owner_filter)
+            .recent_sessions(ws, proj, owner_filter, BRIEFING_RECENT_SESSIONS)
             .await?
             .into_iter()
             .find(|activity| Some(activity.session_id) != caller);
@@ -6477,6 +6521,7 @@ impl AiMemoryServer {
                 ws,
                 proj,
                 ai_memory_core::OwnerFilter::for_actor_context(&actor),
+                BRIEFING_RECENT_SESSIONS,
             )
             .await?
             .into_iter()
@@ -14189,54 +14234,271 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 
-    #[tokio::test]
-    async fn memory_read_session_observations_defaults_to_latest_completed_session() {
-        let (_tmp, store, server, ws, proj) = setup_server().await;
-        let err = server
+    /// One session with a cwd and an owner, and one prompt `start_us`
+    /// into it, for the default-session tests.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_owned_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        cwd: &str,
+        actor_user: Option<&str>,
+        start_us: i64,
+        completed: bool,
+    ) {
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(start_us),
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some(cwd.into()),
+                actor_user: actor_user
+                    .map(|user| ai_memory_core::IdentityKey::User(user.into()).storage_key()),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(start_us + 1_000),
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "work".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        if completed {
+            store.writer.end_session(session_id, None).await.unwrap();
+        }
+    }
+
+    async fn default_session_read(
+        server: &AiMemoryServer,
+        parts: axum::http::request::Parts,
+    ) -> Result<serde_json::Value, McpError> {
+        server
             .memory_read_session_observations(
                 Parameters(session_observations_args(None)),
-                test_optional_parts(),
+                OptionalParts(parts),
             )
             .await
-            .expect_err("an empty project has no completed session");
+            .map(call_tool_json)
+    }
+
+    fn parts_with_caller(user: Option<&str>, session: &str) -> axum::http::request::Parts {
+        let mut parts = test_parts_default();
+        parts
+            .headers
+            .insert("x-memory-actor-session-id", session.parse().unwrap());
+        if let Some(user) = user {
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(ActorContext {
+                user: Some(user.into()),
+                ..ActorContext::default()
+            });
+        }
+        parts
+    }
+
+    /// Omitting `session_id` reads the newest work, ended or not (#1512): a
+    /// harness cut off without ending is exactly what the next one takes
+    /// over. With the caller's session known, its own cwd comes first and
+    /// its own session is never the answer.
+    #[tokio::test]
+    async fn memory_read_session_observations_defaults_to_newest_other_session() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let err = default_session_read(&server, test_parts_default())
+            .await
+            .expect_err("an empty project has no session to default to");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(
             err.to_string()
-                .contains("no completed session in default/scratch"),
+                .contains("no other session in default/scratch"),
             "got {err}"
         );
 
-        let completed = seed_session_observations(
+        // Nothing worked in the window: the latest completed session.
+        let old = SessionId::new();
+        seed_owned_session(
             &store,
             ws,
             proj,
+            old,
+            "/w/a",
+            None,
+            now_us() - 40 * 86_400_000_000,
             true,
-            &[(ObservationKind::UserPrompt, "done", "completed work")],
         )
         .await;
-        let _open = seed_session_observations(
+        let page = default_session_read(&server, test_parts_default())
+            .await
+            .unwrap();
+        assert_eq!(page["session"]["session_id"], old.to_string());
+
+        let start = now_us() - 3_600_000_000;
+        let same_cwd = SessionId::new();
+        seed_owned_session(&store, ws, proj, same_cwd, "/w/a", None, start, false).await;
+        let elsewhere = SessionId::new();
+        seed_owned_session(
             &store,
             ws,
             proj,
+            elsewhere,
+            "/w/b",
+            None,
+            start + 60_000_000,
+            true,
+        )
+        .await;
+        let caller = "codex-taking-over";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(caller),
+            "/w/a",
+            None,
+            start + 120_000_000,
             false,
-            &[(ObservationKind::UserPrompt, "live", "still running")],
         )
         .await;
 
-        let page = call_tool_json(
-            server
-                .memory_read_session_observations(
-                    Parameters(session_observations_args(None)),
-                    test_optional_parts(),
-                )
-                .await
-                .unwrap(),
-        );
+        // No caller session: the newest work in the scope.
+        let page = default_session_read(&server, test_parts_default())
+            .await
+            .unwrap();
         assert_eq!(
             page["session"]["session_id"],
-            completed.to_string(),
-            "the open session must be skipped"
+            SessionId::from_native(caller).to_string()
         );
-        assert_eq!(page["observations"][0]["title"], "done");
+
+        // The caller in /w/a: the open session it takes over, not the newer
+        // one another checkout ended, and never itself.
+        let page = default_session_read(&server, parts_with_caller(None, caller))
+            .await
+            .unwrap();
+        assert_eq!(
+            page["session"]["session_id"],
+            same_cwd.to_string(),
+            "{page}"
+        );
+        assert_eq!(page["session"]["cwd"], "/w/a");
+        assert!(page["session"]["ended_at"].is_null(), "{page}");
+        assert_eq!(page["observations"][0]["title"], "prompt");
+
+        // A caller whose cwd has no other session: the newest other one.
+        let loner = "claude-elsewhere";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(loner),
+            "/w/c",
+            None,
+            start + 180_000_000,
+            false,
+        )
+        .await;
+        let page = default_session_read(&server, parts_with_caller(None, loner))
+            .await
+            .unwrap();
+        assert_eq!(
+            page["session"]["session_id"],
+            SessionId::from_native(caller).to_string()
+        );
+    }
+
+    /// The default never reaches another operator's session or another
+    /// project's, however new and whatever cwd it shares with the caller
+    /// (#1512): the owner filter and the resolved scope bound the scan.
+    #[tokio::test]
+    async fn memory_read_session_observations_default_never_crosses_owner_or_project() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let start = now_us() - 3_600_000_000;
+        let caller = "alice-taking-over";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(caller),
+            "/w/a",
+            Some("alice"),
+            start + 300_000_000,
+            false,
+        )
+        .await;
+        let bobs = SessionId::new();
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            bobs,
+            "/w/a",
+            Some("bob"),
+            start + 200_000_000,
+            false,
+        )
+        .await;
+        let foreign = SessionId::new();
+        seed_owned_session(
+            &store,
+            ws,
+            other_project,
+            foreign,
+            "/w/a",
+            Some("alice"),
+            start + 250_000_000,
+            false,
+        )
+        .await;
+
+        let err = default_session_read(&server, parts_with_caller(Some("alice"), caller))
+            .await
+            .expect_err("only Bob's and another project's sessions exist besides Alice's own");
+        assert_eq!(
+            err.message,
+            "no other session in default/scratch; pass session_id to read one"
+        );
+
+        // Control: Alice's own older session is the default.
+        let alices = SessionId::new();
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            alices,
+            "/w/a",
+            Some("alice"),
+            start,
+            false,
+        )
+        .await;
+        let page = default_session_read(&server, parts_with_caller(Some("alice"), caller))
+            .await
+            .unwrap();
+        assert_eq!(page["session"]["session_id"], alices.to_string(), "{page}");
+        let bob = default_session_read(&server, parts_with_caller(Some("bob"), "bob-new"))
+            .await
+            .unwrap();
+        assert_eq!(bob["session"]["session_id"], bobs.to_string(), "{bob}");
     }
 
     #[tokio::test]
