@@ -2861,8 +2861,21 @@ impl AiMemoryServer {
         // this only fires when the caller passed none of them.
         let explicit_scoping = !args.scopes.is_empty()
             || named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
+        // A non-blank `as_of` is explicit intent to read one project as of an
+        // instant. The global branch below returns its own response, so an
+        // explicit `global` or `scopes` is refused here, before that branch,
+        // and an implicit `default_global` broadening yields to `as_of` the
+        // way the precedence note above says an explicit arg does.
+        let as_of_present = args.as_of.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if as_of_present && (args.global.unwrap_or(false) || !args.scopes.is_empty()) {
+            return Err(McpError::invalid_params(
+                "as_of cannot be combined with global or scopes",
+                None,
+            ));
+        }
         let recall_global = !explicit_scoping
             && !args.global.unwrap_or(false)
+            && !as_of_present
             && self.active_project.default_global_for(&aps_actor);
         if args.global.unwrap_or(false) || recall_global {
             if !args.scopes.is_empty()
@@ -2932,12 +2945,6 @@ impl AiMemoryServer {
         // RRF. Vector, graph, and the raw-observation fallback stay out
         // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
-            if args.global.unwrap_or(false) || !args.scopes.is_empty() {
-                return Err(McpError::invalid_params(
-                    "as_of cannot be combined with global or scopes",
-                    None,
-                ));
-            }
             let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
                 McpError::invalid_params(format!("as_of must be an ISO-8601 instant: {e}"), None)
             })?;
@@ -10889,6 +10896,10 @@ mod tests {
         as_of_scopes.scopes = vec![scope("scratch")];
         as_of_scopes.as_of = Some("2026-06-01T00:00:00Z".into());
 
+        let mut as_of_global = base();
+        as_of_global.global = Some(true);
+        as_of_global.as_of = Some("2026-06-01T00:00:00Z".into());
+
         let mut malformed_as_of = base();
         malformed_as_of.as_of = Some("not-a-time".into());
 
@@ -10899,6 +10910,7 @@ mod tests {
             ("scopes + project", scopes_project),
             ("scopes + workspace", scopes_workspace),
             ("as_of + scopes", as_of_scopes),
+            ("as_of + global", as_of_global),
             ("malformed as_of", malformed_as_of),
         ] {
             let err = server
@@ -14696,6 +14708,53 @@ mod tests {
         assert!(
             !scoped_text.contains("cluster.md"),
             "explicit scope must NOT broaden to infra: {scoped_text}"
+        );
+
+        // `as_of` wins over default_global too: the time-travel lookup reads
+        // the current project (infra) instead of being broadened to a global
+        // search that would drop the instant and answer with today's rows.
+        let historical = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
+                    query: "recall_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: Some(jiff::Timestamp::now().to_string()),
+                    answer: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let historical_text = historical
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            !historical_text.contains("global_hits"),
+            "as_of must not be broadened to global: {historical_text}"
+        );
+        assert!(
+            historical_text.contains("cluster.md"),
+            "as_of reads the current project: {historical_text}"
+        );
+        assert!(
+            !historical_text.contains("deploy.md"),
+            "as_of stays in the current project: {historical_text}"
         );
     }
 
