@@ -658,6 +658,16 @@ async fn exchange_copilot_token(
     let status = resp.status();
     if !status.is_success() {
         let body = provider_error_body(resp).await;
+        // GitHub rate-limits this endpoint per account. A 429/5xx here says
+        // nothing about the credential, and `LlmError::Auth` is not transient,
+        // so classifying it as auth stops the fallback chain and tells the
+        // operator to fix a token that is fine.
+        if LlmError::status_is_transient(status.as_u16()) {
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body,
+            });
+        }
         return Err(LlmError::Auth(format!(
             "copilot token exchange failed ({status}): {body}"
         )));

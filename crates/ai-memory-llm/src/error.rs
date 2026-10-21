@@ -104,10 +104,19 @@ impl LlmError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Provider { status, .. } => *status == 429 || (500..=599).contains(status),
+            Self::Provider { status, .. } => Self::status_is_transient(*status),
             Self::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
         }
+    }
+
+    /// The status half of [`Self::is_transient`], for a call site that must
+    /// pick an error variant before one exists — a token endpoint answering
+    /// `429`/`5xx` has not rejected the credential, so it must not become an
+    /// `Auth` error, which is deterministic.
+    #[must_use]
+    pub fn status_is_transient(status: u16) -> bool {
+        status == 429 || (500..=599).contains(&status)
     }
 
     /// HTTP status captured from this error, when the failure carries one.
@@ -295,6 +304,32 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(err.class(), *expected, "unexpected class for {err}");
             assert!(!err.class().contains("secret upstream body"));
+        }
+    }
+
+    #[test]
+    fn status_is_transient_matches_is_transient() {
+        for status in [429u16, 500, 503, 529, 599] {
+            assert!(LlmError::status_is_transient(status), "{status}");
+            assert!(
+                LlmError::Provider {
+                    status,
+                    body: String::new()
+                }
+                .is_transient(),
+                "{status} must agree with is_transient"
+            );
+        }
+        for status in [400u16, 401, 403, 404, 422, 600] {
+            assert!(!LlmError::status_is_transient(status), "{status}");
+            assert!(
+                !LlmError::Provider {
+                    status,
+                    body: String::new()
+                }
+                .is_transient(),
+                "{status} must agree with is_transient"
+            );
         }
     }
 }
