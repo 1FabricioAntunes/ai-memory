@@ -509,7 +509,11 @@ export type ObservationKind =
 
 /** Arguments of {@link AiMemoryClient.observations}. */
 export interface ObservationsArgs extends ScopedArgs {
-  /** Session id. Omit for the latest completed session in the project. */
+  /**
+   * Session id. Omit for the newest other session with captured work in the
+   * project, ended or cut off (the caller's cwd first), or the latest
+   * completed one when nothing worked in the last 30 days.
+   */
   sessionId?: string;
   /** Maximum observations (server default 50, clamped to 200). */
   limit?: number;

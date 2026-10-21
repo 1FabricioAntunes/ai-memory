@@ -838,7 +838,8 @@ export class AiMemoryClient {
 
   /**
    * A session's captured observations (prompts, tool calls), paged. Omit
-   * `sessionId` for the latest completed session. Calls
+   * `sessionId` for the newest other session with captured work, ended or
+   * cut off. Calls
    * `memory_read_session_observations`.
    */
   async observations(args?: ObservationsArgs, options?: CallOptions): Promise<ObservationsResult> {
