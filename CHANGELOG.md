@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- `ai-memory list-projects` now sizes its columns by characters rather than
+  bytes. The widths were measured with `str::len` while `{:width$}` pads to a
+  character count, so a non-ASCII project or workspace name padded its whole
+  column one space wider than any row needed. Rows were never misaligned.
+  ([#1559](https://github.com/akitaonrails/ai-memory/pull/1559))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
