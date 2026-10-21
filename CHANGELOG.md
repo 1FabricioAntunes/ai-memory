@@ -223,12 +223,6 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
-- The `/hook` ingress now strips a leading UTF-8 byte-order mark, as the native
-  client already did. Some PowerShell pipelines add that marker when writing to
-  a native process, and both hook bundles forward it, so the event was answered
-  with 400 and lost — the hooks are fire-and-forget, so nothing surfaced.
-  ([#1523](https://github.com/akitaonrails/ai-memory/pull/1523))
-
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
@@ -242,6 +236,13 @@ version in [`docs/changelog/`](docs/changelog/):
   session-start fetch whenever any handoff was open, so the session started
   with no profile digest, brief or inbox notice at all. The refusal now costs
   only the claim, and the handoff stays open.
+
+- The `/hook` ingress now skips a leading UTF-8 byte-order mark, as the native
+  hook client already did. Some PowerShell pipelines add that marker when
+  writing to a native process, and the POSIX shell hook bundle forwards the
+  payload byte for byte, so such an event was answered with 400 and lost
+  without notice. `ai-memory-relay enqueue --file` skips the marker too.
+  ([#1523](https://github.com/akitaonrails/ai-memory/pull/1523))
 
 - `mcp-bridge` and the `setup` self-check no longer send requests to the
   server through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the hooks
