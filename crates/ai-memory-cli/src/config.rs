@@ -2019,7 +2019,8 @@ pub struct SearchSettings {
 #[serde(default)]
 pub struct FtsSettings {
     /// Words dropped from a bare (non-explicit-syntax) natural-language FTS
-    /// query before the OR-join
+    /// query, and from the bag-of-words fallback for syntax that does not
+    /// parse, before the OR-join
     /// (`ai_memory_store::fts_query::prepare_fts5_query`).
     ///
     /// - **Absent** (the default, `None`): the built-in English list —
@@ -2041,7 +2042,8 @@ pub struct FtsSettings {
     /// `"não"`. Also note the filter matches whitespace-split raw tokens
     /// before any punctuation handling, so an entry never matches a token
     /// with attached punctuation (`"de,"`, `"que?"`) — the same limitation
-    /// English stopwords have always had.
+    /// English stopwords have always had. The fallback for syntax that does
+    /// not parse strips quotes and parens first, and keeps quoted words.
     ///
     /// A non-English or mixed-language wiki should set this to that
     /// language's function words, or to `[]`: left unset, only the built-in

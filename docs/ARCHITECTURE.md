@@ -1235,11 +1235,14 @@ observation_stream = true         # R1 observation-evidence stream: FTS over obs
                                   # any punctuation handling, so an entry never matches a token
                                   # with attached punctuation ("de," / "que?") — the same
                                   # limitation English stopwords have always had. Explicit FTS5
-                                  # syntax (quoted phrases, OR/AND/NOT/NEAR, parens) always
-                                  # bypasses this filter, exactly as it does with the built-in
-                                  # list; a bare query made ONLY of configured stopwords keeps
-                                  # them all rather than returning nothing. At most 2000 entries
-                                  # of at most 64 characters each, no internal whitespace
+                                  # syntax (quoted phrases, OR/AND/NOT/NEAR, parens) that FTS5
+                                  # accepts bypasses this filter, exactly as it does with the
+                                  # built-in list; syntax that does not parse degrades to a
+                                  # bare OR-join of its words, with quotes and parens stripped,
+                                  # and is filtered like any bare query except for the words
+                                  # inside quotes. A bare query made ONLY of configured stopwords
+                                  # keeps them all rather than returning nothing. At most 2000
+                                  # entries of at most 64 characters each, no internal whitespace
                                   # (entries are matched against single whitespace-split
                                   # tokens); anything past that fails startup.
                                   #
