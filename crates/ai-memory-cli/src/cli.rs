@@ -1530,8 +1530,9 @@ pub struct PurgeProjectArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
     /// Project id (UUID) to purge, as an alternative to `--project`.
@@ -1583,8 +1584,9 @@ pub struct PurgeSessionArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// REQUIRED for the purge to run. Without this flag the CLI errors
@@ -1625,11 +1627,11 @@ pub struct RenameProjectArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Current project name. When omitted, auto-derives from the
-    /// basename of the current git repo root (or CWD) — handy when
-    /// running `ai-memory rename-project --to new-name` from a dir
-    /// that was JUST renamed (the basename will be the new name, so
-    /// you'll want to pass --from explicitly in that workflow).
+    /// Current project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name. After renaming the
+    /// directory itself, pass `--from`: a checkout with no marker or
+    /// remote would resolve to the new name.
     #[arg(long, conflicts_with = "project_id")]
     pub from: Option<String>,
     /// Project id (UUID) to rename, as an alternative to `--from`.
@@ -1653,8 +1655,9 @@ pub struct MoveProjectArgs {
     /// `--to-workspace` names the destination and stays literal.
     #[arg(long)]
     pub from_workspace: Option<String>,
-    /// Project name to move. When omitted, auto-derived from the basename
-    /// of the current git repo root (or CWD if no git repo).
+    /// Project name to move. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
     /// Project id (UUID) to move, as an alternative to `--project`.
@@ -1851,9 +1854,10 @@ pub struct BootstrapArgs {
     /// use, so bootstrap pages land where the session captures do.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the resolved repo path — same heuristic the hook router uses
-    /// to bucket per-cwd observations, so the bootstrap pages land
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name (not `--repo-path`), the
+    /// same resolution the hook router uses, so the bootstrap pages land
     /// in the same project as future session captures.
     ///
     /// Dot-prefixed dirs are preserved verbatim — `~/.config` becomes
@@ -2885,8 +2889,9 @@ pub struct EmbedArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo). Matches the
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name. Matches the
     /// hook router's per-cwd convention so this command targets the
     /// same project sessions write into.
     #[arg(long)]
@@ -2902,8 +2907,9 @@ pub struct ForgetSweepArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
 }
@@ -2922,8 +2928,9 @@ pub struct LintArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
 }
@@ -2941,8 +2948,9 @@ pub struct CuratorArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// Emit only machine-readable JSON.
@@ -2957,8 +2965,9 @@ pub struct AutoImproveReportArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// Lookback window in days.
@@ -2985,8 +2994,9 @@ pub struct AutoImproveArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// Override `[auto_improve].min_observations` for this run.
