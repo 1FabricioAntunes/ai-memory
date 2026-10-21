@@ -215,6 +215,13 @@ version in [`docs/changelog/`](docs/changelog/):
   actually ends. An opt-in real-model contention probe records idle,
   unbounded-load, and bounded-load p50/p95 query latency; hosted embedding
   providers are unchanged.
+- A resumed session that had already ended (`claude --resume` after a clean
+  exit, for example) now still gets its session-start context. An ended
+  session may not take a handoff, and that refused claim used to fail the whole
+  session-start fetch whenever any handoff was open, so the session started
+  with no profile digest, brief or inbox notice at all. The refusal now costs
+  only the claim, and the handoff stays open.
+
 - `mcp-bridge` and the `setup` self-check no longer send requests to the
   server through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the hooks
   already did. A sandbox such as ai-jail exports a proxy with an empty
