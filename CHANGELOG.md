@@ -21,6 +21,11 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Accepted the exact CRLF migration checksums written by Windows-native
+  releases before v3.1.2 and replaced them transactionally with the current
+  LF checksums before strict migration validation. Unknown migration changes
+  still fail closed. ([#1499](https://github.com/akitaonrails/ai-memory/issues/1499))
+
 - Held `ai-memory run` heartbeat notices while the harness owns the terminal
   and printed them after it exits, so a server outage no longer writes into the
   harness TUI. Only the first and latest notices are replayed, with a count of
