@@ -4750,8 +4750,13 @@ mod tests {
             ai_memory_hooks::IDLE_END_INTERVAL_SECS,
         ))
         .await;
+        // The writer runs on its own OS thread, which the paused clock does
+        // not pace: under a loaded test run the end-session transaction can
+        // still be in flight after any number of virtual advances, so each
+        // poll also yields a little real time, bounded by a real deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut ended = false;
-        for _ in 0..500 {
+        while std::time::Instant::now() < deadline {
             let disp = store
                 .reader
                 .session_end_disposition(sid, ws, proj, AgentKind::Codex)
@@ -4762,6 +4767,11 @@ mod tests {
                 break;
             }
             tokio::time::advance(std::time::Duration::from_millis(10)).await;
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            })
+            .await
+            .unwrap();
         }
         assert!(ended, "the first pass must end the idle session");
 
