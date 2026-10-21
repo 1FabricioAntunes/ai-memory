@@ -7,6 +7,14 @@
 > you already have a working tarball routine, treat this as an additional
 > layer.
 
+The on-box tarball is an online **data snapshot**, not a complete host-move
+archive. It contains `wiki/`, a consistent SQLite snapshot, and only the
+`config.toml` located inside the data dir. It deliberately omits root and hook
+credential files, external service configuration, `raw/`, logs, and models.
+For a host move, follow the companion-material checklist in
+[`docs/lifecycle-ops.md#backup`](lifecycle-ops.md#backup); keep secrets in a
+separately protected backup and reinstall hooks/MCP wiring on the destination.
+
 Ai-memory's wiki directory is a real git repository. Every consolidation pass
 writes a checkpoint through libgit2 (see cross-cutting invariant #10 in
 [`AGENTS.md`](../AGENTS.md) and the wiki design notes in

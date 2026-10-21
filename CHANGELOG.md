@@ -21,6 +21,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Defined `ai-memory backup` as an online data snapshot rather than a complete
+  host image, documented the separately protected config, root credentials and
+  raw ledgers a host move may require, and corrected the missing-token startup
+  remedy so it no longer implies the snapshot contains `auth-tokens/`.
+  ([#1494](https://github.com/akitaonrails/ai-memory/issues/1494))
+
 - Accepted the exact CRLF migration checksums written by Windows-native
   releases before v3.1.2 and replaced them transactionally with the current
   LF checksums before strict migration validation. Unknown migration changes

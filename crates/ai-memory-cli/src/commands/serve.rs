@@ -647,7 +647,8 @@ fn refuse_a_missing_token_file(auth: &AuthSettings) -> Result<()> {
         anyhow::bail!(
             "[auth].bearer_token_file names {}, which is missing or empty; refusing to serve \
              without the bearer token it should hold. Run `ai-memory auth enable` to create a \
-             new one, or restore the file from backup.",
+             new one, or restore it from your separate secret backup (`ai-memory backup` \
+             intentionally excludes auth token files).",
             path.display()
         );
     }

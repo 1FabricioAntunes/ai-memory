@@ -226,7 +226,11 @@ pub enum Command {
     /// Prints what it would remove and changes nothing unless `--confirm` is
     /// passed. See also `ai-memory status` for the reclaimable figure.
     ReclaimLedgerVersions(ReclaimLedgerVersionsArgs),
-    /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
+    /// Snapshot wiki/, db/, and an in-data-dir config.toml into a gzipped tarball.
+    ///
+    /// This is not a complete host-migration archive: root/hook credentials,
+    /// external config files, raw workstream ledgers, logs, and models are
+    /// intentionally excluded. See docs/lifecycle-ops.md before moving hosts.
     Backup(BackupArgs),
     /// Snapshot AI agent configurations, skills, and plugins into a portable archive.
     #[command(name = "backup-agents")]

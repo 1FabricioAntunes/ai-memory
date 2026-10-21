@@ -1130,13 +1130,37 @@ What happens on the server:
 
 1. SQLite online-backup API copies the live WAL DB to a temp file,
    a guaranteed consistent snapshot without stopping the writer.
-2. Server tar-gzips the snapshot + the wiki tree + `config.toml`.
+2. Server tar-gzips the snapshot + the wiki tree + `<data_dir>/config.toml`
+   when that file exists.
 3. Response body IS the gzipped tarball
    (`Content-Type: application/gzip`).
 
 CLI writes the response body to `--to`. For a homelab user
 this is the standard "snapshot before doing something dangerous"
 move: `ai-memory backup` first, then proceed.
+
+This tarball is an online **data snapshot**, not a complete host image. It
+intentionally excludes `auth-tokens/`, the hook-side `auth-token` and
+`auth-header` files, `raw/`, logs, models, and a config passed from outside the
+data dir with `--config`. That keeps bearer credentials out of an archive that
+is commonly copied between machines, and avoids racing the actively appended
+managed-workstream ledger. The SQLite snapshot still contains the searchable
+managed-workstream events; omitting `raw/` loses their immutable source copy.
+
+For a move to another host, carry these beside the snapshot through a
+separately encrypted or otherwise access-controlled backup:
+
+- the config file the service actually loads, especially
+  `[auth].token_pepper`; packaged systemd units keep it outside the data dir;
+- `auth-tokens/` if existing root bearers must keep working (otherwise run
+  `ai-memory auth enable` and rewire clients with the replacement);
+- `raw/` when the immutable managed-workstream source ledger must be retained.
+
+Do not copy hook credential files as the destination's wiring. Run
+`install-hooks --apply` and `install-mcp --apply` there so paths, server URLs,
+and credentials match the new host. Treat both the ordinary snapshot and the
+separate material as sensitive: wiki content and SQLite can contain private
+session data even though the archive excludes bearer files.
 
 Restoring a backup follows the inverse:
 
