@@ -677,8 +677,9 @@ impl Embedder for VoyageEmbedder {
 
     async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
         let url = normalize_openai_base(&self.base_url, "embeddings");
+        let input = truncate_for_embedding(text, OPENAI_EMBED_MAX_TOKENS);
         let req = VoyageRequest {
-            input: [text],
+            input: [input.as_str()],
             model: &self.model,
         };
         let mut attempt = 0u32;
