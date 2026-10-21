@@ -223,6 +223,13 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Bounded the embedding input on the Gemini and Voyage embedders, which sent
+  the caller's text verbatim while every other HTTP embedder head-truncated
+  first. Gemini rejects an over-long `embedContent` input with 400
+  INVALID_ARGUMENT, and page embedding is best-effort, so a page past the
+  model's input limit silently ended up with no vector.
+  ([#1513](https://github.com/akitaonrails/ai-memory/pull/1513))
+
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
