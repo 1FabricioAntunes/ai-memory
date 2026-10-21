@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- `install.ps1` now refuses a plain-http GitHub release base. The scheme check
+  sat inside a condition whose arms already implied https, so it could never
+  fire, and an `http://github.com/...` base matched neither arm and skipped it
+  entirely — while the archive and its checksum are fetched from that same
+  origin, so the checksum proved nothing against an on-path rewrite.
+  ([#1541](https://github.com/akitaonrails/ai-memory/pull/1541))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
