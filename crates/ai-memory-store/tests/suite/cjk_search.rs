@@ -236,3 +236,66 @@ async fn superseded_cjk_text_is_hidden_and_startup_repairs_missing_index_rows() 
     assert_eq!(after_rebuild.len(), 1);
     assert_eq!(after_rebuild[0].path.as_str(), "repair.md");
 }
+
+#[tokio::test]
+async fn cjk_stream_honours_a_title_column_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "app").await;
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "titled.md",
+            "支付服务概要",
+            "English body",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "bodied.md",
+            "Callback notes",
+            "启用微信支付服务后检查回调。",
+        ))
+        .await
+        .unwrap();
+
+    // Control: both pages carry 支付服务 in an unspaced run and both are
+    // reachable through the CJK stream, so the narrowed search below failing
+    // to return one of them means the column filter held.
+    let unqualified = store
+        .reader
+        .search_pages_for_project(ws, project, "支付服务".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = unqualified.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(
+        paths.contains(&"titled.md"),
+        "control search failed: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"bodied.md"),
+        "control search failed: {paths:?}"
+    );
+
+    let titled = store
+        .reader
+        .search_pages_for_project(ws, project, "title:支付服务".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = titled.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(
+        paths.contains(&"titled.md"),
+        "the title match lost its page: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"bodied.md"),
+        "the CJK stream ignored the title filter: {paths:?}"
+    );
+}
