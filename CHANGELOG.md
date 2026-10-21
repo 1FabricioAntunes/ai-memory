@@ -13,6 +13,21 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a pointer to a session that was cut off without ending, so the next
+  harness continues from where the work stopped. A harness stopped by a quota
+  limit, a crash or a closed terminal never runs its session end and leaves no
+  handoff, so an older handoff or session page used to win. When the newest
+  captured work in a project belongs to another of the operator's sessions that
+  never ended and left no handoff after that work, session start now adds a
+  one-line notice naming that session's agent and id (no captured text) and
+  pointing at `memory_read_session_observations`. `memory_briefing` gains
+  `recent_sessions` (newest work first, with `ended`, `handed_off` and
+  `current`), and `memory_handoff_list` gains `newer_unended_session` when such
+  a session is newer than every open handoff. `memory_read_session_observations`
+  also accepts a harness's native session id, such as an OpenCode `ses_…` id.
+  The routing block and the handoff and retrieval skills tell agents to read
+  that session first, and the TypeScript SDK decodes both new fields.
+
 - Added first-party Qwen Code lifecycle and MCP support. `install-mcp --client
   qwen-code` (aliases `qwen`, `qwencode`) writes a Streamable HTTP `httpUrl`
   entry into `~/.qwen/settings.json`; a token-file install gets a stdio

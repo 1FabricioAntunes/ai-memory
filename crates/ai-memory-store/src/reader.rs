@@ -1384,6 +1384,36 @@ pub struct IdleOpenSession {
     pub seen_page_id: Option<PageId>,
 }
 
+/// A session's latest captured work in one scope, as listed by
+/// [`ReaderPool::recent_session_activity`]. Ordered by work, not by when the
+/// session started or ended: a harness that resumes an old session, or one
+/// cut off by a quota limit, never writes a fresh start or a clean end, so
+/// only its observations show that it holds the project's newest work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionActivity {
+    /// Session id.
+    pub session_id: SessionId,
+    /// `AgentKind` as stored (`claude-code`, `open-code`, ...).
+    pub agent_kind: String,
+    /// Captured session cwd, if available.
+    pub cwd: Option<String>,
+    /// ISO-8601 time of the session's newest prompt, tool, stop or
+    /// compaction observation in the scope. Bare session starts and ends are
+    /// not work and never count.
+    pub last_activity_at: String,
+    /// The same instant in Unix microseconds, for comparisons.
+    #[serde(skip)]
+    pub last_activity_us: i64,
+    /// Whether the session ended at or after its last activity. `false`
+    /// means it is still running elsewhere or was cut off (a quota limit, a
+    /// crash, a closed terminal) without ending.
+    pub ended: bool,
+    /// Whether a handoff from this session, in any state, was written at or
+    /// after its last activity. Harnesses that checkpoint every turn leave
+    /// one per turn; work after the newest one is not covered by it.
+    pub handed_off: bool,
+}
+
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
 /// and [`ReaderPool::session_summary_scoped`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -5164,6 +5194,92 @@ impl ReaderPool {
             )
             .await?;
         Ok(sessions.pop())
+    }
+
+    /// The sessions with the newest captured work in one scope, newest
+    /// first, limited to work at or after `since`. Owner-filtered on the
+    /// session row exactly like [`Self::sessions_for_scope`], so on a shared
+    /// server one operator never learns another's session ids.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_session_activity(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        since: jiff::Timestamp,
+        limit: usize,
+    ) -> StoreResult<Vec<SessionActivity>> {
+        self.with_conn(move |conn| {
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+            };
+            // The project/time index bounds the scan to the window; the
+            // grouping is per session, so the row count is the number of
+            // sessions that worked in it.
+            let sql = format!(
+                "SELECT w.session_id, w.last_us, w.agent_kind, w.cwd, w.ended_at, \
+                        EXISTS (SELECT 1 FROM handoffs h \
+                                WHERE h.workspace_id = :ws AND h.project_id = :proj \
+                                  AND h.from_session_id = w.session_id \
+                                  AND h.created_at >= w.last_us) \
+                 FROM (SELECT o.session_id, MAX(o.created_at) AS last_us, \
+                              s.agent_kind, s.cwd, s.ended_at \
+                       FROM observations o INDEXED BY idx_observations_project_created \
+                       JOIN sessions s ON s.id = o.session_id \
+                       WHERE o.workspace_id = :ws AND o.project_id = :proj \
+                         AND o.created_at >= :since \
+                         AND o.kind NOT IN ('session-start', 'session-end'){owner_clause} \
+                       GROUP BY o.session_id \
+                       ORDER BY last_us DESC, o.session_id DESC \
+                       LIMIT :limit) w \
+                 ORDER BY w.last_us DESC, w.session_id DESC"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let since_us = since.as_microsecond();
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut named: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+                (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+                (":proj", &proj_bytes),
+                (":since", &since_us),
+                (":limit", &limit),
+            ];
+            if let OwnerFilter::User(user) = &owner_filter {
+                named.push((":actor", user));
+            }
+            let rows = stmt.query_map(named.as_slice(), |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, last_us, agent_kind, cwd, ended_us, handed_off) = row?;
+                out.push(SessionActivity {
+                    session_id: SessionId::from_slice(&id_bytes)?,
+                    agent_kind,
+                    cwd,
+                    last_activity_at: jiff::Timestamp::from_microsecond(last_us)
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_default(),
+                    last_activity_us: last_us,
+                    ended: ended_us.is_some_and(|ended| ended >= last_us),
+                    handed_off,
+                });
+            }
+            Ok(out)
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

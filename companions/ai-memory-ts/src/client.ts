@@ -30,6 +30,7 @@ import {
   record,
   relatedPage,
   requiredList,
+  sessionActivity,
   statusCounts,
   str,
   untrusted,
@@ -395,7 +396,15 @@ export class HandoffsNamespace {
       options,
     );
     const o = record(decoded, "memory_handoff_list");
-    return { handoffs: requiredList(o, "handoffs", "memory_handoff_list", handoff), raw: o };
+    const newer = o["newer_unended_session"];
+    return {
+      handoffs: requiredList(o, "handoffs", "memory_handoff_list", handoff),
+      newerUnendedSession:
+        newer === undefined || newer === null
+          ? undefined
+          : sessionActivity(newer, "memory_handoff_list.newer_unended_session"),
+      raw: o,
+    };
   }
 
   /**

@@ -96,11 +96,11 @@ pub use reader::{
     ProjectCoordinateDiagnostic, ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH,
     RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
     RrfContributions, SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow,
-    SearchExplain, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionPromptTitles, SessionSummary, SessionToolTitles, SettledPage, StatusCounts,
-    StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    SearchExplain, SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary,
+    SessionDependentRows, SessionEndDisposition, SessionKindSummary, SessionLine,
+    SessionObservationSnapshot, SessionPromptTitles, SessionSummary, SessionToolTitles,
+    SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings,
+    VectorQuery, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{

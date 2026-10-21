@@ -484,6 +484,15 @@ present. A switch on another machine still gets the server's portable ledger
 and handoff, but cannot read a native transcript that exists only on the first
 machine.
 
+Without the managed launcher, a harness cut off the same way leaves no handoff
+at all, so the next one could pick up an older handoff or session page. When the
+newest captured work in the project is in another of your sessions that never
+ended and left no handoff after that work, the next session start carries a
+one-line notice that names that session. The agent then reads its newest prompts and
+tool results with `memory_read_session_observations`. The same session is
+listed first in `memory_briefing`'s `recent_sessions`, and `memory_handoff_list`
+names it as `newer_unended_session`.
+
 If that variable is absent on a real same-machine switch, run
 `type -a ai-memory` and `ai-memory --version` in the launching shell. This path
 requires the 3.1.0 or newer host client; a stale Cargo or package-manager binary

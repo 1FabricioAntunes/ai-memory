@@ -1023,10 +1023,29 @@ struct StatusResponse {
 struct BriefingResponse {
     #[serde(flatten)]
     snapshot: ai_memory_store::BriefingSnapshot,
+    /// Sessions with the newest captured work, newest first. A session
+    /// with `ended: false` that is not `current` was cut off or is still
+    /// running elsewhere; its observations are where the work stopped.
+    recent_sessions: Vec<RecentSession>,
     /// Which project the briefing describes — the inbox `pending_message_count`
     /// counts, so the agent can pop it by name.
     scope: AnsweredScope,
 }
+
+/// One entry of [`BriefingResponse::recent_sessions`].
+#[derive(Debug, Serialize)]
+struct RecentSession {
+    #[serde(flatten)]
+    activity: ai_memory_store::SessionActivity,
+    /// The caller's own session, when the client forwards its session id.
+    current: bool,
+}
+
+/// How many sessions `memory_briefing` lists in `recent_sessions`, and how
+/// far back it looks.
+const BRIEFING_RECENT_SESSIONS: usize = 5;
+const BRIEFING_RECENT_SESSIONS_WINDOW: jiff::SignedDuration =
+    jiff::SignedDuration::from_hours(30 * 24);
 
 /// The scope a response was answered from. Without it an unscoped call that
 /// fell back to another project returns plausible numbers the caller has no
@@ -1690,10 +1709,13 @@ const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ReadSessionObservationsArgs {
-    /// Session id (UUID) to read, typically taken from a `memory_query`
-    /// raw hit, `memory_briefing`, or an admin session listing. Omit to
+    /// Session id to read: the UUID from a `memory_query` raw hit,
+    /// `memory_briefing`'s `recent_sessions`, a session-start notice or an
+    /// admin session listing, or the harness's own native id (an OpenCode
+    /// `ses_…` id, for example), which maps to the same session. Omit to
     /// read the most recent COMPLETED session visible to you in the
-    /// resolved project.
+    /// resolved project; a session cut off without ending is not completed,
+    /// so name it.
     #[serde(default)]
     session_id: Option<String>,
     /// Maximum observations per call (default 50, max 200).
@@ -2153,6 +2175,24 @@ impl AiMemoryServer {
             })
             .or_else(|| header_session("mcp-session-id"));
         ai_memory_core::ActorKey { user, session_id }
+    }
+
+    /// The sessions with the newest captured work in one scope, for
+    /// `memory_briefing`'s `recent_sessions` and `memory_handoff_list`'s
+    /// `newer_unended_session`.
+    async fn recent_sessions(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner_filter: ai_memory_core::OwnerFilter,
+    ) -> Result<Vec<ai_memory_store::SessionActivity>, McpError> {
+        let since = jiff::Timestamp::now()
+            .saturating_sub(BRIEFING_RECENT_SESSIONS_WINDOW)
+            .unwrap_or(jiff::Timestamp::MIN);
+        self.reader
+            .recent_session_activity(ws, proj, owner_filter, since, BRIEFING_RECENT_SESSIONS)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     /// Resolve which `(workspace_id, project_id)` a read tool should
@@ -5044,8 +5084,12 @@ impl AiMemoryServer {
         consolidation. Use when the user asks what actually happened in a \
         session, wants to audit or verify a compiled page against its \
         evidence, or needs the exact prompt/tool text behind a `memory_query` \
-        raw hit. Pass `session_id` (UUID); omit it to read the most recent \
-        completed session visible to you in the resolved project. Pages with \
+        raw hit, or to continue a session that was cut off without ending \
+        (a session-start notice, `memory_briefing` `recent_sessions` or \
+        `memory_handoff_list` `newer_unended_session` names it; read it with \
+        `order: \"desc\"`). Pass `session_id` (the UUID, or the harness's \
+        native id); omit it to read the most recent completed session \
+        visible to you in the resolved project. Pages with \
         `limit`/`offset` (default 50, max 200) and returns `total`, so loop on \
         `offset` to read more. `order` is `asc` (capture order) or `desc`; \
         `kinds` and `query` narrow the rows; `body_max_chars` (default 4000) \
@@ -5129,9 +5173,10 @@ impl AiMemoryServer {
         // uuid cannot probe across projects.
         let session = match args.session_id.as_deref().map(str::trim) {
             Some(raw) if !raw.is_empty() => {
-                let session_id = SessionId::from_str(raw).map_err(|_| {
-                    McpError::invalid_params(format!("invalid session id: {raw}"), None)
-                })?;
+                // The hooks store a native id that is not a UUID under its
+                // v5 mapping, so the same mapping finds it here. The scoped
+                // lookup below still decides visibility.
+                let session_id = SessionId::from_native(raw);
                 let summary = self
                     .reader
                     .session_summary_scoped(ws, proj, session_id, owner_filter)
@@ -5641,7 +5686,12 @@ impl AiMemoryServer {
         or when you need an exact id for memory_handoff_accept or \
         memory_handoff_cancel. After inspecting, claim one row with \
         memory_handoff_accept passing that `handoff_id` — handoffs remain \
-        SINGLE-USE. This is not a briefing or status tool. \
+        SINGLE-USE. This is not a briefing or status tool. When a session \
+        that never ended (cut off by a quota limit or a crash, or still \
+        running) holds newer work than every open handoff, the response \
+        also names it as `newer_unended_session`: read that session with \
+        memory_read_session_observations before relying on an older \
+        handoff. \
         \
         Follow the client-aware project-scope instructions: static clients \
         pass `workspace` + `project` together for every project-scoped call. \
@@ -5686,10 +5736,41 @@ impl AiMemoryServer {
         .unwrap_or(OPEN_HANDOFFS_DEFAULT_LIMIT as usize);
         let handoffs = self
             .reader
-            .list_handoffs(ws, proj, Some(HandoffState::Open), owner_filter, limit)
+            .list_handoffs(
+                ws,
+                proj,
+                Some(HandoffState::Open),
+                owner_filter.clone(),
+                limit,
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&serde_json::json!({ "handoffs": handoffs }))
+        // A harness cut off without ending leaves no handoff, so the open ones
+        // can all predate where the work actually stopped. Name that session.
+        let caller = aps_actor.session_id.as_deref().map(SessionId::from_native);
+        let newest = self
+            .recent_sessions(ws, proj, owner_filter)
+            .await?
+            .into_iter()
+            .find(|activity| Some(activity.session_id) != caller);
+        let newer_unended_session = newest.filter(|activity| {
+            !activity.ended
+                && !activity.handed_off
+                && handoffs.iter().all(|handoff| {
+                    handoff.lifecycle.created_at.as_microsecond() < activity.last_activity_us
+                })
+        });
+        match newer_unended_session {
+            Some(session) => ok_json(&serde_json::json!({
+                "handoffs": handoffs,
+                "newer_unended_session": session,
+                "hint": "The newest work in this project is in a session that never ended (cut \
+                         off, or still running) and is newer than every open handoff. To \
+                         continue where it stopped, read it with \
+                         memory_read_session_observations (that session_id, order \"desc\")."
+            })),
+            None => ok_json(&serde_json::json!({ "handoffs": handoffs })),
+        }
     }
 
     /// Fetch the latest open handoff for this project (optionally filtered
@@ -6340,7 +6421,12 @@ impl AiMemoryServer {
         description = "Compose a structured snapshot of project activity \
         WITHOUT any LLM call: lifetime counts, 7-day and 30-day activity \
         windows, last-observation timestamp, pending handoff count, \
-        current `_rules/` pages, and recent-page list. Cheap, fast, \
+        current `_rules/` pages, recent-page list, and `recent_sessions`: \
+        the sessions with the newest captured work, newest first. A \
+        session there with `ended: false` that is not `current` was cut \
+        off (a quota limit, a crash) or is still running; when the user \
+        asks to continue, read it with memory_read_session_observations \
+        (order `desc`) before older handoffs or pages. Cheap, fast, \
         deterministic, and READ-ONLY: it never creates handoffs or mutates \
         project state. Use this when you want a programmatic view of \
         project state; use `memory_explore` if you want an LLM-composed \
@@ -6380,9 +6466,24 @@ impl AiMemoryServer {
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let caller = aps_actor.session_id.as_deref().map(SessionId::from_native);
+        let recent_sessions = self
+            .recent_sessions(
+                ws,
+                proj,
+                ai_memory_core::OwnerFilter::for_actor_context(&actor),
+            )
+            .await?
+            .into_iter()
+            .map(|activity| RecentSession {
+                current: Some(activity.session_id) == caller,
+                activity,
+            })
+            .collect();
         let (workspace, project) = self.scope_names(ws, proj).await;
         ok_json(&BriefingResponse {
             snapshot,
+            recent_sessions,
             scope: AnsweredScope {
                 workspace,
                 project,
@@ -13783,14 +13884,274 @@ mod tests {
             "error must name the resolved scope; got {msg}"
         );
 
+        // A non-UUID id is a native id: it maps like the hooks map it, and an
+        // unknown one reads as not found in the resolved scope.
         let mut args = session_observations_args(Some(session_id));
         args.session_id = Some("not-a-uuid".into());
         let err = server
             .memory_read_session_observations(Parameters(args), test_optional_parts())
             .await
-            .expect_err("a malformed session id must be rejected");
+            .expect_err("an unknown native session id must read as not found");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert_eq!(err.message, "invalid session id: not-a-uuid");
+        assert_eq!(
+            err.message,
+            "session not-a-uuid not found in default/scratch"
+        );
+    }
+
+    /// One session with an explicit id and agent whose rows land `step_us`
+    /// apart from `start_us`, so tests can order sessions by their work.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_session_at(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        start_us: i64,
+        kinds: &[ObservationKind],
+        completed: bool,
+    ) {
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(start_us),
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for (step, kind) in kinds.iter().enumerate() {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(start_us + 1_000 * (step as i64 + 1)),
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: *kind,
+                        extension: None,
+                        source_event: None,
+                        title: format!("{kind:?}"),
+                        body: "router ipv6".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        if completed {
+            store.writer.end_session(session_id, None).await.unwrap();
+        }
+    }
+
+    fn now_us() -> i64 {
+        jiff::Timestamp::now().as_microsecond()
+    }
+
+    /// The harness's own native id (an OpenCode `ses_…`) reads the session
+    /// the hooks stored under its v5 mapping.
+    #[tokio::test]
+    async fn memory_read_session_observations_accepts_a_native_session_id() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let native = "ses_ff9168f0dffexGd81eJNiCuKBB";
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(native),
+            AgentKind::OpenCode,
+            now_us() - 60_000_000,
+            &[ObservationKind::UserPrompt, ObservationKind::PostToolUse],
+            false,
+        )
+        .await;
+        let mut args = session_observations_args(None);
+        args.session_id = Some(native.into());
+        args.order = Some("desc".into());
+        let page = call_tool_json(
+            server
+                .memory_read_session_observations(Parameters(args), test_optional_parts())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(page["total"], 2);
+        assert_eq!(
+            page["session"]["session_id"],
+            SessionId::from_native(native).to_string()
+        );
+        assert_eq!(page["observations"][0]["kind"], "post-tool-use");
+    }
+
+    /// `recent_sessions` orders by newest work and flags the caller's own
+    /// session, so a harness that was cut off without ending is visible to
+    /// the next one even though an older session ended more recently.
+    #[tokio::test]
+    async fn memory_briefing_lists_a_cut_off_session_before_older_work() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let start = now_us() - 3_600_000_000;
+        let clean = SessionId::new();
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            clean,
+            AgentKind::ClaudeCode,
+            start,
+            &[ObservationKind::UserPrompt],
+            true,
+        )
+        .await;
+        let cut_off = SessionId::from_native("ses_cut_off");
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            cut_off,
+            AgentKind::OpenCode,
+            start + 60_000_000,
+            &[ObservationKind::UserPrompt, ObservationKind::PostToolUse],
+            false,
+        )
+        .await;
+        let caller = "claude-resumed";
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(caller),
+            AgentKind::ClaudeCode,
+            start + 30_000_000,
+            &[ObservationKind::UserPrompt],
+            false,
+        )
+        .await;
+        let mut parts = test_parts_default();
+        parts
+            .headers
+            .insert("x-memory-actor-session-id", caller.parse().unwrap());
+        let briefing = call_tool_json(
+            server
+                .memory_briefing(
+                    Parameters(BriefingArgs {
+                        recent_pages_limit: None,
+                        project: None,
+                        workspace: None,
+                        settled_first: None,
+                    }),
+                    OptionalParts(parts),
+                )
+                .await
+                .unwrap(),
+        );
+        let sessions = briefing["recent_sessions"].as_array().unwrap();
+        let listed: Vec<(&str, bool, bool)> = sessions
+            .iter()
+            .map(|entry| {
+                (
+                    entry["agent_kind"].as_str().unwrap(),
+                    entry["ended"].as_bool().unwrap(),
+                    entry["current"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("open-code", false, false),
+                ("claude-code", false, true),
+                ("claude-code", true, false),
+            ],
+            "{briefing}"
+        );
+        assert_eq!(sessions[0]["session_id"], cut_off.to_string());
+    }
+
+    /// `memory_handoff_list` names a cut-off session only while it is newer
+    /// than every open handoff; a newer handoff already covers it.
+    #[tokio::test]
+    async fn memory_handoff_list_names_a_cut_off_session_newer_than_every_handoff() {
+        async fn baton(store: &Store, ws: WorkspaceId, proj: ProjectId) {
+            store
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id: ws,
+                    project_id: proj,
+                    from_session_id: None,
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: None,
+                    summary: "a baton".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    owner_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        async fn list(server: &AiMemoryServer) -> serde_json::Value {
+            call_tool_json(
+                server
+                    .memory_handoff_list(
+                        Parameters(HandoffListArgs {
+                            any_owner: None,
+                            limit: None,
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        }
+        let cut_off = SessionId::from_native("ses_cut_off");
+
+        // The baton first, then work that never ended: the baton is stale.
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        baton(&store, ws, proj).await;
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            cut_off,
+            AgentKind::OpenCode,
+            now_us(),
+            &[ObservationKind::UserPrompt],
+            false,
+        )
+        .await;
+        let listed = list(&server).await;
+        assert_eq!(listed["handoffs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listed["newer_unended_session"]["session_id"],
+            cut_off.to_string(),
+            "{listed}"
+        );
+
+        // Work first, then a baton: the baton covers it.
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            cut_off,
+            AgentKind::OpenCode,
+            now_us() - 60_000_000,
+            &[ObservationKind::UserPrompt],
+            false,
+        )
+        .await;
+        baton(&store, ws, proj).await;
+        let listed = list(&server).await;
+        assert!(listed.get("newer_unended_session").is_none(), "{listed}");
     }
 
     #[tokio::test]
