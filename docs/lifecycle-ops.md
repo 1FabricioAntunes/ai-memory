@@ -1370,8 +1370,11 @@ ai-memory purge-project --project tmp --confirm
 
 ### Wiki git history unreadable after a crash
 
-The server turns on `core.fsyncObjectFiles` in `wiki/.git/config` when it opens
-the wiki, so libgit2 syncs each object and ref before renaming it into place.
+Every repository handle the server opens carries `core.fsyncObjectFiles = true`
+from `wiki/.git/ai-memory.gitconfig`, a file the git CLI never reads, so libgit2
+syncs each object and ref before renaming it into place while `git status` in
+the wiki stays free of git's deprecation warning for that key. Setting
+`core.fsyncObjectFiles = false` in `wiki/.git/config` turns it off.
 Before that, a power loss or kernel crash could keep a ref update while the
 objects it names were never written: zero-length files under `.git/objects`,
 `HEAD` pointing at one of them, and every later checkpoint failing with
@@ -1399,8 +1402,7 @@ git fsck --full                        # clean (a dangling blob is harmless)
 ```
 
 Start the server again; the next checkpoint commits the pages written after
-that commit. Git prints a deprecation warning for `core.fsyncObjectFiles`
-(it prefers `core.fsync`); libgit2 reads only the older key, so leave it set.
+that commit.
 
 ## Why this matters: the flat-wiki incident
 

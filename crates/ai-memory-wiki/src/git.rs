@@ -17,9 +17,9 @@
 //! new version as a whole blob, and nothing reads them back from git; see
 //! [`is_ledger_file`].
 //!
-//! Opening the repository turns on libgit2's fsync for `.git` through the
-//! repository's own config, so a crash cannot leave a ref naming an object
-//! whose bytes never reached disk; see [`enable_object_fsync`].
+//! Every repository handle turns on libgit2's fsync for `.git` through a
+//! config file only libgit2 reads, so a crash cannot leave a ref naming an
+//! object whose bytes never reached disk; see [`attach_libgit2_config`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -179,6 +179,7 @@ fn open_validated_repository(root: &Path) -> Result<Repository, OpenRepositoryEr
             reason: "wiki repository metadata escapes the in-root .git directory",
         }));
     }
+    attach_libgit2_config(&repo).map_err(OpenRepositoryError::Git)?;
     Ok(repo)
 }
 
@@ -203,13 +204,35 @@ fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<Option<R
     }
 }
 
-/// The repository-config key that makes libgit2 fsync each loose object,
-/// ref and reflog (and the directory it lands in) before renaming it into
-/// place.
+/// The config key that makes libgit2 fsync each loose object, ref and reflog
+/// (and the directory it lands in) before renaming it into place.
 const FSYNC_OBJECT_FILES: &str = "core.fsyncObjectFiles";
 
-/// Turn on libgit2's fsync for the wiki repository in its local config,
-/// unless that config already names a value. Returns whether it is on.
+/// Config file in the wiki's `.git` that only libgit2 reads: git looks for
+/// `config` (and `config.worktree`) there, never for this name.
+const LIBGIT2_CONFIG_FILE: &str = "ai-memory.gitconfig";
+
+const LIBGIT2_CONFIG: &str = "\
+# Written by ai-memory and read only by its libgit2 handles (#1511).
+[core]
+\tfsyncObjectFiles = true
+";
+
+/// Write [`LIBGIT2_CONFIG_FILE`] into the wiki's `.git` unless it already
+/// holds [`LIBGIT2_CONFIG`]. Runs once per adapter, at startup.
+fn write_libgit2_config(git_dir: &Path) -> WikiResult<()> {
+    let path = git_dir.join(LIBGIT2_CONFIG_FILE);
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == LIBGIT2_CONFIG.as_bytes()) {
+        return Ok(());
+    }
+    // Inside `.git`, which a commit never stages, so there is nothing to report.
+    #[allow(clippy::disallowed_methods)]
+    crate::atomic::write_atomic(&path, LIBGIT2_CONFIG.as_bytes())?;
+    Ok(())
+}
+
+/// Give this handle libgit2's fsync for `.git`, unless the repository's own
+/// config turns it off.
 ///
 /// libgit2 writes objects and refs to a temp file and renames it, without
 /// fsync by default. After a crash the rename, and the ref update that names
@@ -217,20 +240,38 @@ const FSYNC_OBJECT_FILES: &str = "core.fsyncObjectFiles";
 /// zero-length loose objects and a HEAD that no longer reads, so every later
 /// checkpoint fails (#1511). The process-wide `GIT_OPT_ENABLE_FSYNC_GITDIR`
 /// covers the same writes, but git2 has no safe wrapper for it and the
-/// workspace forbids `unsafe`. The config key is per repository, persists in
-/// `.git/config`, and the git CLI honours it too, with a warning that it is
-/// deprecated in favour of `core.fsync`. An explicit `false` is the
-/// operator's choice and is kept.
-fn enable_object_fsync(repo: &Repository) -> Result<bool, git2::Error> {
-    let mut local = repo.config()?.open_level(git2::ConfigLevel::Local)?;
-    match local.get_bool(FSYNC_OBJECT_FILES) {
-        Ok(enabled) => Ok(enabled),
-        Err(error) if error.code() == ErrorCode::NotFound => {
-            local.set_bool(FSYNC_OBJECT_FILES, true)?;
-            Ok(true)
-        }
-        Err(error) => Err(error),
+/// workspace forbids `unsafe`. Writing the key to `.git/config` would make the
+/// git CLI warn that it is deprecated on every command an operator runs in the
+/// wiki, so it goes in [`LIBGIT2_CONFIG_FILE`], added to this handle's live
+/// config at the app level.
+///
+/// Why this reaches the fsync decision (vendored libgit2 1.9.3):
+/// `Repository::config` returns the handle's own config object, not a
+/// snapshot, and libgit2 reads `core.fsyncObjectFiles` from that object
+/// through the configmap cache when it first loads the object database
+/// (`git_odb__set_caps`) and the refdb (`refdb_fs` backend). Opening a
+/// repository loads neither, so the cached value is still unset here; this
+/// runs before any caller touches the handle.
+///
+/// The app level outranks every file git itself reads, so an explicit
+/// `false` in `.git/config` is checked first and kept. The app backend also
+/// becomes the handle's preferred writer; ai-memory never writes config
+/// through a handle.
+fn attach_libgit2_config(repo: &Repository) -> Result<(), git2::Error> {
+    let mut config = repo.config()?;
+    let local = match config.open_level(git2::ConfigLevel::Local) {
+        Ok(local) => local.get_bool(FSYNC_OBJECT_FILES).ok(),
+        Err(error) if error.code() == ErrorCode::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if local == Some(false) {
+        return Ok(());
     }
+    config.add_file(
+        &repo.path().join(LIBGIT2_CONFIG_FILE),
+        git2::ConfigLevel::App,
+        false,
+    )
 }
 
 /// `Ok` when HEAD is unborn (a fresh repository) or resolves to a commit
@@ -253,7 +294,10 @@ fn readable_head(repo: &Repository) -> Result<(), git2::Error> {
 /// history that cannot take a commit is reported once, loudly, instead of
 /// only as a warning from each checkpoint that fails.
 fn check_repository_durability(root: &Path, repo: &Repository) {
-    match enable_object_fsync(repo) {
+    match repo
+        .config()
+        .and_then(|config| config.get_bool(FSYNC_OBJECT_FILES))
+    {
         Ok(true) => {}
         Ok(false) => warn!(
             root = %root.display(),
@@ -263,7 +307,7 @@ fn check_repository_durability(root: &Path, repo: &Repository) {
         Err(error) => warn!(
             root = %root.display(),
             %error,
-            "could not turn on fsync for the wiki repository; a crash can leave its history \
+            "could not read the wiki repository's fsync setting; a crash can leave its history \
              with empty objects"
         ),
     }
@@ -366,20 +410,16 @@ impl GitAdapter {
     /// Propagates any underlying libgit2 error.
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
         crate::confinement::initialize_root(root)?;
-        let git_dir = root.join(".git");
-        let repo = match std::fs::symlink_metadata(&git_dir) {
-            Ok(_) => {
-                debug!(root = %root.display(), "wiki repo already initialised");
-                validate_repository_or_allow_cli_fallback(root)?
-            }
+        match std::fs::symlink_metadata(root.join(".git")) {
+            Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 debug!(root = %root.display(), "initialising wiki repo");
                 init_repo(root)?;
-                validate_repository_or_allow_cli_fallback(root)?
             }
             Err(error) => return Err(error.into()),
-        };
-        if let Some(repo) = repo {
+        }
+        write_libgit2_config(&crate::confinement::inspect_git_directory(root)?)?;
+        if let Some(repo) = validate_repository_or_allow_cli_fallback(root)? {
             check_repository_durability(root, &repo);
         }
         Ok(Self {
@@ -2791,25 +2831,56 @@ mod tests {
             .ok()
     }
 
+    fn fsync_setting(repo: &Repository) -> Option<bool> {
+        repo.config().unwrap().get_bool(FSYNC_OBJECT_FILES).ok()
+    }
+
+    /// What the git CLI prints for `status`, or `None` without git on PATH.
+    fn git_status_stderr(root: &Path) -> Option<String> {
+        let output = git_command(root).arg("status").output().ok()?;
+        assert!(output.status.success(), "git status failed: {output:?}");
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
     /// #1511: without it libgit2 renames objects and refs into place unsynced,
-    /// and a crash left a ref naming an empty commit object.
+    /// and a crash left a ref naming an empty commit object. The setting lives
+    /// on ai-memory's handles only, never in `.git/config`, where git warns
+    /// that the key is deprecated on every command.
     #[test]
-    fn opening_the_wiki_turns_on_git_object_fsync() {
+    fn every_wiki_handle_turns_on_git_object_fsync_without_touching_git_config() {
         let tmp = tempdir();
         let fresh = tmp.path().join("fresh");
-        GitAdapter::open_or_init(&fresh).unwrap();
-        assert_eq!(local_fsync_setting(&fresh), Some(true));
-
-        // A repository an older version created gets it on the next open.
         let existing = tmp.path().join("existing");
+        // A repository an older version created gets it on the next open.
         Repository::init(&existing).unwrap();
-        assert_eq!(local_fsync_setting(&existing), None);
-        GitAdapter::open_or_init(&existing).unwrap();
-        assert_eq!(local_fsync_setting(&existing), Some(true));
+
+        for root in [&fresh, &existing] {
+            let adapter = GitAdapter::open_or_init(root).unwrap();
+            write(root, "page.md", "page");
+            adapter.commit_all("checkpoint").unwrap().unwrap();
+
+            let slot = adapter.writing();
+            let kept = &slot.as_ref().expect("the commit keeps its handle").repo;
+            assert_eq!(fsync_setting(kept), Some(true));
+            drop(slot);
+            let validated = open_validated_repository(root).ok().unwrap();
+            assert_eq!(fsync_setting(&validated), Some(true));
+
+            assert_eq!(local_fsync_setting(root), None);
+            assert_eq!(fsync_setting(&Repository::open(root).unwrap()), None);
+            let git_config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+            assert!(!git_config.to_ascii_lowercase().contains("fsyncobjectfiles"));
+            if let Some(stderr) = git_status_stderr(root) {
+                assert!(
+                    !stderr.contains("deprecated"),
+                    "git status warned: {stderr}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn an_explicit_fsync_opt_out_is_kept() {
+    fn an_explicit_fsync_opt_out_in_git_config_is_kept() {
         let tmp = tempdir();
         let root = tmp.path().join("wiki");
         Repository::init(&root)
@@ -2821,6 +2892,8 @@ mod tests {
 
         GitAdapter::open_or_init(&root).unwrap();
 
+        let validated = open_validated_repository(&root).ok().unwrap();
+        assert_eq!(fsync_setting(&validated), Some(false));
         assert_eq!(local_fsync_setting(&root), Some(false));
     }
 

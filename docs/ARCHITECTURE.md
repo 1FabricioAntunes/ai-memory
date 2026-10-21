@@ -1055,8 +1055,9 @@ that touch the relevant area.
     [design-windows-ci.md](design-windows-ci.md#windows-transient-file-errors).
     New file-I/O code with the same race follows the same pattern, with a
     test that injects the error so it also runs off Windows.
-    The wiki's `.git` gets the same durability from libgit2: opening the
-    wiki sets `core.fsyncObjectFiles` in the repository's config, so objects
+    The wiki's `.git` gets the same durability from libgit2: every handle
+    ai-memory opens carries `core.fsyncObjectFiles = true` from
+    `.git/ai-memory.gitconfig`, a file the git CLI never reads, so objects
     and refs are synced before their rename, and startup logs an `ERROR` when
     `HEAD` does not resolve to a readable commit (the repair is in
     [lifecycle-ops.md](lifecycle-ops.md#wiki-git-history-unreadable-after-a-crash)).
