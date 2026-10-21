@@ -608,11 +608,15 @@ readable wiki pages; the next session starts with a handoff.
 - Inspect content-free per-workload LLM call, outcome, latency, and usage
   telemetry with `ai-memory status --json`; it diagnoses the configured
   provider but does not route different workloads to different models.
-- Ask "catch me up" for a prose digest of recent project activity.
+- Ask "catch me up" for a prose digest of recent project activity, or run
+  `ai-memory recent` (`--global` for every project) to list the newest pages.
+- Search Chinese, Japanese and Korean text without spaces: zero-LLM search
+  matches unspaced Han, Kana and Hangul substrings.
 - Run `ai-memory bootstrap` once when adopting an existing project with
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
-  the wiki, a root/operator managed-workstream overview at `/web/workstreams`,
+  the wiki, a link graph at `/web/graph`, a root/operator managed-workstream
+  overview at `/web/workstreams`,
   and a JSON API under `/api/v1`. On a server with a bearer token
   and no user accounts (every fresh install), the browser asks for a username
   and password: any username, and the contents of

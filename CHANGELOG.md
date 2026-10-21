@@ -40,7 +40,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `submitted_prompt`, never an automated continuation in `prompt`. Capture
   exclusions cover Qwen's Gemini-like tools. Qwen-only agent backups include
   its settings, both documented global skill roots, `QWEN.md`, and `AGENTS.md`.
-  `setup` detects `~/.qwen`. There is no `ai-memory run qwen` adapter.
+  `setup` detects `~/.qwen`. There is no `ai-memory run qwen` adapter. ([#1487](https://github.com/akitaonrails/ai-memory/pull/1487))
 - Added zero-LLM substring retrieval for unspaced Han, Kana, and Hangul text.
   Pages and observations gain transactionally maintained derived unigram/bigram
   FTS indexes; existing unicode61 search and ranking remain unchanged for
@@ -181,7 +181,7 @@ version in [`docs/changelog/`](docs/changelog/):
   preferring those with the most same-project neighbours and then the most
   recently updated; the store applies that cap before loading nodes or their
   selected edges into the process. Expired pages stay hidden. An edge still
-  requires both ends to be readable.
+  requires both ends to be readable. ([#1378](https://github.com/akitaonrails/ai-memory/pull/1378))
 - Added Antigravity hook parity with Claude Code and Codex for the `agy` CLI,
   the desktop App and the IDE. `install-hooks --agent antigravity-cli` now
   wires the native `SessionStart`, which injects the handoff as an
