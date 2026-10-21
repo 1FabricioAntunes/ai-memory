@@ -331,7 +331,7 @@ printf 'project = "acme-api"\naliases = [" former-name ", "legacy_name", "former
 ALIAS_JSON='["former-name","legacy_name"]'
 ALIAS_QS=$(ai_memory_marker_qs "$TMP/aliases")
 assert_eq "marker aliases keep canonical project and forward remote identity" "yes" \
-    "$(case "$ALIAS_QS" in *'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$ALIAS_QS" in (*'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; (*) printf no ;; esac)"
 
 mkdir -p "$TMP/home-routes/src/api/lib" "$TMP/home-routes/src/api-sibling"
 HOME="$TMP/home-routes"
@@ -349,9 +349,9 @@ route_aliases = ["old-api"]
 EOF
 HOME_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
 assert_eq "home route uses longest component path and marker provenance" "yes" \
-    "$(case "$HOME_ROUTE" in *'&workspace=oss&project=acme-api&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_ROUTE" in (*'&workspace=oss&project=acme-api&project_src=marker'*) printf yes ;; (*) printf no ;; esac)"
 assert_eq "non-git home path route omits aliases" "no" \
-    "$(case "$HOME_ROUTE" in *'&aliases='*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_ROUTE" in (*'&aliases='*) printf yes ;; (*) printf no ;; esac)"
 PS_ROUTE_STATIC=$(grep -Fq 'if ($aliases) { $qs += "&aliases=' hooks/lib/ai-memory-hook.ps1 \
     && grep -Fq 'if (-not $stack.Count) { return $null }' hooks/lib/ai-memory-hook.ps1 \
     && printf ok || printf fail)
@@ -371,14 +371,14 @@ route_project = "wrong"
 EOF
 HOME_IDENTITY_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
 assert_eq "home exact hostful identity wins path and forwards aliases safely" "yes" \
-    "$(case "$HOME_IDENTITY_ROUTE" in *'&workspace=identity&project=identity-api&project_src=marker'*'&identity=github.com%2Facme%2Fapi&identity_src=git_remote&identity_style=path'*'&aliases=%5B%22main%22%5D'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_IDENTITY_ROUTE" in (*'&workspace=identity&project=identity-api&project_src=marker'*'&identity=github.com%2Facme%2Fapi&identity_src=git_remote&identity_style=path'*'&aliases=%5B%22main%22%5D'*) printf yes ;; (*) printf no ;; esac)"
 HOME_SIBLING=$(ai_memory_marker_qs "$HOME/src/api-sibling")
 assert_eq "home route does not string-prefix match a sibling" "yes" \
-    "$(case "$HOME_SIBLING" in *'&project=broad&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_SIBLING" in (*'&project=broad&project_src=marker'*) printf yes ;; (*) printf no ;; esac)"
 printf 'workspace = "local"\nproject = "local-project"\n' >"$HOME/src/api/.ai-memory.toml"
 LOCAL_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
 assert_eq "local settings marker wins over home route" "yes" \
-    "$(case "$LOCAL_ROUTE" in *'&workspace=local&project=local-project&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$LOCAL_ROUTE" in (*'&workspace=local&project=local-project&project_src=marker'*) printf yes ;; (*) printf no ;; esac)"
 rm -f "$HOME/src/api/.ai-memory.toml"
 cat >"$HOME/.ai-memory.toml" <<EOF
 workspace = "wrong"
@@ -399,13 +399,13 @@ route_project = "api"
 EOF
 HOME_FLAG_ROUTE=$(ai_memory_marker_qs "$HOME/src/api")
 assert_eq "home route replaces scope and keeps root privacy settings" "yes" \
-    "$(case "$HOME_FLAG_ROUTE" in *'&workspace=right&project=api&project_src=marker'*'&drop_subagent=true&default_global=true&profile_contribute=1&profile_consume=0'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_FLAG_ROUTE" in (*'&workspace=right&project=api&project_src=marker'*'&drop_subagent=true&default_global=true&profile_contribute=1&profile_consume=0'*) printf yes ;; (*) printf no ;; esac)"
 printf 'workspace = "wrong"\nproject = "wrong"\n[routes.path."relative"]\nroute_workspace = "oss"\nroute_project = "api"\n' >"$HOME/.ai-memory.toml"
 assert_eq "malformed home routes fail closed instead of root fallback" "&ai_memory_invalid_home_routes=1" \
     "$(ai_memory_marker_qs "$HOME/src/api")"
 printf 'workspace = wrong\n' >"$HOME/.ai-memory.toml"
 assert_eq "malformed root-only home marker keeps legacy parser behavior" "yes" \
-    "$(case "$(ai_memory_marker_qs "$HOME/src/api")" in *'&ai_memory_invalid_home_routes=1'*) printf no ;; *) printf yes ;; esac)"
+    "$(case "$(ai_memory_marker_qs "$HOME/src/api")" in (*'&ai_memory_invalid_home_routes=1'*) printf no ;; (*) printf yes ;; esac)"
 ai_memory_home
 ROUTE_FS=$(printf '\034')
 printf '[routes.path."C:/Work/API"]\nroute_workspace="windows"\nroute_project="drive"\n[routes.path."//Server/Share/API"]\nroute_workspace="windows"\nroute_project="unc"\n' >"$HOME/.ai-memory.toml"
