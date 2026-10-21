@@ -44,6 +44,15 @@ version in [`docs/changelog/`](docs/changelog/):
   a missing project from the marker, the git remote, then the directory name.
   ([#1493](https://github.com/akitaonrails/ai-memory/issues/1493))
 
+- Named the install's data dir in the `mcp-bridge` entries `install-mcp`
+  writes for Claude Code and the session-less stdio bridge when the install
+  was given one (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in the
+  config), as Muse's entry and the install's hooks already did. The bridge
+  read the default data dir's config and token instead, so on a host whose
+  server uses the default data dir it authenticated with the server's root
+  bearer.
+  ([#1489](https://github.com/akitaonrails/ai-memory/issues/1489))
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed

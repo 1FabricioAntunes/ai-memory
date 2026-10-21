@@ -25,7 +25,11 @@ Warp, Cline, Kilo Code, Goose, Qwen Code and OpenHuman have no
 > the token file at launch and forwards no session id, so the client passes
 > `workspace` and `project` like any static client. Stdio entries name the
 > `ai-memory` binary by its absolute path, so the client does not need it on
-> its `PATH`; the Docker wrapper keeps the bare `ai-memory`. ZCode keeps
+> its `PATH`; the Docker wrapper keeps the bare `ai-memory`. When the install
+> was given a data dir (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in
+> the config), every bridge entry names it with `--data-dir`, as that
+> install's hooks do, so the bridge reads that install's config and token
+> rather than the default data dir's. ZCode keeps
 > HTTP entries only and is refused. Passing `--auth-token` explicitly (or
 > `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
 
