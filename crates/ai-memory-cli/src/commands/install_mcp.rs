@@ -4871,11 +4871,18 @@ mod tests {
     /// keeps its entries unchanged (only Muse, which clears the environment,
     /// names the dir regardless), and the Docker helper, whose data dir is a
     /// container path, names it for no client.
+    /// Whether a written entry names `path`. JSON (and TOML basic strings)
+    /// escape a Windows path's backslashes, so look for that form too.
+    fn names_path(text: &str, path: &Path) -> bool {
+        let raw = path.to_string_lossy();
+        let escaped = serde_json::to_string(raw.as_ref()).unwrap();
+        text.contains(raw.as_ref()) || text.contains(escaped.trim_matches('"'))
+    }
+
     #[test]
     fn bridge_entries_name_a_data_dir_the_install_was_given() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("client-data");
-        let marker = data_dir.to_string_lossy().into_owned();
         let installed = |config: &Config, label: &str| {
             let mut bridges = 0;
             for &client in <McpClient as clap::ValueEnum>::value_variants() {
@@ -4896,7 +4903,7 @@ mod tests {
                 if text.contains("mcp-bridge") {
                     bridges += 1;
                 }
-                let names_dir = text.contains("--data-dir") && text.contains(marker.as_str());
+                let names_dir = text.contains("--data-dir") && names_path(&text, &data_dir);
                 let expected = match label {
                     "explicit" => text.contains("mcp-bridge"),
                     "default" => matches!(client, McpClient::Muse | McpClient::Freebuff),
@@ -4962,7 +4969,7 @@ mod tests {
             assert!(!text.contains("AI_MEMORY_AUTH_TOKEN"), "{client:?}: {text}");
             assert!(text.contains("--data-dir"), "{client:?}: {text}");
             assert!(
-                text.contains(config.data_dir.to_string_lossy().as_ref()),
+                names_path(&text, &config.data_dir),
                 "{client:?} entry must name the dir the key went into: {text}"
             );
             assert_eq!(stored(&config).as_deref(), Some(KEY), "{client:?}");
