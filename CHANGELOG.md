@@ -208,6 +208,13 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Reserved local-embedding capacity for interactive search queries instead of
+  allowing concurrent page writes and backfill work to occupy every inference
+  slot. Excess queries fall back immediately to non-vector retrieval, and a
+  cancelled request retains its slot until its non-cancellable CPU inference
+  actually ends. An opt-in real-model contention probe records idle,
+  unbounded-load, and bounded-load p50/p95 query latency; hosted embedding
+  providers are unchanged.
 - Bound native API-key hashes to their configured pepper with a persisted
   Argon2id verifier. A restored database with existing keys now refuses to
   serve under a different `[auth].token_pepper` instead of silently making
@@ -283,13 +290,6 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [3.1.2] - 2026-10-20
 
 ### Fixed
-- Reserved local-embedding capacity for interactive search queries instead of
-  allowing concurrent page writes and backfill work to occupy every inference
-  slot. Excess queries fall back immediately to non-vector retrieval, and a
-  cancelled request retains its slot until its non-cancellable CPU inference
-  actually ends. An opt-in real-model contention probe records idle,
-  unbounded-load, and bounded-load p50/p95 query latency; hosted embedding
-  providers are unchanged.
 - Reported appended and removed lines in wiki sync conflict summaries, with
   an explicit end-of-file marker instead of line 0 and matching previews.
   ([#1477](https://github.com/akitaonrails/ai-memory/issues/1477))
