@@ -223,6 +223,14 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- A byte size just under a unit boundary now carries to the next unit instead
+  of printing a magnitude that unit cannot hold. The scaling loop stopped at
+  `value < 1024.0` while the result is rendered with one decimal, so a
+  database of 1 MiB minus six bytes made `ai-memory status` report
+  `1024.0 KiB on disk` rather than `1.0 MiB`; `reclaim-ledger-versions` could
+  likewise print `1024.0 KiB -> 1.0 MiB` for a six-byte difference.
+  ([#1562](https://github.com/akitaonrails/ai-memory/pull/1562))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
