@@ -34,6 +34,16 @@ version in [`docs/changelog/`](docs/changelog/):
   `[search.fts] stopwords` list like a bare query, keeps the words the user
   quoted, and keeps every word when all of them are stopwords.
 
+- Corrected `docs/lifecycle-ops.md` on two points. The `move-project` merge
+  drops everything the source project owns, the same set `purge-project`
+  deletes. This includes managed workstreams, cross-project messages,
+  auto-improvement and profile-harvest state, consolidation jobs, ingest keys,
+  entities, page feedback, purge tombstones and project grants as well as
+  sessions, observations and handoffs. The `400` for sending both a project
+  name and an id, or neither, applies to the admin endpoints; the CLI resolves
+  a missing project from the marker, the git remote, then the directory name.
+  ([#1493](https://github.com/akitaonrails/ai-memory/issues/1493))
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed

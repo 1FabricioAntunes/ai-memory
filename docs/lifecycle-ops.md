@@ -33,10 +33,13 @@ on a homelab box where mistakes are harder to undo.
 whose name is ambiguous: an empty legacy twin row left by an older migration
 can carry another project's old name, and the name lookup refuses it.
 `list-projects` prints each project's id. The id is looked up inside the
-workspace the command names. Sending both the name and the id, or neither, is
-a `400`, so is a malformed UUID, and an id that names no project in that
-workspace is a `404`. `--confirm`, the preview and every other guard behave
-the same as with a name.
+workspace the command names. On the admin endpoints, sending both the name and
+the id, or neither, is a `400`, so is a malformed UUID, and an id that names no
+project in that workspace is a `404`. The CLI refuses both flags together before
+sending anything, and with neither it resolves the project the way other
+commands do: the `.ai-memory.toml` marker's `project`, then the git remote, then
+the directory name. `--confirm`, the preview and every other guard behave the
+same as with a name.
 
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
@@ -614,11 +617,18 @@ destination promotes its legacy name first, the response includes
 `manifest_warning` when that committed promotion's manifest refresh/checkpoint
 fails; the CLI prints it.
 
-**What does NOT migrate (merge case only):** in the `copy-purge` path the
-source's `sessions`, `observations`, and `handoffs` (the raw episodic
-capture log) are dropped by the purge, and the moved pages start a fresh
-supersession chain (the real page history lives in the wiki's git
-mirror). The `true-move` path has no such loss.
+**What does NOT migrate (merge case only):** the `copy-purge` path copies
+only the source's latest pages and their embeddings. The purge then drops
+everything else the source project owns, the same set `purge-project`
+deletes: its `sessions`, `observations`, and `handoffs` (the raw episodic
+capture log), its managed workstreams with their native sessions, runs,
+events and `raw/workstreams/` segments, the cross-project messages it sent
+or received, auto-improvement and profile-harvest state, session-consolidation
+jobs, ingest deduplication keys, entities, page feedback, purge tombstones and
+project grants. The moved pages start a fresh supersession chain (the real
+page history lives in the wiki's git mirror). The append-only audit trail
+remains, with references to the removed source ids. The `true-move` path has
+no such loss.
 
 > **Operational caveat: moving the project the current session writes
 > to.** Lifecycle hooks stamp a bounded observation on every supported tool-lifecycle event into the
