@@ -223,6 +223,14 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- A popped message can no longer pass its own text off as `ai-memory`'s. The
+  human rendering of `message pop` printed the sender's subject above the
+  security notice and the body between two literal fence lines, neither
+  escaped, so a newline in the subject forged lines in the provenance block
+  and an `---- end of body ----` line in the body closed the fence early. The
+  subject now renders on one line and the body's fence markers are
+  neutralized; both JSON paths were already structural and are unchanged.
+  ([#1563](https://github.com/akitaonrails/ai-memory/pull/1563))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
