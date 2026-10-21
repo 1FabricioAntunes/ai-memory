@@ -20,6 +20,13 @@ version in [`docs/changelog/`](docs/changelog/):
   bundled roots still trusted distrusted emSign intermediates. The importer,
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
+### Fixed
+- Held `ai-memory run` heartbeat notices while the harness owns the terminal
+  and printed them after it exits, so a server outage no longer writes into the
+  harness TUI. Only the first and latest notices are replayed, with a count of
+  the rest.
+  ([#1500](https://github.com/akitaonrails/ai-memory/issues/1500))
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed

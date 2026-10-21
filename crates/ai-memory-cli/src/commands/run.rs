@@ -188,9 +188,50 @@ struct AutoSessionCandidate {
 #[derive(Debug, Default)]
 struct HeartbeatHealth {
     consecutive_failures: u64,
+    /// Set while the harness owns the terminal: a line written to stderr then
+    /// lands inside its TUI (the prompt box, mid-render), so notices are held
+    /// until the harness exits.
+    defer_notices: bool,
+    first_deferred: Option<String>,
+    last_deferred: Option<String>,
+    deferred_count: u64,
 }
 
 impl HeartbeatHealth {
+    fn deferring() -> Self {
+        Self {
+            defer_notices: true,
+            ..Self::default()
+        }
+    }
+
+    fn notify(&mut self, notice: String) {
+        if !self.defer_notices {
+            eprintln!("{notice}");
+            return;
+        }
+        self.deferred_count = self.deferred_count.saturating_add(1);
+        if self.first_deferred.is_none() {
+            self.first_deferred = Some(notice);
+        } else {
+            self.last_deferred = Some(notice);
+        }
+    }
+
+    /// The held notices, bounded to the first and the latest so a server that
+    /// flapped all day does not replay hundreds of lines.
+    fn into_deferred(self) -> Vec<String> {
+        let mut lines: Vec<String> = self.first_deferred.into_iter().collect();
+        let skipped = self.deferred_count.saturating_sub(2);
+        if skipped > 0 {
+            lines.push(format!(
+                "ai-memory: ({skipped} more managed workstream notices while the harness ran)"
+            ));
+        }
+        lines.extend(self.last_deferred);
+        lines
+    }
+
     fn record_failure(&mut self) -> bool {
         let first = self.consecutive_failures == 0;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
@@ -1196,6 +1237,8 @@ async fn run_once_with_wiring(
             ));
         }
     };
+    // The harness owns the terminal from here until it exits.
+    let mut heartbeat_health = HeartbeatHealth::deferring();
     if (harness == ManagedHarness::Crush || grok_context.is_some())
         && let Err(error) = post_empty_with_retry(
             &endpoint,
@@ -1204,19 +1247,18 @@ async fn run_once_with_wiring(
         )
         .await
     {
-        eprintln!(
+        heartbeat_health.notify(format!(
             "ai-memory: {error}; the context may be delivered again on the next {} run",
             harness.as_str()
-        );
+        ));
     }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
-    let mut heartbeat_health = HeartbeatHealth::default();
-    let status = loop {
+    let waited = loop {
         tokio::select! {
-            result = child.wait() => break acquired_try!(result.context("waiting for managed harness")),
+            result = child.wait() => break result,
             _ = heartbeat.tick() => {
                 let _ = send_managed_heartbeat(
                     &endpoint,
@@ -1226,6 +1268,10 @@ async fn run_once_with_wiring(
             }
         }
     };
+    for notice in heartbeat_health.into_deferred() {
+        eprintln!("{notice}");
+    }
+    let status = acquired_try!(waited.context("waiting for managed harness"));
     let exit_code = status.code().unwrap_or(1);
 
     let server_status = if plan.mode == LaunchMode::Session {
@@ -2119,14 +2165,15 @@ async fn send_managed_heartbeat_with_timeout(
         .and_then(|result| result);
     match &result {
         Ok(()) if health.record_success() => {
-            eprintln!(
+            health.notify(
                 "ai-memory: server connection restored; managed workstream heartbeat resumed"
+                    .to_string(),
             );
         }
         Ok(()) => {}
         Err(error) if health.record_failure() => {
             tracing::debug!(error = %error, "managed workstream heartbeat became unavailable");
-            eprintln!("{}", heartbeat_failure_notice(error));
+            health.notify(heartbeat_failure_notice(error));
         }
         Err(_) => {}
     }
@@ -5820,6 +5867,37 @@ mod tests {
         assert!(health.record_success());
         assert!(!health.record_success());
         assert!(health.record_failure());
+    }
+
+    #[test]
+    fn deferred_heartbeat_notices_wait_for_the_harness_to_exit() {
+        assert!(HeartbeatHealth::deferring().into_deferred().is_empty());
+
+        let mut health = HeartbeatHealth::deferring();
+        health.notify("outage 1".to_string());
+        health.notify("restored 1".to_string());
+        health.notify("outage 2".to_string());
+        health.notify("restored 2".to_string());
+
+        assert_eq!(
+            health.into_deferred(),
+            [
+                "outage 1".to_string(),
+                "ai-memory: (2 more managed workstream notices while the harness ran)".to_string(),
+                "restored 2".to_string(),
+            ]
+        );
+
+        let mut health = HeartbeatHealth::deferring();
+        health.notify("outage".to_string());
+        assert_eq!(health.into_deferred(), ["outage".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_notices_print_immediately_when_nothing_owns_the_terminal() {
+        let mut health = HeartbeatHealth::default();
+        health.notify("outage".to_string());
+        assert!(health.into_deferred().is_empty());
     }
 
     #[tokio::test]
