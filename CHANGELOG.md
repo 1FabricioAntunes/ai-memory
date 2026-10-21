@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- `memory_auto_improve` now reports an exhausted implicit queue — every
+  completed session already has a review run — as invalid params rather than an
+  internal error, matching `memory_consolidate` for the same dead end. A client
+  no longer reads the routine end of the queue as a server fault and retries it.
+  ([#1518](https://github.com/akitaonrails/ai-memory/pull/1518))
+
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
