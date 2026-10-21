@@ -260,6 +260,41 @@ pub fn api_credentials_exist(conn: &Connection) -> StoreResult<bool> {
     .map_err(StoreError::from)
 }
 
+/// Return the Argon2id verifier bound to the native-key pepper, when one has
+/// been recorded.
+///
+/// # Errors
+/// SQL failures.
+pub fn api_credential_pepper_verifier(conn: &Connection) -> StoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT verifier FROM api_credential_pepper_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// Insert or replace the verifier for the configured native-key pepper.
+///
+/// The caller decides whether replacement is allowed after checking whether
+/// any credentials exist. Keeping that policy above this storage primitive
+/// lets startup perform the expensive Argon2id verification off the writer
+/// thread.
+///
+/// # Errors
+/// SQL failures.
+pub fn set_api_credential_pepper_verifier(conn: &Connection, verifier: &str) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO api_credential_pepper_state (singleton, verifier, updated_at) \
+         VALUES (1, ?1, ?2) \
+         ON CONFLICT(singleton) DO UPDATE SET \
+             verifier = excluded.verifier, updated_at = excluded.updated_at",
+        params![verifier, Timestamp::now().as_microsecond()],
+    )?;
+    Ok(())
+}
+
 fn row_to_credential(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiCredential> {
     let id_bytes: Vec<u8> = row.get(0)?;
     let id = ApiCredentialId::from_slice(&id_bytes).map_err(|e| {
@@ -433,7 +468,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 83, "update the pin when adding a migration");
+        assert_eq!(version, 84, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') \

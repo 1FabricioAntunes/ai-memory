@@ -1162,6 +1162,13 @@ and credentials match the new host. Treat both the ordinary snapshot and the
 separate material as sensitive: wiki content and SQLite can contain private
 session data even though the archive excludes bearer files.
 
+Current databases carry an Argon2id verifier for the API-key pepper. If a
+restored database contains native API credentials but the destination loads a
+different pepper, `serve` refuses instead of starting with keys that can never
+authenticate. A database first opened by a version that predates this verifier
+cannot prove which pepper created its existing hashes; for those older
+snapshots, restoring the original external config remains mandatory.
+
 Restoring a backup follows the inverse:
 
 ```bash

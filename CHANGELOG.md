@@ -21,6 +21,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Bound native API-key hashes to their configured pepper with a persisted
+  Argon2id verifier. A restored database with existing keys now refuses to
+  serve under a different `[auth].token_pepper` instead of silently making
+  every key return 401; pepper rotation remains allowed while no keys exist.
+  ([#1495](https://github.com/akitaonrails/ai-memory/issues/1495))
+
 - Defined `ai-memory backup` as an online data snapshot rather than a complete
   host image, documented the separately protected config, root credentials and
   raw ledgers a host move may require, and corrected the missing-token startup

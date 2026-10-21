@@ -419,8 +419,13 @@ passwords and sessions do not use it.
 sessions can operate without a machine-root bearer; native API-key lookup
 still requires the original pepper. If `api_credentials` contains rows and
 the pepper is missing or blank, `serve` refuses startup before applying
-human bootstrap. Restore the original pepper from configuration backup
-rather than deleting identities or keys.
+human bootstrap. Current databases also keep an Argon2id verifier and refuse
+a different pepper instead of starting with keys that can only return 401.
+Restore the original pepper from a separately protected configuration backup
+rather than deleting identities or keys: `ai-memory backup` includes only a
+`config.toml` inside the data dir, while packaged systemd units load one from
+outside it. Snapshots created before the verifier existed cannot be checked
+and still require the original config.
 
 ### 2. Add another human
 

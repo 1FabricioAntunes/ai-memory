@@ -313,6 +313,52 @@ fn validate_api_credential_pepper(api_credentials_exist: bool, auth: &AuthSettin
     Ok(())
 }
 
+/// Bind native API-key hashes to the pepper that produced them.
+///
+/// The Argon2id verifier travels with SQLite backups without storing the
+/// pepper. A different pepper is safe to bind while no credentials exist;
+/// once hashes exist, a mismatch means the restored database and config do
+/// not belong together and serving would silently reject every key.
+async fn validate_api_credential_pepper_binding(
+    store: &Store,
+    api_credentials_exist: bool,
+    auth: &AuthSettings,
+) -> Result<()> {
+    validate_api_credential_pepper(api_credentials_exist, auth)?;
+    let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    if let Some(verifier) = store.reader.api_credential_pepper_verifier().await? {
+        let matches = ai_memory_store::password::verify_password(pepper.to_owned(), verifier)
+            .await
+            .context("verifying the configured API credential pepper")?;
+        if matches {
+            return Ok(());
+        }
+        if api_credentials_exist {
+            anyhow::bail!(
+                "[auth].token_pepper does not match the pepper that hashed the restored API \
+                 credentials; restore the original external config or token_pepper before \
+                 serving (ai-memory backup does not archive config files outside the data dir)"
+            );
+        }
+    }
+
+    let verifier = ai_memory_store::password::hash_password(pepper.to_owned())
+        .await
+        .context("binding the configured API credential pepper")?;
+    store
+        .writer
+        .set_api_credential_pepper_verifier(verifier)
+        .await?;
+    Ok(())
+}
+
 /// Validate the credentials that keep an existing multi-user installation
 /// closed. Bootstrap installs have no user rows yet and retain their historical
 /// compatibility behavior regardless of placeholder auth values.
@@ -1225,7 +1271,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     }
 
     let api_credentials_exist = store.reader.api_credentials_exist().await?;
-    validate_api_credential_pepper(api_credentials_exist, &config.auth)?;
+    validate_api_credential_pepper_binding(&store, api_credentials_exist, &config.auth).await?;
     let bootstrap_completed_before_start = store.reader.bootstrap_completed().await?;
     validate_configured_secret_collisions(&store, &config.auth, !bootstrap_completed_before_start)
         .await?;
@@ -3699,6 +3745,50 @@ mod tests {
         };
         assert!(validate_api_credential_pepper(true, &configured).is_ok());
         assert!(validate_api_credential_pepper(false, &missing).is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_key_pepper_binding_refuses_a_mismatch_once_credentials_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let original = AuthSettings {
+            token_pepper: Some("original-pepper-with-enough-entropy".into()),
+            ..AuthSettings::default()
+        };
+        let replacement = AuthSettings {
+            token_pepper: Some("replacement-pepper-with-enough-entropy".into()),
+            ..AuthSettings::default()
+        };
+
+        validate_api_credential_pepper_binding(&store, false, &original)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .api_credential_pepper_verifier()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        validate_api_credential_pepper_binding(&store, true, &original)
+            .await
+            .unwrap();
+
+        let mismatch = validate_api_credential_pepper_binding(&store, true, &replacement)
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("does not match"),
+            "unexpected error: {mismatch:#}"
+        );
+
+        validate_api_credential_pepper_binding(&store, false, &replacement)
+            .await
+            .unwrap();
+        validate_api_credential_pepper_binding(&store, true, &replacement)
+            .await
+            .unwrap();
     }
 
     #[test]

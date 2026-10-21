@@ -11774,6 +11774,15 @@ impl ReaderPool {
             .await
     }
 
+    /// Argon2id verifier for the pepper that hashes native API credentials.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn api_credential_pepper_verifier(&self) -> StoreResult<Option<String>> {
+        self.with_conn(crate::api_credentials::api_credential_pepper_verifier)
+            .await
+    }
+
     /// True when any credential (active or revoked) stores this hash.
     ///
     /// # Errors
