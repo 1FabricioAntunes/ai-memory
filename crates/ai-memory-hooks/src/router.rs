@@ -674,14 +674,25 @@ async fn repair_hook_json(request: Request<Body>, next: Next) -> Response {
 }
 
 fn repair_hook_json_bytes(bytes: axum::body::Bytes) -> axum::body::Bytes {
-    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
-        std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(crate::replace_lone_surrogate_escapes)
-            .map_or(bytes, axum::body::Bytes::from)
+    if serde_json::from_slice::<serde_json::Value>(&bytes).is_ok() {
+        return bytes;
+    }
+    // A harness that writes its payload as UTF-8 with a byte-order mark — some
+    // PowerShell pipelines do when writing to a native process (#197) — fails
+    // the `Json` extractor outright, and the hook is fire-and-forget, so the
+    // event is lost silently. The native client strips it in
+    // `parse_hook_payload` for the same reason; strip it before the surrogate
+    // repair so a body needing both still parses.
+    const BOM: &[u8] = b"\xEF\xBB\xBF";
+    let body = if bytes.starts_with(BOM) {
+        bytes.slice(BOM.len()..)
     } else {
         bytes
-    }
+    };
+    std::str::from_utf8(&body)
+        .ok()
+        .and_then(crate::replace_lone_surrogate_escapes)
+        .map_or(body, axum::body::Bytes::from)
 }
 
 /// Unix milliseconds for an ingest metric stamp, saturating rather than
@@ -6894,6 +6905,34 @@ pub(crate) mod tests {
         );
         let repaired = repair_hook_json_bytes(raw);
         let value: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["tool_response"]["stdout"], "ok \u{FFFD} tail");
+    }
+
+    #[test]
+    fn hook_ingress_strips_a_utf8_bom_before_json_extraction() {
+        let raw = axum::body::Bytes::from_static(
+            b"\xEF\xBB\xBF{\"session_id\":\"bom\",\"prompt\":\"hi\"}",
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&raw).is_err(),
+            "a BOM-prefixed body must not parse as JSON, or this test proves nothing"
+        );
+
+        let repaired = repair_hook_json_bytes(raw);
+        let value: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["session_id"], "bom");
+        assert_eq!(value["prompt"], "hi");
+    }
+
+    /// A BOM and a lone surrogate in one body: both repairs must apply.
+    #[test]
+    fn hook_ingress_repairs_a_bom_and_a_lone_surrogate_together() {
+        let raw = axum::body::Bytes::from_static(
+            b"\xEF\xBB\xBF{\"session_id\":\"both\",\"tool_response\":{\"stdout\":\"ok \\ud83d tail\"}}",
+        );
+        let repaired = repair_hook_json_bytes(raw);
+        let value: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        assert_eq!(value["session_id"], "both");
         assert_eq!(value["tool_response"]["stdout"], "ok \u{FFFD} tail");
     }
 

@@ -301,6 +301,14 @@ version in [`docs/changelog/`](docs/changelog/):
   under `.ai-memory-delete.` during a delete, or under
   `.ai-memory-tmp.move-session.` during a session move, is left out the same
   way. ([#1524](https://github.com/akitaonrails/ai-memory/pull/1524))
+
+- The `/hook` ingress now skips a leading UTF-8 byte-order mark, as the native
+  hook client already did. Some PowerShell pipelines add that marker when
+  writing to a native process, and the POSIX shell hook bundle forwards the
+  payload byte for byte, so such an event was answered with 400 and lost
+  without notice. `ai-memory-relay enqueue --file` skips the marker too.
+  ([#1523](https://github.com/akitaonrails/ai-memory/pull/1523))
+
 - `mcp-bridge` and the `setup` self-check no longer send requests to the
   server through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the hooks
   already did. A sandbox such as ai-jail exports a proxy with an empty
