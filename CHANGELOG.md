@@ -223,14 +223,14 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
-- Cold-cluster dedup (A3) now collapses a set of exactly `min_pts`
-  near-duplicates. The adaptive eps returned nothing for a point count at or
-  below the density floor, so with the default `min_pts = 2` a pair of
-  near-identical cold pages was never merged — while the same pair alongside
-  any unrelated third cold page collapsed normally. The conservative `max_eps`
-  ceiling is unchanged.
+- Cold-cluster dedup (A3) and the opt-in dream pass (B2) now merge a cold set
+  of exactly `min_pts` near-duplicates. The adaptive eps returned nothing when
+  the cold set had no more points than the density floor, so with the default
+  `min_pts = 2` a lone pair of near-identical cold pages was never merged,
+  while the same pair next to any unrelated third cold page was. The
+  conservative `max_eps` ceiling still decides whether a pair is close enough
+  to merge.
   ([#1528](https://github.com/akitaonrails/ai-memory/pull/1528))
-
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
