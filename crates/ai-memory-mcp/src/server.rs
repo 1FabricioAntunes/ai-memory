@@ -384,9 +384,14 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_read_session_observations` — when the user asks what actually \
   happened in a session, wants to check a compiled page against its raw \
   evidence, or needs the exact prompt/tool text behind a `memory_query` \
-  raw hit. Pass `session_id`, or omit it for the latest completed session \
-  in the current project; page with `limit`/`offset`, narrow with `kinds` \
-  or `query`. Read-only, no LLM call.\n\
+  raw hit. Also the first read when the user asks to continue and a \
+  session-start notice, `memory_briefing` `recent_sessions` or \
+  `memory_handoff_list` `newer_unended_session` names a session that never \
+  ended (a harness cut off by a quota limit or a crash): read it with \
+  `order: \"desc\"` before relying on an older handoff or page. Pass \
+  `session_id` (the UUID or the harness's native id), or omit it for the \
+  latest completed session in the current project; page with \
+  `limit`/`offset`, narrow with `kinds` or `query`. Read-only, no LLM call.\n\
 - `memory_delete_page` — when the user explicitly asks to delete or \
   remove a specific page (by exact path). Idempotent; fires the \
   admission chain so mirrors/backups stay consistent. Follow the client-aware \
