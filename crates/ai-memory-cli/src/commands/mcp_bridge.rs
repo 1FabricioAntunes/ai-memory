@@ -680,27 +680,26 @@ mod tests {
     #[test]
     fn a_stored_user_key_outranks_the_discovered_root_token() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("auth-tokens")).unwrap();
-        std::fs::write(
-            tmp.path().join("auth-tokens").join("default"),
-            "root-token\n",
-        )
-        .unwrap();
-        let load = || {
-            Config::load_with_runtime_env(
-                None,
-                Some(tmp.path().to_path_buf()),
-                RuntimeEnv::default(),
-            )
-            .unwrap()
+        let discovered_root = || {
+            let mut config = Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            };
+            config.auth.bearer_token = Some("root-token".into());
+            config.auth.token_file = Some(crate::config::ResolvedTokenFile {
+                path: tmp.path().join("auth-tokens").join("default"),
+                loaded: true,
+                discovered: true,
+            });
+            config
         };
 
-        let discovered = load();
+        let discovered = discovered_root();
         assert_eq!(discovered.auth.bearer_token.as_deref(), Some("root-token"));
         assert_eq!(bridge_bearer(&discovered).as_deref(), Some("root-token"));
 
         crate::config::store_hook_auth_token(tmp.path(), "aim_user_key").unwrap();
-        let both = load();
+        let both = discovered_root();
         assert_eq!(both.auth.bearer_token.as_deref(), Some("root-token"));
         assert_eq!(bridge_bearer(&both).as_deref(), Some("aim_user_key"));
     }
