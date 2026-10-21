@@ -144,6 +144,47 @@ pub enum ToolFamily {
 pub(crate) struct ToolObservationMetadata {
     pub(crate) tool_family: ToolFamily,
     pub(crate) tool_call_id: Option<String>,
+    /// Set only for an unknown-family call whose name is a strictly
+    /// validated MCP tool name; see [`mcp_tool_name`].
+    pub(crate) mcp_tool: Option<McpToolName>,
+}
+
+/// The server and tool an MCP tool name identifies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpToolName {
+    pub(crate) server: String,
+    pub(crate) tool: String,
+}
+
+/// Longest MCP tool name kept. Hermes clamps its generated names to the 64
+/// characters OpenAI-compatible providers accept (`tools/mcp_tool_schema.py`,
+/// v0.22.2); a longer name is not a shape any documented harness sends.
+const MAX_MCP_TOOL_NAME_CHARS: usize = 64;
+
+/// The server and tool of an `mcp__<server>__<tool>` tool name, the shape
+/// Claude Code (<https://code.claude.com/docs/en/hooks>, "Match MCP tools",
+/// plugin servers as `mcp__plugin_<plugin>_<server>__<tool>`), Codex
+/// (<https://learn.chatgpt.com/docs/hooks>, `mcp__fs__read`) and Hermes Agent
+/// (`mcp_prefixed_tool_name`, v0.22.2; server and tool reduced to
+/// `[A-Za-z0-9_]`) put in a tool hook's `tool_name`.
+///
+/// An MCP tool's arguments have no known path shape, so it stays an unknown
+/// family and keeps no input or output. Only the two names are kept, and only
+/// when the whole name is at most 64 ASCII letters, digits, `_` or `-`: an
+/// identifier, never free text. The server ends at the first `__`.
+pub(crate) fn mcp_tool_name(name: &str) -> Option<McpToolName> {
+    if name.len() > MAX_MCP_TOOL_NAME_CHARS
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then(|| McpToolName {
+        server: server.to_owned(),
+        tool: tool.to_owned(),
+    })
 }
 
 /// Safe outcome class for a completed tool call.
@@ -305,9 +346,17 @@ pub(crate) fn tool_observation_metadata(
                 )
                 .is_some(),
         };
-    has_args.then(|| ToolObservationMetadata {
-        tool_family: agent_family(agent, name),
-        tool_call_id: id.filter(|id| valid_call_id(id)).map(str::to_owned),
+    has_args.then(|| {
+        let tool_family = agent_family(agent, name);
+        ToolObservationMetadata {
+            tool_family,
+            tool_call_id: id.filter(|id| valid_call_id(id)).map(str::to_owned),
+            mcp_tool: if tool_family == ToolFamily::Unknown {
+                mcp_tool_name(name)
+            } else {
+                None
+            },
+        }
     })
 }
 
