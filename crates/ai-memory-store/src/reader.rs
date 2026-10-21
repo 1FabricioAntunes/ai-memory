@@ -1959,8 +1959,8 @@ pub struct ActivityWindow {
     /// Observations whose `created_at` falls in the window.
     pub observations: u64,
     /// Pages whose `updated_at` falls in the window — counts only
-    /// `is_latest = 1`. Supersession of an old version into a new one
-    /// counts as one update (the new row).
+    /// `is_latest = 1` pages whose TTL has not passed. Supersession of an old
+    /// version into a new one counts as one update (the new row).
     pub pages_updated: u64,
 }
 
@@ -8628,8 +8628,8 @@ impl ReaderPool {
                 evidence_rows: count(conn, "SELECT COUNT(*) FROM page_evidence")?,
             };
 
-            let activity_7d = window_activity(conn, 7, cutoff_7d)?;
-            let activity_30d = window_activity(conn, 30, cutoff_30d)?;
+            let activity_7d = window_activity(conn, 7, cutoff_7d, now_us)?;
+            let activity_30d = window_activity(conn, 30, cutoff_30d, now_us)?;
 
             let last_observation_at: Option<i64> = conn
                 .query_row("SELECT MAX(created_at) FROM observations", [], |row| {
@@ -8814,8 +8814,10 @@ impl ReaderPool {
                 )?,
             };
 
-            let activity_7d = window_activity_project(conn, 7, cutoff_7d, workspace_id, project_id)?;
-            let activity_30d = window_activity_project(conn, 30, cutoff_30d, workspace_id, project_id)?;
+            let activity_7d =
+                window_activity_project(conn, 7, cutoff_7d, now_us, workspace_id, project_id)?;
+            let activity_30d =
+                window_activity_project(conn, 30, cutoff_30d, now_us, workspace_id, project_id)?;
 
             let last_observation_at: Option<i64> = conn
                 .query_row(
@@ -9325,9 +9327,9 @@ impl ReaderPool {
             };
 
             let activity_7d =
-                window_activity_workspace(conn, 7, cutoff_7d, workspace_id, &visible)?;
+                window_activity_workspace(conn, 7, cutoff_7d, now_us, workspace_id, &visible)?;
             let activity_30d =
-                window_activity_workspace(conn, 30, cutoff_30d, workspace_id, &visible)?;
+                window_activity_workspace(conn, 30, cutoff_30d, now_us, workspace_id, &visible)?;
 
             let last_observation_at: Option<i64> = conn
                 .query_row(
@@ -14773,22 +14775,37 @@ fn normalize_fts_query(query: &str, stopwords: &FtsStopwords) -> String {
 
 /// Count rows in a time-bounded window. Used by [`ReaderPool::briefing`]
 /// to compute "last 7 days" / "last 30 days" activity slices.
-fn window_activity(conn: &Connection, days: u32, cutoff_us: i64) -> StoreResult<ActivityWindow> {
+fn window_activity(
+    conn: &Connection,
+    days: u32,
+    cutoff_us: i64,
+    now_us: i64,
+) -> StoreResult<ActivityWindow> {
     let count_since = |sql: &str| -> StoreResult<u64> {
         let n: Option<i64> = conn
             .query_row(sql, params![cutoff_us], |row| row.get(0))
             .optional()?;
         Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
     };
+    // `pages` is the only table counted here with a TTL, so it is the only one
+    // that needs `now_us` bound alongside the cutoff.
+    let pages_updated: Option<i64> = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM pages WHERE is_latest = 1 AND updated_at > ?1{not_expired}",
+                not_expired = not_expired("pages", "?2"),
+            ),
+            params![cutoff_us, now_us],
+            |row| row.get(0),
+        )
+        .optional()?;
     Ok(ActivityWindow {
         days,
         // `sessions` schema uses `started_at`, not `created_at` — easy
         // to forget because the other tables all use `created_at`.
         sessions: count_since("SELECT COUNT(*) FROM sessions WHERE started_at > ?1")?,
         observations: count_since("SELECT COUNT(*) FROM observations WHERE created_at > ?1")?,
-        pages_updated: count_since(
-            "SELECT COUNT(*) FROM pages WHERE is_latest = 1 AND updated_at > ?1",
-        )?,
+        pages_updated: u64::try_from(pages_updated.unwrap_or(0)).unwrap_or(0),
     })
 }
 
@@ -14796,6 +14813,7 @@ fn window_activity_project(
     conn: &Connection,
     days: u32,
     cutoff_us: i64,
+    now_us: i64,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
 ) -> StoreResult<ActivityWindow> {
@@ -14817,9 +14835,28 @@ fn window_activity_project(
         observations: count_since(
             "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1 AND project_id = ?2 AND created_at > ?3",
         )?,
-        pages_updated: count_since(
-            "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND updated_at > ?3",
-        )?,
+        // See the TTL note in `window_activity`; the guard needs a fourth bind,
+        // so this one statement does not go through `count_since`.
+        pages_updated: {
+            let n: Option<i64> = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pages \
+                         WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                           AND updated_at > ?3{not_expired}",
+                        not_expired = not_expired("pages", "?4"),
+                    ),
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        cutoff_us,
+                        now_us
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            u64::try_from(n.unwrap_or(0)).unwrap_or(0)
+        },
     })
 }
 
@@ -14829,6 +14866,7 @@ fn window_activity_workspace(
     conn: &Connection,
     days: u32,
     cutoff_us: i64,
+    now_us: i64,
     workspace_id: WorkspaceId,
     visible: &str,
 ) -> StoreResult<ActivityWindow> {
@@ -14848,10 +14886,22 @@ fn window_activity_workspace(
         observations: count_since(&format!(
             "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1 AND created_at > ?2{visible}"
         ))?,
-        pages_updated: count_since(&format!(
-            "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1 \
-             AND updated_at > ?2{visible}"
-        ))?,
+        // See the TTL note in `window_activity`; the guard needs a third bind,
+        // so this one statement does not go through `count_since`.
+        pages_updated: {
+            let n: Option<i64> = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1 \
+                         AND updated_at > ?2{visible}{not_expired}",
+                        not_expired = not_expired("pages", "?3"),
+                    ),
+                    params![workspace_id.as_bytes(), cutoff_us, now_us],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            u64::try_from(n.unwrap_or(0)).unwrap_or(0)
+        },
     })
 }
 
