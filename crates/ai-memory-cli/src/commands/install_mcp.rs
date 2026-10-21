@@ -30,6 +30,7 @@ use crate::commands::render_shared::{
     bearer_header_value, hook_embedded_exe_path, shell_quote, yaml_single_quote,
 };
 use crate::config::{Config, DEFAULT_MCP_URL};
+use crate::local_auth::HookCredential;
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
 
@@ -110,6 +111,7 @@ pub(crate) fn run_with_opencode_dialect(
     // inferred literal from an old entry is ignored then too, since it would
     // re-embed a stale credential.
     let token_file = config.auth.token_file_path();
+    let token_given = args.auth_token.is_some();
     let auth_token = args
         .auth_token
         .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned))
@@ -141,6 +143,31 @@ pub(crate) fn run_with_opencode_dialect(
     if config.runtime_env.host_cwd().is_none()
         && (args.client == McpClient::Muse || (runs_bridge && config.data_dir_explicit))
     {
+        args.bridge_data_dir = Some(config.data_dir.clone());
+    }
+    // An explicit `--auth-token` for an entry that runs `mcp-bridge` goes where
+    // the hooks keep theirs, `<data_dir>/auth-token`, and the bridge reads it
+    // from there when nothing else is configured. Inline in the harness config
+    // it would sit outside the data dir's protection and outlive a rotation,
+    // the reasons #552 moved the hooks' copy. The entry then names that data
+    // dir, so the bridge reads the file the key went into. Only `--apply`
+    // stores, as with `install-hooks`: a printed snippet is the operator's to
+    // place. The key stays inline, as before, whenever the bridge would not
+    // reach it: a bearer this config is configured with would win over it, a
+    // different key already stored belongs to the hooks, the store failed, or
+    // this is the Docker helper, whose data dir the host-side bridge cannot
+    // open.
+    let bridge_carries_token = matches!(args.client, McpClient::Muse)
+        || (args.client == McpClient::ClaudeCode && args.session_aware);
+    if args.apply
+        && token_given
+        && bridge_carries_token
+        && config.auth.configured_bearer_token().is_none()
+        && config.runtime_env.host_cwd().is_none()
+        && let Some(token) = args.auth_token.as_deref()
+        && store_bridge_key(&config.data_dir, token)
+    {
+        args.auth_token = None;
         args.bridge_data_dir = Some(config.data_dir.clone());
     }
     validate_args(&args)?;
@@ -213,6 +240,53 @@ fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> 
         _ => args.stdio_bridge = true,
     }
     Ok(())
+}
+
+/// Store `token` in `<data_dir>/auth-token` for the bridge, the file and
+/// format `install-hooks --apply` uses. `false` when the bridge would not read
+/// this key from there: a different key is already stored (it belongs to the
+/// install's hooks and is left alone), the hooks sign in with OIDC, or the
+/// write failed. The caller then keeps the key in the entry.
+fn store_bridge_key(data_dir: &Path, token: &str) -> bool {
+    // The hooks present an OIDC `auth.json` only while no key is stored, so
+    // storing one here would quietly switch them to this key.
+    if crate::config::read_hook_auth_token(data_dir).is_none()
+        && ai_memory_llm::OidcToken::load(&data_dir.join("auth.json"))
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        eprintln!(
+            "[ai-memory] this install's hooks sign in with OIDC; keeping the --auth-token key \
+             in the MCP entry, as before, so they keep doing so"
+        );
+        return false;
+    }
+    match crate::local_auth::seed_hook_credential(data_dir, token) {
+        Ok(HookCredential::Seeded | HookCredential::Current) => {
+            eprintln!(
+                "[ai-memory] stored the bridge's key in {}; the MCP entry carries no token",
+                crate::config::hook_auth_token_path_in(data_dir).display()
+            );
+            true
+        }
+        Ok(HookCredential::KeptOther) => {
+            eprintln!(
+                "[ai-memory] warning: {} already holds a different key for this install's \
+                 hooks; keeping the --auth-token key in the MCP entry, as before",
+                crate::config::hook_auth_token_path_in(data_dir).display()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "[ai-memory] warning: could not store the key under {} ({e:#}); keeping it in \
+                 the MCP entry, as before",
+                data_dir.display()
+            );
+            false
+        }
+    }
 }
 
 /// The bare command name, resolved through `PATH`. Inside a container the
@@ -1004,6 +1078,20 @@ pub(crate) fn existing_entry_is_session_aware(
         .and_then(serde_json::Value::as_array)
         .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("mcp-bridge")));
     is_stdio && runs_bridge
+}
+
+/// True when Claude Code or Muse still holds an ai-memory bridge entry under
+/// `name` in its default config file. `install-mcp --apply --auth-token`
+/// writes those two without the key, which the bridge then reads from
+/// `<data_dir>/auth-token`, so an uninstall that keeps such an entry must keep
+/// that file. Unreadable files answer `false`, as for the session-aware check.
+pub(crate) fn bridge_entry_remains(name: &str) -> bool {
+    existing_entry_is_session_aware(McpClient::ClaudeCode, None, name)
+        || mcp_config_path(McpClient::Muse)
+            .ok()
+            .and_then(|path| existing_entry_endpoint(McpClient::Muse, &path, name).ok())
+            .flatten()
+            .is_some()
 }
 
 /// Mutate the resolved client config file in place. Idempotent —
@@ -1854,7 +1942,8 @@ fn build_mcp_entry_zcode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
 /// the install's data dir (`--data-dir`, when [`InstallMcpArgs::bridge_data_dir`]
 /// is set) and the bridge reads its bearer from that install's config
 /// (`[auth].bearer_token_file`) at launch; a token given explicitly is
-/// passed in `env` the way Claude Code's session-aware entry carries it. `mode` is written
+/// passed in `env` the way Claude Code's session-aware entry carries it,
+/// unless `--apply` stored it in that data dir for the bridge. `mode` is written
 /// explicitly because Muse defaults it to `required`, which aborts the whole
 /// run when the server cannot start; ai-memory augments a session and must
 /// never gate it.
@@ -4372,6 +4461,102 @@ mod tests {
         let mut docker = explicit.clone();
         docker.runtime_env = crate::config::RuntimeEnv::with_host_cwd_for_tests("/host/repo");
         installed(&docker, "docker");
+    }
+
+    /// An explicit `--auth-token` for an entry that runs the bridge is stored
+    /// in `<data_dir>/auth-token`, where the bridge reads it, and the entry
+    /// names that data dir instead of carrying the key. Controls, each of
+    /// which keeps the key inline as before and stores nothing new: the print
+    /// path, a bearer the config already resolves (it would win over the
+    /// stored key), a different key already stored for the hooks, hooks that
+    /// sign in with OIDC, the Docker helper, and an HTTP entry, whose literal
+    /// header is documented.
+    #[test]
+    fn an_explicit_key_for_a_bridge_is_stored_instead_of_written_inline() {
+        const KEY: &str = "aim_explicit_key";
+        let tmp = tempfile::tempdir().unwrap();
+        let config_in = |name: &str| Config {
+            data_dir: tmp.path().join(name),
+            ..Config::default()
+        };
+        let install = |config: &Config, client: McpClient, apply: bool| -> String {
+            let file = config.data_dir.with_extension(format!("{client:?}.json"));
+            let mut args = args_for(client);
+            args.apply = apply;
+            args.config_file = Some(file.clone());
+            args.session_aware = client == McpClient::ClaudeCode;
+            args.auth_token = Some(KEY.into());
+            run_with_opencode_dialect(config, args, None).unwrap();
+            std::fs::read_to_string(&file).unwrap_or_default()
+        };
+        let stored = |config: &Config| crate::config::read_hook_auth_token(&config.data_dir);
+
+        for client in [McpClient::ClaudeCode, McpClient::Muse] {
+            let config = config_in(&format!("stored-{client:?}"));
+            let text = install(&config, client, true);
+            assert!(
+                !text.contains(KEY),
+                "{client:?} entry still carries the key: {text}"
+            );
+            assert!(!text.contains("AI_MEMORY_AUTH_TOKEN"), "{client:?}: {text}");
+            assert!(text.contains("--data-dir"), "{client:?}: {text}");
+            assert!(
+                text.contains(config.data_dir.to_string_lossy().as_ref()),
+                "{client:?} entry must name the dir the key went into: {text}"
+            );
+            assert_eq!(stored(&config).as_deref(), Some(KEY), "{client:?}");
+            // The shell hooks read the header file of the same pair.
+            assert_eq!(
+                std::fs::read_to_string(crate::config::hook_auth_header_path_in(&config.data_dir))
+                    .unwrap(),
+                format!("Authorization: Bearer {KEY}\n")
+            );
+        }
+
+        let printed = config_in("printed");
+        install(&printed, McpClient::ClaudeCode, false);
+        assert_eq!(
+            stored(&printed),
+            None,
+            "a printed snippet must store nothing"
+        );
+
+        let mut configured = config_in("configured");
+        configured.auth.bearer_token = Some("configured-bearer".into());
+        assert!(install(&configured, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(stored(&configured), None);
+
+        let other = config_in("other");
+        crate::config::store_hook_auth_token(&other.data_dir, "aim_hooks_key").unwrap();
+        assert!(install(&other, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(stored(&other).as_deref(), Some("aim_hooks_key"));
+
+        let oidc = config_in("oidc");
+        let response = ai_memory_llm::OidcTokenResponse {
+            access_token: "oidc-access".into(),
+            refresh_token: Some("oidc-refresh".into()),
+            expires_in: None,
+        };
+        std::fs::create_dir_all(&oidc.data_dir).unwrap();
+        ai_memory_llm::OidcToken::from_token_response(&response, "iss", "cid", "ep", None)
+            .unwrap()
+            .save(&oidc.data_dir.join("auth.json"))
+            .unwrap();
+        assert!(install(&oidc, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(
+            stored(&oidc),
+            None,
+            "OIDC hooks must not be switched to the key"
+        );
+
+        let mut docker = config_in("docker");
+        docker.runtime_env = crate::config::RuntimeEnv::with_host_cwd_for_tests("/host/repo");
+        assert!(install(&docker, McpClient::ClaudeCode, true).contains(KEY));
+        assert_eq!(stored(&docker), None);
+
+        let http = config_in("http");
+        assert!(install(&http, McpClient::Cursor, true).contains(&format!("Bearer {KEY}")));
+        assert_eq!(stored(&http), None);
     }
 
     #[test]

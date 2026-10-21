@@ -1131,6 +1131,9 @@ pub(crate) struct ResolvedTokenFile {
     /// missing or blank leaves [`AuthSettings::bearer_token`] unset, and
     /// `serve` refuses to start rather than run open.
     pub(crate) loaded: bool,
+    /// Whether [`discover_root_token`] found it rather than the config naming
+    /// it, so a credential this install chose can outrank it.
+    pub(crate) discovered: bool,
 }
 
 impl AuthSettings {
@@ -1155,6 +1158,16 @@ impl AuthSettings {
         self.token_file.as_ref().map(|file| file.path.as_path())
     }
 
+    /// The bearer the environment, the inline key or `[auth].bearer_token_file`
+    /// supplied, leaving out a root token only [`discover_root_token`] found.
+    #[must_use]
+    pub(crate) fn configured_bearer_token(&self) -> Option<&str> {
+        if self.token_file.as_ref().is_some_and(|file| file.discovered) {
+            return None;
+        }
+        self.bearer_token.as_deref()
+    }
+
     /// The configured token file when it could not supply a token.
     #[must_use]
     pub(crate) fn missing_token_file(&self) -> Option<&Path> {
@@ -1169,7 +1182,11 @@ impl AuthSettings {
     /// re-renders wiring in the same process.
     pub(crate) fn adopt_token_file(&mut self, path: PathBuf, token: String) {
         self.bearer_token = Some(token);
-        self.token_file = Some(ResolvedTokenFile { path, loaded: true });
+        self.token_file = Some(ResolvedTokenFile {
+            path,
+            loaded: true,
+            discovered: false,
+        });
     }
 }
 
@@ -1216,6 +1233,7 @@ fn apply_bearer_token_file(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) 
     auth.token_file = Some(ResolvedTokenFile {
         path,
         loaded: token.is_some(),
+        discovered: false,
     });
     auth.bearer_token = token;
     Ok(())
@@ -1254,7 +1272,11 @@ fn discover_root_token(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) {
     if profile_named_default {
         return;
     }
-    auth.token_file = Some(ResolvedTokenFile { path, loaded: true });
+    auth.token_file = Some(ResolvedTokenFile {
+        path,
+        loaded: true,
+        discovered: true,
+    });
     auth.bearer_token = Some(token);
 }
 
@@ -3607,6 +3629,41 @@ mod tests {
         clear_hook_auth_token(&dd).unwrap();
         assert!(read_hook_auth_token(&dd).is_none());
         clear_hook_auth_token(&dd).expect("clearing twice must not error");
+    }
+
+    /// Adversarial: the stored hook key is a client credential, read by the
+    /// hooks and, as a last resort, by `mcp-bridge`. `Config::load` must never
+    /// adopt it, or `serve` on the same data dir would start requiring that
+    /// key and accepting it as its bearer. Control: a key named by
+    /// `[auth].bearer_token_file` is adopted.
+    #[test]
+    fn config_load_never_adopts_the_stored_hook_key() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        store_hook_auth_token(&dd, "aim_hook_key").unwrap();
+        let config_path = dd.join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(dd.clone()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.bearer_token, None);
+        assert!(cfg.auth.token_file_path().is_none());
+
+        std::fs::write(
+            &config_path,
+            "bind = \"127.0.0.1:49921\"\n[auth]\nbearer_token_file = \"auth-token\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(dd.clone()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.bearer_token.as_deref(), Some("aim_hook_key"));
     }
     use super::*;
     use rstest::rstest;
