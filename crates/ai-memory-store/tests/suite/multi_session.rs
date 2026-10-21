@@ -4380,6 +4380,55 @@ async fn memory_health_orphans_ignore_links_from_a_superseded_version() {
     );
 }
 
+/// A link authored by a TTL-expired page is not a reference either, and the
+/// workspace-wide health queries (which bind no project) agree with the
+/// project-scoped ones. A live link to a second target is the control.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_an_expired_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let link_to = |path: &str| ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: None,
+    };
+
+    for path in ["notes/expired_target.md", "notes/live_target.md"] {
+        store
+            .writer
+            .upsert_page(page(ws, proj, path, path, "target"))
+            .await
+            .unwrap();
+    }
+    let mut expired_source = page(ws, proj, "notes/expired_source.md", "E", "see target");
+    expired_source.links = vec![link_to("notes/expired_target.md")];
+    expired_source.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired_source).await.unwrap();
+    let mut live_source = page(ws, proj, "notes/live_source.md", "L", "see target");
+    live_source.links = vec![link_to("notes/live_target.md")];
+    store.writer.upsert_page(live_source).await.unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 1,
+        "only the target of the expired page's link is an orphan"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(orphan_paths, ["notes/expired_target.md"]);
+}
+
 /// Memory health counts and detail lists ignore TTL-expired pages.
 #[tokio::test]
 async fn memory_health_ignores_expired_pages() {
