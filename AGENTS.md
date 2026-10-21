@@ -404,6 +404,14 @@ covers the same tests, slower, no tiers.
   listed in `ci.yml`), and differential gitleaks scanning.
   `.github/workflows/secret-scan.yml` runs the separate weekly/manual
   full-history gitleaks scan.
+- **CodeQL** runs from `.github/workflows/codeql.yml` (advanced setup, not
+  GitHub's default setup). Before upload it drops the three name-based Rust
+  queries (`cleartext-logging`, `cleartext-transmission`,
+  `hard-coded-cryptographic-value`) on test code only: `tests/` directories,
+  the test-support crate and `#[cfg(test)]` modules. Production code keeps every
+  query; a session id or username printed there goes through the log-barrier
+  helpers in `.github/codeql/extensions`. Run the filter's own tests with
+  `python3 -I -m unittest discover -s .github/codeql`.
 - **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
   nightly, on dispatch, and automatically on any PR touching the
   platform-sensitive paths in its `changes` filter (the wiki, store and
