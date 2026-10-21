@@ -276,7 +276,12 @@ version in [`docs/changelog/`](docs/changelog/):
   session-start fetch whenever any handoff was open, so the session started
   with no profile digest, brief or inbox notice at all. The refusal now costs
   only the claim, and the handoff stays open.
-
+- The pre-migration backup archive is now flushed and fsynced, along with its
+  directory entry, before it is verified. The buffered tail of the archive was
+  written when the writer was dropped, which discarded any error such as a full
+  disk, and the file was never put on stable storage, while the verify pass
+  re-read it from the page cache and cleared a destructive in-place migration
+  to run. ([#1525](https://github.com/akitaonrails/ai-memory/pull/1525))
 - `mcp-bridge` and the `setup` self-check no longer send requests to the
   server through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the hooks
   already did. A sandbox such as ai-jail exports a proxy with an empty
