@@ -732,9 +732,8 @@ cwd parameters use their canonical names.
 implementation. It serves the upstream tool catalogue over local stdio and
 delegates tool calls to the configured HTTP server through rmcp's client
 transport. It uses the bearer `Config::load` resolved, or the install's stored
-hook key before a loopback-only discovered root key. Implicit install-local
-keys are accepted only for that install's configured endpoint. The server
-therefore keeps the same auth, scope resolver, and tool handlers as direct
+hook key before a discovered root key, which it sends only to a loopback
+server. The server therefore keeps the same auth, scope resolver, and tool handlers as direct
 HTTP clients. It has two modes, chosen by the entry that launches it:
 
 - session-aware (Claude Code, `install-mcp --client claude-code

@@ -86,10 +86,12 @@ version in [`docs/changelog/`](docs/changelog/):
   entries keep working. `uninstall --only hooks` keeps the stored key while
   such a bridge entry remains. ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
 
-- Scoped implicit bridge credentials to their configured endpoint, rejected a
-  malformed stored user key instead of falling through to root, made failed
-  installs roll back newly stored credentials, and included the absolute data
-  dir in Claude Code's printed session-aware command as well as its JSON entry.
+- Kept the bridge from sending a discovered root key to a non-loopback
+  server, rejected a malformed stored user key instead of falling through to
+  root, made failed installs roll back newly stored credentials, and included
+  the absolute data dir in Claude Code's printed session-aware command as well
+  as its JSON entry.
+  ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
 
 ## [3.1.2] - 2026-10-20
 

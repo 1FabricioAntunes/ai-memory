@@ -51,7 +51,7 @@ use rmcp::transport::{StreamableHttpClientTransport, Transport, stdio};
 use rmcp::{ErrorData as McpError, Peer, ServerHandler, ServiceExt};
 
 use crate::cli::{BridgeAgent, McpBridgeArgs};
-use crate::commands::install_mcp::{mcp_server_url_from_base, same_mcp_endpoint};
+use crate::commands::install_mcp::mcp_server_url_from_base;
 use crate::config::Config;
 
 const ACTOR_SESSION_HEADER: HeaderName = HeaderName::from_static("x-memory-actor-session-id");
@@ -260,10 +260,11 @@ fn bridge_base_url<'a>(flag: Option<&'a str>, configured: &'a str) -> &'a str {
         .unwrap_or(configured)
 }
 
-/// The bearer the bridge sends. Configured credentials may intentionally
-/// follow an explicit remote URL. Implicit install-local credentials may not:
-/// both the stored hook key and a discovered root key are scoped to the
-/// configured endpoint that caused them to be found.
+/// The bearer the bridge sends: a configured one, else the user key stored
+/// for this install's hooks, else the root key `Config::load` discovered.
+/// Configured and stored keys follow the entry's `--server-url`: the stored
+/// key is the user's own, which the hooks already send to a remote server
+/// (#1490). The discovered root key never leaves loopback.
 fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
     let usable = |token: &str| !token.trim().is_empty();
     if let Some(token) = config
@@ -273,10 +274,6 @@ fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
         .map(str::to_owned)
     {
         return Ok(Some(token));
-    }
-
-    if !same_mcp_endpoint(&config.server_url, server_url) {
-        return Ok(None);
     }
 
     let stored_path = crate::config::hook_auth_token_path_in(&config.data_dir);
@@ -754,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_local_credentials_never_follow_a_server_url_override() {
+    fn discovered_root_never_leaves_loopback_but_the_stored_user_key_follows_the_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: tmp.path().to_path_buf(),
@@ -767,11 +764,29 @@ mod tests {
             loaded: true,
             discovered: true,
         });
-        crate::config::store_hook_auth_token(tmp.path(), "stored-user").unwrap();
 
+        // Adversarial: a remote --server-url never receives the root key.
         assert_eq!(
             bridge_bearer(&config, "https://remote.example/mcp").unwrap(),
             None
+        );
+        // Control: a loopback server the config does not name (a packaged
+        // install whose config lives outside the data dir) still gets it.
+        assert_eq!(
+            bridge_bearer(&config, "http://127.0.0.1:41234/mcp")
+                .unwrap()
+                .as_deref(),
+            Some("discovered-root")
+        );
+
+        // The stored key is the user's own, the one the hooks send to that
+        // remote server (#1490), so it follows the entry's URL.
+        crate::config::store_hook_auth_token(tmp.path(), "stored-user").unwrap();
+        assert_eq!(
+            bridge_bearer(&config, "https://remote.example/mcp")
+                .unwrap()
+                .as_deref(),
+            Some("stored-user")
         );
 
         config.auth.token_file = None;

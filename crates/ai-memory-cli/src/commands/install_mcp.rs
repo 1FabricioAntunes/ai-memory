@@ -568,7 +568,7 @@ pub(crate) fn mcp_server_url_from_base(server_url: &str) -> String {
     }
 }
 
-pub(crate) fn same_mcp_endpoint(left: &str, right: &str) -> bool {
+fn same_mcp_endpoint(left: &str, right: &str) -> bool {
     fn normalized(url: &str) -> String {
         mcp_server_url_from_base(url).split_once('?').map_or_else(
             || mcp_server_url_from_base(url),
