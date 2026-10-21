@@ -922,7 +922,7 @@ fn stage_working_tree(root: &Path, index: &mut git2::Index) -> Result<Vec<PathBu
         ["*"].iter(),
         IndexAddOption::DEFAULT,
         Some(&mut |path: &Path, _: &[u8]| {
-            if is_ledger_file(root, path) {
+            if is_ledger_file(root, path) || is_in_flight_write(path) {
                 return 1;
             }
             touched.push(path.to_path_buf());
@@ -930,6 +930,26 @@ fn stage_working_tree(root: &Path, index: &mut git2::Index) -> Result<Vec<PathBu
         }),
     )?;
     Ok(touched)
+}
+
+/// True when `rel`'s basename belongs to a write still in flight: a
+/// `.ai-memory-tmp.` staging file or a `.ai-memory-delete.` parked page.
+///
+/// These exist only between a write starting and its rename, so committing one
+/// records a page body that may never be installed. `Wiki::apply_batch` holds
+/// one staging file per page across an `await`, and `commit_all` takes only the
+/// commit lock, never the mutation lock, so a checkpoint can land in that
+/// window. A parked page is also reported by name: `rename_checked` marks the
+/// `.ai-memory-delete.` quarantine and the `.ai-memory-tmp.move-session.` name
+/// written, so the reported-file branch of [`stage_paths`] checks this too.
+/// The watcher drops both for its own reasons: `is_tempfile` matches the
+/// `.ai-memory-tmp.` prefix, and a quarantine name carries no `.md` suffix.
+fn is_in_flight_write(rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(".ai-memory-tmp.") || name.starts_with(".ai-memory-delete.")
+        })
 }
 
 /// True when `rel` (relative to the wiki root) is a raw hook event ledger:
@@ -1009,7 +1029,9 @@ fn stage_paths(
             index.add_all(
                 [spec.as_str()].iter(),
                 IndexAddOption::DISABLE_PATHSPEC_MATCH,
-                Some(&mut |path: &Path, _: &[u8]| i32::from(is_ledger_file(root, path))),
+                Some(&mut |path: &Path, _: &[u8]| {
+                    i32::from(is_ledger_file(root, path) || is_in_flight_write(path))
+                }),
             )?;
             untrack_ledgers(root, index, Some(&spec))?;
         } else if abs.is_file() {
@@ -1017,7 +1039,7 @@ fn stage_paths(
                 if index.get_path(rel, 0).is_some() {
                     index.remove_path(rel)?;
                 }
-            } else {
+            } else if !is_in_flight_write(rel) {
                 index.add_path(rel)?;
             }
         } else if index.get_path(rel, 0).is_some() {
@@ -1944,6 +1966,80 @@ mod tests {
         }
         adapter.commit_all("initial").unwrap();
         (tmp, root, adapter)
+    }
+
+    /// `apply_batch` keeps one `.ai-memory-tmp.*` staging file per page on disk
+    /// across an await, and `commit_all` takes only the commit lock — so a
+    /// sweep landing in that window must not capture a write in flight.
+    #[test]
+    fn a_sweep_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/b.md", "b");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.aB3x9Q",
+            "a body still being written",
+        );
+        write(
+            &root,
+            "ws/proj/.ai-memory-delete.b.md",
+            "a page parked for deletion",
+        );
+
+        assert!(
+            adapter
+                .commit_all("sweep with writes in flight")
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(head_blob(&adapter, "ws/proj/b.md").as_deref(), Some("b"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.aB3x9Q"), None);
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-delete.b.md"), None);
+    }
+
+    /// The same for a path-scoped commit, whose directory pathspec reaches
+    /// `stage_paths`' own `add_all` rather than the sweep's.
+    #[test]
+    fn a_path_scoped_commit_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/c.md", "c");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.cD4y0R",
+            "a body still being written",
+        );
+        adapter.mark_written(&root.join("ws/proj"));
+
+        adapter.commit_all("scoped with a write in flight").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.cD4y0R"), None);
+    }
+
+    /// `quarantine_file` and `move_session_page` park a page under a staging
+    /// name with `rename_checked`, which reports that exact path, so the
+    /// reported-file branch of `stage_paths` must skip it as well.
+    #[test]
+    fn a_reported_staging_file_is_never_staged() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        let parked = [
+            "ws/proj/.ai-memory-delete.Xy12Ab",
+            "ws/proj/.ai-memory-tmp.move-session.s1.md",
+        ];
+        for rel in parked {
+            write(&root, rel, "a page between two renames");
+            adapter.mark_written(&root.join(rel));
+        }
+        write(&root, "ws/proj/c.md", "c");
+        adapter.mark_written(&root.join("ws/proj/c.md"));
+
+        adapter.commit_all("scoped with pages parked").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        for rel in parked {
+            assert_eq!(head_blob(&adapter, rel), None, "{rel} was committed");
+        }
     }
 
     #[test]
