@@ -731,9 +731,11 @@ cwd parameters use their canonical names.
 `ai-memory mcp-bridge` is a transport adapter, not a second tool
 implementation. It serves the upstream tool catalogue over local stdio and
 delegates tool calls to the configured HTTP server through rmcp's client
-transport, authenticating with the bearer `Config::load` resolved, so the
-server keeps the same auth, scope resolver, and tool handlers as direct HTTP
-clients. It has two modes, chosen by the entry that launches it:
+transport. It uses the bearer `Config::load` resolved, or the install's stored
+hook key before a loopback-only discovered root key. Implicit install-local
+keys are accepted only for that install's configured endpoint. The server
+therefore keeps the same auth, scope resolver, and tool handlers as direct
+HTTP clients. It has two modes, chosen by the entry that launches it:
 
 - session-aware (Claude Code, `install-mcp --client claude-code
   --session-aware`, and every Claude Code entry on a token-file install; and

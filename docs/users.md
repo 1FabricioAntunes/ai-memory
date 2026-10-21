@@ -424,8 +424,10 @@ a different pepper instead of starting with keys that can only return 401.
 Restore the original pepper from a separately protected configuration backup
 rather than deleting identities or keys: `ai-memory backup` includes only a
 `config.toml` inside the data dir, while packaged systemd units load one from
-outside it. Snapshots created before the verifier existed cannot be checked
-and still require the original config.
+outside it. A restore of a snapshot created before the verifier existed fails
+closed when keys are present. Load the original pepper and explicitly confirm
+it with `ai-memory restore --accept-legacy-api-key-pepper`; the staged database
+is sealed before it replaces live data.
 
 ### 2. Add another human
 

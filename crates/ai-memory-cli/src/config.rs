@@ -3416,11 +3416,42 @@ pub fn hook_auth_header_path_in(data_dir: &Path) -> PathBuf {
 /// Propagates IO failures from creating the data dir or writing either file.
 pub fn store_hook_auth_token(data_dir: &Path, token: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir)?;
-    write_secret(&hook_auth_token_path_in(data_dir), token)?;
-    write_secret(
-        &hook_auth_header_path_in(data_dir),
-        &format!("Authorization: Bearer {token}\n"),
-    )
+    let token_path = hook_auth_token_path_in(data_dir);
+    let header_path = hook_auth_header_path_in(data_dir);
+    let previous_token = read_optional_secret_bytes(&token_path)?;
+    let previous_header = read_optional_secret_bytes(&header_path)?;
+
+    write_secret(&token_path, token)?;
+    if let Err(error) = write_secret(&header_path, &format!("Authorization: Bearer {token}\n")) {
+        let token_rollback = restore_secret_bytes(&token_path, previous_token.as_deref());
+        let header_rollback = restore_secret_bytes(&header_path, previous_header.as_deref());
+        if let Err(rollback) = token_rollback.and(header_rollback) {
+            return Err(std::io::Error::other(format!(
+                "writing hook credential pair failed ({error}); rollback also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_optional_secret_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_secret_bytes(path: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => write_secret_bytes(path, bytes),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
 }
 
 /// Remove a persisted bearer pair. Absent files are not an error.
@@ -3460,6 +3491,10 @@ pub(crate) fn read_trimmed_secret(path: &Path) -> Option<String> {
 /// The mode is set on the handle before any bytes are written on Unix, so the
 /// secret is never briefly world-readable between `create` and `set_permissions`.
 fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_secret_bytes(path, contents.as_bytes())
+}
+
+fn write_secret_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -3470,7 +3505,7 @@ fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        file.write_all(contents.as_bytes())
+        file.write_all(contents)
     }
     #[cfg(not(unix))]
     {
@@ -3505,7 +3540,15 @@ fn canonicalise_or_keep(p: &Path) -> PathBuf {
     {
         return canon_parent.join(name);
     }
-    p.to_path_buf()
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    // A nested path may have no existing ancestor beyond the current
+    // directory yet. Keep the invocation-time meaning when this path is later
+    // embedded in an MCP entry launched from an unrelated project directory.
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p))
+        .unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Normalize home for prefix-match comparisons: accept either slash spelling,
@@ -3604,6 +3647,25 @@ mod tests {
                 .contains("old-token"),
             "a rotated token must not leave the previous one behind"
         );
+    }
+
+    #[test]
+    fn an_invalid_header_target_cannot_partially_replace_the_token() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        std::fs::create_dir_all(hook_auth_header_path_in(&dd)).unwrap();
+
+        let error = store_hook_auth_token(&dd, "must-not-stick").unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!hook_auth_token_path_in(&dd).exists());
+    }
+
+    #[test]
+    fn a_nested_nonexistent_relative_data_dir_becomes_absolute() {
+        let relative = Path::new("target/nonexistent-ai-memory-test/data");
+        let resolved = canonicalise_or_keep(relative);
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(resolved.ends_with(relative));
     }
 
     /// Absent, empty, and whitespace-only files all read as "no token" rather

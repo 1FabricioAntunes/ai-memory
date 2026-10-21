@@ -2308,6 +2308,10 @@ pub struct RestoreArgs {
     /// Overwrite an existing non-empty data dir.
     #[arg(long)]
     pub force: bool,
+    /// Confirm that the configured token pepper is the original one for a
+    /// pre-verifier backup that already contains native API keys.
+    #[arg(long)]
+    pub accept_legacy_api_key_pepper: bool,
 }
 
 /// Arguments for `restore-agents`.

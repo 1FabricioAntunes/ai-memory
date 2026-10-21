@@ -159,19 +159,36 @@ pub(crate) fn run_with_opencode_dialect(
     // open.
     let bridge_carries_token = matches!(args.client, McpClient::Muse)
         || (args.client == McpClient::ClaudeCode && args.session_aware);
-    if args.apply
+    let may_store_bridge_key = args.apply
         && token_given
         && bridge_carries_token
         && config.auth.configured_bearer_token().is_none()
         && config.runtime_env.host_cwd().is_none()
-        && let Some(token) = args.auth_token.as_deref()
-        && store_bridge_key(&config.data_dir, token)
-    {
-        args.auth_token = None;
-        args.bridge_data_dir = Some(config.data_dir.clone());
-    }
+        && same_mcp_endpoint(
+            &config.server_url,
+            args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        );
     validate_args(&args)?;
     if args.apply {
+        if may_store_bridge_key
+            && let Some(token) = args.auth_token.clone()
+            && let Some(stored) = store_bridge_key(&config.data_dir, &token)
+        {
+            args.auth_token = None;
+            args.bridge_data_dir = Some(config.data_dir.clone());
+            if let Err(error) = apply_to_config_file(&args) {
+                if stored == HookCredential::Seeded
+                    && crate::config::read_hook_auth_token(&config.data_dir).as_deref()
+                        == Some(token.as_str())
+                {
+                    crate::config::clear_hook_auth_token(&config.data_dir).with_context(
+                        || "rolling back the bridge credential after MCP config update failed",
+                    )?;
+                }
+                return Err(error);
+            }
+            return Ok(());
+        }
         return apply_to_config_file(&args);
     }
     let snippet = match args.client {
@@ -243,11 +260,10 @@ fn route_file_token(args: &mut InstallMcpArgs, token_file: &Path) -> Result<()> 
 }
 
 /// Store `token` in `<data_dir>/auth-token` for the bridge, the file and
-/// format `install-hooks --apply` uses. `false` when the bridge would not read
-/// this key from there: a different key is already stored (it belongs to the
-/// install's hooks and is left alone), the hooks sign in with OIDC, or the
-/// write failed. The caller then keeps the key in the entry.
-fn store_bridge_key(data_dir: &Path, token: &str) -> bool {
+/// format `install-hooks --apply` uses. Returns whether this call created the
+/// files or found the same key; `None` means the caller must keep the key in
+/// the entry.
+fn store_bridge_key(data_dir: &Path, token: &str) -> Option<HookCredential> {
     // The hooks present an OIDC `auth.json` only while no key is stored, so
     // storing one here would quietly switch them to this key.
     if crate::config::read_hook_auth_token(data_dir).is_none()
@@ -260,15 +276,15 @@ fn store_bridge_key(data_dir: &Path, token: &str) -> bool {
             "[ai-memory] this install's hooks sign in with OIDC; keeping the --auth-token key \
              in the MCP entry, as before, so they keep doing so"
         );
-        return false;
+        return None;
     }
     match crate::local_auth::seed_hook_credential(data_dir, token) {
-        Ok(HookCredential::Seeded | HookCredential::Current) => {
+        Ok(outcome @ (HookCredential::Seeded | HookCredential::Current)) => {
             eprintln!(
                 "[ai-memory] stored the bridge's key in {}; the MCP entry carries no token",
                 crate::config::hook_auth_token_path_in(data_dir).display()
             );
-            true
+            Some(outcome)
         }
         Ok(HookCredential::KeptOther) => {
             eprintln!(
@@ -276,7 +292,7 @@ fn store_bridge_key(data_dir: &Path, token: &str) -> bool {
                  hooks; keeping the --auth-token key in the MCP entry, as before",
                 crate::config::hook_auth_token_path_in(data_dir).display()
             );
-            false
+            None
         }
         Err(e) => {
             eprintln!(
@@ -284,7 +300,7 @@ fn store_bridge_key(data_dir: &Path, token: &str) -> bool {
                  the MCP entry, as before",
                 data_dir.display()
             );
-            false
+            None
         }
     }
 }
@@ -550,6 +566,16 @@ pub(crate) fn mcp_server_url_from_base(server_url: &str) -> String {
         Some(query) => format!("{path}?{query}"),
         None => path,
     }
+}
+
+pub(crate) fn same_mcp_endpoint(left: &str, right: &str) -> bool {
+    fn normalized(url: &str) -> String {
+        mcp_server_url_from_base(url).split_once('?').map_or_else(
+            || mcp_server_url_from_base(url),
+            |(base, _)| base.to_owned(),
+        )
+    }
+    normalized(left) == normalized(right)
 }
 
 fn validate_args(args: &InstallMcpArgs) -> Result<()> {
@@ -2156,11 +2182,18 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
             .as_deref()
             .map(|token| format!(" --env \"AI_MEMORY_AUTH_TOKEN={token}\""))
             .unwrap_or_default();
+        let data_dir = args
+            .bridge_data_dir
+            .as_ref()
+            .map_or_else(String::new, |path| {
+                format!(" --data-dir {}", shell_quote(&path.to_string_lossy()))
+            });
         format!(
-            "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}",
+            "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}{data_dir}",
             name = args.name,
             command = shell_quote(&bridge_command()),
             url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+            data_dir = data_dir,
         )
     } else if let Some(b) = &bearer {
         format!(
@@ -4008,6 +4041,7 @@ mod tests {
         let mut args = args_with_token(McpClient::ClaudeCode);
         args.server_url = Some("https://memory.example/mcp".into());
         args.session_aware = true;
+        args.bridge_data_dir = Some(PathBuf::from("/srv/AI Memory/data"));
 
         let entry = build_mcp_entry(&args).unwrap();
 
@@ -4015,7 +4049,13 @@ mod tests {
         assert_eq!(entry["command"], bridge_command());
         assert_eq!(
             entry["args"],
-            json!(["mcp-bridge", "--server-url", "https://memory.example/mcp"])
+            json!([
+                "mcp-bridge",
+                "--server-url",
+                "https://memory.example/mcp",
+                "--data-dir",
+                "/srv/AI Memory/data"
+            ])
         );
         assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "test-token-deadbeef");
         assert!(entry.get("url").is_none());
@@ -4027,6 +4067,7 @@ mod tests {
             "{} mcp-bridge --server-url",
             shell_quote(&bridge_command())
         )));
+        assert!(rendered.contains("--data-dir '/srv/AI Memory/data'"));
     }
 
     #[test]
@@ -4526,6 +4567,23 @@ mod tests {
         assert!(install(&configured, McpClient::ClaudeCode, true).contains(KEY));
         assert_eq!(stored(&configured), None);
 
+        let remote = config_in("different-endpoint");
+        let remote_file = remote.data_dir.with_extension("remote.json");
+        let mut remote_args = args_for(McpClient::ClaudeCode);
+        remote_args.apply = true;
+        remote_args.session_aware = true;
+        remote_args.config_file = Some(remote_file.clone());
+        remote_args.server_url = Some("https://other.example/mcp".into());
+        remote_args.auth_token = Some(KEY.into());
+        run_with_opencode_dialect(&remote, remote_args, None).unwrap();
+        let remote_text = std::fs::read_to_string(remote_file).unwrap();
+        assert!(remote_text.contains(KEY));
+        assert_eq!(
+            stored(&remote),
+            None,
+            "a key for another server is not hook auth"
+        );
+
         let other = config_in("other");
         crate::config::store_hook_auth_token(&other.data_dir, "aim_hooks_key").unwrap();
         assert!(install(&other, McpClient::ClaudeCode, true).contains(KEY));
@@ -4557,6 +4615,27 @@ mod tests {
         let http = config_in("http");
         assert!(install(&http, McpClient::Cursor, true).contains(&format!("Bearer {KEY}")));
         assert_eq!(stored(&http), None);
+    }
+
+    #[test]
+    fn failed_bridge_apply_rolls_back_a_newly_stored_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let config_file = tmp.path().join("broken.json");
+        std::fs::write(&config_file, "[]").unwrap();
+        let mut args = args_for(McpClient::ClaudeCode);
+        args.apply = true;
+        args.session_aware = true;
+        args.config_file = Some(config_file);
+        args.auth_token = Some("aim_must_rollback".into());
+
+        let error = run_with_opencode_dialect(&config, args, None).unwrap_err();
+        assert!(error.to_string().contains("object"), "{error:#}");
+        assert_eq!(crate::config::read_hook_auth_token(&config.data_dir), None);
+        assert!(!crate::config::hook_auth_header_path_in(&config.data_dir).exists());
     }
 
     #[test]

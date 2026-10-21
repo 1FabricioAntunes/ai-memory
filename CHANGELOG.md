@@ -25,6 +25,9 @@ version in [`docs/changelog/`](docs/changelog/):
   Argon2id verifier. A restored database with existing keys now refuses to
   serve under a different `[auth].token_pepper` instead of silently making
   every key return 401; pepper rotation remains allowed while no keys exist.
+  A pre-verifier backup containing keys fails restore until the operator
+  supplies the original pepper and explicitly confirms it with
+  `--accept-legacy-api-key-pepper`.
   ([#1495](https://github.com/akitaonrails/ai-memory/issues/1495))
 
 - Defined `ai-memory backup` as an online data snapshot rather than a complete
@@ -36,12 +39,15 @@ version in [`docs/changelog/`](docs/changelog/):
 - Accepted the exact CRLF migration checksums written by Windows-native
   releases before v3.1.2 and replaced them transactionally with the current
   LF checksums before strict migration validation. Unknown migration changes
-  still fail closed. ([#1499](https://github.com/akitaonrails/ai-memory/issues/1499))
+  still fail closed. Bare hook reinstallation also preserves the Windows
+  exec-form `--capture-assistant` opt-in instead of looking only inside the
+  command string. ([#1499](https://github.com/akitaonrails/ai-memory/issues/1499))
 
 - Held `ai-memory run` heartbeat notices while the harness owns the terminal
   and printed them after it exits, so a server outage no longer writes into the
   harness TUI. Only the first and latest notices are replayed, with a count of
-  the rest.
+  the rest. A transport outage that changes into a server-side lease rejection
+  is reported as a new state instead of being hidden as the same failure.
   ([#1500](https://github.com/akitaonrails/ai-memory/issues/1500))
 
 - Dropped stopwords from the quoted bag of words a search falls back to when
@@ -55,7 +61,7 @@ version in [`docs/changelog/`](docs/changelog/):
   drops everything the source project owns, the same set `purge-project`
   deletes. This includes managed workstreams, cross-project messages,
   auto-improvement and profile-harvest state, consolidation jobs, ingest keys,
-  entities, page feedback, purge tombstones and project grants as well as
+  entities, page feedback, per-session purge tombstones and project grants as well as
   sessions, observations and handoffs. The `400` for sending both a project
   name and an id, or neither, applies to the admin endpoints; the CLI resolves
   a missing project from the marker, the git remote, then the directory name.
@@ -79,6 +85,11 @@ version in [`docs/changelog/`](docs/changelog/):
   it out of the harness config, where it outlived a key rotation; existing
   entries keep working. `uninstall --only hooks` keeps the stored key while
   such a bridge entry remains. ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
+
+- Scoped implicit bridge credentials to their configured endpoint, rejected a
+  malformed stored user key instead of falling through to root, made failed
+  installs roll back newly stored credentials, and included the absolute data
+  dir in Claude Code's printed session-aware command as well as its JSON entry.
 
 ## [3.1.2] - 2026-10-20
 

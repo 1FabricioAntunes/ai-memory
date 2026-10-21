@@ -188,6 +188,7 @@ struct AutoSessionCandidate {
 #[derive(Debug, Default)]
 struct HeartbeatHealth {
     consecutive_failures: u64,
+    last_failure_kind: Option<HeartbeatFailureKind>,
     /// Set while the harness owns the terminal: a line written to stderr then
     /// lands inside its TUI (the prompt box, mid-render), so notices are held
     /// until the harness exits.
@@ -232,17 +233,25 @@ impl HeartbeatHealth {
         lines
     }
 
-    fn record_failure(&mut self) -> bool {
-        let first = self.consecutive_failures == 0;
+    fn record_failure(&mut self, kind: HeartbeatFailureKind) -> bool {
+        let changed = self.last_failure_kind != Some(kind);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        first
+        self.last_failure_kind = Some(kind);
+        changed
     }
 
     fn record_success(&mut self) -> bool {
         let recovered = self.consecutive_failures > 0;
         self.consecutive_failures = 0;
+        self.last_failure_kind = None;
         recovered
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatFailureKind {
+    Unreachable,
+    Rejected,
 }
 
 fn resolve_opencode_for_launch(
@@ -2134,13 +2143,21 @@ async fn capture_interrupts(interrupted: CancellationToken) {
 /// finished, cancelled, or expired by a later prepare. Reporting it as an
 /// outage sends the operator looking for a server that never went away.
 fn heartbeat_failure_notice(error: &anyhow::Error) -> String {
+    if heartbeat_failure_kind(error) == HeartbeatFailureKind::Rejected {
+        format!("ai-memory: managed workstream heartbeat rejected: {error:#}; retrying quietly")
+    } else {
+        "ai-memory: server unavailable; managed workstream heartbeat will retry quietly".to_string()
+    }
+}
+
+fn heartbeat_failure_kind(error: &anyhow::Error) -> HeartbeatFailureKind {
     if error
         .chain()
         .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some())
     {
-        format!("ai-memory: managed workstream heartbeat rejected: {error:#}; retrying quietly")
+        HeartbeatFailureKind::Rejected
     } else {
-        "ai-memory: server unavailable; managed workstream heartbeat will retry quietly".to_string()
+        HeartbeatFailureKind::Unreachable
     }
 }
 
@@ -2171,7 +2188,7 @@ async fn send_managed_heartbeat_with_timeout(
             );
         }
         Ok(()) => {}
-        Err(error) if health.record_failure() => {
+        Err(error) if health.record_failure(heartbeat_failure_kind(error)) => {
             tracing::debug!(error = %error, "managed workstream heartbeat became unavailable");
             health.notify(heartbeat_failure_notice(error));
         }
@@ -5861,12 +5878,13 @@ mod tests {
     fn heartbeat_health_reports_each_outage_and_recovery_once() {
         let mut health = HeartbeatHealth::default();
 
-        assert!(health.record_failure());
-        assert!(!health.record_failure());
-        assert!(!health.record_failure());
+        assert!(health.record_failure(HeartbeatFailureKind::Unreachable));
+        assert!(!health.record_failure(HeartbeatFailureKind::Unreachable));
+        assert!(health.record_failure(HeartbeatFailureKind::Rejected));
+        assert!(!health.record_failure(HeartbeatFailureKind::Rejected));
         assert!(health.record_success());
         assert!(!health.record_success());
-        assert!(health.record_failure());
+        assert!(health.record_failure(HeartbeatFailureKind::Unreachable));
     }
 
     #[test]

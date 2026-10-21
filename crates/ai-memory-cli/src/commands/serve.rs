@@ -352,10 +352,16 @@ async fn validate_api_credential_pepper_binding(
     let verifier = ai_memory_store::password::hash_password(pepper.to_owned())
         .await
         .context("binding the configured API credential pepper")?;
-    store
+    let bound = store
         .writer
-        .set_api_credential_pepper_verifier(verifier)
+        .bind_api_credential_pepper_verifier(verifier)
         .await?;
+    if !bound {
+        anyhow::bail!(
+            "API credentials were added while binding [auth].token_pepper; restart so the \
+             server can verify the final credential state"
+        );
+    }
     Ok(())
 }
 

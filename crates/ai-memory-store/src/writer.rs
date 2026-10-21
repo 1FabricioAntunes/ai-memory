@@ -719,9 +719,9 @@ pub(crate) enum WriteCmd {
         id: ApiCredentialId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
-    SetApiCredentialPepperVerifier {
+    BindApiCredentialPepperVerifier {
         verifier: String,
-        reply: oneshot::Sender<StoreResult<()>>,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     TouchUserLastSeen {
         user_id: UserId,
@@ -3245,9 +3245,9 @@ impl WriterHandle {
     ///
     /// # Errors
     /// Writer closed / SQL.
-    pub async fn set_api_credential_pepper_verifier(&self, verifier: String) -> StoreResult<()> {
+    pub async fn bind_api_credential_pepper_verifier(&self, verifier: String) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::SetApiCredentialPepperVerifier {
+        self.send(WriteCmd::BindApiCredentialPepperVerifier {
             verifier,
             reply: tx,
         })
@@ -4783,9 +4783,9 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = api_credentials::touch_api_credential(&conn, id);
                 send_or_warn(reply, result, "touch_api_credential");
             }
-            WriteCmd::SetApiCredentialPepperVerifier { verifier, reply } => {
-                let result = api_credentials::set_api_credential_pepper_verifier(&conn, &verifier);
-                send_or_warn(reply, result, "set_api_credential_pepper_verifier");
+            WriteCmd::BindApiCredentialPepperVerifier { verifier, reply } => {
+                let result = api_credentials::bind_api_credential_pepper_verifier(&conn, &verifier);
+                send_or_warn(reply, result, "bind_api_credential_pepper_verifier");
             }
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);
