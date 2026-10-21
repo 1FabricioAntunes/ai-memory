@@ -242,6 +242,14 @@ version in [`docs/changelog/`](docs/changelog/):
   to global and answers it with present-day rows.
   ([#1519](https://github.com/akitaonrails/ai-memory/pull/1519))
 
+- A `429` or `5xx` from a token endpoint is now a transient provider error
+  rather than an auth failure. The Copilot token exchange, which GitHub
+  rate-limits per account, and the shared `openai-oauth`/OIDC refresh both
+  reported throttling as a credential problem, so the fallback chain stopped
+  instead of trying the next provider and the operator was told to log in
+  again for a grant that was never rejected.
+  ([#1520](https://github.com/akitaonrails/ai-memory/pull/1520))
+
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
