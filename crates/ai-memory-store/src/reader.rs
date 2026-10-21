@@ -9511,6 +9511,13 @@ impl ReaderPool {
 
             let ttl = not_expired("pages", "?");
             let ttl_p = not_expired("p", "?");
+            // Incoming links are only evidence of a reference when their
+            // source page is itself a live page. `replace_links_in_tx` deletes
+            // rows only for the new version's id, so a superseded version's
+            // links survive, and `refresh_incoming_links_for_path` repoints
+            // them at the new latest id without filtering on `is_latest` — so
+            // a link removed by an edit still answers for the target.
+            let ttl_fp = not_expired("fp", "?");
 
             let stale: i64 = conn
                 .query_row(
@@ -9555,11 +9562,16 @@ impl ReaderPool {
                         "SELECT COUNT(*) FROM pages p \
                          WHERE p.workspace_id = ? AND p.is_latest = 1{clause_p}{ttl_p} \
                            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id) \
-                           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)"
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM links l \
+                               JOIN pages fp ON fp.id = l.from_page_id \
+                                 AND fp.is_latest = 1{ttl_fp} \
+                               WHERE l.to_page_id = p.id)"
                     ),
                     params_from_iter(
                         std::iter::once(ws())
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(now_us))),
                     ),
                     |row| row.get(0),
@@ -9654,6 +9666,7 @@ impl ReaderPool {
             );
 
             let ttl_pg = not_expired("pg", "?");
+            let ttl_fp = not_expired("fp", "?");
             let ttl_inner = not_expired("pages", "?");
 
             // Params follow placeholder order: ws, cutoff, [proj], now_us, limit.
@@ -9702,11 +9715,15 @@ impl ReaderPool {
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Params: ws, [proj], now_us, limit.
+            // Params: ws, [proj], now_us, now_us, limit.
             let orphan_sql = format!(
                 "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause}{ttl_pg} \
                    AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = pg.id) \
-                   AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = pg.id) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM links l \
+                       JOIN pages fp ON fp.id = l.from_page_id \
+                         AND fp.is_latest = 1{ttl_fp} \
+                       WHERE l.to_page_id = pg.id) \
                  ORDER BY pg.updated_at DESC LIMIT ?"
             );
             let mut orphan_stmt = conn.prepare(&orphan_sql)?;
@@ -9715,6 +9732,7 @@ impl ReaderPool {
                     params_from_iter(
                         std::iter::once(ws())
                             .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(now_us)))
                             .chain(std::iter::once(Value::Integer(limit))),
                     ),
