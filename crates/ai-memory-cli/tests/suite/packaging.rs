@@ -741,6 +741,33 @@ fn install_ps1_keeps_its_safety_checks() {
     );
     assert_eq!(script.trim_end().lines().last(), Some("Install-AiMemory"));
     assert!(!script.contains("raw.githubusercontent.com"));
+
+    // A plain-http GitHub base must be refused, and the refusal must not be
+    // nested inside a branch that already requires https. That nesting is what
+    // made it unreachable: both arms of
+    // `$base -eq $defaultBase -or StartsWith('https://github.com/')` imply
+    // `https://`, so the inner `-not StartsWith('https://')` could never fire,
+    // and an `http://github.com/...` base matched neither arm and skipped the
+    // check entirely.
+    assert!(
+        script.contains(r"^http://github\.com"),
+        "install.ps1 must refuse a plain-http GitHub release base"
+    );
+    assert!(
+        !script.contains("StartsWith('https://github.com/'"),
+        "the GitHub refusal must not be gated on an https-only branch again"
+    );
+    assert!(
+        script.contains("refusing a non-https GitHub URL"),
+        "the refusal keeps its operator-facing message"
+    );
+    // Scoped to GitHub on purpose: `tests/install_ps1.ps1` serves its fixture
+    // releases over plain http from loopback, and the header documents a
+    // non-GitHub base as the operator's own trust decision.
+    assert!(
+        !script.contains("-match '(?i)^http://'"),
+        "refusing every plain-http base would break the loopback test harness"
+    );
 }
 
 #[test]
