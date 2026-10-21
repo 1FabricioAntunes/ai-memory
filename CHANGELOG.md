@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- The PowerShell `session-start` hooks for Claude Code, Command Code and Devin
+  now wrap the handoff in the same `hookSpecificOutput` envelope their POSIX
+  peers emit. On Windows the baton was written as bare text, so the harness
+  logged "Hook output does not start with {, treating as plain text" on every
+  start and the handoff arrived unstructured instead of as `additionalContext`.
+  ([#1551](https://github.com/akitaonrails/ai-memory/pull/1551))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
