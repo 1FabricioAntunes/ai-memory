@@ -339,6 +339,14 @@ version in [`docs/changelog/`](docs/changelog/):
   expanded entries.
   ([#1509](https://github.com/akitaonrails/ai-memory/issues/1509))
 
+- A tool hook for an MCP tool now keeps the tool's identity. Claude Code, Codex
+  and Hermes Agent name such a call `mcp__<server>__<tool>`; it stays in the
+  `unknown` family, so its arguments and result are still never stored, but the
+  observation now adds `mcp_server` and `mcp_tool` lines when the name is at
+  most 64 ASCII letters, digits, `_` or `-`. Before, a session's MCP calls
+  were recorded only as `tool unknown`.
+  ([#1522](https://github.com/akitaonrails/ai-memory/issues/1522))
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed

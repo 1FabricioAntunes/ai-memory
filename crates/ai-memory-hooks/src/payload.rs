@@ -937,6 +937,12 @@ fn safe_tool_body(
         summary.push_str("\ntool_call_id: ");
         summary.push_str(id);
     }
+    if let Some(mcp) = &metadata.mcp_tool {
+        summary.push_str("\nmcp_server: ");
+        summary.push_str(&mcp.server);
+        summary.push_str("\nmcp_tool: ");
+        summary.push_str(&mcp.tool);
+    }
     match event {
         HookEvent::PreToolUse => Some(summary),
         HookEvent::PostToolUse => {
@@ -1406,6 +1412,7 @@ mod tests {
             let written = safe_tool_title(&ToolObservationMetadata {
                 tool_family: family,
                 tool_call_id: None,
+                mcp_tool: None,
             });
             assert!(
                 is_safe_tool_title(&written),
@@ -2574,6 +2581,142 @@ mod tests {
         );
     }
 
+    /// Hermes v0.22.2 names an MCP tool `mcp__<server>__<tool>`
+    /// (`tools/mcp_tool_schema.py` `mcp_prefixed_tool_name`) in the same
+    /// `pre_tool_call` / `post_tool_call` envelope as its own tools. Such a
+    /// call stays an unknown family, so its arguments and result are never
+    /// kept, but its server and tool names are (#1522).
+    #[test]
+    fn hermes_mcp_tool_keeps_its_server_and_tool_names_but_no_input_or_output() {
+        for (event, hermes_event, expected) in [
+            (
+                "pre-tool-use",
+                "pre_tool_call",
+                "tool_family: unknown\ntool_call_id: call_00_2m0e\nmcp_server: aim\nmcp_tool: memory_query",
+            ),
+            (
+                "post-tool-use",
+                "post_tool_call",
+                "tool_family: unknown\ntool_call_id: call_00_2m0e\nmcp_server: aim\nmcp_tool: memory_query\noutcome: success",
+            ),
+        ] {
+            let raw = serde_json::json!({
+                "hook_event_name": hermes_event,
+                "tool_name": "mcp__aim__memory_query",
+                "tool_input": {"query": "SECRET-ARGUMENT"},
+                "session_id": "hermes-session",
+                "cwd": "/repo",
+                "extra": {
+                    "tool_call_id": "call_00_2m0e",
+                    "status": "ok",
+                    "result": "SECRET-RESULT"
+                }
+            });
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("hermes".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert_eq!(env.title_hint.as_deref(), Some("tool unknown"));
+            assert_eq!(env.body_excerpt.as_deref(), Some(expected), "{event}");
+        }
+    }
+
+    /// Every documented `mcp__<server>__<tool>` spelling keeps both names:
+    /// a hyphenated Claude Code server, a Claude Code plugin server, Codex's
+    /// own example and a Hermes name clamped to 64 characters with a hash.
+    #[test]
+    fn mcp_tool_names_from_each_documented_harness_keep_server_and_tool() {
+        for (agent, tool_name, server, tool) in [
+            (
+                "claude-code",
+                "mcp__brave-search__web_search",
+                "brave-search",
+                "web_search",
+            ),
+            (
+                "claude-code",
+                "mcp__plugin_my-plugin_db__query",
+                "plugin_my-plugin_db",
+                "query",
+            ),
+            ("codex", "mcp__fs__read", "fs", "read"),
+            (
+                "hermes",
+                "mcp__plugin_bridge_team_server__list_open_pull_requests_1a2b3c4d",
+                "plugin_bridge_team_server",
+                "list_open_pull_requests_1a2b3c4d",
+            ),
+        ] {
+            let mut raw = serde_json::json!({
+                "tool_name": tool_name,
+                "tool_input": {"path": "/etc/SECRET"},
+                "tool_use_id": "call-1",
+                "tool_response": "SECRET-OUTPUT",
+            });
+            if agent == "hermes" {
+                raw["extra"] =
+                    serde_json::json!({"tool_call_id": "call-1", "result": "SECRET-OUTPUT"});
+            }
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PreToolUse".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some(
+                    format!(
+                        "tool_family: unknown\ntool_call_id: call-1\nmcp_server: {server}\nmcp_tool: {tool}"
+                    )
+                    .as_str()
+                ),
+                "{agent} {tool_name}"
+            );
+        }
+    }
+
+    /// A name that is not exactly the documented MCP shape keeps no name at
+    /// all, as before: an older Hermes `mcp_<server>_<tool>` cannot be split,
+    /// and free text, over-long names and empty halves are refused.
+    #[test]
+    fn names_outside_the_mcp_shape_keep_no_tool_identity() {
+        for tool_name in [
+            "mcp_github_create_issue",
+            "mcp__server",
+            "mcp____tool",
+            "mcp__server__",
+            "MCP__server__tool",
+            "mcp__my server__tool",
+            "mcp__srv__tool\nsecret",
+            "mcp__srv__tool.read",
+            "mcp__srv/path__tool",
+            "mcp__s\u{e9}rver__tool",
+            &format!("mcp__srv__{}", "t".repeat(55)),
+            "brand_new_tool",
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PreToolUse".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"tool_name": tool_name, "tool_input": {}, "tool_use_id": "call-1"}),
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some("tool_family: unknown\ntool_call_id: call-1"),
+                "{tool_name:?}"
+            );
+        }
+    }
+
     /// Real Hermes execution-surface tools classify as non-file so their
     /// bodies carry the `extra.result` output (live names, 2026-10-07).
     #[test]
@@ -3535,7 +3678,13 @@ mod tests {
                 assert!(env.body_excerpt.is_none());
             }
         }
-        for tool in ["mcp__fs__read", "update_plan", "UNPROVEN_TOOL"] {
+        for (tool, identity) in [
+            // An MCP tool keeps its validated names (#1522), never its input
+            // or output.
+            ("mcp__fs__read", "\nmcp_server: fs\nmcp_tool: read"),
+            ("update_plan", ""),
+            ("UNPROVEN_TOOL", ""),
+        ] {
             let env = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: "PostToolUse".into(),
@@ -3546,7 +3695,12 @@ mod tests {
             );
             assert_eq!(
                 env.body_excerpt.as_deref(),
-                Some("tool_family: unknown\ntool_call_id: call-unknown\noutcome: unknown")
+                Some(
+                    format!(
+                        "tool_family: unknown\ntool_call_id: call-unknown{identity}\noutcome: unknown"
+                    )
+                    .as_str()
+                )
             );
         }
         for response in [
