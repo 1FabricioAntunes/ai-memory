@@ -4911,13 +4911,28 @@ impl AiMemoryServer {
             .is_none_or(|s| s.trim().is_empty())
             && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
 
-        let page_path = if let Some(p) = args.path {
+        // A blank fill is not a supplied argument: an empty/whitespace `path`
+        // would otherwise fail as "invalid path: empty path" with `query` never
+        // tried, and a blank `query` normalizes to an empty FTS expression that
+        // matches nothing. Both must fall through to the instructive
+        // exactly-one refusal below (issue #155) the same way a null does.
+        let path = args
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let page_path = if let Some(p) = path {
             PagePath::new(p)
                 .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?
-        } else if let Some(query) = args.query {
+        } else if let Some(query) = query {
             let hits = self
                 .reader
-                .search_pages_for_project(ws, proj, query.clone(), 1, None)
+                .search_pages_for_project(ws, proj, query.to_string(), 1, None)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             match hits.into_iter().next() {
@@ -13444,6 +13459,109 @@ mod tests {
         for needle in ["`path`", "`query`", "notes/topic.md", "do not retry"] {
             assert!(msg.contains(needle), "error must contain {needle:?}: {msg}");
         }
+    }
+
+    // A blank fill is not a supplied argument. Without the trim, a whitespace
+    // `query` reached the store as an empty FTS expression and came back as
+    // internal_error "no pages found", and an empty `path` short-circuited the
+    // whole call with "invalid path: empty path" so the `query` beside it was
+    // never tried.
+    #[tokio::test]
+    async fn memory_read_page_reads_blank_path_or_query_as_omitted() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/blankfill.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Blank Fill"}),
+            body: "zonkolite reserves body".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Blank Fill".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let server = server.with_wiki(wiki);
+
+        // Whitespace-only `query`, nothing else: the instructive exactly-one
+        // refusal, not an internal_error a looping client reads as "retry".
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("  ".into()),
+                    path: None,
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a blank query must fail closed");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.to_string().contains("exactly one of"),
+            "blank query must get the instructive refusal; got {err}"
+        );
+
+        // Empty `path` beside a real `query`: the query arm actually runs.
+        let result = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("zonkolite".into()),
+                    path: Some(String::new()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("an empty path must fall through to the query");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("zonkolite reserves body"),
+            "expected the queried page body; got {text}"
+        );
+
+        // Control: a non-blank path still takes precedence over the query, so
+        // the trim did not turn `path` into a value the chain skips.
+        let result = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: Some("no-such-term-anywhere".into()),
+                    path: Some("notes/blankfill.md".into()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("an explicit path must still win over the query");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("notes/blankfill.md"),
+            "expected the by-path read; got {text}"
+        );
     }
 
     #[tokio::test]
