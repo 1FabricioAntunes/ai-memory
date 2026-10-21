@@ -680,10 +680,12 @@ impl Bootstrap {
         }
 
         let _ids = self.wiki.apply_batch(requests).await?;
-        let _ = self.wiki.commit_all(&format!(
+        if let Err(e) = self.wiki.commit_all(&format!(
             "bootstrap: {llm_chunks} LLM chunk(s), ingested {collected} sources, wrote {} pages",
             written_paths.len() + 1,
-        ));
+        )) {
+            warn!(error = %e, "bootstrap auto-commit failed");
+        }
 
         // Best-effort: the run already succeeded (pages are written), so a
         // failure here must not fail the whole run — it would just leave

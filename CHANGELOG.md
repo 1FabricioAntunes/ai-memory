@@ -263,6 +263,17 @@ version in [`docs/changelog/`](docs/changelog/):
   no longer reads the routine end of the queue as a server fault and retries it.
   ([#1518](https://github.com/akitaonrails/ai-memory/pull/1518))
 
+- The wiki's git objects and refs are now synced to disk. libgit2 renamed them
+  into place without fsync, so a power loss could keep a ref naming a commit
+  whose object was never written, and every later checkpoint failed. Every
+  repository handle ai-memory opens now turns on `core.fsyncObjectFiles` from
+  `.git/ai-memory.gitconfig`, a file only libgit2 reads, so `.git/config` is
+  untouched and the git CLI shows no deprecation warning; an explicit `false`
+  in `.git/config` is kept. Startup logs an `ERROR` when `HEAD` does not
+  resolve to a readable commit, and a failed bootstrap auto-commit is logged
+  instead of dropped. `docs/lifecycle-ops.md` describes the repair for a
+  history already damaged.
+  ([#1511](https://github.com/akitaonrails/ai-memory/issues/1511))
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
