@@ -537,7 +537,9 @@ prunable rather than only after it ages in place.
 * `<data_dir>/wiki/`: markdown source of truth. Owned by a `git2`
   repo so every consolidation pass + every session-end produces a
   durable commit. Editable by hand in Obsidian / vim; the watcher
-  reconciles outside edits.
+  reconciles outside edits. A checkpoint never stages a hook event ledger or
+  a write still in flight (an `.ai-memory-tmp.` staging file or an
+  `.ai-memory-delete.` parked page).
 * `<data_dir>/db/memory.sqlite`: derived index. WAL mode. One
   writer actor owns the writer `Connection`; reads go through a
   cloneable read-only pool.

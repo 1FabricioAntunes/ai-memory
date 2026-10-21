@@ -223,13 +223,6 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
-- Wiki commits no longer stage a write that is still in flight. A batch write
-  keeps one `.ai-memory-tmp.` staging file per page on disk across an await,
-  and auto-commit does not hold the mutation lock, so a checkpoint landing in
-  that window committed page bodies that were never installed — and a batch
-  that then failed left the rolled-back content in wiki history.
-  ([#1524](https://github.com/akitaonrails/ai-memory/pull/1524))
-
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
@@ -243,7 +236,14 @@ version in [`docs/changelog/`](docs/changelog/):
   session-start fetch whenever any handoff was open, so the session started
   with no profile digest, brief or inbox notice at all. The refusal now costs
   only the claim, and the handoff stays open.
-
+- Wiki commits no longer stage a write that is still in flight. A batch write
+  keeps one `.ai-memory-tmp.` staging file per page on disk across an await,
+  and auto-commit does not hold the mutation lock, so a checkpoint landing in
+  that window committed page bodies that were never installed, and a batch
+  that then failed left the rolled-back content in wiki history. A page parked
+  under `.ai-memory-delete.` during a delete, or under
+  `.ai-memory-tmp.move-session.` during a session move, is left out the same
+  way. ([#1524](https://github.com/akitaonrails/ai-memory/pull/1524))
 - `mcp-bridge` and the `setup` self-check no longer send requests to the
   server through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the hooks
   already did. A sandbox such as ai-jail exports a proxy with an empty

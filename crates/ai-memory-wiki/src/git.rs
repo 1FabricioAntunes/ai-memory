@@ -939,8 +939,11 @@ fn stage_working_tree(root: &Path, index: &mut git2::Index) -> Result<Vec<PathBu
 /// records a page body that may never be installed. `Wiki::apply_batch` holds
 /// one staging file per page across an `await`, and `commit_all` takes only the
 /// commit lock, never the mutation lock, so a checkpoint can land in that
-/// window. The watcher already ignores the same prefix
-/// ([`crate::watcher`]'s `is_tempfile`).
+/// window. A parked page is also reported by name: `rename_checked` marks the
+/// `.ai-memory-delete.` quarantine and the `.ai-memory-tmp.move-session.` name
+/// written, so the reported-file branch of [`stage_paths`] checks this too.
+/// The watcher drops both for its own reasons: `is_tempfile` matches the
+/// `.ai-memory-tmp.` prefix, and a quarantine name carries no `.md` suffix.
 fn is_in_flight_write(rel: &Path) -> bool {
     rel.file_name()
         .and_then(|name| name.to_str())
@@ -1036,7 +1039,7 @@ fn stage_paths(
                 if index.get_path(rel, 0).is_some() {
                     index.remove_path(rel)?;
                 }
-            } else {
+            } else if !is_in_flight_write(rel) {
                 index.add_path(rel)?;
             }
         } else if index.get_path(rel, 0).is_some() {
@@ -2012,6 +2015,31 @@ mod tests {
 
         assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
         assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.cD4y0R"), None);
+    }
+
+    /// `quarantine_file` and `move_session_page` park a page under a staging
+    /// name with `rename_checked`, which reports that exact path, so the
+    /// reported-file branch of `stage_paths` must skip it as well.
+    #[test]
+    fn a_reported_staging_file_is_never_staged() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        let parked = [
+            "ws/proj/.ai-memory-delete.Xy12Ab",
+            "ws/proj/.ai-memory-tmp.move-session.s1.md",
+        ];
+        for rel in parked {
+            write(&root, rel, "a page between two renames");
+            adapter.mark_written(&root.join(rel));
+        }
+        write(&root, "ws/proj/c.md", "c");
+        adapter.mark_written(&root.join("ws/proj/c.md"));
+
+        adapter.commit_all("scoped with pages parked").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        for rel in parked {
+            assert_eq!(head_blob(&adapter, rel), None, "{rel} was committed");
+        }
     }
 
     #[test]
