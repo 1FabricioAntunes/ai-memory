@@ -183,7 +183,7 @@ where
         if LlmError::status_is_transient(status.as_u16()) {
             return Err(LlmError::Provider {
                 status: status.as_u16(),
-                body,
+                body: format!("{failure_label}: {body}"),
             });
         }
         return Err(LlmError::Auth(format!(
@@ -272,6 +272,10 @@ mod tests {
                 "{wire} has not rejected the grant: {err:?}"
             );
             assert_eq!(err.http_status(), Some(code), "{wire}: {err:?}");
+            assert!(
+                err.to_string().contains("test refresh failed"),
+                "{wire} must name the failing exchange: {err}"
+            );
             assert!(
                 !err.to_string().contains("Run `test login` again."),
                 "{wire} must not tell the operator to re-login: {err}"
