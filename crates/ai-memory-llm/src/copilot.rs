@@ -452,6 +452,7 @@ impl LlmProvider for CopilotProvider {
                     &build_responses_request(&self.model, &request, None),
                 )
                 .await?,
+                &self.model,
             )?),
         }
     }
@@ -497,6 +498,7 @@ impl LlmProvider for CopilotProvider {
                         &build_responses_request(&self.model, &request, Some(schema)),
                     )
                     .await?,
+                &self.model,
             )?,
         };
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
@@ -881,6 +883,8 @@ struct CopilotResponsesResponse {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
+    incomplete_details: Option<CopilotIncompleteDetails>,
+    #[serde(default)]
     error: Option<CopilotResponsesError>,
 }
 
@@ -910,6 +914,14 @@ struct CopilotResponsesUsage {
     output_tokens: u32,
 }
 
+/// Why a `/responses` answer stopped short. `error` is null on an incomplete
+/// response, so this is the only field that explains one.
+#[derive(Debug, Deserialize)]
+struct CopilotIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CopilotResponsesError {
     #[serde(default)]
@@ -918,12 +930,26 @@ struct CopilotResponsesError {
     message: Option<String>,
 }
 
-fn response_text(response: &CopilotResponsesResponse) -> LlmResult<String> {
+fn response_text(response: &CopilotResponsesResponse, model: &str) -> LlmResult<String> {
     if response
         .status
         .as_deref()
         .is_some_and(|status| status != "completed")
     {
+        // `max_output_tokens` is the one non-completed status the operator can
+        // act on, and it is not an unexpected shape: raising `max_tokens` fixes
+        // it. The OpenAI path reports the same stop as `TruncatedResponse`.
+        if response
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            == Some("max_output_tokens")
+        {
+            return Err(LlmError::TruncatedResponse {
+                model: model.to_owned(),
+                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+            });
+        }
         let detail = response
             .error
             .as_ref()
@@ -964,8 +990,11 @@ fn response_text(response: &CopilotResponsesResponse) -> LlmResult<String> {
     ))
 }
 
-fn to_responses_chat_response(response: CopilotResponsesResponse) -> LlmResult<ChatResponse> {
-    let text = response_text(&response)?;
+fn to_responses_chat_response(
+    response: CopilotResponsesResponse,
+    model: &str,
+) -> LlmResult<ChatResponse> {
+    let text = response_text(&response, model)?;
     Ok(ChatResponse {
         text,
         usage: response.usage.map(|usage| Usage {
