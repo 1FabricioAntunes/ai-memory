@@ -93,6 +93,17 @@ version in [`docs/changelog/`](docs/changelog/):
   as its JSON entry.
   ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
 
+- Kept the user PATH's `%VAR%` entries and its `REG_EXPAND_SZ` type when
+  `install.ps1` and the desktop installer add their directory to it, and in
+  the manual PATH steps in `docs/windows.md`. They read the value with
+  `[Environment]::GetEnvironmentVariable`, which expands every variable, and
+  wrote it back with `SetEnvironmentVariable`, which stores it as `REG_SZ`.
+  An entry such as `%JAVA_HOME%\bin` stopped following its variable, and one
+  whose variable the installer did not have stayed as literal text that
+  Windows never expands. A PATH an earlier install already rewrote keeps its
+  expanded entries.
+  ([#1509](https://github.com/akitaonrails/ai-memory/issues/1509))
+
 ## [3.1.2] - 2026-10-20
 
 ### Fixed
