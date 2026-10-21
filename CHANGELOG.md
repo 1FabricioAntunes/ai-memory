@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-10-21
+
 ### Added
 
 - Added a pointer to a session that was cut off without ending, so the next
@@ -1962,7 +1964,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.1.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.0...HEAD
+[3.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.0
 [3.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.2
 [3.1.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.1
 [3.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.0
