@@ -1368,6 +1368,40 @@ ai-memory move-session --from-project tmp --to my-project --confirm
 ai-memory purge-project --project tmp --confirm
 ```
 
+### Wiki git history unreadable after a crash
+
+The server turns on `core.fsyncObjectFiles` in `wiki/.git/config` when it opens
+the wiki, so libgit2 syncs each object and ref before renaming it into place.
+Before that, a power loss or kernel crash could keep a ref update while the
+objects it names were never written: zero-length files under `.git/objects`,
+`HEAD` pointing at one of them, and every later checkpoint failing with
+`failed to parse loose object: invalid header`. The pages on disk are not
+affected; only their history stops. At startup the server logs an `ERROR`
+("wiki git history is unreadable") when `HEAD` does not resolve to a readable
+commit.
+
+The working tree is the source of truth, so repair points the branch back at
+the newest intact commit and lets the next checkpoint record everything since.
+Stop the server first, then from `<data_dir>/wiki`:
+
+```bash
+git fsck --full                        # names the empty objects and the bad ref
+mkdir -p ../wiki-empty-objects         # move them out, don't delete them
+find .git/objects -type f -empty -exec mv {} ../wiki-empty-objects/ \;
+# Newest reflog entry whose commit and tree still read back:
+for oid in $(awk '{print $2}' .git/logs/HEAD | tac); do
+  git cat-file -e "$oid^{tree}" 2>/dev/null && echo "$oid" && break
+done
+git update-ref refs/heads/main <oid>   # the branch `git symbolic-ref HEAD` names
+rm .git/index && git reset -q          # rebuild the index; pages are untouched
+git reflog expire --stale-fix --expire=never --all
+git fsck --full                        # clean (a dangling blob is harmless)
+```
+
+Start the server again; the next checkpoint commits the pages written after
+that commit. Git prints a deprecation warning for `core.fsyncObjectFiles`
+(it prefers `core.fsync`); libgit2 reads only the older key, so leave it set.
+
 ## Why this matters: the flat-wiki incident
 
 Before the per-project disk layout (commits up to `e7b9a17`), the

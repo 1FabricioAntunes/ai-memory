@@ -16,6 +16,10 @@
 //! They are append-only logs that reach hundreds of megabytes, git stores each
 //! new version as a whole blob, and nothing reads them back from git; see
 //! [`is_ledger_file`].
+//!
+//! Opening the repository turns on libgit2's fsync for `.git` through the
+//! repository's own config, so a crash cannot leave a ref naming an object
+//! whose bytes never reached disk; see [`enable_object_fsync`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -23,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::{WikiError, WikiResult};
 
@@ -185,15 +189,92 @@ fn map_open_error(error: OpenRepositoryError) -> WikiError {
     }
 }
 
-fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<()> {
+/// The validated repository, or `None` when libgit2 cannot open it and the
+/// Windows git CLI fallback will serve it instead.
+fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<Option<Repository>> {
     match open_validated_repository(root) {
-        Ok(_) => Ok(()),
+        Ok(repo) => Ok(Some(repo)),
         Err(OpenRepositoryError::Git(error))
             if cfg!(windows) && should_try_commit_cli_fallback(&error) =>
         {
-            validate_cli_fallback_root(root)
+            validate_cli_fallback_root(root).map(|()| None)
         }
         Err(error) => Err(map_open_error(error)),
+    }
+}
+
+/// The repository-config key that makes libgit2 fsync each loose object,
+/// ref and reflog (and the directory it lands in) before renaming it into
+/// place.
+const FSYNC_OBJECT_FILES: &str = "core.fsyncObjectFiles";
+
+/// Turn on libgit2's fsync for the wiki repository in its local config,
+/// unless that config already names a value. Returns whether it is on.
+///
+/// libgit2 writes objects and refs to a temp file and renames it, without
+/// fsync by default. After a crash the rename, and the ref update that names
+/// the new commit, can survive while the object's bytes never reached disk:
+/// zero-length loose objects and a HEAD that no longer reads, so every later
+/// checkpoint fails (#1511). The process-wide `GIT_OPT_ENABLE_FSYNC_GITDIR`
+/// covers the same writes, but git2 has no safe wrapper for it and the
+/// workspace forbids `unsafe`. The config key is per repository, persists in
+/// `.git/config`, and the git CLI honours it too, with a warning that it is
+/// deprecated in favour of `core.fsync`. An explicit `false` is the
+/// operator's choice and is kept.
+fn enable_object_fsync(repo: &Repository) -> Result<bool, git2::Error> {
+    let mut local = repo.config()?.open_level(git2::ConfigLevel::Local)?;
+    match local.get_bool(FSYNC_OBJECT_FILES) {
+        Ok(enabled) => Ok(enabled),
+        Err(error) if error.code() == ErrorCode::NotFound => {
+            local.set_bool(FSYNC_OBJECT_FILES, true)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `Ok` when HEAD is unborn (a fresh repository) or resolves to a commit
+/// whose tree reads back; the error otherwise, such as libgit2's
+/// "failed to parse loose object" for an object a crash left empty.
+fn readable_head(repo: &Repository) -> Result<(), git2::Error> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    head.peel_to_commit()?.tree()?;
+    Ok(())
+}
+
+/// Startup checks on the wiki repository. Neither fails the server: the
+/// markdown on disk is the source of truth and keeps being served, but a
+/// history that cannot take a commit is reported once, loudly, instead of
+/// only as a warning from each checkpoint that fails.
+fn check_repository_durability(root: &Path, repo: &Repository) {
+    match enable_object_fsync(repo) {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            root = %root.display(),
+            "{FSYNC_OBJECT_FILES} is false in the wiki repository's config; a crash can leave \
+             its history with empty objects"
+        ),
+        Err(error) => warn!(
+            root = %root.display(),
+            %error,
+            "could not turn on fsync for the wiki repository; a crash can leave its history \
+             with empty objects"
+        ),
+    }
+    if let Err(error) = readable_head(repo) {
+        error!(
+            root = %root.display(),
+            %error,
+            "wiki git history is unreadable: HEAD does not resolve to a readable commit, so \
+             every checkpoint will fail until it is repaired. Pages on disk are not affected. \
+             See \"Wiki git history unreadable after a crash\" in docs/lifecycle-ops.md"
+        );
     }
 }
 
@@ -286,17 +367,20 @@ impl GitAdapter {
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
         crate::confinement::initialize_root(root)?;
         let git_dir = root.join(".git");
-        match std::fs::symlink_metadata(&git_dir) {
+        let repo = match std::fs::symlink_metadata(&git_dir) {
             Ok(_) => {
-                validate_repository_or_allow_cli_fallback(root)?;
                 debug!(root = %root.display(), "wiki repo already initialised");
+                validate_repository_or_allow_cli_fallback(root)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 debug!(root = %root.display(), "initialising wiki repo");
                 init_repo(root)?;
-                validate_repository_or_allow_cli_fallback(root)?;
+                validate_repository_or_allow_cli_fallback(root)?
             }
             Err(error) => return Err(error.into()),
+        };
+        if let Some(repo) = repo {
+            check_repository_durability(root, &repo);
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -2694,5 +2778,80 @@ mod tests {
             .file_at_rev(&first.to_string(), Path::new("a.md"))
             .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "one");
+    }
+
+    fn local_fsync_setting(root: &Path) -> Option<bool> {
+        Repository::open(root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .get_bool(FSYNC_OBJECT_FILES)
+            .ok()
+    }
+
+    /// #1511: without it libgit2 renames objects and refs into place unsynced,
+    /// and a crash left a ref naming an empty commit object.
+    #[test]
+    fn opening_the_wiki_turns_on_git_object_fsync() {
+        let tmp = tempdir();
+        let fresh = tmp.path().join("fresh");
+        GitAdapter::open_or_init(&fresh).unwrap();
+        assert_eq!(local_fsync_setting(&fresh), Some(true));
+
+        // A repository an older version created gets it on the next open.
+        let existing = tmp.path().join("existing");
+        Repository::init(&existing).unwrap();
+        assert_eq!(local_fsync_setting(&existing), None);
+        GitAdapter::open_or_init(&existing).unwrap();
+        assert_eq!(local_fsync_setting(&existing), Some(true));
+    }
+
+    #[test]
+    fn an_explicit_fsync_opt_out_is_kept() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        Repository::init(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool(FSYNC_OBJECT_FILES, false)
+            .unwrap();
+
+        GitAdapter::open_or_init(&root).unwrap();
+
+        assert_eq!(local_fsync_setting(&root), Some(false));
+    }
+
+    /// The crash shape from #1511: HEAD names a commit whose loose object is
+    /// empty. Startup still opens the wiki, the check reports it, and a
+    /// checkpoint returns the error instead of passing for a clean tree.
+    #[test]
+    fn an_empty_head_commit_object_is_reported_not_swallowed() {
+        let (_tmp, root, _adapter) = committed(&[("page.md", "page")]);
+        let repo = Repository::open(&root).unwrap();
+        readable_head(&repo).unwrap();
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let object = root.join(".git/objects").join(&head[..2]).join(&head[2..]);
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&object, permissions).unwrap();
+        std::fs::write(&object, b"").unwrap();
+        drop(repo);
+
+        let reopened = GitAdapter::open_or_init(&root).unwrap();
+        assert!(readable_head(&Repository::open(&root).unwrap()).is_err());
+        write(&root, "page.md", "page, edited after the crash");
+        assert!(reopened.commit_all("after the crash").is_err());
+    }
+
+    #[test]
+    fn a_fresh_repository_has_a_readable_head() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        GitAdapter::open_or_init(&root).unwrap();
+        readable_head(&Repository::open(&root).unwrap()).unwrap();
     }
 }

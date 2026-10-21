@@ -1055,6 +1055,11 @@ that touch the relevant area.
     [design-windows-ci.md](design-windows-ci.md#windows-transient-file-errors).
     New file-I/O code with the same race follows the same pattern, with a
     test that injects the error so it also runs off Windows.
+    The wiki's `.git` gets the same durability from libgit2: opening the
+    wiki sets `core.fsyncObjectFiles` in the repository's config, so objects
+    and refs are synced before their rename, and startup logs an `ERROR` when
+    `HEAD` does not resolve to a readable commit (the repair is in
+    [lifecycle-ops.md](lifecycle-ops.md#wiki-git-history-unreadable-after-a-crash)).
 11. **Absolute canonical data dir** default; logged loudly on
     startup. (agentmemory #303.)
 12. **No global singletons / `lazy_static` configs.** All deps
