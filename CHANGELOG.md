@@ -223,6 +223,10 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Counted a file's final line in `ai-memory-wikisync` diff summaries when it
+  does not end in a newline, so the `bytes/lines` figures no longer contradict
+  the `first difference at line N` printed beside them.
+  ([#1531](https://github.com/akitaonrails/ai-memory/pull/1531))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
