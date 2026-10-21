@@ -223,6 +223,15 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- An Anthropic structured answer the model stopped at `max_tokens` is now a
+  terminal truncation instead of a successful result. The provider did not read
+  `stop_reason`, so a `tool_use` block holding only the JSON produced before the
+  budget ran out was returned as a complete answer: a consolidation or bootstrap
+  chunk could write a fraction of its pages and report success. On models that
+  reject a forced `tool_choice` the same stop reported "no tool_use block"
+  instead. Non-structured completions are unchanged — prose cut at the budget is
+  still returned.
+  ([#1549](https://github.com/akitaonrails/ai-memory/pull/1549))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
