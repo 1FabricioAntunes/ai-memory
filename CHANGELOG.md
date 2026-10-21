@@ -223,6 +223,13 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- An `openai-oauth` answer the Codex backend stopped at its output-token
+  budget is now a terminal truncation instead of a retryable `502`. The
+  streaming parser read `response.incomplete` as a provider fault, so the
+  fallback chain advanced to the next candidate and opened a circuit, and the
+  SessionEnd consolidation job kept re-sending the same prompt on its backoff
+  schedule, each attempt truncating again at the same budget.
+  ([#1543](https://github.com/akitaonrails/ai-memory/pull/1543))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
