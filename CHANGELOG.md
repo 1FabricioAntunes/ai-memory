@@ -223,6 +223,13 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Memory health no longer counts a link from a superseded or TTL-expired page
+  version as a reference. A page whose only inbound link was removed by a later
+  edit was reported as linked, because the old version's `links` row survives
+  the edit and is repointed at the new latest id, so the orphan count and
+  detail list disagreed with the page's own backlinks.
+  ([#1526](https://github.com/akitaonrails/ai-memory/pull/1526))
+
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
