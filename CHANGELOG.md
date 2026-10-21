@@ -223,6 +223,14 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- The staged POSIX shell hook bundle no longer sends its requests through
+  `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the native hook client and the
+  bridge already did. In a sandbox that exports a proxy with an empty
+  `NO_PROXY`, the filtering proxy answered the loopback event POST with a 4xx,
+  which the bundle treats as a permanent rejection, so the observation was
+  dropped instead of spooled and a resuming session got no handoff.
+  ([#1517](https://github.com/akitaonrails/ai-memory/pull/1517))
+
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
