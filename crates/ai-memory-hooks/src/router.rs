@@ -1807,7 +1807,7 @@ async fn fetch_and_accept_handoff_at(
         None
     };
     let acceptance = if handoff.is_some() || managed.is_some() {
-        state
+        match state
             .writer
             .accept_startup_context(
                 handoff
@@ -1826,7 +1826,19 @@ async fn fetch_and_accept_handoff_at(
                 receiving_session,
                 busy_since,
             )
-            .await?
+            .await
+        {
+            Ok(acceptance) => acceptance,
+            // A refused claim (a resumed session that already ended may not
+            // take a baton, #840) claims nothing, since the transaction rolled
+            // back. Like a refused admission chain it costs only the claim: the
+            // handoff stays open and the rest of the on-start context is still
+            // delivered, instead of the whole response coming back empty.
+            Err(e) => {
+                warn!(error = %e, "startup claim refused; delivering the rest of the session-start context");
+                ai_memory_store::StartupContextAcceptance::default()
+            }
+        }
     } else {
         ai_memory_store::StartupContextAcceptance::default()
     };
@@ -5315,6 +5327,52 @@ pub(crate) mod tests {
         assert!(
             popped.is_some(),
             "a message the notice reported must still be poppable afterwards",
+        );
+    }
+
+    /// A resumed session that had already ended may not take a baton
+    /// (#840), but the refused claim must cost only the claim. Before, the
+    /// refusal failed the whole fetch, so `claude --resume` of a session that
+    /// had exited cleanly started with no on-start context at all (no profile
+    /// digest, brief or inbox notice) whenever any baton was open.
+    #[tokio::test]
+    async fn a_resumed_ended_session_still_gets_its_session_start_context() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let resumed = "claude-ended-then-resumed";
+        for event in ["session-start", "user-prompt", "session-end"] {
+            process(
+                &state,
+                HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    serde_json::json!({ "session_id": resumed, "prompt": "pair the controller" }),
+                ),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(open_handoff_exists(&state).await, "the end left a baton");
+        seed_inbox(&state, 1).await;
+
+        let mut query = session_start_query(&tmp.path().to_string_lossy());
+        query.session_id = Some(resumed.into());
+        let body = fetch_and_accept_handoff(&state, query, None, Vec::new(), None)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            body.contains("1 cross-project message waiting"),
+            "the rest of the on-start context must still arrive: {body:?}"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "the refused claim must leave the baton open"
         );
     }
 
