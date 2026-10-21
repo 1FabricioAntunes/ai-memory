@@ -223,6 +223,10 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Reported a wiki page renamed away with an external tool, which arrives as a
+  rename event rather than a removal, so the next auto-commit drops it from the
+  tree instead of leaving a checkpoint naming a page that no longer exists.
+  ([#1537](https://github.com/akitaonrails/ai-memory/pull/1537))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
