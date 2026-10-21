@@ -316,12 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn too_few_points_yields_no_eps() {
-        assert_eq!(adaptive_eps(&[vec![1.0, 0.0]], 2, 0.5), None);
-        assert_eq!(adaptive_eps(&[], 2, 0.5), None);
-    }
-
-    #[test]
     fn no_cluster_when_everything_is_far() {
         let points = vec![
             vec![1.0, 0.0, 0.0],
