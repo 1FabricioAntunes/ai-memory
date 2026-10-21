@@ -3035,7 +3035,10 @@ async function drainHookSpool(): Promise<void> {
         "X-AI-Memory-Client": AGENT,
       };
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
+      // Bun reads HTTP(S)_PROXY and ALL_PROXY even for a loopback URL;
+      // `proxy: false` connects directly. Node's fetch ignores the key.
       const resp = await fetch(entry.url, {
+        proxy: false,
         method: "POST",
         headers,
         body: entry.body,
@@ -3164,6 +3167,13 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
                 || call.contains("mcpHeaders(")
                 || call.contains("        headers,\n"),
             "{name}: a fetch without the client marker:\n{call}"
+        );
+        // Bun's fetch sends even a loopback request through an environment
+        // proxy, which a sandbox with an empty NO_PROXY (ai-jail) answers
+        // with a 4xx; the native hook and the shell bundle skip proxies too.
+        assert!(
+            call.contains("proxy: false,"),
+            "{name}: a fetch that can reach an environment proxy:\n{call}"
         );
     }
     assert!(

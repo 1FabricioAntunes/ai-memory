@@ -785,8 +785,9 @@ function Invoke-AiMemoryDrainSpool {
             $headers["Authorization"] = "Bearer $($entry.token)"
         }
         $code = 0
+        $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest `
+            Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
@@ -895,6 +896,17 @@ function Clear-AiMemorySessionId {
     param([string] $Agent)
     $Path = Get-AiMemorySessionIdPath -Agent $Agent
     Remove-Item -Force -ErrorAction SilentlyContinue $Path
+}
+
+# PowerShell 7 hands Invoke-WebRequest the HTTP_PROXY, HTTPS_PROXY and
+# ALL_PROXY proxy even for a loopback URL, so a sandbox with an empty NO_PROXY
+# (ai-jail) routes the hook to a proxy that answers 4xx. -NoProxy (PowerShell
+# 6+) connects directly, as the native hook and the shell bundle do. Windows
+# PowerShell 5.1 reads no environment proxy and has no -NoProxy. Splat the
+# result into every Invoke-WebRequest.
+function Get-AiMemoryNoProxy {
+    if ($PSVersionTable.PSVersion.Major -ge 6) { return @{ NoProxy = $true } }
+    return @{}
 }
 
 function Read-AiMemoryStdin {
@@ -1060,8 +1072,9 @@ function Invoke-AiMemoryHook {
         # reason the shell bundle mints `ai_memory_ingest_key`. `ps` plus a
         # GUID's hex fits the server's key grammar.
         $HookUrl = "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS&ingest_key=ps$([Guid]::NewGuid().ToString('N').Substring(0, 16))"
+        $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest `
+            Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
@@ -1177,8 +1190,9 @@ function Invoke-AiMemoryHook {
         if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
         }
+        $NoProxy = Get-AiMemoryNoProxy
         try {
-            $Response = Invoke-WebRequest `
+            $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
                 -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
