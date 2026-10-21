@@ -200,6 +200,28 @@ pub(crate) fn upstream_config(
     Ok(config)
 }
 
+/// The upstream transport for `server_url`, built on a client that ignores
+/// `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, as the hooks' client does
+/// (`hook_capture::build_client`). rmcp's default client reads them, so a
+/// sandbox that exports a proxy with an empty `NO_PROXY` (ai-jail) sent the
+/// loopback `initialize` to that proxy, which answered 405. Pooling and
+/// redirects are off, as in rmcp's default.
+pub(crate) fn upstream_transport(
+    server_url: &str,
+    session_id: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<StreamableHttpClientTransport<reqwest_mcp::Client>> {
+    // First: it installs the crypto provider the client builder needs.
+    let config = upstream_config(server_url, session_id, auth_token)?;
+    let client = reqwest_mcp::Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest_mcp::redirect::Policy::none())
+        .build()
+        .context("building the MCP bridge HTTP client")?;
+    Ok(StreamableHttpClientTransport::with_client(client, config))
+}
+
 /// The session id to forward: in the session-aware mode, the one `agent`
 /// sets (`CLAUDE_CODE_SESSION_ID` or `MUSE_SESSION_ID`), refusing to run
 /// without it; in the session-less mode nothing at all, whatever the
@@ -320,11 +342,7 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         &config.server_url,
     ));
     let bearer = bridge_bearer(config, &server_url)?;
-    let transport = StreamableHttpClientTransport::from_config(upstream_config(
-        &server_url,
-        session_id,
-        bearer.as_deref(),
-    )?);
+    let transport = upstream_transport(&server_url, session_id, bearer.as_deref())?;
 
     // Connecting before serving stdio means a refused credential (401) or an
     // unreachable server ends the process with this error at once; the client
@@ -624,14 +642,12 @@ mod tests {
                 .unwrap();
         });
 
-        let upstream_transport = StreamableHttpClientTransport::from_config(
-            upstream_config(
-                &format!("http://{address}/mcp"),
-                Some("claude-session-244"),
-                None,
-            )
-            .unwrap(),
-        );
+        let upstream_transport = upstream_transport(
+            &format!("http://{address}/mcp"),
+            Some("claude-session-244"),
+            None,
+        )
+        .unwrap();
         let upstream = ().serve(upstream_transport).await.unwrap();
         let bridge = SessionAwareBridge {
             upstream: upstream.peer().clone(),

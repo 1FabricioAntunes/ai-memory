@@ -215,6 +215,13 @@ version in [`docs/changelog/`](docs/changelog/):
   actually ends. An opt-in real-model contention probe records idle,
   unbounded-load, and bounded-load p50/p95 query latency; hosted embedding
   providers are unchanged.
+- `mcp-bridge` and the `setup` self-check no longer send requests to the
+  server through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, as the hooks
+  already did. A sandbox such as ai-jail exports a proxy with an empty
+  `NO_PROXY`, and its filtering proxy answered the bridge's loopback
+  `initialize` with 405, so Claude Code reported `CONNECTION_CLOSED`.
+  ([#1504](https://github.com/akitaonrails/ai-memory/pull/1504))
+
 - Bound native API-key hashes to their configured pepper with a persisted
   Argon2id verifier. A restored database with existing keys now refuses to
   serve under a different `[auth].token_pepper` instead of silently making
@@ -286,6 +293,29 @@ version in [`docs/changelog/`](docs/changelog/):
   the absolute data dir in Claude Code's printed session-aware command as well
   as its JSON entry.
   ([#1490](https://github.com/akitaonrails/ai-memory/issues/1490))
+
+- Moved the commented `[run.profiles.work.env]` and `[ingest]` examples in the
+  default config, the `config.toml` that `ai-memory init` writes and the
+  native packages install, below its top-level keys. A TOML table header owns
+  every key after it, so uncommenting one of those tables and a top-level
+  example below it, such as `reranker`, `capture_assistant` or
+  `gemini_safe_schemas`, put that key inside the table: `[ingest]` ignored it
+  without a warning, and the run profile's env map either failed the config
+  load or exported the key to the harness. A config written by an earlier
+  release keeps its layout; move an uncommented table there below the last
+  top-level key.
+  ([#1506](https://github.com/akitaonrails/ai-memory/issues/1506))
+
+- Kept the user PATH's `%VAR%` entries and its `REG_EXPAND_SZ` type when
+  `install.ps1` and the desktop installer add their directory to it, and in
+  the manual PATH steps in `docs/windows.md`. They read the value with
+  `[Environment]::GetEnvironmentVariable`, which expands every variable, and
+  wrote it back with `SetEnvironmentVariable`, which stores it as `REG_SZ`.
+  An entry such as `%JAVA_HOME%\bin` stopped following its variable, and one
+  whose variable the installer did not have stayed as literal text that
+  Windows never expands. A PATH an earlier install already rewrote keeps its
+  expanded entries.
+  ([#1509](https://github.com/akitaonrails/ai-memory/issues/1509))
 
 ## [3.1.2] - 2026-10-20
 

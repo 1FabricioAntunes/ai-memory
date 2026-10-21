@@ -1092,14 +1092,10 @@ async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
 async fn memory_status(config: &Config) -> Result<()> {
     use rmcp::ServiceExt as _;
     use rmcp::model::CallToolRequestParams;
-    use rmcp::transport::StreamableHttpClientTransport;
 
     let url = install_mcp::mcp_server_url_from_base(&config.server_url);
-    let transport = StreamableHttpClientTransport::from_config(super::mcp_bridge::upstream_config(
-        &url,
-        None,
-        config.auth.bearer_token.as_deref(),
-    )?);
+    let transport =
+        super::mcp_bridge::upstream_transport(&url, None, config.auth.bearer_token.as_deref())?;
     let client = ().serve(transport).await.with_context(|| format!("connecting to {url}"))?;
     let result = client
         .peer()
