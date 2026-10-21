@@ -1349,21 +1349,33 @@ fn baked_capture_assistant(existing: &str) -> Option<bool> {
         for entry in entries {
             // Nested (`hooks:[{command}]`) or flat (`{command}`) shape.
             let nested = entry.get("hooks").and_then(serde_json::Value::as_array);
-            let commands: Vec<&str> = match nested {
-                Some(inner) => inner
-                    .iter()
-                    .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
-                    .collect(),
-                None => entry
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .into_iter()
-                    .collect(),
+            let hook_entries: Vec<&serde_json::Value> = match nested {
+                Some(inner) => inner.iter().collect(),
+                None => vec![entry],
             };
-            for command in commands {
-                if hook_command_is_ours(command) {
+            for hook_entry in hook_entries {
+                let Some(command) = hook_entry.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                let args = hook_entry.get("args").and_then(serde_json::Value::as_array);
+                let recognizer = args.map_or_else(
+                    || command.to_owned(),
+                    |args| {
+                        let suffix = args
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        format!("{command} {suffix}")
+                    },
+                );
+                if hook_command_is_ours(&recognizer) {
                     saw_ai_memory = true;
-                    if command.contains("--capture-assistant") {
+                    let args_have_marker = args.is_some_and(|args| {
+                        args.iter()
+                            .any(|arg| arg.as_str() == Some("--capture-assistant"))
+                    });
+                    if command.contains("--capture-assistant") || args_have_marker {
                         has_marker = true;
                     }
                 }
@@ -12226,11 +12238,8 @@ model = "gpt-5"
     /// auto-wire issues — must PRESERVE a user's existing assistant-capture
     /// opt-in, not silently strip it.
     ///
-    /// Unix-gated: `--capture-assistant` is baked onto the native Stop command on
-    /// POSIX-native platforms; the Windows Claude command form does not carry the
-    /// flag in its rendered JSON, so there is nothing to drop or preserve there.
-    /// The preserve logic itself (`baked_capture_assistant`) has no platform
-    /// branch.
+    /// Unix-gated because this end-to-end render uses the host platform. The
+    /// parser itself has a platform-independent Windows exec-form regression.
     #[cfg(unix)]
     #[test]
     fn a_bare_reapply_preserves_an_existing_capture_assistant_opt_in() {
@@ -12256,6 +12265,25 @@ model = "gpt-5"
                 .unwrap()
                 .contains("--capture-assistant"),
             "a bare re-apply must preserve the existing --capture-assistant opt-in"
+        );
+    }
+
+    #[test]
+    fn windows_exec_form_preserves_capture_assistant_from_args() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": r"C:\Program Files\ai-memory\ai-memory.exe",
+                        "args": ["hook", "--event", "stop", "--agent", "claude-code", "--server-url", "http://127.0.0.1:49374", "--capture-assistant"]
+                    }]
+                }]
+            }
+        });
+        assert_eq!(
+            baked_capture_assistant(&serde_json::to_string(&settings).unwrap()),
+            Some(true)
         );
     }
 

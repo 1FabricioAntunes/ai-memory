@@ -779,9 +779,10 @@ cwd parameters use their canonical names.
 `ai-memory mcp-bridge` is a transport adapter, not a second tool
 implementation. It serves the upstream tool catalogue over local stdio and
 delegates tool calls to the configured HTTP server through rmcp's client
-transport, authenticating with the bearer `Config::load` resolved, so the
-server keeps the same auth, scope resolver, and tool handlers as direct HTTP
-clients. It has two modes, chosen by the entry that launches it:
+transport. It uses the bearer `Config::load` resolved, or the install's stored
+hook key before a discovered root key, which it sends only to a loopback
+server. The server therefore keeps the same auth, scope resolver, and tool handlers as direct
+HTTP clients. It has two modes, chosen by the entry that launches it:
 
 - session-aware (Claude Code, `install-mcp --client claude-code
   --session-aware`, and every Claude Code entry on a token-file install; and
@@ -1324,11 +1325,14 @@ observation_stream = true         # R1 observation-evidence stream: FTS over obs
                                   # any punctuation handling, so an entry never matches a token
                                   # with attached punctuation ("de," / "que?") — the same
                                   # limitation English stopwords have always had. Explicit FTS5
-                                  # syntax (quoted phrases, OR/AND/NOT/NEAR, parens) always
-                                  # bypasses this filter, exactly as it does with the built-in
-                                  # list; a bare query made ONLY of configured stopwords keeps
-                                  # them all rather than returning nothing. At most 2000 entries
-                                  # of at most 64 characters each, no internal whitespace
+                                  # syntax (quoted phrases, OR/AND/NOT/NEAR, parens) that FTS5
+                                  # accepts bypasses this filter, exactly as it does with the
+                                  # built-in list; syntax that does not parse degrades to a
+                                  # bare OR-join of its words, with quotes and parens stripped,
+                                  # and is filtered like any bare query except for the words
+                                  # inside quotes. A bare query made ONLY of configured stopwords
+                                  # keeps them all rather than returning nothing. At most 2000
+                                  # entries of at most 64 characters each, no internal whitespace
                                   # (entries are matched against single whitespace-split
                                   # tokens); anything past that fails startup.
                                   #

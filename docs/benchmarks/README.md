@@ -13,6 +13,8 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-10-20** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.1.2 release)** | **0.951** | [longmemeval-s-3.1.2-release.md](longmemeval-s-3.1.2-release.md) |
+| **2026-10-20** | LongMemEval-S (v1) | **local embeddings + observation stream (3.1.2 release)** | **0.947** | [longmemeval-s-3.1.2-release.md](longmemeval-s-3.1.2-release.md) |
 | **2026-10-16** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.1 release)** | **0.951** | [longmemeval-s-3.1.0-release.md](longmemeval-s-3.1.0-release.md) |
 | **2026-10-16** | LongMemEval-S (v1) | **local embeddings + observation stream (3.1 release)** | **0.940** | [longmemeval-s-3.1.0-release.md](longmemeval-s-3.1.0-release.md) |
 | **2026-10-15** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.0.1 release)** | **0.951** | [longmemeval-s-3.0.1-release.md](longmemeval-s-3.0.1-release.md) |
@@ -24,6 +26,12 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 2026-10-20 patch-release run found no retrieval regression against 3.1.
+FTS is identical at every accuracy cutoff. Local embeddings improved from
+0.940 to 0.947 `hit@5`, with stable latency and context size. See the
+[3.1.2 release report](longmemeval-s-3.1.2-release.md) for every slice,
+ingest performance, commands, and exact provenance.
 
 The 2026-10-16 minor-release run found no material retrieval regression
 against 3.0.1. FTS is identical at every overall cutoff. Local embeddings

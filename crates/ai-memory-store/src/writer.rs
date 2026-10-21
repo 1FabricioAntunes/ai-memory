@@ -736,6 +736,10 @@ pub(crate) enum WriteCmd {
         id: ApiCredentialId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    BindApiCredentialPepperVerifier {
+        verifier: String,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     TouchUserLastSeen {
         user_id: UserId,
         reply: oneshot::Sender<StoreResult<bool>>,
@@ -3300,6 +3304,20 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record the Argon2id verifier for the configured native-key pepper.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn bind_api_credential_pepper_verifier(&self, verifier: String) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::BindApiCredentialPepperVerifier {
+            verifier,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Update `last_seen_at = now()` for the user. Called fire-and-forget
     /// by the auth middleware on every authenticated request. Returns
     /// `false` when the user doesn't exist (caller authenticated against
@@ -4851,6 +4869,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::TouchApiCredential { id, reply } => {
                 let result = api_credentials::touch_api_credential(&conn, id);
                 send_or_warn(reply, result, "touch_api_credential");
+            }
+            WriteCmd::BindApiCredentialPepperVerifier { verifier, reply } => {
+                let result = api_credentials::bind_api_credential_pepper_verifier(&conn, &verifier);
+                send_or_warn(reply, result, "bind_api_credential_pepper_verifier");
             }
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);

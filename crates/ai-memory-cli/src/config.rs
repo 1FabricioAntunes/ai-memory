@@ -274,6 +274,17 @@ pub struct FallbackProfile {
 pub struct Config {
     /// Root data directory holding `wiki/`, `raw/`, `db/`, `models/`, `logs/`.
     pub data_dir: PathBuf,
+    /// Whether `--data-dir`, `AI_MEMORY_DATA_DIR` or the config file's
+    /// `data_dir` key chose [`Self::data_dir`], including an explicit value
+    /// equal to the platform default.
+    ///
+    /// Loader provenance, like [`Self::server_url_explicit`]. `install-mcp`
+    /// names the data dir in the bridge entries it writes only when it was
+    /// chosen, so a bridge installed against a non-default data dir reads the
+    /// same config and token as the hooks of that install, while a default
+    /// install keeps resolving its data dir when the bridge starts.
+    #[serde(skip)]
+    pub data_dir_explicit: bool,
     /// HTTP bind address used by `ai-memory serve`.
     pub bind: String,
     /// Idle-time (seconds) before the OS starts probing an accepted `serve`
@@ -1122,6 +1133,9 @@ pub(crate) struct ResolvedTokenFile {
     /// missing or blank leaves [`AuthSettings::bearer_token`] unset, and
     /// `serve` refuses to start rather than run open.
     pub(crate) loaded: bool,
+    /// Whether [`discover_root_token`] found it rather than the config naming
+    /// it, so a credential this install chose can outrank it.
+    pub(crate) discovered: bool,
 }
 
 impl AuthSettings {
@@ -1146,6 +1160,16 @@ impl AuthSettings {
         self.token_file.as_ref().map(|file| file.path.as_path())
     }
 
+    /// The bearer the environment, the inline key or `[auth].bearer_token_file`
+    /// supplied, leaving out a root token only [`discover_root_token`] found.
+    #[must_use]
+    pub(crate) fn configured_bearer_token(&self) -> Option<&str> {
+        if self.token_file.as_ref().is_some_and(|file| file.discovered) {
+            return None;
+        }
+        self.bearer_token.as_deref()
+    }
+
     /// The configured token file when it could not supply a token.
     #[must_use]
     pub(crate) fn missing_token_file(&self) -> Option<&Path> {
@@ -1160,7 +1184,11 @@ impl AuthSettings {
     /// re-renders wiring in the same process.
     pub(crate) fn adopt_token_file(&mut self, path: PathBuf, token: String) {
         self.bearer_token = Some(token);
-        self.token_file = Some(ResolvedTokenFile { path, loaded: true });
+        self.token_file = Some(ResolvedTokenFile {
+            path,
+            loaded: true,
+            discovered: false,
+        });
     }
 }
 
@@ -1207,6 +1235,7 @@ fn apply_bearer_token_file(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) 
     auth.token_file = Some(ResolvedTokenFile {
         path,
         loaded: token.is_some(),
+        discovered: false,
     });
     auth.bearer_token = token;
     Ok(())
@@ -1245,7 +1274,11 @@ fn discover_root_token(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) {
     if profile_named_default {
         return;
     }
-    auth.token_file = Some(ResolvedTokenFile { path, loaded: true });
+    auth.token_file = Some(ResolvedTokenFile {
+        path,
+        loaded: true,
+        discovered: true,
+    });
     auth.bearer_token = Some(token);
 }
 
@@ -1364,6 +1397,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
+            data_dir_explicit: false,
             bind: DEFAULT_BIND.into(),
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
@@ -2051,7 +2085,8 @@ pub struct SearchSettings {
 #[serde(default)]
 pub struct FtsSettings {
     /// Words dropped from a bare (non-explicit-syntax) natural-language FTS
-    /// query before the OR-join
+    /// query, and from the bag-of-words fallback for syntax that does not
+    /// parse, before the OR-join
     /// (`ai_memory_store::fts_query::prepare_fts5_query`).
     ///
     /// - **Absent** (the default, `None`): the built-in English list —
@@ -2073,7 +2108,8 @@ pub struct FtsSettings {
     /// `"não"`. Also note the filter matches whitespace-split raw tokens
     /// before any punctuation handling, so an entry never matches a token
     /// with attached punctuation (`"de,"`, `"que?"`) — the same limitation
-    /// English stopwords have always had.
+    /// English stopwords have always had. The fallback for syntax that does
+    /// not parse strips quotes and parens first, and keeps quoted words.
     ///
     /// A non-English or mixed-language wiki should set this to that
     /// language's function words, or to `[]`: left unset, only the built-in
@@ -2378,6 +2414,14 @@ impl Config {
         // so the #103 catch-all guard is not inert there.
         config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
+        // As with `server_url`, the file is asked for the key: a chosen dir
+        // equal to the default still counts as chosen.
+        config.data_dir_explicit = cli_data_dir.is_some()
+            || runtime_env.data_dir.is_some()
+            || (resolved_config_path.exists()
+                && Figment::from(Toml::file(&resolved_config_path))
+                    .find_value("data_dir")
+                    .is_ok());
         // CLI override always wins (figment doesn't see it because clap has
         // already parsed the flag into `cli_data_dir`).
         if let Some(dir) = cli_data_dir {
@@ -3420,11 +3464,42 @@ pub fn hook_auth_header_path_in(data_dir: &Path) -> PathBuf {
 /// Propagates IO failures from creating the data dir or writing either file.
 pub fn store_hook_auth_token(data_dir: &Path, token: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir)?;
-    write_secret(&hook_auth_token_path_in(data_dir), token)?;
-    write_secret(
-        &hook_auth_header_path_in(data_dir),
-        &format!("Authorization: Bearer {token}\n"),
-    )
+    let token_path = hook_auth_token_path_in(data_dir);
+    let header_path = hook_auth_header_path_in(data_dir);
+    let previous_token = read_optional_secret_bytes(&token_path)?;
+    let previous_header = read_optional_secret_bytes(&header_path)?;
+
+    write_secret(&token_path, token)?;
+    if let Err(error) = write_secret(&header_path, &format!("Authorization: Bearer {token}\n")) {
+        let token_rollback = restore_secret_bytes(&token_path, previous_token.as_deref());
+        let header_rollback = restore_secret_bytes(&header_path, previous_header.as_deref());
+        if let Err(rollback) = token_rollback.and(header_rollback) {
+            return Err(std::io::Error::other(format!(
+                "writing hook credential pair failed ({error}); rollback also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_optional_secret_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_secret_bytes(path: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => write_secret_bytes(path, bytes),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
 }
 
 /// Remove a persisted bearer pair. Absent files are not an error.
@@ -3464,6 +3539,10 @@ pub(crate) fn read_trimmed_secret(path: &Path) -> Option<String> {
 /// The mode is set on the handle before any bytes are written on Unix, so the
 /// secret is never briefly world-readable between `create` and `set_permissions`.
 fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_secret_bytes(path, contents.as_bytes())
+}
+
+fn write_secret_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -3474,7 +3553,7 @@ fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        file.write_all(contents.as_bytes())
+        file.write_all(contents)
     }
     #[cfg(not(unix))]
     {
@@ -3509,7 +3588,15 @@ fn canonicalise_or_keep(p: &Path) -> PathBuf {
     {
         return canon_parent.join(name);
     }
-    p.to_path_buf()
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    // A nested path may have no existing ancestor beyond the current
+    // directory yet. Keep the invocation-time meaning when this path is later
+    // embedded in an MCP entry launched from an unrelated project directory.
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p))
+        .unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Normalize home for prefix-match comparisons: accept either slash spelling,
@@ -3610,6 +3697,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_invalid_header_target_cannot_partially_replace_the_token() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        std::fs::create_dir_all(hook_auth_header_path_in(&dd)).unwrap();
+
+        let error = store_hook_auth_token(&dd, "must-not-stick").unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!hook_auth_token_path_in(&dd).exists());
+    }
+
+    #[test]
+    fn a_nested_nonexistent_relative_data_dir_becomes_absolute() {
+        let relative = Path::new("target/nonexistent-ai-memory-test/data");
+        let resolved = canonicalise_or_keep(relative);
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(resolved.ends_with(relative));
+    }
+
     /// Absent, empty, and whitespace-only files all read as "no token" rather
     /// than as an empty bearer, which would send `Authorization: Bearer `.
     #[test]
@@ -3633,6 +3739,41 @@ mod tests {
         clear_hook_auth_token(&dd).unwrap();
         assert!(read_hook_auth_token(&dd).is_none());
         clear_hook_auth_token(&dd).expect("clearing twice must not error");
+    }
+
+    /// Adversarial: the stored hook key is a client credential, read by the
+    /// hooks and, as a last resort, by `mcp-bridge`. `Config::load` must never
+    /// adopt it, or `serve` on the same data dir would start requiring that
+    /// key and accepting it as its bearer. Control: a key named by
+    /// `[auth].bearer_token_file` is adopted.
+    #[test]
+    fn config_load_never_adopts_the_stored_hook_key() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        store_hook_auth_token(&dd, "aim_hook_key").unwrap();
+        let config_path = dd.join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(dd.clone()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.bearer_token, None);
+        assert!(cfg.auth.token_file_path().is_none());
+
+        std::fs::write(
+            &config_path,
+            "bind = \"127.0.0.1:49921\"\n[auth]\nbearer_token_file = \"auth-token\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(dd.clone()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.bearer_token.as_deref(), Some("aim_hook_key"));
     }
     use super::*;
     use rstest::rstest;
@@ -3845,6 +3986,39 @@ mod tests {
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert!(!cfg.server_url_derived_from_bind);
         assert!(cfg.server_url_configured());
+    }
+
+    /// `data_dir_explicit` records whether the flag, the environment or the
+    /// file chose the data dir, never whether it differs from the default.
+    #[test]
+    fn data_dir_explicit_tracks_who_chose_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let load = |config_path: &Path, cli: Option<PathBuf>, env: Option<PathBuf>| {
+            Config::load_with_runtime_env(
+                Some(config_path),
+                cli,
+                RuntimeEnv {
+                    data_dir: env,
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap()
+        };
+
+        assert!(!load(&config_path, None, None).data_dir_explicit);
+        assert!(load(&config_path, Some(tmp.path().to_path_buf()), None).data_dir_explicit);
+        assert!(load(&config_path, None, Some(tmp.path().to_path_buf())).data_dir_explicit);
+
+        // The file's key counts even when it names the default dir itself.
+        let from_file = tmp.path().join("from-file.toml");
+        std::fs::write(
+            &from_file,
+            format!("data_dir = {:?}\n", default_data_dir().to_string_lossy()),
+        )
+        .unwrap();
+        assert!(load(&from_file, None, None).data_dir_explicit);
     }
 
     /// A bind that maps onto the default URL (an unspecified address on the

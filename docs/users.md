@@ -422,8 +422,15 @@ passwords and sessions do not use it.
 sessions can operate without a machine-root bearer; native API-key lookup
 still requires the original pepper. If `api_credentials` contains rows and
 the pepper is missing or blank, `serve` refuses startup before applying
-human bootstrap. Restore the original pepper from configuration backup
-rather than deleting identities or keys.
+human bootstrap. Current databases also keep an Argon2id verifier and refuse
+a different pepper instead of starting with keys that can only return 401.
+Restore the original pepper from a separately protected configuration backup
+rather than deleting identities or keys: `ai-memory backup` includes only a
+`config.toml` inside the data dir, while packaged systemd units load one from
+outside it. A restore of a snapshot created before the verifier existed fails
+closed when keys are present. Load the original pepper and explicitly confirm
+it with `ai-memory restore --accept-legacy-api-key-pepper`; the staged database
+is sealed before it replaces live data.
 
 ### 2. Add another human
 
@@ -514,12 +521,17 @@ the data dir, both `0600` (the data dir itself is `0700`):
 
 | file | read by |
 |---|---|
-| `<data_dir>/auth-token` | the native `ai-memory hook` command |
+| `<data_dir>/auth-token` | the native `ai-memory hook` command, and `ai-memory mcp-bridge` when no bearer is configured (ahead of a discovered loopback root token) |
 | `<data_dir>/auth-header` | the shell hooks, via `curl -H @<file>` |
 
+`install-mcp --apply --auth-token …` writes the same pair for a Claude Code
+(`--session-aware`) or Muse bridge entry and leaves the key out of that entry,
+unless a different key is already stored there or the hooks sign in with OIDC.
+
 `ai-memory uninstall` deletes both files when it removes the hooks (a full
-uninstall or `--only hooks`); `--only mcp`, `--only instructions` and `--only
-skills` keep them for the hooks still installed.
+uninstall, or `--only hooks` while no Claude Code or Muse bridge entry
+remains); `--only mcp`, `--only instructions` and `--only skills` keep them for
+the hooks still installed.
 
 It is deliberately **not** written into the agent's own config any more. Before
 #552 it went onto the hook's command line (`--auth-token <token>` for native
@@ -552,6 +564,12 @@ just failed.
 Until you re-run `install-hooks`, the hooks still hold the old token and there
 is nothing newer to retry with, so those events stay queued and age out on the
 normal retry budget rather than blocking the rest of the spool (#493).
+
+The same re-run rotates the MCP bridge's key when the bridge reads the stored
+file, which is the case for an entry written without a key. An entry that still
+carries the old key in `AI_MEMORY_AUTH_TOKEN` (written by the print path, or by
+`install-mcp` before the key moved to the data dir) keeps sending it: re-run
+`install-mcp --apply` without `--auth-token` to drop it.
 
 ## Running for a team
 
@@ -715,6 +733,11 @@ operator honest, not to enforce.
 Without `--as-user`, hooks install the same way they always have:
 the bearer authenticates and attribution flows from the token's owner
 (root user or DB user) at write time.
+
+The MCP side needs no second copy of the key. `ai-memory install-mcp
+--client claude-code --session-aware --apply` on the same data dir writes a
+bridge entry without a key, and the bridge sends the key the hooks hold, so
+MCP calls and captured events attribute to the same user.
 
 ## Per-project access
 

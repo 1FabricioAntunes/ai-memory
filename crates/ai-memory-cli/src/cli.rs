@@ -228,7 +228,11 @@ pub enum Command {
     /// Prints what it would remove and changes nothing unless `--confirm` is
     /// passed. See also `ai-memory status` for the reclaimable figure.
     ReclaimLedgerVersions(ReclaimLedgerVersionsArgs),
-    /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
+    /// Snapshot wiki/, db/, and an in-data-dir config.toml into a gzipped tarball.
+    ///
+    /// This is not a complete host-migration archive: root/hook credentials,
+    /// external config files, raw workstream ledgers, logs, and models are
+    /// intentionally excluded. See docs/lifecycle-ops.md before moving hosts.
     Backup(BackupArgs),
     /// Snapshot AI agent configurations, skills, and plugins into a portable archive.
     #[command(name = "backup-agents")]
@@ -1532,8 +1536,9 @@ pub struct PurgeProjectArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
     /// Project id (UUID) to purge, as an alternative to `--project`.
@@ -1585,8 +1590,9 @@ pub struct PurgeSessionArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// REQUIRED for the purge to run. Without this flag the CLI errors
@@ -1627,11 +1633,11 @@ pub struct RenameProjectArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Current project name. When omitted, auto-derives from the
-    /// basename of the current git repo root (or CWD) — handy when
-    /// running `ai-memory rename-project --to new-name` from a dir
-    /// that was JUST renamed (the basename will be the new name, so
-    /// you'll want to pass --from explicitly in that workflow).
+    /// Current project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name. After renaming the
+    /// directory itself, pass `--from`: a checkout with no marker or
+    /// remote would resolve to the new name.
     #[arg(long, conflicts_with = "project_id")]
     pub from: Option<String>,
     /// Project id (UUID) to rename, as an alternative to `--from`.
@@ -1655,8 +1661,9 @@ pub struct MoveProjectArgs {
     /// `--to-workspace` names the destination and stays literal.
     #[arg(long)]
     pub from_workspace: Option<String>,
-    /// Project name to move. When omitted, auto-derived from the basename
-    /// of the current git repo root (or CWD if no git repo).
+    /// Project name to move. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
     /// Project id (UUID) to move, as an alternative to `--project`.
@@ -1859,9 +1866,10 @@ pub struct BootstrapArgs {
     /// use, so bootstrap pages land where the session captures do.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the resolved repo path — same heuristic the hook router uses
-    /// to bucket per-cwd observations, so the bootstrap pages land
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name (not `--repo-path`), the
+    /// same resolution the hook router uses, so the bootstrap pages land
     /// in the same project as future session captures.
     ///
     /// Dot-prefixed dirs are preserved verbatim — `~/.config` becomes
@@ -2330,6 +2338,10 @@ pub struct RestoreArgs {
     /// Overwrite an existing non-empty data dir.
     #[arg(long)]
     pub force: bool,
+    /// Confirm that the configured token pepper is the original one for a
+    /// pre-verifier backup that already contains native API keys.
+    #[arg(long)]
+    pub accept_legacy_api_key_pepper: bool,
 }
 
 /// Arguments for `restore-agents`.
@@ -2971,8 +2983,9 @@ pub struct EmbedArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo). Matches the
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name. Matches the
     /// hook router's per-cwd convention so this command targets the
     /// same project sessions write into.
     #[arg(long)]
@@ -2988,8 +3001,9 @@ pub struct ForgetSweepArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
 }
@@ -3008,8 +3022,9 @@ pub struct LintArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
 }
@@ -3027,8 +3042,9 @@ pub struct CuratorArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// Emit only machine-readable JSON.
@@ -3043,8 +3059,9 @@ pub struct AutoImproveReportArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// Lookback window in days.
@@ -3071,8 +3088,9 @@ pub struct AutoImproveArgs {
     /// `workspace`, else `default`.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Project name. When omitted, auto-derived from the basename of
-    /// the current git repo root (or CWD if no git repo).
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
     #[arg(long)]
     pub project: Option<String>,
     /// Override `[auto_improve].min_observations` for this run.
@@ -3453,9 +3471,10 @@ pub struct InstallMcpArgs {
     /// in `[auth].bearer_token_file`.
     #[arg(skip)]
     pub stdio_bridge: bool,
-    /// The data dir a bridge entry passes as `--data-dir`, for a client that
-    /// starts its MCP servers with a cleared environment (Muse Code), where
-    /// the bridge could not otherwise find this install's config and token.
+    /// The data dir a bridge entry passes as `--data-dir`: always for a client
+    /// that starts its MCP servers with a cleared environment (Muse Code), and
+    /// for any other bridge entry when the install was given a data dir, so
+    /// the bridge reads the same config and token as the install's hooks.
     /// Set by the installer, never a flag.
     #[arg(skip)]
     pub bridge_data_dir: Option<std::path::PathBuf>,

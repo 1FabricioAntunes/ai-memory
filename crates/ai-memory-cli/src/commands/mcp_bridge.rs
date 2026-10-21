@@ -21,10 +21,20 @@
 //!   that session's id, and forwarding it would steer this client's unscoped
 //!   calls through another session's active-project pointer.
 //!
-//! Either way the bridge authenticates with the bearer `Config::load`
-//! resolved (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token`, or the file
-//! `[auth].bearer_token_file` names), so a harness config that launches it
-//! carries no token and no token reaches its command line.
+//! Either way the bridge authenticates with a configured bearer
+//! (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token`, or the file
+//! `[auth].bearer_token_file` names). With none of those, it sends the key
+//! `install-hooks --apply --auth-token` stored for this install's hooks in
+//! `<data_dir>/auth-token`, so a client whose hooks hold a native API key
+//! reaches the server as the same user, and only then the root token
+//! `Config::load` discovers on a loopback install, so a host running both the
+//! server and a client never sends root over a stored user key. That fallback
+//! is the bridge's alone:
+//! `Config::load` never reads the file, so `serve` neither requires nor
+//! accepts the key because it is stored there. `install-mcp --apply` relies on
+//! it to write an entry without the key when the key was given explicitly; an
+//! entry written before that, or by the print path, still carries it in
+//! `AI_MEMORY_AUTH_TOKEN`, which wins.
 
 use std::collections::HashMap;
 
@@ -250,6 +260,52 @@ fn bridge_base_url<'a>(flag: Option<&'a str>, configured: &'a str) -> &'a str {
         .unwrap_or(configured)
 }
 
+/// The bearer the bridge sends: a configured one, else the user key stored
+/// for this install's hooks, else the root key `Config::load` discovered.
+/// Configured and stored keys follow the entry's `--server-url`: the stored
+/// key is the user's own, which the hooks already send to a remote server
+/// (#1490). The discovered root key never leaves loopback.
+fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
+    let usable = |token: &str| !token.trim().is_empty();
+    if let Some(token) = config
+        .auth
+        .configured_bearer_token()
+        .filter(|token| usable(token))
+        .map(str::to_owned)
+    {
+        return Ok(Some(token));
+    }
+
+    let stored_path = crate::config::hook_auth_token_path_in(&config.data_dir);
+    match std::fs::read_to_string(&stored_path) {
+        Ok(raw) => {
+            let token = raw.trim();
+            if token.is_empty() {
+                anyhow::bail!(
+                    "stored bridge credential {} is blank; repair or remove it instead of falling back to root",
+                    stored_path.display()
+                );
+            }
+            return Ok(Some(token.to_owned()));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading stored bridge credential {}", stored_path.display())
+            });
+        }
+    }
+
+    if crate::commands::hook_spool::is_loopback_url(server_url) {
+        return Ok(config
+            .auth
+            .bearer_token
+            .clone()
+            .filter(|token| usable(token)));
+    }
+    Ok(None)
+}
+
 /// Run the stdio bridge, session-aware or session-less (see the module docs).
 ///
 /// # Errors
@@ -263,10 +319,11 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         args.server_url.as_deref(),
         &config.server_url,
     ));
+    let bearer = bridge_bearer(config, &server_url)?;
     let transport = StreamableHttpClientTransport::from_config(upstream_config(
         &server_url,
         session_id,
-        config.auth.bearer_token.as_deref(),
+        bearer.as_deref(),
     )?);
 
     // Connecting before serving stdio means a refused credential (401) or an
@@ -286,11 +343,12 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
                     } else {
                         ""
                     },
-                    if config.auth.bearer_token.is_some() {
+                    if bearer.is_some() {
                         ""
                     } else {
                         " (sent without a bearer token; the bridge reads it from \
-                         AI_MEMORY_AUTH_TOKEN, [auth].bearer_token or [auth].bearer_token_file)"
+                         AI_MEMORY_AUTH_TOKEN, [auth].bearer_token, [auth].bearer_token_file \
+                         or the key `install-hooks --apply --auth-token` stored in the data dir)"
                     }
                 )
             });
@@ -614,5 +672,149 @@ mod tests {
     async fn stdio_bridge_forwards_tools_and_session_header_in_both_http_modes() {
         assert_bridge_round_trip(false).await;
         assert_bridge_round_trip(true).await;
+    }
+
+    /// The stored hook key is the bridge's last resort: a configured bearer
+    /// (env, inline key, token file) outranks it, a blank one does not, and
+    /// with neither the bridge sends nothing.
+    #[test]
+    fn bridge_bearer_puts_the_stored_hook_key_below_a_configured_bearer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        assert_eq!(bridge_bearer(&config, &config.server_url).unwrap(), None);
+
+        crate::config::store_hook_auth_token(tmp.path(), "aim_stored").unwrap();
+        assert_eq!(
+            bridge_bearer(&config, &config.server_url)
+                .unwrap()
+                .as_deref(),
+            Some("aim_stored")
+        );
+
+        config.auth.bearer_token = Some("configured".into());
+        assert_eq!(
+            bridge_bearer(&config, &config.server_url)
+                .unwrap()
+                .as_deref(),
+            Some("configured")
+        );
+
+        config.auth.bearer_token = Some("  ".into());
+        assert_eq!(
+            bridge_bearer(&config, &config.server_url)
+                .unwrap()
+                .as_deref(),
+            Some("aim_stored")
+        );
+    }
+
+    /// Adversarial: on a host that runs the server and a client from one data
+    /// dir, `Config::load` discovers the root token, and a user's key is
+    /// stored for the hooks. The bridge must send the user's key, never root.
+    /// Control: without a stored key, discovery still authenticates the bridge.
+    #[test]
+    fn a_stored_user_key_outranks_the_discovered_root_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let discovered_root = || {
+            let mut config = Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            };
+            config.auth.bearer_token = Some("root-token".into());
+            config.auth.token_file = Some(crate::config::ResolvedTokenFile {
+                path: tmp.path().join("auth-tokens").join("default"),
+                loaded: true,
+                discovered: true,
+            });
+            config
+        };
+
+        let discovered = discovered_root();
+        assert_eq!(discovered.auth.bearer_token.as_deref(), Some("root-token"));
+        assert_eq!(
+            bridge_bearer(&discovered, &discovered.server_url)
+                .unwrap()
+                .as_deref(),
+            Some("root-token")
+        );
+
+        crate::config::store_hook_auth_token(tmp.path(), "aim_user_key").unwrap();
+        let both = discovered_root();
+        assert_eq!(both.auth.bearer_token.as_deref(), Some("root-token"));
+        assert_eq!(
+            bridge_bearer(&both, &both.server_url).unwrap().as_deref(),
+            Some("aim_user_key")
+        );
+    }
+
+    #[test]
+    fn discovered_root_never_leaves_loopback_but_the_stored_user_key_follows_the_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            server_url: "http://127.0.0.1:49374".into(),
+            ..Config::default()
+        };
+        config.auth.bearer_token = Some("discovered-root".into());
+        config.auth.token_file = Some(crate::config::ResolvedTokenFile {
+            path: tmp.path().join("auth-tokens/default"),
+            loaded: true,
+            discovered: true,
+        });
+
+        // Adversarial: a remote --server-url never receives the root key.
+        assert_eq!(
+            bridge_bearer(&config, "https://remote.example/mcp").unwrap(),
+            None
+        );
+        // Control: a loopback server the config does not name (a packaged
+        // install whose config lives outside the data dir) still gets it.
+        assert_eq!(
+            bridge_bearer(&config, "http://127.0.0.1:41234/mcp")
+                .unwrap()
+                .as_deref(),
+            Some("discovered-root")
+        );
+
+        // The stored key is the user's own, the one the hooks send to that
+        // remote server (#1490), so it follows the entry's URL.
+        crate::config::store_hook_auth_token(tmp.path(), "stored-user").unwrap();
+        assert_eq!(
+            bridge_bearer(&config, "https://remote.example/mcp")
+                .unwrap()
+                .as_deref(),
+            Some("stored-user")
+        );
+
+        config.auth.token_file = None;
+        assert_eq!(
+            bridge_bearer(&config, "https://remote.example/mcp")
+                .unwrap()
+                .as_deref(),
+            Some("discovered-root"),
+            "an explicitly configured credential remains remote-capable"
+        );
+    }
+
+    #[test]
+    fn malformed_stored_credential_fails_instead_of_escalating_to_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.auth.bearer_token = Some("discovered-root".into());
+        config.auth.token_file = Some(crate::config::ResolvedTokenFile {
+            path: tmp.path().join("auth-tokens/default"),
+            loaded: true,
+            discovered: true,
+        });
+        std::fs::write(crate::config::hook_auth_token_path_in(tmp.path()), " \n").unwrap();
+
+        let error = bridge_bearer(&config, &config.server_url).unwrap_err();
+        assert!(error.to_string().contains("is blank"), "{error:#}");
     }
 }

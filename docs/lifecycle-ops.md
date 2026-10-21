@@ -33,10 +33,13 @@ on a homelab box where mistakes are harder to undo.
 whose name is ambiguous: an empty legacy twin row left by an older migration
 can carry another project's old name, and the name lookup refuses it.
 `list-projects` prints each project's id. The id is looked up inside the
-workspace the command names. Sending both the name and the id, or neither, is
-a `400`, so is a malformed UUID, and an id that names no project in that
-workspace is a `404`. `--confirm`, the preview and every other guard behave
-the same as with a name.
+workspace the command names. On the admin endpoints, sending both the name and
+the id, or neither, is a `400`, so is a malformed UUID, and an id that names no
+project in that workspace is a `404`. The CLI refuses both flags together before
+sending anything, and with neither it resolves the project the way other
+commands do: the `.ai-memory.toml` marker's `project`, then the git remote, then
+the directory name. `--confirm`, the preview and every other guard behave the
+same as with a name.
 
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
@@ -614,11 +617,18 @@ destination promotes its legacy name first, the response includes
 `manifest_warning` when that committed promotion's manifest refresh/checkpoint
 fails; the CLI prints it.
 
-**What does NOT migrate (merge case only):** in the `copy-purge` path the
-source's `sessions`, `observations`, and `handoffs` (the raw episodic
-capture log) are dropped by the purge, and the moved pages start a fresh
-supersession chain (the real page history lives in the wiki's git
-mirror). The `true-move` path has no such loss.
+**What does NOT migrate (merge case only):** the `copy-purge` path copies
+only the source's latest pages and their embeddings. The purge then drops
+everything else the source project owns, the same set `purge-project`
+deletes: its `sessions`, `observations`, and `handoffs` (the raw episodic
+capture log), its managed workstreams with their native sessions, runs,
+events and `raw/workstreams/` segments, the cross-project messages it sent
+or received, auto-improvement and profile-harvest state, session-consolidation
+jobs, ingest deduplication keys, entities, page feedback, per-session purge tombstones and
+project grants. The moved pages start a fresh supersession chain (the real
+page history lives in the wiki's git mirror). The append-only audit trail
+remains, with references to the removed source ids. The `true-move` path has
+no such loss.
 
 > **Operational caveat: moving the project the current session writes
 > to.** Lifecycle hooks stamp a bounded observation on every supported tool-lifecycle event into the
@@ -1120,13 +1130,50 @@ What happens on the server:
 
 1. SQLite online-backup API copies the live WAL DB to a temp file,
    a guaranteed consistent snapshot without stopping the writer.
-2. Server tar-gzips the snapshot + the wiki tree + `config.toml`.
+2. Server tar-gzips the snapshot + the wiki tree + `<data_dir>/config.toml`
+   when that file exists.
 3. Response body IS the gzipped tarball
    (`Content-Type: application/gzip`).
 
 CLI writes the response body to `--to`. For a homelab user
 this is the standard "snapshot before doing something dangerous"
 move: `ai-memory backup` first, then proceed.
+
+This tarball is an online **data snapshot**, not a complete host image. It
+intentionally excludes `auth-tokens/`, the hook-side `auth-token` and
+`auth-header` files, `raw/`, logs, models, and a config passed from outside the
+data dir with `--config`. The included `<data_dir>/config.toml` is archived
+verbatim and may itself contain inline root/proxy/recovery credentials, the
+API-key pepper, or sensitive LLM headers. Always protect the snapshot as a
+secret-bearing artifact. Excluding the separate credential files limits the
+copied auth material; omitting `raw/` avoids racing the actively appended
+managed-workstream ledger. The SQLite snapshot still contains the searchable
+managed-workstream events, but loses their immutable source copy.
+
+For a move to another host, carry these beside the snapshot through a
+separately encrypted or otherwise access-controlled backup:
+
+- the config file the service actually loads, especially
+  `[auth].token_pepper`; packaged systemd units keep it outside the data dir;
+- `auth-tokens/` if existing root bearers must keep working (otherwise run
+  `ai-memory auth enable` and rewire clients with the replacement);
+- `raw/` when the immutable managed-workstream source ledger must be retained.
+
+Do not copy hook credential files as the destination's wiring. Run
+`install-hooks --apply` and `install-mcp --apply` there so paths, server URLs,
+and credentials match the new host. Treat both the ordinary snapshot and the
+separate material as sensitive: wiki content and SQLite can contain private
+session data even though the archive excludes bearer files.
+
+Current databases carry an Argon2id verifier for the API-key pepper. If a
+restored database contains native API credentials but the destination loads a
+different pepper, `serve` refuses instead of starting with keys that can never
+authenticate. A database first opened by a version that predates this verifier
+cannot prove which pepper created its existing hashes; for those older
+snapshots, restoring the original external config remains mandatory. Restore
+refuses such a database until the operator supplies that original pepper and
+adds `--accept-legacy-api-key-pepper`, which seals a verifier into the staged
+database before the live data is changed.
 
 Restoring a backup follows the inverse:
 
@@ -1158,7 +1205,9 @@ Order of operations:
 2. Extract the tarball into a staging directory beside the live data
    (`<data_dir>/.restore-staging-<stamp>/`), validating every entry.
 3. Open the staged store so pending migrations run and the SQLite
-   snapshot is verified, still without touching the live data.
+   snapshot is verified, still without touching the live data. A legacy
+   database with API keys but no pepper verifier stops here unless the original
+   pepper is configured and `--accept-legacy-api-key-pepper` was passed.
 4. Swap: rename the live `wiki/` and `db/` (and `config.toml`, when the
    archive carries one) aside, rename the staged copies into place, then
    delete the previous data. Each move is a same-filesystem rename; if
@@ -1180,6 +1229,10 @@ Failure modes:
   a snapshot the current binary cannot open** (for example a backup taken
   by a newer release) → exits with the error; the existing `wiki/` and
   `db/` are left as they were.
+- **Legacy backup has API keys but no pepper verifier** → restore the original
+  `[auth].token_pepper` through the current config/environment and rerun with
+  `--accept-legacy-api-key-pepper`. This flag confirms provenance; it cannot
+  determine whether an unknown pepper is correct.
 - **A rename in the swap fails and cannot be reversed** → exits with an
   `INCONSISTENT STATE` message naming the
   `<data_dir>/.restore-previous-<stamp>/` directory that still holds the

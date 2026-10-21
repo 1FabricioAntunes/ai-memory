@@ -869,13 +869,21 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     uninstall_plugins(&plugins, &user_service::SystemRunner);
 
-    // Removing the hooks removes the only readers of the stored bearer, so
-    // leaving it on disk would strand a live credential (#552). An uninstall
-    // that keeps the hooks (`--only mcp|instructions|skills`) keeps it: the
-    // native hook, the shell hooks and the generated TypeScript integrations
-    // (the Pi one also bridges MCP) all still read it. Best-effort: an
-    // unremovable file must not fail a teardown that otherwise succeeded.
-    if hooks_removed && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
+    // Removing the hooks removes the readers of the stored bearer, so leaving
+    // it on disk would strand a live credential (#552). An uninstall that
+    // keeps the hooks (`--only mcp|instructions|skills`) keeps it: the native
+    // hook, the shell hooks and the generated TypeScript integrations (the Pi
+    // one also bridges MCP) all still read it. So does `--only hooks` while a
+    // Claude Code or Muse bridge entry remains, since the bridge reads the same
+    // file and `install-mcp --apply --auth-token` leaves the key out of those
+    // entries. Best-effort: an unremovable file must not fail a teardown that
+    // otherwise succeeded.
+    let bridge_keeps_key = args.only == Some(crate::cli::UninstallOnly::Hooks)
+        && install_mcp::bridge_entry_remains(name.as_deref().unwrap_or("ai-memory"));
+    if hooks_removed
+        && !bridge_keeps_key
+        && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir)
+    {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
             config.data_dir.display()

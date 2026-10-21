@@ -23,7 +23,7 @@ const V62_NAME: &str = "page_ingestion_windows";
 /// is remapped to [`StoreError::DataSchemaAhead`], which names the offending
 /// migration and points the operator at the fix.
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
-    repair_original_v62_checksum(conn)?;
+    repair_known_migration_checksums(conn)?;
     migrations::runner()
         .set_abort_divergent(true)
         .set_abort_missing(true)
@@ -32,11 +32,15 @@ pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
     Ok(())
 }
 
-/// Rewrite only the known V62 checksum produced by v2.2.1. The replacement
-/// SQL moved an equivalent backfill to the bounded boot path (#776); stores
-/// that applied the original migration are already in the same end state.
-/// Every other checksum mismatch remains a hard refinery error.
-fn repair_original_v62_checksum(conn: &rusqlite::Connection) -> StoreResult<()> {
+/// Rewrite only checksums whose SQL bytes are known to be equivalent.
+///
+/// Windows release builds before v3.1.2 embedded the checked-out migration
+/// files with CRLF endings. The SQL and resulting schema are identical to the
+/// LF files embedded now, but refinery hashes the raw bytes. V62 also has one
+/// older released layout whose equivalent backfill moved to the bounded boot
+/// path (#776). Match version, name and the exact historical checksum before
+/// changing anything; every other mismatch remains a hard refinery error.
+fn repair_known_migration_checksums(conn: &mut rusqlite::Connection) -> StoreResult<()> {
     let has_history: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master \
          WHERE type = 'table' AND name = 'refinery_schema_history')",
@@ -46,31 +50,72 @@ fn repair_original_v62_checksum(conn: &rusqlite::Connection) -> StoreResult<()> 
     if !has_history {
         return Ok(());
     }
-    let Some(current_checksum) = migrations::runner()
+    let runner = migrations::runner();
+    let mut known = Vec::new();
+    for migration in runner.get_migrations() {
+        let Some(crlf_checksum) = crlf_checksum(migration) else {
+            continue;
+        };
+        known.push((
+            migration.version(),
+            migration.name().to_owned(),
+            crlf_checksum,
+            migration.checksum(),
+        ));
+    }
+    let Some(v62) = runner
         .get_migrations()
         .iter()
         .find(|migration| migration.version() == V62_VERSION)
-        .map(refinery::Migration::checksum)
     else {
         return Ok(());
     };
-    let repaired = conn.execute(
-        "UPDATE refinery_schema_history SET checksum = ?1 \
-         WHERE version = ?2 AND name = ?3 AND checksum = ?4",
-        rusqlite::params![
-            current_checksum.to_string(),
-            V62_VERSION,
-            V62_NAME,
-            ORIGINAL_V62_CHECKSUM.to_string()
-        ],
-    )?;
-    if repaired == 1 {
+    known.push((
+        V62_VERSION,
+        V62_NAME.to_owned(),
+        ORIGINAL_V62_CHECKSUM,
+        v62.checksum(),
+    ));
+    let original_v62 = include_str!("testdata/V62__page_ingestion_windows.pre776.sql");
+    known.push((
+        V62_VERSION,
+        V62_NAME.to_owned(),
+        checksum_for_sql(V62_VERSION, V62_NAME, &original_v62.replace('\n', "\r\n")),
+        v62.checksum(),
+    ));
+
+    let tx = conn.transaction()?;
+    let mut repaired = 0_usize;
+    for (version, name, historical, current) in known {
+        repaired += tx.execute(
+            "UPDATE refinery_schema_history SET checksum = ?1 \
+             WHERE version = ?2 AND name = ?3 AND checksum = ?4",
+            rusqlite::params![current.to_string(), version, name, historical.to_string()],
+        )?;
+    }
+    tx.commit()?;
+    if repaired > 0 {
         tracing::info!(
-            version = V62_VERSION,
-            "repaired known V62 migration checksum from the v2.2.1 layout"
+            migrations = repaired,
+            "repaired known byte-equivalent migration checksums"
         );
     }
     Ok(())
+}
+
+fn crlf_checksum(migration: &refinery::Migration) -> Option<u64> {
+    let sql = migration.sql()?;
+    Some(checksum_for_sql(
+        migration.version(),
+        migration.name(),
+        &sql.replace('\n', "\r\n"),
+    ))
+}
+
+fn checksum_for_sql(version: u32, name: &str, sql: &str) -> u64 {
+    refinery::Migration::unapplied(&format!("V{version}__{name}"), sql)
+        .expect("embedded migration identity must remain valid")
+        .checksum()
 }
 
 /// Highest schema version baked into this binary (the max embedded migration).
@@ -1553,13 +1598,13 @@ mod tests {
         }
     }
 
-    /// V87 expands the sessions enum for Qwen Code. Existing sessions and
-    /// dependent observations survive the table rebuild, while the old V86
+    /// V88 expands the sessions enum for Qwen Code. Existing sessions and
+    /// dependent observations survive the table rebuild, while the old V87
     /// constraint rejects the new value and the migrated schema accepts it.
     #[test]
-    fn v86_to_v87_preserves_sessions_and_observations_and_accepts_qwen_code() {
+    fn v87_to_v88_preserves_sessions_and_observations_and_accepts_qwen_code() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run_to(&mut conn, 86).unwrap();
+        run_to(&mut conn, 87).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
         let project_id =
@@ -1588,7 +1633,7 @@ mod tests {
                 ],
             )
             .is_err(),
-            "the V86 CHECK must reject qwen-code"
+            "the V87 CHECK must reject qwen-code"
         );
         conn.execute(
             "INSERT INTO observations \
@@ -1735,9 +1780,7 @@ mod tests {
     #[test]
     fn original_v62_checksum_matches_the_released_sql() {
         let released_sql = include_str!("testdata/V62__page_ingestion_windows.pre776.sql");
-        let checksum = refinery::Migration::unapplied("V62__page_ingestion_windows", released_sql)
-            .expect("the released V62 fixture must remain a valid migration")
-            .checksum();
+        let checksum = checksum_for_sql(V62_VERSION, V62_NAME, released_sql);
 
         assert_eq!(checksum, ORIGINAL_V62_CHECKSUM);
         let embedded = migrations::runner()
@@ -1752,27 +1795,54 @@ mod tests {
         );
     }
 
-    /// The one known V62 checksum is repaired before the strict runner sees
-    /// it. An arbitrary mismatch still fails closed.
+    /// The reporter's three samples pin the exact Windows-native failure: the
+    /// checksums are the current embedded SQL with only LF changed to CRLF.
     #[test]
-    fn only_the_original_v62_checksum_is_repaired() {
+    fn windows_release_checksums_match_crlf_embedded_sql() {
+        let runner = migrations::runner();
+        for (version, reported) in [
+            (1, 17_285_868_314_470_184_417),
+            (62, 3_297_905_123_477_343_401),
+            (83, 11_621_067_245_702_300_616),
+        ] {
+            let migration = runner
+                .get_migrations()
+                .iter()
+                .find(|migration| migration.version() == version)
+                .unwrap();
+            assert_eq!(crlf_checksum(migration), Some(reported), "V{version}");
+        }
+    }
+
+    /// Every known byte-equivalent checksum is repaired before the strict
+    /// runner sees it. An arbitrary mismatch still fails closed.
+    #[test]
+    fn only_known_equivalent_migration_checksums_are_repaired() {
         let mut conn = Connection::open_in_memory().unwrap();
         run(&mut conn).unwrap();
-        let current_checksum = migrations::runner()
+        let runner = migrations::runner();
+        let v62 = runner
             .get_migrations()
             .iter()
             .find(|migration| migration.version() == V62_VERSION)
-            .unwrap()
-            .checksum();
+            .unwrap();
+        let current_checksum = v62.checksum();
         assert_ne!(current_checksum, ORIGINAL_V62_CHECKSUM);
 
-        let rewritten = conn
-            .execute(
-                "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2",
-                params![ORIGINAL_V62_CHECKSUM.to_string(), V62_VERSION],
-            )
-            .unwrap();
-        assert_eq!(rewritten, 1, "V62 history row must exist to diverge");
+        for version in [1, 62, 83] {
+            let migration = runner
+                .get_migrations()
+                .iter()
+                .find(|migration| migration.version() == version)
+                .unwrap();
+            let rewritten = conn
+                .execute(
+                    "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2",
+                    params![crlf_checksum(migration).unwrap().to_string(), version],
+                )
+                .unwrap();
+            assert_eq!(rewritten, 1, "V{version} history row must exist");
+        }
 
         // A strict runner (refinery's default) rejects the divergence.
         let strict = migrations::runner().run(&mut conn);
@@ -1784,6 +1854,30 @@ mod tests {
             Ok(_) => panic!("strict runner should reject a divergent checksum"),
         }
 
+        run(&mut conn).expect("the Windows-native checksums must be repaired");
+        for version in [1, 62, 83] {
+            let expected = runner
+                .get_migrations()
+                .iter()
+                .find(|migration| migration.version() == version)
+                .unwrap()
+                .checksum()
+                .to_string();
+            let repaired: String = conn
+                .query_row(
+                    "SELECT checksum FROM refinery_schema_history WHERE version = ?1",
+                    [version],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repaired, expected, "V{version}");
+        }
+
+        conn.execute(
+            "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2",
+            params![ORIGINAL_V62_CHECKSUM.to_string(), V62_VERSION],
+        )
+        .unwrap();
         run(&mut conn).expect("the released V62 checksum must be repaired");
         let repaired: String = conn
             .query_row(
@@ -1793,6 +1887,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(repaired, current_checksum.to_string());
+
+        let original_crlf = checksum_for_sql(
+            V62_VERSION,
+            V62_NAME,
+            &include_str!("testdata/V62__page_ingestion_windows.pre776.sql").replace('\n', "\r\n"),
+        );
+        conn.execute(
+            "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2",
+            params![original_crlf.to_string(), V62_VERSION],
+        )
+        .unwrap();
+        run(&mut conn).expect("the Windows-native original V62 checksum must be repaired");
 
         conn.execute(
             "UPDATE refinery_schema_history SET checksum = '0' WHERE version = ?1",

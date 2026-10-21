@@ -25,10 +25,25 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > the token file at launch and forwards no session id, so the client passes
 > `workspace` and `project` like any static client. Stdio entries name the
 > `ai-memory` binary by its absolute path, so the client does not need it on
-> its `PATH`; the Docker wrapper keeps the bare `ai-memory`. ZCode keeps
+> its `PATH`; the Docker wrapper keeps the bare `ai-memory`. When the install
+> was given a data dir (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in
+> the config), every bridge entry names it with `--data-dir`, as that
+> install's hooks do, so the bridge reads that install's config and token
+> rather than the default data dir's. ZCode keeps
 > HTTP entries only and is refused. Hermes Agent gets the bridge entry
 > whatever the token source, so its config never holds a token. Passing `--auth-token` explicitly (or
 > `AI_MEMORY_AUTH_TOKEN`) keeps the HTTP snippets below, header included.
+> The two entries that run the bridge with an explicit key are the
+> exception: `install-mcp --apply --auth-token <key>` for Claude Code with
+> `--session-aware`, and for Muse, stores the key in `<data_dir>/auth-token`,
+> the file `install-hooks --apply --auth-token` writes, and writes the entry
+> with `--data-dir` and no key. The bridge reads that file whenever no
+> bearer is configured, ahead of the root token it discovers on a loopback
+> install, so a client whose hooks already hold a key needs no
+> `--auth-token` here at all, and rotating the key with `install-hooks` also
+> rotates the bridge's. The key stays in the entry, as before, when the
+> config already resolves a bearer, a different key is stored, the hooks
+> sign in with OIDC, or the snippet is only printed.
 
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`

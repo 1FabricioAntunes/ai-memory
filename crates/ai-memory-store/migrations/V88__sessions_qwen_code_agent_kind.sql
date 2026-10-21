@@ -1,5 +1,5 @@
--- Expand sessions.agent_kind CHECK for Qwen Code while preserving V85's
--- schema, indexes, and scope-pairing triggers (V86 only added CJK search
+-- Expand sessions.agent_kind CHECK for Qwen Code while preserving V86's
+-- schema, indexes, and scope-pairing triggers (V87 only added CJK search
 -- indexes and does not rebuild sessions).
 --
 -- `Store::open` turns foreign keys off around the migration runner (a PRAGMA

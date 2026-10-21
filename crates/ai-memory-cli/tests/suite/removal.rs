@@ -2394,6 +2394,57 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
     }
 }
 
+/// `install-mcp --apply --auth-token` for Claude Code stores the key where the
+/// hooks keep theirs and writes the bridge entry without it, so the stored
+/// key is the bridge's too: `--only hooks` keeps it while that entry remains,
+/// and the full uninstall still removes it.
+#[test]
+fn an_explicit_bridge_key_is_stored_and_outlives_only_hooks_removal() {
+    const KEY: &str = "aim_bridge_key_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "install-mcp",
+        "--client",
+        "claude-code",
+        "--session-aware",
+        "--auth-token",
+        KEY,
+        "--apply",
+    ]);
+    run(&["install-hooks", "--agent", "claude-code", "--apply"]);
+    let claude = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+    assert!(
+        !claude.contains(KEY),
+        "the key stayed in ~/.claude.json: {claude}"
+    );
+    assert!(claude.contains("mcp-bridge"), "{claude}");
+    let stored = home.path().join(".ai-memory-data").join("auth-token");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap().trim(), KEY);
+
+    run(&["uninstall", "--only", "hooks", "--apply", "--yes"]);
+    assert!(
+        stored.exists(),
+        "--only hooks stranded the bridge without its key"
+    );
+
+    run(&["uninstall", "--apply", "--yes"]);
+    assert!(!stored.exists(), "the full uninstall must remove the key");
+}
+
 /// Meta Muse Code: `install-mcp` and `install-hooks` both merge into
 /// `$XDG_CONFIG_HOME/muse/settings.json` around the user's own server and
 /// hook, keeping `schema_version` and unknown keys, the MCP entry goes under

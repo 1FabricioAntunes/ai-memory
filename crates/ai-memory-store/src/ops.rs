@@ -1594,7 +1594,7 @@ pub(crate) struct CjkBackfillSummary {
 /// Every source row receives an auxiliary row, including Latin-only content
 /// (whose terms are empty). That makes this an idempotent anti-join instead of
 /// rescanning every Latin row at each startup. Deletes and direct content
-/// updates remove the derived row through V86 triggers, so a crash or an
+/// updates remove the derived row through V87 triggers, so a crash or an
 /// offline maintenance edit converges here on the next open.
 pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBackfillSummary> {
     type PageRow = (i64, String, String, String);
@@ -1691,7 +1691,7 @@ fn finish_cjk_index_write(result: rusqlite::Result<usize>) -> StoreResult<()> {
         Err(error) => {
             // Historical migration tests deliberately stop at V18/V19/V33
             // and then exercise current operation helpers against that frozen
-            // schema. A real Store migrates through V86 before the writer is
+            // schema. A real Store migrates through V87 before the writer is
             // spawned, so a missing table remains a fatal integrity error in
             // every production build.
             #[cfg(test)]

@@ -1,4 +1,4 @@
--- Expand sessions.agent_kind CHECK for Cline CLI while preserving V84's
+-- Expand sessions.agent_kind CHECK for Cline CLI while preserving V85's
 -- schema, indexes, and scope-pairing triggers.
 --
 -- `Store::open` turns foreign keys off around the migration runner (a PRAGMA
