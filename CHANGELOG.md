@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- `ai-memory run` no longer loses a native session selector that sits behind a
+  non-UTF-8 argument. The scan over the forwarded arguments ended at the first
+  argument that was not valid UTF-8 instead of skipping it, so a run pinned with
+  an explicit `--session`/`--resume` kept no expected session id and fell back
+  to post-exit transcript discovery.
+  ([#1555](https://github.com/akitaonrails/ai-memory/pull/1555))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
