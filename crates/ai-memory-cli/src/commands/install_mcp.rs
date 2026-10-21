@@ -4879,8 +4879,11 @@ mod tests {
         let installed = |config: &Config, label: &str| {
             let mut bridges = 0;
             for &client in <McpClient as clap::ValueEnum>::value_variants() {
-                if matches!(client, McpClient::Pi | McpClient::Dsh | McpClient::Zcode) {
-                    continue; // no config file, print-only, and HTTP-only
+                if matches!(
+                    client,
+                    McpClient::Pi | McpClient::Dsh | McpClient::Zcode | McpClient::Hermes
+                ) {
+                    continue; // no config file, print-only, HTTP-only, and YAML print-only
                 }
                 let ext = if matches!(client, McpClient::Codex | McpClient::Grok) {
                     "toml"
@@ -4896,7 +4899,7 @@ mod tests {
                 let names_dir = text.contains("--data-dir") && text.contains(marker.as_str());
                 let expected = match label {
                     "explicit" => text.contains("mcp-bridge"),
-                    "default" => client == McpClient::Muse,
+                    "default" => matches!(client, McpClient::Muse | McpClient::Freebuff),
                     _ => false,
                 };
                 assert_eq!(names_dir, expected, "{label} {client:?}: {text}");
