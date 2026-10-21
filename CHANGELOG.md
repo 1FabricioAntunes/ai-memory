@@ -223,6 +223,15 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- A server profile's `roots` now admit a checkout whose Windows cwd differs
+  from the registered root only in case. `Path::starts_with` compares
+  components byte-exactly, so a root added as `C:\Work\team-b` refused
+  `C:\work\team-b\repo` and every event captured there was dropped as
+  `rejected-outside-roots`, even though the home marker's own path routes
+  already fold case under a drive-letter or UNC root. POSIX roots stay
+  case-sensitive.
+  ([#1538](https://github.com/akitaonrails/ai-memory/pull/1538))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
