@@ -147,6 +147,74 @@ impl IngestGates {
     }
 }
 
+/// Filesystem probes of a caller's cwd that may run at once.
+const CWD_PROBE_MAX_IN_FLIGHT: usize = 4;
+
+/// How long one cwd resolution waits for its probe, permit included.
+const CWD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Runs the hook resolver's filesystem probes of a caller-supplied cwd (git
+/// discovery, canonicalization) off the async workers (#1514).
+///
+/// The cwd names a directory the server has never seen, and one `open()` on
+/// it can block indefinitely: macOS privacy controls (TCC) hold reads of a
+/// protected folder or an external volume for a LaunchAgent binary without
+/// Full Disk Access. On a tokio worker that stalls the worker, and the worker
+/// that last polled the I/O driver takes the accept loop down with it. Each
+/// probe runs on the blocking pool, holding one of a fixed number of permits
+/// until the syscall really returns, so probes that never return pin at most
+/// that many threads, and the caller gives up after a deadline.
+#[derive(Clone)]
+pub struct CwdProbes {
+    permits: Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+}
+
+impl Default for CwdProbes {
+    fn default() -> Self {
+        Self::new(CWD_PROBE_MAX_IN_FLIGHT, CWD_PROBE_TIMEOUT)
+    }
+}
+
+impl CwdProbes {
+    fn new(max_in_flight: usize, timeout: std::time::Duration) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+            timeout,
+        }
+    }
+
+    /// Run `probe` on the blocking pool. Fails when no permit frees up or
+    /// the probe does not finish before the deadline; the event then fails
+    /// rather than routing on a guess, and nothing is cached.
+    async fn run<T: Send + 'static>(
+        &self,
+        cwd: &str,
+        probe: impl FnOnce() -> T + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let finished = async {
+            let permit = self.permits.clone().acquire_owned().await.ok()?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                probe()
+            })
+            .await
+            .ok()
+        };
+        match tokio::time::timeout_at(deadline, finished).await {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(anyhow::anyhow!("inspecting cwd {cwd:?} failed")),
+            Err(_) => Err(anyhow::anyhow!(
+                "inspecting cwd {cwd:?} did not finish within {:?}; on macOS a server \
+                 without Full Disk Access can block on a privacy-protected folder or \
+                 an external volume",
+                self.timeout
+            )),
+        }
+    }
+}
+
 /// Bounded cwd-resolution cache used by the hook router.
 #[derive(Debug)]
 pub struct ProjectCacheStore {
@@ -499,6 +567,9 @@ pub struct HookState {
     /// Project/key gates that serialize an original delivery with an
     /// overlapping retry until the first processor marks completion or exits.
     pub ingest_gates: IngestGates,
+    /// Bounded blocking path for the resolver's filesystem probes of a
+    /// caller's cwd, so a stuck `open()` cannot stall the async workers.
+    pub cwd_probes: CwdProbes,
     /// Per-source ingest rate limiter. The global `ingest_semaphore` is acquired
     /// first for stored events so globally rejected events do not spend source
     /// tokens. Disabled (pass-through) unless configured by the CLI.
@@ -3166,16 +3237,35 @@ async fn resolve_project_ids_inner(
     // match below deliberately keep `cwd_norm` (case-folded) so #806 handoff
     // stickiness is unaffected, and `derive_project_from_cwd` re-normalizes the
     // repo_path it returns regardless of the input casing.
-    let (project_name, repo_path) = match (project_override, cwd_raw, cwd_norm.as_deref()) {
-        (Some(p), _, Some(c)) => (
-            p.to_string(),
-            repo_path_from_project_override(c, p, project_strategy),
-        ),
+    //
+    // Both rungs touch the filesystem at the caller's cwd, so they run through
+    // `cwd_probes`, never on this async worker (#1514).
+    let (project_name, repo_path) = match (project_override, cwd_raw, cwd_norm.clone()) {
+        (Some(p), _, Some(c)) => {
+            let project = p.to_string();
+            let repo_path = state
+                .cwd_probes
+                .run(&c, {
+                    let (c, project) = (c.clone(), project.clone());
+                    move || repo_path_from_project_override(&c, &project, project_strategy)
+                })
+                .await?;
+            (project, repo_path)
+        }
         (Some(p), _, None) => (p.to_string(), None),
-        (None, Some(raw), Some(_)) => match derive_project_from_cwd(raw, project_strategy) {
-            Some(resolved) => resolved,
-            None => return Ok((state.workspace_id, state.project_id)),
-        },
+        (None, Some(raw), Some(_)) => {
+            let owned = raw.to_string();
+            match state
+                .cwd_probes
+                .run(raw, move || {
+                    derive_project_from_cwd(&owned, project_strategy)
+                })
+                .await?
+            {
+                Some(resolved) => resolved,
+                None => return Ok((state.workspace_id, state.project_id)),
+            }
+        }
         _ => {
             // The early-return at the top of the function guards
             // against a cwd-less, override-less event; the explicit
@@ -6891,6 +6981,7 @@ pub(crate) mod tests {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             ingest_gates: IngestGates::default(),
+            cwd_probes: CwdProbes::default(),
             per_user_slots: false,
             mid_session_routing: MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
@@ -7498,6 +7589,104 @@ pub(crate) mod tests {
         // The MCP-shared pointer reflects the most recently resolved
         // project (issue #2) — here, project-beta.
         assert_eq!(state.active_project.get(), Some((ws_b, proj_b)));
+    }
+
+    /// A probe that never returns, like an `open()` macOS privacy controls
+    /// hold, must not run on the async worker (#1514). On this
+    /// current-thread runtime an inline probe would freeze the timer below
+    /// until the probe returned; off the worker the timer fires on time, the
+    /// caller gives up at its deadline, and a second probe waits for the
+    /// held permit instead of pinning another thread.
+    #[tokio::test]
+    async fn cwd_probes_keep_a_stuck_open_off_the_async_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let probes = CwdProbes::new(1, std::time::Duration::from_millis(200));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        // Unblocks the stuck probe from outside the runtime, so a probe run
+        // inline fails the assertions below instead of hanging the test.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = release.send(());
+        });
+        let started = std::time::Instant::now();
+        let (stuck, timer_at) = tokio::join!(
+            probes.run("/Volumes/stuck", move || {
+                let _ = released.recv();
+                "returned"
+            }),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                started.elapsed()
+            }
+        );
+        assert!(
+            timer_at < std::time::Duration::from_millis(400),
+            "the runtime stalled behind the probe for {timer_at:?}"
+        );
+        let err = stuck.expect_err("the caller gives up at the deadline");
+        assert!(err.to_string().contains("Full Disk Access"), "{err}");
+
+        // The stuck probe still holds the only permit: the next one never runs.
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = probes
+            .run("/Volumes/next", {
+                let ran = ran.clone();
+                move || ran.store(true, Ordering::SeqCst)
+            })
+            .await;
+        assert!(second.is_err());
+        assert!(!ran.load(Ordering::SeqCst), "a second blocking thread ran");
+
+        // Once the syscall returns the permit comes back and probes work.
+        releaser.join().unwrap();
+        let healthy = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = probes.run("/w/ok", || 7).await {
+                    break value;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(healthy, 7);
+    }
+
+    /// The resolver's filesystem rungs go through the bounded probe path: with
+    /// no probe able to run, resolving a cwd fails closed instead of probing
+    /// inline or routing on a guess, and caches nothing (#1514).
+    #[tokio::test]
+    async fn cwd_resolution_fails_closed_when_its_probe_cannot_run() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.cwd_probes = CwdProbes::new(0, std::time::Duration::from_millis(20));
+        for project_override in [None, Some("declared")] {
+            let err = resolve_project_ids(
+                &state,
+                Some("/Volumes/ext/project-alpha"),
+                None,
+                project_override,
+                ProjectStrategy::RepoRoot,
+                &ai_memory_core::ActorKey::default(),
+            )
+            .await
+            .expect_err("no probe can run");
+            assert!(err.to_string().contains("did not finish"), "{err}");
+        }
+        assert!(state.project_cache.lock().await.entries.is_empty());
+        assert_eq!(state.active_project.get(), None);
+
+        state.cwd_probes = CwdProbes::default();
+        let (_, proj) = resolve_project_ids(
+            &state,
+            Some("/Volumes/ext/project-alpha"),
+            None,
+            None,
+            ProjectStrategy::RepoRoot,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(proj, state.project_id);
     }
 
     // Catch-all guards on stickiness: a session accidentally started at a
