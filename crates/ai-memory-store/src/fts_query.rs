@@ -382,11 +382,15 @@ fn prepare_fts5_token(token: &str) -> Vec<String> {
     // A known column filter keeps its column when its term needs quoting:
     // `title:ai-memory` becomes `title:("ai-memory" OR "ai memory")`, not a
     // quoted phrase that also searches for the literal word `title`.
+    // A second colon in the term (`title:10:30`) needs that same quoting:
+    // left bare, FTS5 reads the inner `10` as a column name and rejects the
+    // whole expression, so the query degrades to the bag of words — which
+    // drops the filter and searches every column for the word `title`.
     if !token.contains('"')
         && let Some((column, term)) = token.split_once(':')
         && matches!(column, "title" | "body")
         && !term.is_empty()
-        && should_quote_fts5_token(term)
+        && (should_quote_fts5_token(term) || term.contains(':'))
     {
         return vec![format!("{column}:{}", quote_fts5_token(term))];
     }
@@ -837,6 +841,21 @@ mod tests {
                 assert_parses(&prepared);
             }
         }
+    }
+
+    /// A second colon inside a known column's term must not defeat the
+    /// filter. FTS5 reads the inner `10` as a column name and rejects the
+    /// expression, so the whole query degrades to the quoted bag of words:
+    /// that drops the column filter and searches every column for the
+    /// literal word "title", the outcome
+    /// `known_column_filter_survives_quoting_of_its_term` exists to prevent.
+    #[test]
+    fn known_column_filter_survives_a_second_colon_in_its_term() {
+        assert_eq!(
+            prepare_fts5_query("title:10:30"),
+            r#"title:("10:30" OR "10 30")"#
+        );
+        assert_parses(&prepare_fts5_query("title:10:30"));
     }
 
     /// A column filter inside a group keeps its column: the paren attached
