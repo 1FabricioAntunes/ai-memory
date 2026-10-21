@@ -223,6 +223,13 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- The pre-migration backup archive is now flushed and fsynced before it is
+  verified. `finish` returned the buffered writer and it was dropped, so the
+  archive's tail was written by `Drop` — discarding any error — and never put
+  on stable storage, while the verify pass re-read it from the page cache and
+  cleared a destructive in-place migration to run.
+  ([#1525](https://github.com/akitaonrails/ai-memory/pull/1525))
+
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
