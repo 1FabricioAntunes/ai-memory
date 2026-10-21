@@ -684,10 +684,10 @@ unclaimed tree. Building the guard on ai-memory's captured
   the harness.
 - **ai-memory does not retain the file paths.** For closed-tool agents the
   stored observation is reduced to a `tool_family` label plus outcome (and an
-  MCP tool's validated server and tool names); raw
-  arguments, paths, and other tool names are extracted only transiently for
-  denylist matching, then dropped (`CaptureDecision` "never retains raw
-  arguments, paths, or arbitrary tool names"). A consumer can see *that* a file
+  MCP tool's validated server and tool names); raw arguments, paths, and other
+  tool names are extracted only transiently for denylist matching, then dropped
+  (`CaptureDecision` "never retains raw arguments, paths, or arbitrary tool
+  names"). A consumer can see *that* a file
   op happened in a session, never *which file*.
 
 Reversing either (persisting paths, or adding a blocking hook) would trade away a

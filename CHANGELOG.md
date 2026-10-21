@@ -229,7 +229,6 @@ version in [`docs/changelog/`](docs/changelog/):
   the edit and is repointed at the new latest id, so the orphan count and
   detail list disagreed with the page's own backlinks.
   ([#1526](https://github.com/akitaonrails/ai-memory/pull/1526))
-
 - A `title:` or `body:` search filter whose term carries a second colon, such
   as `title:10:30`, now keeps its column. FTS5 read the inner `10` as a column
   name and rejected the whole expression, so the query degraded to the quoted
@@ -241,7 +240,6 @@ version in [`docs/changelog/`](docs/changelog/):
   and a repo on `[recall] default_global` no longer broadens an `as_of` query
   to global and answers it with present-day rows.
   ([#1519](https://github.com/akitaonrails/ai-memory/pull/1519))
-
 - A `429` or `5xx` from a token endpoint is now a transient provider error
   rather than an auth failure. The Copilot token exchange, which GitHub
   rate-limits per account, and the shared `openai-oauth`/OIDC refresh both
@@ -249,20 +247,17 @@ version in [`docs/changelog/`](docs/changelog/):
   instead of trying the next provider and the operator was told to log in
   again for a grant that was never rejected.
   ([#1520](https://github.com/akitaonrails/ai-memory/pull/1520))
-
 - The Gemini embedder now cuts a long input to the same 8 KB head as the
   OpenAI, Copilot and local embedders. It sent the whole page, while the
   default `gemini-embedding-001` takes at most 2,048 input tokens, and a
   refused page embedding is only logged, so a long page could end up with no
   vector. Voyage is unchanged: its API shortens an over-long input itself.
   ([#1513](https://github.com/akitaonrails/ai-memory/pull/1513))
-
-- `memory_auto_improve` now reports an exhausted implicit queue — every
-  completed session already has a review run — as invalid params rather than an
+- `memory_auto_improve` now reports an exhausted implicit queue (every
+  completed session already has a review run) as invalid params instead of an
   internal error, matching `memory_consolidate` for the same dead end. A client
   no longer reads the routine end of the queue as a server fault and retries it.
   ([#1518](https://github.com/akitaonrails/ai-memory/pull/1518))
-
 - The wiki's git objects and refs are now synced to disk. libgit2 renamed them
   into place without fsync, so a power loss could keep a ref naming a commit
   whose object was never written, and every later checkpoint failed. Every
@@ -319,14 +314,12 @@ version in [`docs/changelog/`](docs/changelog/):
   under `.ai-memory-delete.` during a delete, or under
   `.ai-memory-tmp.move-session.` during a session move, is left out the same
   way. ([#1524](https://github.com/akitaonrails/ai-memory/pull/1524))
-
 - The `/hook` ingress now skips a leading UTF-8 byte-order mark, as the native
   hook client already did. Some PowerShell pipelines add that marker when
   writing to a native process, and the POSIX shell hook bundle forwards the
   payload byte for byte, so such an event was answered with 400 and lost
   without notice. `ai-memory-relay enqueue --file` skips the marker too.
   ([#1523](https://github.com/akitaonrails/ai-memory/pull/1523))
-
 - The POSIX shell hook bundle, the PowerShell bundle under PowerShell 7 and the
   generated TypeScript integrations under Bun (OpenCode) no longer send
   their requests through an environment proxy (`http_proxy`, `HTTPS_PROXY`,
