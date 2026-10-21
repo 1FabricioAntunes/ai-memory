@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- A `title:` or `body:` search filter whose term carries a second colon, such
+  as `title:10:30`, now keeps its column. FTS5 read the inner `10` as a column
+  name and rejected the whole expression, so the query degraded to the quoted
+  bag of words: the filter was dropped and every column was searched for the
+  literal word `title`.
+  ([#1521](https://github.com/akitaonrails/ai-memory/pull/1521))
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
