@@ -26,6 +26,8 @@ version in [`docs/changelog/`](docs/changelog/):
   already did. A sandbox such as ai-jail exports a proxy with an empty
   `NO_PROXY`, and its filtering proxy answered the bridge's loopback
   `initialize` with 405, so Claude Code reported `CONNECTION_CLOSED`.
+  ([#1504](https://github.com/akitaonrails/ai-memory/pull/1504))
+
 - Bound native API-key hashes to their configured pepper with a persisted
   Argon2id verifier. A restored database with existing keys now refuses to
   serve under a different `[auth].token_pepper` instead of silently making
