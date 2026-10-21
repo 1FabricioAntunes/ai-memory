@@ -57,7 +57,7 @@ pub(crate) async fn post_codex_responses(
         });
     }
     if body.stream {
-        parse_sse_response(&response_text_limited(response).await?)
+        parse_sse_response(&response_text_limited(response).await?, body.model)
     } else {
         response_json_limited::<CodexResponsesResponse>(response).await
     }
