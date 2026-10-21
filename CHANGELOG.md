@@ -223,6 +223,11 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- `ai-memory run` now refuses an `--env`/`--env-file` entry whose key carries
+  whitespace. `--env-file` lines are trimmed as a whole, not per half, so the
+  common dotenv spelling `KEY = value` produced a key with a trailing space —
+  an entry no shell or harness can read, so the override silently did nothing.
+  ([#1532](https://github.com/akitaonrails/ai-memory/pull/1532))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
