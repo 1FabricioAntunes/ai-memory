@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- The OKF migration now conforms a page nested under a project bundle whose
+  file is named `index.md`. Only the bundle root's own `index.md` is reserved,
+  but the skip matched on the basename at any depth, so the database row was
+  conformed while its file kept pre-OKF frontmatter — and markdown being the
+  source of truth, the next reindex de-conformed the page again.
+  ([#1557](https://github.com/akitaonrails/ai-memory/pull/1557))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
