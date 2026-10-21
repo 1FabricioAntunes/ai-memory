@@ -267,6 +267,21 @@ from hook paths.
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
 
+**Session-start continuity notice:** `GET /handoff` also names a session that
+was cut off without ending. It reads the project's sessions ordered by their
+newest prompt, tool, stop or compaction observation over the last seven days
+(`ReaderPool::recent_session_activity`, owner-filtered on the session row). It
+adds a notice when the newest one is not the receiver's own session, neither
+ended nor wrote a handoff after that work (a per-turn checkpoint baton covers
+the turn it closed), and is newer than both the receiver's own work and any
+handoff being delivered. The notice carries only the agent kind, session id, age and
+scope names, never captured text, and points at
+`memory_read_session_observations`. A client that re-fetches on every prompt
+sends `profile_digest=0` after the first, which also stops the notice.
+`memory_briefing` lists the same ordering as `recent_sessions`, and
+`memory_handoff_list` names the session as `newer_unended_session` when it is
+newer than every open handoff.
+
 **Session-start project brief:** when the project's marker sets
 `[briefing] inject_on_session_start`, `GET /handoff` appends a brief of the
 project's pinned, `_rules/` and `_slots/` pages, packed into `[briefing]

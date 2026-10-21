@@ -138,6 +138,16 @@ wrapper-owned variables `AI_MEMORY_RUN_ID`, `AI_MEMORY_WORKSTREAM_ID`, and
 unfinished task. This covers quota exhaustion and other abrupt exits where the
 outgoing harness cannot prepare a handoff.
 
+Outside a managed run there is no dossier, but the server still sees the cut-off
+session's captured observations. When the newest work in the project belongs to
+another session of the same operator that never ended and left no handoff after
+that work,
+`GET /handoff` adds a metadata-only notice (agent kind, session id, age) that
+tells the agent to read that session with `memory_read_session_observations`,
+newest first. `memory_briefing` (`recent_sessions`) and `memory_handoff_list`
+(`newer_unended_session`) expose the same pointer to clients whose session start
+injects nothing.
+
 The dossier is evidence, not instructions: it is fenced as untrusted history,
 contains no hidden reasoning or unsupported/private records, and disappears
 when the child exits. The remote ai-memory server never receives its path or
