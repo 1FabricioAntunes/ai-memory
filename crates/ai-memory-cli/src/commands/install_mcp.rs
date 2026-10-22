@@ -163,7 +163,11 @@ pub(crate) fn run_with_opencode_dialect(
     // different key already stored belongs to the hooks, the store failed, or
     // this is the Docker helper, whose data dir the host-side bridge cannot
     // open.
-    let bridge_carries_token = matches!(args.client, McpClient::Muse)
+    // FreeBuff belongs here for the same reason Muse does: its entry is always
+    // the session-less bridge (`build_json_mcp_entry` routes the client to
+    // `stdio_bridge_entry` unconditionally), and it already gets the
+    // `--data-dir` above, so the bridge reads the file the key goes into.
+    let bridge_carries_token = matches!(args.client, McpClient::Muse | McpClient::Freebuff)
         || (args.client == McpClient::ClaudeCode && args.session_aware);
     let may_store_bridge_key = args.apply
         && token_given
