@@ -477,7 +477,7 @@ fn push_html_escaped(out: &mut String, input: &str) {
     }
 }
 
-fn serialize_highlighted_snippet<S>(snippet: &String, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_highlighted_snippet<S>(snippet: &str, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {

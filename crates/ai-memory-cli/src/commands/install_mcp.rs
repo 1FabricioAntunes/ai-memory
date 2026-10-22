@@ -6388,10 +6388,33 @@ mod tests {
              #\n\
              [mcp_servers.ai-memory]\n\
              url = \"http://127.0.0.1:49374/mcp\"\n\
-             # Skip per-call approval prompts on ai-memory's tools.\n\
-             # ai-memory is read-mostly + writes are auto-capture; the\n\
-             # approval friction makes it unusable otherwise.\n\
-             default_tools_approval_mode = \"approve\"\n"
+             # Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n\
+             default_tools_approval_mode = \"approve\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_feedback]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n"
         );
 
         let mut with_token = args_with_token(McpClient::Codex);
@@ -6402,13 +6425,36 @@ mod tests {
              #\n\
              [mcp_servers.ai-memory]\n\
              url = \"http://127.0.0.1:49374/mcp\"\n\
-             # Skip per-call approval prompts on ai-memory's tools.\n\
-             # ai-memory is read-mostly + writes are auto-capture; the\n\
-             # approval friction makes it unusable otherwise.\n\
+             # Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n\
              default_tools_approval_mode = \"approve\"\n\
              \n\
              [mcp_servers.ai-memory.http_headers]\n\
              Authorization = \"Bearer test-token-deadbeef\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_feedback]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n\
              # Alternative (avoids embedding the literal token):\n\
              # bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\"\n\
              # — and export AI_MEMORY_AUTH_TOKEN in your shell init.\n"
@@ -6424,11 +6470,34 @@ mod tests {
                  #\n\
                  [mcp_servers.ai-memory]\n\
                  url = \"http://127.0.0.1:49374/mcp\"\n\
-                 # Skip per-call approval prompts on ai-memory's tools.\n\
-                 # ai-memory is read-mostly + writes are auto-capture; the\n\
-                 # approval friction makes it unusable otherwise.\n\
+                 # Skip per-call approval prompts on ai-memory's read tools;\n\
+                 # the destructive ones below still ask first.\n\
                  default_tools_approval_mode = \"approve\"\n\
                  bearer_token_env_var = \"{PRIME_AGENT_TOKEN_ENV}\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_feedback]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_forget_sweep]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_handoff_accept]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_handoff_cancel]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_message_cancel]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_message_pop]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+                 approval_mode = \"prompt\"\n\
                  # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
             )
         );

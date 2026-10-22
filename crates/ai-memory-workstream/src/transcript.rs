@@ -9723,7 +9723,7 @@ mod tests {
             exported
                 .losses
                 .iter()
-                .any(|loss| loss.contains("history.jsonl is missing")),
+                .any(|loss| loss.contains("history.jsonl and brain transcript are missing")),
             "{:?}",
             exported.losses
         );

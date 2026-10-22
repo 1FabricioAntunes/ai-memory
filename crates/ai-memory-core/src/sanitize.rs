@@ -406,7 +406,7 @@ impl Sanitizer {
             let secret_group = re.capture_names().any(|name| name == Some("secret"));
             patterns.push(Pattern {
                 re,
-                label: *label,
+                label,
                 secret_group,
             });
         }
