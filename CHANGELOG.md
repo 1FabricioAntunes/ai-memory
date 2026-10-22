@@ -291,6 +291,10 @@ version in [`docs/changelog/`](docs/changelog/):
   handed it to the parser, so the operator saw `serde: EOF while parsing a
   value at line 1 column 0`, naming neither the model nor the cause.
   ([#1529](https://github.com/akitaonrails/ai-memory/pull/1529))
+- Detected `core.hooksPath` when a git config set it on the same physical
+  line as the `[core]` section header, so `ai-memory-wikisync install-hook`
+  no longer writes a `.git/hooks/post-merge` that git would never run.
+  ([#1530](https://github.com/akitaonrails/ai-memory/pull/1530))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
