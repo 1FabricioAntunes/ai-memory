@@ -3005,6 +3005,9 @@ impl AiMemoryServer {
         // Explain-only: per-stream timings of the primary search, summed over
         // `scopes`. `None` on the normal path, which reads no clocks for it.
         let mut timings: Option<ai_memory_store::StreamTimings> = None;
+        // Whether any page matched the query's own terms; see the
+        // raw-observation fallback below.
+        let mut lexical_match = false;
         // Session pages are shared and every operator's observations may vote
         // for them, but observation text (a hit's excerpt, explain's
         // observation ids, the raw fallback) follows the session timeline's
@@ -3036,6 +3039,7 @@ impl AiMemoryServer {
         }
         .map(|outcome| {
             timings = outcome.timings;
+            lexical_match = outcome.lexical_match;
             outcome.hits
         });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -3054,7 +3058,11 @@ impl AiMemoryServer {
         // for explicit `scopes` — the recommended scope-bleed mitigation —
         // by searching observations in each resolved (ws, proj) and
         // rank-merging, so the fallback isn't lost on the scoped path.
-        let raw_hits = if !hits.is_empty() || filtered {
+        // Hits the vector streams alone found do not count as a match: they
+        // have no similarity floor, so with an embedder they answer every
+        // query and would otherwise hide observations from sessions that
+        // have no page yet.
+        let raw_hits = if (!hits.is_empty() && lexical_match) || filtered {
             Vec::new()
         } else if let Some(scopes) = &resolved_scopes {
             let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
