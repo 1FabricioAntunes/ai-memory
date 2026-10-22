@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `/api/v1/search` no longer tells the browser it may reuse a search response
+  for 30 seconds. The handler takes an owner filter that reaches the hybrid
+  ranker, so both the ranking and each hit's observation snippet depend on who
+  asked, and a credential switch at the same URL inside that window could be
+  answered from the browser cache without the filtering path running. The
+  endpoint now sends `private, no-store`, as every other owner-scoped route in
+  the same module already does.
+  ([#1571](https://github.com/akitaonrails/ai-memory/pull/1571))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
