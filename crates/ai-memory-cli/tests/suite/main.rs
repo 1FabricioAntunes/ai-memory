@@ -11,6 +11,7 @@ mod backfill_dry_run;
 mod backfill_e2e;
 mod backfill_failures;
 mod backfill_member;
+mod backfill_oversized;
 mod backup_agents;
 mod backup_download;
 mod completions;
