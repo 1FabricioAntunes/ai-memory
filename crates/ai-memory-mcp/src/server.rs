@@ -2600,31 +2600,25 @@ impl AiMemoryServer {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<(
-        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
-        Option<ai_memory_store::StreamTimings>,
-    )> {
+    ) -> ai_memory_store::StoreResult<ai_memory_store::HybridSearchOutcome> {
         self.search_scopes(&[(workspace_id, project_id)], options)
             .await
     }
 
     /// Fused hits over `scopes` through the shared hybrid ranker
-    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes`]), the same call
-    /// the web search makes.
+    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes_outcome`]), the
+    /// same ranking the web search uses.
     async fn search_scopes(
         &self,
         scopes: &[(WorkspaceId, ProjectId)],
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<(
-        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
-        Option<ai_memory_store::StreamTimings>,
-    )> {
+    ) -> ai_memory_store::StoreResult<ai_memory_store::HybridSearchOutcome> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = options.include_expired.then_some(i64::MIN);
         self.reader
-            .hybrid_search_scopes(
+            .hybrid_search_scopes_outcome(
                 scopes,
                 ai_memory_store::HybridSearch {
                     query: options.query,
@@ -3040,9 +3034,9 @@ impl AiMemoryServer {
                 .await?;
             self.search_project(ws, proj, options).await
         }
-        .map(|(hits, search_timings)| {
-            timings = search_timings;
-            hits
+        .map(|outcome| {
+            timings = outcome.timings;
+            outcome.hits
         });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let rerank_started = (explain && self.rerank.is_some()).then(std::time::Instant::now);
@@ -3133,7 +3127,7 @@ impl AiMemoryServer {
                     if current == scope.as_tuple() {
                         Vec::new()
                     } else {
-                        let (hits, _) = self
+                        let ai_memory_store::HybridSearchOutcome { hits, .. } = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
@@ -3204,7 +3198,7 @@ impl AiMemoryServer {
                     .await
                 {
                     Ok(Some(scope)) if scope.as_tuple() != current => {
-                        let (hits, _) = self
+                        let ai_memory_store::HybridSearchOutcome { hits, .. } = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
