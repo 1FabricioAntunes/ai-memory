@@ -44,7 +44,8 @@ same as with a name.
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
-[CLAUDE.md §16](../CLAUDE.md) for the invariant.
+[AGENTS.md, invariant 9](../AGENTS.md#cross-cutting-invariants-do-not-violate)
+for the live-process guard.
 
 
 ## What "deleted" means (`purge-session`, `purge-project`, `delete-workspace`)
