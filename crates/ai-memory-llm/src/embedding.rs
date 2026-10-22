@@ -124,7 +124,8 @@ pub async fn embed_search_query(embedder: &dyn Embedder, query: &str) -> Option<
             debug!(
                 provider = embedder.provider(),
                 model = embedder.model(),
-                "embedding capacity busy; degrading search to FTS5 + entity + graph"
+                "embedding capacity stayed busy past the bounded query wait; \
+                 degrading search to FTS5 + entity + graph"
             );
             None
         }

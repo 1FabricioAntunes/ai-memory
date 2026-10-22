@@ -11,6 +11,21 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a 3.2.0 regression that serialized local document embedding and
+  dropped the vector stream from queries that raced a document embed: the
+  local embedder's capacity was hardcoded to two slots (one document, one
+  query), and a query finding both busy degraded instantly to lexical
+  search. The scheduler is now sized from the CPU (half the available
+  parallelism, clamped to between 2 and 6 slots, documents capped at
+  capacity minus one so a slot stays query-reserved), and a query waits up
+  to 250 ms for a slot before degrading. On the affected LongMemEval-S
+  question set this restores query latency (p50/p95 66/87 ms vs 3.2.0's
+  118/295) and ingest throughput; the reported hit@5 delta (0.947 → 0.938)
+  traces to rank-boundary questions that flip between identical runs, not
+  a deterministic ranking change (#1580).
+
 ## [3.2.0] - 2026-10-21
 
 ### Added

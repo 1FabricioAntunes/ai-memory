@@ -16,7 +16,9 @@ use ai_memory_hooks::{
     CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
     WorkstreamState, hook_router, workstream_router,
 };
-use ai_memory_llm::{Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder};
+use ai_memory_llm::{
+    Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder, local_capacity,
+};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
@@ -3063,10 +3065,15 @@ async fn configure_embedder(
     );
     let embedder = provider_health.wrap_embedder(embedder, provider_name, model, dim);
     let embedder: Arc<dyn Embedder> = if is_local {
-        // all-MiniLM inference parallelizes internally. A single background
-        // document slot plus one reserved query slot avoids CPU oversubscription
-        // while keeping interactive vector retrieval available during writes.
-        Arc::new(EmbeddingCapacity::new(embedder, 2)?)
+        // all-MiniLM inference parallelizes internally, so capacity bounds
+        // concurrent calls rather than threads. Sizing from the CPU count
+        // recovers the ingest throughput a single background document slot
+        // lost (#1580) while keeping one slot query-reserved; see
+        // `local_capacity` for the halve-and-clamp rationale.
+        let cores = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(4);
+        Arc::new(EmbeddingCapacity::new(embedder, local_capacity(cores))?)
     } else {
         embedder
     };
