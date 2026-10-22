@@ -1743,7 +1743,7 @@ impl From<ai_memory_store::PageHitWithMeta> for GlobalSearchHit {
             id: hit.id,
             path: hit.path,
             title: hit.title,
-            snippet: hit.snippet,
+            snippet: ai_memory_store::highlighted_snippet_html(&hit.snippet),
             rank: hit.rank,
             workspace: hit.workspace_name,
             project: hit.project_name,

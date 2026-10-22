@@ -194,7 +194,11 @@ async fn an_observation_hit_lifts_its_own_session_page() {
     assert!((details.fused - details.rrf.observation).abs() < 1e-12);
     // The page had no snippet of its own for these words, so the bounded,
     // already-sanitized observation excerpt explains the hit.
-    assert!(hit.snippet.contains("<mark>"), "{}", hit.snippet);
+    assert!(
+        ai_memory_store::highlighted_snippet_html(&hit.snippet).contains("<mark>"),
+        "{}",
+        hit.snippet
+    );
     assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
     assert!(!hit.title.is_empty());
 }
@@ -574,7 +578,8 @@ async fn an_untitled_session_page_keeps_the_observation_excerpt() {
     let hits = search(&store, ws, proj, "heron").await;
     assert_eq!(hits.len(), 1);
     assert!(
-        hits[0].0.snippet.contains("<mark>heron</mark>"),
+        ai_memory_store::highlighted_snippet_html(&hits[0].0.snippet)
+            .contains("<mark>heron</mark>"),
         "{}",
         hits[0].0.snippet
     );

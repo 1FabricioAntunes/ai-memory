@@ -87,10 +87,10 @@ pub use reader::{
     AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
     CrossProjectEdge, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
-    FeedbackFinding, GraphVia, HealthDetail, HealthPage, HybridSearch, HybridSearchOutcome,
-    IdleOpenSession, InboxCount, InboxEntry, LinkGraph, LinkGraphEdge, LinkGraphNode,
-    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult,
-    ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
+    FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
+    HybridSearch, HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, LinkGraph,
+    LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
     PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
     PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
     PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
@@ -101,7 +101,7 @@ pub use reader::{
     SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
     SessionPromptTitles, SessionSummary, SessionToolTitles, SettledPage, StatusCounts,
     StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -2481,7 +2481,7 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "alpha.md");
-        assert!(hits[0].snippet.contains("<mark>quick</mark>"));
+        assert!(highlighted_snippet_html(&hits[0].snippet).contains("<mark>quick</mark>"));
 
         // Supersede: only the latest version should appear in counts'
         // pages_latest, and search should still return exactly one hit.
@@ -3628,7 +3628,7 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, session_id);
-        assert!(hits[0].snippet.contains("<mark>zebra</mark>"));
+        assert!(highlighted_snippet_html(&hits[0].snippet).contains("<mark>zebra</mark>"));
     }
 
     /// The public writer API only accepts `Sanitized<NewObservation>`, and

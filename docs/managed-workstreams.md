@@ -739,7 +739,7 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
 | OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`, or the XDG session directory described below |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
-| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts only from `~/.gemini/antigravity-cli/history.jsonl` (assistant and tool steps come from lifecycle-hook capture) |
+| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts from `history.jsonl`, falling back to that conversation's bounded `brain/<id>/.system_generated/logs/transcript{,_full}.jsonl` for print mode (assistant and tool steps come from lifecycle-hook capture) |
 | GitHub Copilot CLI | generated `--session-id` | `--resume=<id>` | `$COPILOT_HOME/session-state/<uuid>/events.jsonl` (`COPILOT_HOME` defaults to `~/.copilot`) |
 
 OMP's agent directory is `~/.omp/agent` for the default profile and

@@ -269,11 +269,7 @@ impl LlmProvider for OpenAiOAuthProvider {
         // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
         // an empty string to serde, so the caller saw "EOF while parsing a value
         // at line 1 column 0", which names neither the model nor the cause.
-        let Some(text) = extract_output_text(&response).filter(|t| !t.trim().is_empty()) else {
-            return Err(LlmError::EmptyContent {
-                model: self.model.clone(),
-            });
-        };
+        let text = require_output_text(&response, &self.model)?;
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
     }
 }
@@ -584,6 +580,17 @@ pub(crate) fn extract_output_text(response: &CodexResponsesResponse) -> Option<S
         .filter_map(|content| content.text.as_deref())
         .find(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+pub(crate) fn require_output_text(
+    response: &CodexResponsesResponse,
+    model: &str,
+) -> LlmResult<String> {
+    extract_output_text(response)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| LlmError::EmptyContent {
+            model: model.to_owned(),
+        })
 }
 
 fn extract_account_id_from_jwt(token: &str) -> Option<String> {
@@ -1010,5 +1017,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(extract_output_text(&nested).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn responses_structured_output_requires_non_blank_text() {
+        for response in [
+            serde_json::from_value(json!({"output": []})).unwrap(),
+            serde_json::from_value(json!({"output_text": " \n\t", "output": []})).unwrap(),
+        ] {
+            let error = require_output_text(&response, "gpt-empty")
+                .expect_err("missing or blank Responses output must be empty content");
+            assert_eq!(error.class(), "empty-content");
+            assert!(matches!(error, LlmError::EmptyContent { model } if model == "gpt-empty"));
+        }
     }
 }

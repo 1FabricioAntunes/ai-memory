@@ -1430,8 +1430,10 @@ handoff are built with them. Each prompt is keyed as `backfill` keys it, so a
 re-close stores it once and a prompt typed after the first finalize arrives
 with the next. A checkout the capture allowlist does not admit sends none,
 `--all-owners` replays none (other users' prompts are not in this machine's
-history), and a missing or unreadable `history.jsonl` only prints a warning.
-`agy -p` runs write no `history.jsonl` line, so they have no prompt to replay.
+history). When history is missing or yields no prompt, export falls back to
+the selected conversation's bounded, containment-checked brain transcript and
+keeps only explicit user-input steps. `agy -p` writes no `history.jsonl` line,
+so this fallback supplies its prompt.
 
 Rerun `ai-memory install-hooks --agent antigravity-cli --apply` after
 upgrading. An install from an earlier release runs its `session-start` handler

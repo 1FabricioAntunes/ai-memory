@@ -426,6 +426,63 @@ const OBSERVATION_STREAM_IDS_PER_PAGE: usize = 3;
 /// window; an observation body usually does, and a full window made each
 /// excerpt-backed hit cost more context than the page hit it stands in for.
 const OBSERVATION_SNIPPET_TOKENS: usize = 16;
+/// Internal FTS highlight delimiters. Durable text crosses the sanitizer,
+/// which strips both control characters, so page content cannot impersonate
+/// a match. Presentation boundaries translate these markers to HTML or remove
+/// them for plain-text/model input.
+pub const FTS_HIGHLIGHT_START: &str = "\u{1e}";
+/// Closing delimiter paired with [`FTS_HIGHLIGHT_START`].
+pub const FTS_HIGHLIGHT_END: &str = "\u{1f}";
+
+/// Remove internal FTS highlight delimiters without altering page text.
+#[must_use]
+pub fn plain_snippet(snippet: &str) -> String {
+    snippet
+        .replace(FTS_HIGHLIGHT_START, "")
+        .replace(FTS_HIGHLIGHT_END, "")
+}
+
+/// Render an internal FTS snippet as safe HTML, preserving only highlights
+/// produced by SQLite. All page text, including literal `<mark>` tags, is
+/// escaped before it reaches an HTML `|safe` boundary or JSON frontend.
+#[must_use]
+pub fn highlighted_snippet_html(snippet: &str) -> String {
+    let mut out = String::with_capacity(snippet.len());
+    let mut rest = snippet;
+    while let Some(at) = rest.find(FTS_HIGHLIGHT_START) {
+        let after = &rest[at + FTS_HIGHLIGHT_START.len()..];
+        let Some(close) = after.find(FTS_HIGHLIGHT_END) else {
+            break;
+        };
+        push_html_escaped(&mut out, &rest[..at]);
+        out.push_str("<mark>");
+        push_html_escaped(&mut out, &after[..close]);
+        out.push_str("</mark>");
+        rest = &after[close + FTS_HIGHLIGHT_END.len()..];
+    }
+    push_html_escaped(&mut out, rest);
+    out
+}
+
+fn push_html_escaped(out: &mut String, input: &str) {
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+fn serialize_highlighted_snippet<S>(snippet: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&highlighted_snippet_html(snippet))
+}
 /// A project's first and last observation rowid, bound to `?1` = project id.
 ///
 /// `idx_observations_project` is `(project_id)` with the implicit rowid
@@ -1282,7 +1339,9 @@ pub struct PageHit {
     pub path: PagePath,
     /// Page title.
     pub title: String,
-    /// FTS5 snippet of the body around the matched terms (HTML-marked).
+    /// FTS5 snippet of the body around matched terms. Internally delimited;
+    /// serialized as safe HTML with `<mark>` around genuine matches.
+    #[serde(serialize_with = "serialize_highlighted_snippet")]
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
@@ -1586,7 +1645,9 @@ pub struct PageHitWithMeta {
     pub path: PagePath,
     /// Page title.
     pub title: String,
-    /// FTS5 snippet of the body around the matched terms (HTML-marked).
+    /// FTS5 snippet of the body around matched terms. Internally delimited;
+    /// serialized as safe HTML with `<mark>` around genuine matches.
+    #[serde(serialize_with = "serialize_highlighted_snippet")]
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
@@ -1604,6 +1665,7 @@ pub struct ObservationHit {
     /// Observation title.
     pub title: String,
     /// FTS5 snippet of the raw observation body around the matched terms.
+    #[serde(serialize_with = "serialize_highlighted_snippet")]
     pub snippet: String,
     /// FTS5 rank score (lower is better).
     pub rank: f64,
@@ -2902,7 +2964,7 @@ impl ReaderPool {
                 readable_repository_filter("pages.project_id", viewer, 4);
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, char(30), char(31), '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
@@ -3059,7 +3121,7 @@ impl ReaderPool {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, char(30), char(31), '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind, pages.id \
                  FROM pages_fts \
@@ -3262,7 +3324,7 @@ impl ReaderPool {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, char(30), char(31), '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
@@ -3421,7 +3483,7 @@ impl ReaderPool {
             let limit_placeholder = 7 + kept_params.len();
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, char(30), char(31), '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
@@ -3795,7 +3857,7 @@ impl ReaderPool {
             let mut stmt = conn.prepare(&format!(
                 "SELECT observations.id, observations.session_id, observations.kind, \
                         observations.title, \
-                        snippet(observations_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(observations_fts, 1, char(30), char(31), '…', 24) AS snip, \
                         observations_fts.rank, observations.created_at \
                  FROM observations_fts \
                  JOIN observations ON observations.rowid = observations_fts.rowid \
@@ -3980,7 +4042,7 @@ impl ReaderPool {
                 // and re-enters FTS once per row, which is far slower.
                 let mut stmt = tx.prepare(&format!(
                     "SELECT observations.id, observations.session_id, \
-                            snippet(observations_fts, 1, '<mark>', '</mark>', '…', \
+                            snippet(observations_fts, 1, char(30), char(31), '…', \
                                     {OBSERVATION_SNIPPET_TOKENS}) \
                      FROM observations_fts \
                      CROSS JOIN observations ON observations.rowid = observations_fts.rowid \

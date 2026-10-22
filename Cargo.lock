@@ -346,6 +346,7 @@ dependencies = [
  "ai-memory-core",
  "anyhow",
  "jiff",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

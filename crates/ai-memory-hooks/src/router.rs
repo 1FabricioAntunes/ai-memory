@@ -1792,7 +1792,10 @@ async fn fetch_and_accept_handoff_at(
             busy_since,
         )
         .await?;
-    let handoff_md = handoff.as_ref().map(render_handoff_markdown);
+    let claude_capped = agent == AgentKind::ClaudeCode;
+    let handoff_md = handoff.as_ref().map(|handoff| {
+        render_handoff_markdown_with_budget(handoff, claude_capped.then_some(CLAUDE_HANDOFF_CHARS))
+    });
     // The brief is additive and non-destructive: unlike the handoff (a
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
@@ -1816,9 +1819,16 @@ async fn fetch_and_accept_handoff_at(
         }
     };
     let profile_flags = persist_profile_flags(state, &query, ws, proj, may_write_profile).await;
-    let profile_md =
-        render_requested_profile_digest(state, &query, ws, proj, viewer, profile_flags.consume)
-            .await;
+    let profile_md = render_requested_profile_digest(
+        state,
+        &query,
+        ws,
+        proj,
+        viewer,
+        profile_flags.consume,
+        claude_capped.then_some(CLAUDE_PROFILE_CHARS),
+    )
+    .await;
     // Handoff right after the profile digest: it is a short curated pointer
     // and must not be buried under a ledger that can run tens of KB. The
     // existing ledger-then-brief order is preserved. Claim both single-use inputs only after every
@@ -1998,21 +2008,15 @@ async fn fetch_and_accept_handoff_at(
     // while everything after it changes every session, so leading with it
     // keeps it in the reusable part of the harness's prompt cache (design:
     // docs/design-cross-project-profile.md §3).
-    Ok(combine_handoff_and_brief(
+    Ok(combine_startup_context(
+        agent,
         profile_md,
-        combine_handoff_and_brief(
-            handoff_md,
-            combine_handoff_and_brief(
-                handoff_notice,
-                combine_handoff_and_brief(
-                    continuity_notice,
-                    combine_handoff_and_brief(
-                        managed_md,
-                        combine_handoff_and_brief(brief_md, inbox_notice),
-                    ),
-                ),
-            ),
-        ),
+        handoff_md,
+        handoff_notice,
+        continuity_notice,
+        managed_md,
+        brief_md,
+        inbox_notice,
     ))
 }
 
@@ -2440,6 +2444,7 @@ async fn render_requested_profile_digest(
     project_id: ProjectId,
     viewer: Option<ai_memory_core::UserId>,
     consume: bool,
+    budget_cap: Option<usize>,
 ) -> Option<String> {
     if !state.profile.inject_on_session_start
         || !consume
@@ -2492,6 +2497,7 @@ async fn render_requested_profile_digest(
     } else {
         state.profile.digest_budget()
     };
+    let budget = budget_cap.map_or(budget, |cap| budget.min(cap));
     ai_memory_core::profile::render_digest(
         &inputs.entries,
         &inputs.project_tags,
@@ -2511,6 +2517,87 @@ fn combine_handoff_and_brief(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+const CLAUDE_ADDITIONAL_CONTEXT_CHARS: usize = 9_800;
+const CLAUDE_PROFILE_CHARS: usize = 2_400;
+const CLAUDE_HANDOFF_CHARS: usize = 4_800;
+
+#[allow(clippy::too_many_arguments)]
+fn combine_startup_context(
+    agent: AgentKind,
+    profile: Option<String>,
+    handoff: Option<String>,
+    handoff_notice: Option<String>,
+    continuity_notice: Option<String>,
+    managed: Option<String>,
+    brief: Option<String>,
+    inbox: Option<String>,
+) -> Option<String> {
+    if agent != AgentKind::ClaudeCode {
+        return combine_handoff_and_brief(
+            profile,
+            combine_handoff_and_brief(
+                handoff,
+                combine_handoff_and_brief(
+                    handoff_notice,
+                    combine_handoff_and_brief(
+                        continuity_notice,
+                        combine_handoff_and_brief(managed, combine_handoff_and_brief(brief, inbox)),
+                    ),
+                ),
+            ),
+        );
+    }
+
+    // Mandatory signals are selected first but retain their normal display
+    // order. Optional ledger/brief material is admitted only when the whole
+    // response stays inline under Claude Code's fixed 10k hook ceiling.
+    let sections = [profile, handoff, handoff_notice, continuity_notice, inbox];
+    let mut selected = [false; 5];
+    let mut used = 0usize;
+    let mut selected_count = 0usize;
+    // Continue-work signals outrank the profile when an unusually large
+    // combination approaches Claude Code's fixed hook-response ceiling.
+    for index in [1, 2, 3, 4, 0] {
+        if let Some(section) = sections[index].as_ref() {
+            let separator = usize::from(selected_count > 0);
+            if used + separator + section.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS {
+                used += separator + section.chars().count();
+                selected[index] = true;
+                selected_count += 1;
+            }
+        }
+    }
+    let mut kept = sections
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, section)| selected[index].then_some(section).flatten())
+        .collect::<Vec<_>>();
+    for (section, omission_notice) in [
+        (
+            managed,
+            Some(
+                "ai-memory: additional managed-workstream history did not fit Claude Code's inline startup limit. Search the complete visible ledger with `ai-memory workstream-search \"<query>\"`; this managed process already carries the workstream id.",
+            ),
+        ),
+        (brief, None),
+    ] {
+        if let Some(section) = section {
+            let separator = usize::from(!kept.is_empty());
+            if used + separator + section.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS {
+                used += separator + section.chars().count();
+                kept.push(section);
+            } else if let Some(notice) = omission_notice {
+                let notice_chars = notice.chars().count();
+                if used + separator + notice_chars <= CLAUDE_ADDITIONAL_CONTEXT_CHARS {
+                    used += separator + notice_chars;
+                    kept.push(notice.to_owned());
+                }
+            }
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join("\n"))
 }
 
 /// Default char budget for the session-start brief (~1k tokens at the
@@ -2942,7 +3029,7 @@ fn render_session_brief(
     Some(buf)
 }
 
-fn render_handoff_markdown(h: &Handoff) -> String {
+fn render_handoff_markdown_with_budget(h: &Handoff, budget: Option<usize>) -> String {
     // Layout goal: TUI-renderable + agent-friendly. The previous
     // shape put a paragraph-long `## Summary` first, which made the
     // hook output look like a wall of text in Codex's "completed"
@@ -2991,6 +3078,18 @@ fn render_handoff_markdown(h: &Handoff) -> String {
     buf.push_str(h.content.summary.trim());
     buf.push('\n');
     escape_untrusted_history_tail(&mut buf, history_start);
+    if let Some(budget) = budget {
+        let footer_room = UNTRUSTED_HISTORY_END.chars().count() + 520;
+        let ceiling = budget.saturating_sub(footer_room).max(history_start);
+        if buf.chars().count() > ceiling {
+            let cut = buf
+                .char_indices()
+                .nth(ceiling)
+                .map_or(buf.len(), |(at, _)| at);
+            buf.truncate(cut);
+            buf.push_str("\n[handoff detail omitted to fit this harness's startup limit]\n");
+        }
+    }
     buf.push('\n');
     buf.push_str(UNTRUSTED_HISTORY_END);
     buf.push('\n');
@@ -7433,6 +7532,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn claude_startup_context_stays_inline_and_keeps_must_see_notices() {
+        let output = combine_startup_context(
+            AgentKind::ClaudeCode,
+            Some("profile".repeat(300)),
+            Some("HANDOFF".repeat(500)),
+            Some("handoff notice".into()),
+            Some("continuity notice".into()),
+            Some("managed ledger".repeat(2_000)),
+            Some("project brief".repeat(2_000)),
+            Some("INBOX NOTICE".into()),
+        )
+        .unwrap();
+
+        assert!(output.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS);
+        assert!(output.contains("HANDOFF"));
+        assert!(output.contains("continuity notice"));
+        assert!(output.contains("INBOX NOTICE"));
+        assert!(!output.contains("managed ledger"));
+        assert!(!output.contains("project brief"));
+    }
+
+    #[test]
+    fn claude_startup_context_prioritizes_continuation_over_a_large_profile() {
+        let output = combine_startup_context(
+            AgentKind::ClaudeCode,
+            Some("profile".repeat(1_400)),
+            Some("HANDOFF".repeat(600)),
+            Some("HANDOFF NOTICE".repeat(40)),
+            Some("CONTINUITY NOTICE".repeat(40)),
+            None,
+            None,
+            Some("INBOX NOTICE".repeat(40)),
+        )
+        .unwrap();
+
+        assert!(output.chars().count() <= CLAUDE_ADDITIONAL_CONTEXT_CHARS);
+        assert!(output.contains("HANDOFF"));
+        assert!(output.contains("HANDOFF NOTICE"));
+        assert!(output.contains("CONTINUITY NOTICE"));
+        assert!(output.contains("INBOX NOTICE"));
+        assert!(!output.contains("profile"));
+    }
+
+    #[test]
     fn automatic_memory_blocks_mark_dynamic_content_as_untrusted() {
         let handoff = Handoff {
             scope: ai_memory_core::HandoffScope {
@@ -7464,7 +7607,7 @@ pub(crate) mod tests {
                 accepted_by_user: None,
             },
         };
-        let rendered = render_handoff_markdown(&handoff);
+        let rendered = render_handoff_markdown_with_budget(&handoff, None);
         let warning = rendered
             .find(ai_memory_core::UNTRUSTED_MEMORY_NOTICE)
             .expect("handoff must include the trust boundary");

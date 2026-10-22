@@ -1450,6 +1450,8 @@ fn run_powershell_wrapper_with_fake_native(
             ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo autowire: %AI_MEMORY_RUN_AUTOWIRE%\r\n",
             "if not defined AI_MEMORY_RUN_AUTOWIRE ",
             ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo autowire: unset\r\n",
+            "if defined AI_MEMORY_AUTH__BEARER_TOKEN_FILE ",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo bearer-file: %AI_MEMORY_AUTH__BEARER_TOKEN_FILE%\r\n",
             "exit /b %AI_MEMORY_TEST_NATIVE_EXIT%\r\n",
         ),
     )
@@ -1457,7 +1459,12 @@ fn run_powershell_wrapper_with_fake_native(
     let docker = tmp.path().join("docker.cmd");
     std::fs::write(
         &docker,
-        "@echo off\r\n>>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\nexit /b 0\r\n",
+        concat!(
+            "@echo off\r\n",
+            ">>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\n",
+            "echo %* | findstr /c:\"auth-tokens/default\" >nul && echo test-volume-token\r\n",
+            "exit /b 0\r\n",
+        ),
     )
     .unwrap();
 
@@ -1480,6 +1487,7 @@ fn run_powershell_wrapper_with_fake_native(
         .env("AI_MEMORY_TEST_NATIVE_EXIT", "7")
         .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env("LOCALAPPDATA", tmp.path())
         .env_remove("AI_MEMORY_DATA_DIR")
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("AI_MEMORY_RUN_AUTOWIRE");
@@ -3641,6 +3649,28 @@ mod slow {
         assert!(
             native_log.contains("autowire: true"),
             "an explicit AI_MEMORY_RUN_AUTOWIRE must win; got {native_log}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_hooks_refreshes_the_volume_bearer_for_managed_launches() {
+        let (code, native_log, docker_log) = run_powershell_wrapper_with_fake_native(
+            &["install-hooks", "--agent", "claude-code"],
+            &[],
+        );
+        assert_eq!(code, Some(7));
+        assert!(
+            native_log.contains("argv: install-hooks --agent claude-code"),
+            "native install must receive the original argv; got {native_log}"
+        );
+        assert!(
+            native_log.contains("bearer-file:"),
+            "native install must receive the refreshed bearer path; got {native_log}"
+        );
+        assert!(
+            docker_log.contains("auth-tokens/default"),
+            "setup must read the configured bearer from the named volume; got {docker_log}"
         );
     }
 

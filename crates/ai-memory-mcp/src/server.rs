@@ -926,7 +926,7 @@ async fn rerank_page_hits(
             |(hit, _)| ai_memory_llm::RerankCandidate {
                 id: hit.id.to_string(),
                 title: hit.title.clone(),
-                snippet: hit.snippet.clone(),
+                snippet: ai_memory_store::plain_snippet(&hit.snippet),
             },
             |(_, explain), relevance| {
                 if let Some(explain) = explain.as_mut() {
@@ -7689,7 +7689,7 @@ fn build_answer_request(
     reasoning: ReasoningTier,
 ) -> ai_memory_llm::ChatRequest {
     fn clean(snippet: &str) -> String {
-        snippet.replace("<mark>", "").replace("</mark>", "")
+        ai_memory_store::plain_snippet(snippet)
     }
     let mut user = String::new();
     user.push_str("## Question\n\n");

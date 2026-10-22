@@ -105,8 +105,67 @@ function Get-NativeHostBin {
     exit 127
 }
 
+$VolumeTokenFile = if ($env:LOCALAPPDATA) {
+    Join-Path $env:LOCALAPPDATA "ai-memory\server-token"
+} else {
+    Join-Path $HOME ".local\share\ai-memory\server-token"
+}
+
+function Test-VolumeTokenApplies {
+    if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("AI_MEMORY_AUTH_TOKEN")) -or
+        -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("AI_MEMORY_AUTH__BEARER_TOKEN_FILE"))) {
+        return $false
+    }
+    return -not ($env:AI_MEMORY_DATA_DIR -and
+        (Test-Path -LiteralPath $env:AI_MEMORY_DATA_DIR -PathType Container))
+}
+
+function Use-VolumeToken {
+    if ((Test-VolumeTokenApplies) -and
+        (Test-Path -LiteralPath $VolumeTokenFile -PathType Leaf) -and
+        (Get-Item -LiteralPath $VolumeTokenFile).Length -gt 0) {
+        $env:AI_MEMORY_AUTH__BEARER_TOKEN_FILE = $VolumeTokenFile
+    }
+}
+
+# Refresh once during native hook setup. Managed launches stay independent of
+# the container engine and reuse this host copy, matching the POSIX wrapper.
+function Update-VolumeToken {
+    if (-not (Test-VolumeTokenApplies)) {
+        return
+    }
+    if (-not (Get-Command $Docker -ErrorAction SilentlyContinue)) {
+        Use-VolumeToken
+        return
+    }
+    $PreviousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        $Token = (& $Docker run --rm -v "${DataVolume}:/data:ro" --entrypoint /bin/sh $Image -c 'if grep -qs ''^[[:space:]]*bearer_token_file[[:space:]]*=[[:space:]]*"auth-tokens/default"'' /data/config.toml; then cat /data/auth-tokens/default 2>/dev/null; fi; exit 0' 2>$null)
+        $Succeeded = $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $PreviousErrorAction
+    }
+    if (-not $Succeeded) {
+        Use-VolumeToken
+        return
+    }
+    $Token = ([string]$Token).Trim()
+    if ([string]::IsNullOrEmpty($Token)) {
+        Remove-Item -LiteralPath $VolumeTokenFile -Force -ErrorAction SilentlyContinue
+        return
+    }
+    $TokenDir = Split-Path -Parent $VolumeTokenFile
+    New-Item -ItemType Directory -Force -Path $TokenDir | Out-Null
+    $Temporary = "$VolumeTokenFile.tmp.$PID"
+    [IO.File]::WriteAllText($Temporary, "$Token`n", [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $Temporary -Destination $VolumeTokenFile -Force
+    Use-VolumeToken
+}
+
 if ((Get-WrapperSubcommand $CommandArgs) -in $NativeHostCommands) {
     $NativeBin = Get-NativeHostBin
+    Use-VolumeToken
     # The intercepted commands run on the host, so AI_MEMORY_SERVER_URL is
     # inherited untouched: the client's own default (http://127.0.0.1:49374)
     # already reaches the port Docker Desktop publishes there; an explicit
@@ -122,6 +181,14 @@ if ((Get-WrapperSubcommand $CommandArgs) -in $NativeHostCommands) {
     if ($null -eq [Environment]::GetEnvironmentVariable("AI_MEMORY_RUN_AUTOWIRE")) {
         $env:AI_MEMORY_RUN_AUTOWIRE = "false"
     }
+    & $NativeBin @CommandArgs
+    exit $LASTEXITCODE
+}
+
+if ((Get-WrapperSubcommand $CommandArgs) -eq "install-hooks" -and
+    [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("AI_MEMORY_HOOK_PLATFORM"))) {
+    $NativeBin = Get-NativeHostBin
+    Update-VolumeToken
     & $NativeBin @CommandArgs
     exit $LASTEXITCODE
 }

@@ -1361,7 +1361,7 @@ async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSear
                 path: meta.path,
                 project: meta.project_name,
                 rank: hit.rank,
-                snippet: hit.snippet,
+                snippet: ai_memory_store::highlighted_snippet_html(&hit.snippet),
                 title: hit.title,
                 workspace: meta.workspace_name,
             });

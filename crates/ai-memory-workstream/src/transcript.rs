@@ -4189,15 +4189,18 @@ fn export_antigravity(
         Some((path, file, len))
     });
     let Some((history, mut file, len)) = opened else {
-        losses.push(
-            "Antigravity history.jsonl is missing or unreadable; no user prompts were imported"
-                .into(),
-        );
+        let events = antigravity_brain_prompt_events(home, session_dir, session, &mut losses);
+        if events.is_empty() {
+            losses.push(
+                "Antigravity history.jsonl and brain transcript are missing or unreadable; no user prompts were imported"
+                    .into(),
+            );
+        }
         losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
         return Ok(ExportedTranscript {
             native_session_id: session.to_string(),
             source_cursor: None,
-            events: Vec::new(),
+            events,
             losses,
         });
     };
@@ -4227,6 +4230,7 @@ fn export_antigravity(
     let mut offset = start;
     let mut line = Vec::new();
     let mut prompts: Vec<HistoryPrompt> = Vec::new();
+    let mut saw_session_prompt = false;
     // Unlabelled prompts from this checkout that could have opened it.
     let mut openers: Vec<HistoryPrompt> = Vec::new();
     loop {
@@ -4294,6 +4298,7 @@ fn export_antigravity(
                 losses.push("Antigravity shell commands were intentionally excluded".into());
             }
             (Some(_), AntigravityHistoryKind::Prompt) => {
+                saw_session_prompt = true;
                 if in_checkout(entry.workspace) {
                     prompts.push(prompt());
                 } else {
@@ -4343,6 +4348,17 @@ fn export_antigravity(
             prompt.metadata,
         );
     }
+    // A prompt explicitly attributed to this conversation but typed in a
+    // different checkout is authoritative scope evidence. Falling back to
+    // the conversation-wide brain log here would re-admit the rejected text.
+    if events.is_empty() && !saw_session_prompt {
+        events.extend(antigravity_brain_prompt_events(
+            home,
+            session_dir,
+            session,
+            &mut losses,
+        ));
+    }
     losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -4357,7 +4373,182 @@ fn export_antigravity(
     })
 }
 
-const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only user prompts from history.jsonl were imported";
+const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only explicit user prompts were imported";
+
+const MAX_ANTIGRAVITY_BRAIN_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ANTIGRAVITY_BRAIN_LINE_BYTES: usize = 1024 * 1024;
+
+fn antigravity_brain_prompt_events(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    losses: &mut Vec<String>,
+) -> Vec<NewWorkstreamEvent> {
+    let session_root = session_root(ManagedHarness::Antigravity, home, session_dir);
+    let Some(root) = session_root.parent() else {
+        return Vec::new();
+    };
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let logs = root
+        .join("brain")
+        .join(session)
+        .join(".system_generated")
+        .join("logs");
+    let opened = ["transcript.jsonl", "transcript_full.jsonl"]
+        .into_iter()
+        .map(|name| logs.join(name))
+        .find_map(|candidate| open_contained_antigravity_transcript(&root, &candidate));
+    let Some(file) = opened else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let start = offset;
+        let read = match read_bounded_line(
+            &mut reader,
+            MAX_ANTIGRAVITY_BRAIN_LINE_BYTES,
+            b"USER_INPUT",
+            &mut line,
+            &mut Sha256::new(),
+        ) {
+            Ok(BoundedLine::Line(read)) => read,
+            Ok(BoundedLine::Oversized { read, mentions }) => {
+                offset += read;
+                if mentions {
+                    losses.push("oversized Antigravity brain prompt records were skipped".into());
+                }
+                continue;
+            }
+            Ok(BoundedLine::Eof | BoundedLine::Partial) => break,
+            Err(_) => {
+                losses.push("Antigravity brain transcript became unreadable".into());
+                break;
+            }
+        };
+        offset += read;
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        let Some((text, step, created_at)) = antigravity_brain_prompt(raw) else {
+            continue;
+        };
+        let hash = format!("{:x}", Sha256::digest(raw));
+        let record = format!("brain-{}-{}", step.unwrap_or(start), &hash[..16]);
+        push_event(
+            &mut events,
+            AgentKind::AntigravityCli,
+            session,
+            &record,
+            0,
+            WorkstreamEventKind::Message,
+            Some("user"),
+            &text,
+            created_at,
+            json!({"source": "brain-transcript"}),
+        );
+    }
+    events
+}
+
+fn open_contained_antigravity_transcript(root: &Path, path: &Path) -> Option<File> {
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(root) || fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&canonical)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = File::open(&canonical).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ANTIGRAVITY_BRAIN_BYTES {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let descriptor = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+        if descriptor != canonical {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+fn antigravity_brain_prompt(raw: &[u8]) -> Option<(String, Option<u64>, Option<String>)> {
+    if !raw
+        .windows(b"USER_INPUT".len())
+        .any(|window| window.eq_ignore_ascii_case(b"USER_INPUT"))
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    let step = value.as_object()?;
+    let kind = step.get("type")?.as_str()?.trim().to_ascii_uppercase();
+    if kind != "USER_INPUT" && !kind.ends_with("_USER_INPUT") {
+        return None;
+    }
+    if let Some(source) = step.get("source") {
+        let source = source.as_str()?.trim().to_ascii_uppercase();
+        if source != "USER_EXPLICIT" && !source.ends_with("_USER_EXPLICIT") {
+            return None;
+        }
+    }
+    let content = antigravity_content_text(step.get("content")?)?;
+    let text = antigravity_user_request_text(&content).trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let index = step.get("step_index").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    });
+    let created_at = step
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| value.parse::<jiff::Timestamp>().is_ok())
+        .map(str::to_owned);
+    Some((text, index, created_at))
+}
+
+fn antigravity_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(part) => part.get("text").and_then(Value::as_str).map(str::to_owned),
+        Value::Array(parts) => {
+            let text: Vec<&str> = parts
+                .iter()
+                .filter_map(|part| {
+                    part.as_str()
+                        .or_else(|| part.get("text").and_then(Value::as_str))
+                })
+                .collect();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn antigravity_user_request_text(content: &str) -> &str {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    let Some(start) = content.find(OPEN) else {
+        return content;
+    };
+    let inner = &content[start + OPEN.len()..];
+    inner.find(CLOSE).map_or(inner, |end| &inner[..end])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AntigravityHistoryKind {
@@ -9155,6 +9346,23 @@ mod tests {
         fs::write(root.parent().unwrap().join("history.jsonl"), body).unwrap();
     }
 
+    fn write_antigravity_brain(root: &Path, lines: &[Value]) {
+        let logs = root
+            .parent()
+            .unwrap()
+            .join("brain")
+            .join(AG_MINE)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let mut body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push('\n');
+        fs::write(logs.join("transcript.jsonl"), body).unwrap();
+    }
+
     async fn export_antigravity_fixture(
         fixture: &AntigravityFixture,
         cursor: Option<&str>,
@@ -9216,6 +9424,107 @@ mod tests {
             "other conversations are not this session's losses: {:?}",
             exported.losses
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_print_mode_falls_back_to_explicit_brain_prompts() {
+        let fixture = antigravity_fixture();
+        write_antigravity_brain(
+            &fixture.root,
+            &[
+                json!({
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "print-mode prompt",
+                    "created_at": "2026-10-22T12:00:00Z"
+                }),
+                json!({
+                    "step_index": 2,
+                    "type": "USER_INPUT",
+                    "source": "HOOK",
+                    "content": "injected canary"
+                }),
+                json!({
+                    "step_index": 3,
+                    "type": "TOOL_OUTPUT",
+                    "content": "USER_INPUT canary in tool output"
+                }),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["print-mode prompt"]);
+        assert_eq!(
+            exported.events[0].metadata,
+            json!({"source": "brain-transcript"})
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_brain_fallback_does_not_re_admit_foreign_workspace_prompts() {
+        let fixture = antigravity_fixture();
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                Some(AG_MINE),
+                &fixture.other,
+                "foreign history prompt",
+                AG_PAST,
+            )],
+        );
+        write_antigravity_brain(
+            &fixture.root,
+            &[json!({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": "foreign brain prompt"
+            })],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another workspace")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_brain_fallback_refuses_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = antigravity_fixture();
+        let outside = fixture.temp.path().join("outside");
+        fs::create_dir_all(outside.join(".system_generated/logs")).unwrap();
+        fs::write(
+            outside.join(".system_generated/logs/transcript.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "escape canary"
+                })
+            ),
+        )
+        .unwrap();
+        let brain = fixture.root.parent().unwrap().join("brain");
+        fs::create_dir_all(&brain).unwrap();
+        symlink(&outside, brain.join(AG_MINE)).unwrap();
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
     }
 
     /// `agy --conversation=<id>` run from another directory keeps the id but
