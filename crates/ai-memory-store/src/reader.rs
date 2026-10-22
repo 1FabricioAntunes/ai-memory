@@ -7433,7 +7433,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<(Vec<(PageHit, SearchExplain)>, StreamTimings)> {
-        let (hits, timings) = self
+        let (hits, timings, _) = self
             .hybrid_search_inner(
                 workspace_id,
                 project_id,
@@ -7498,7 +7498,7 @@ impl ReaderPool {
         let mut timings: Option<StreamTimings> = None;
         let mut per_scope = Vec::with_capacity(scopes.len());
         for &(workspace_id, project_id) in scopes {
-            let (hits, scope_timings) = self
+            let (hits, scope_timings, _) = self
                 .hybrid_search_inner(
                     workspace_id,
                     project_id,
@@ -7597,7 +7597,7 @@ impl ReaderPool {
         include_superseded: bool,
         owner_filter: &OwnerFilter,
         filter: PageFilter<'_>,
-    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings)> {
+    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings, bool)> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Stream timings exist only for explain: `explain.then(Instant::now)`
         // reads no clock on the normal path.
@@ -7754,6 +7754,13 @@ impl ReaderPool {
         } else {
             Vec::new()
         };
+
+        // Whether a stream that matches the query's own terms found a page.
+        // The vector streams have no similarity floor, so once any page has
+        // an embedding they answer every query, and graph expansion follows
+        // their seeds: a result without one of these is not a match.
+        let lexical_match =
+            !fts_hits.is_empty() || !entity_hits.is_empty() || !observation_votes.is_empty();
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
@@ -8078,7 +8085,7 @@ impl ReaderPool {
                 hit.superseded = superseded.contains(&hit.id);
             }
         }
-        Ok((out, timings))
+        Ok((out, timings, lexical_match))
     }
 
     /// The subset of `page_ids` that are superseded (non-latest) versions in
@@ -15052,9 +15059,9 @@ mod tests {
                 super::PageFilter::default(),
             )
         };
-        let (_, off) = search(false).await.unwrap();
+        let (_, off, _) = search(false).await.unwrap();
         assert_eq!(off, super::StreamTimings::default());
-        let (_, on) = search(true).await.unwrap();
+        let (_, on, _) = search(true).await.unwrap();
         assert!(on.fts_ms.is_some() && on.entity_ms.is_some() && on.graph_ms.is_some());
         assert!(on.observation_ms.is_some(), "the stream is on by default");
         assert!(on.vector_ms.is_none(), "no query vector, no vector scan");
