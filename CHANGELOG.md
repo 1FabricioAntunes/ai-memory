@@ -13,7 +13,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- Corrected the Docker rollback instructions to retag the prior digest and recreate the service without pulling the newer tag.
+- Corrected the Docker rollback instructions to retag the prior digest and recreate the service without pulling the newer tag. ([#1585](https://github.com/akitaonrails/ai-memory/pull/1585))
 
 ## [3.2.0] - 2026-10-21
 
