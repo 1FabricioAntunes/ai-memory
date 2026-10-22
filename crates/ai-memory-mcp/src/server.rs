@@ -7315,6 +7315,27 @@ fn select_bumpable(
 }
 
 impl AiMemoryServer {
+    /// Names of the tools annotated `destructive_hint = true`, sorted.
+    /// `install-mcp` gives each a per-tool approval prompt in clients that
+    /// support one, so a new destructive tool inherits it from its
+    /// annotation.
+    #[must_use]
+    pub fn destructive_tool_names() -> Vec<String> {
+        let mut names: Vec<String> = Self::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|tool| {
+                tool.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.destructive_hint)
+                    == Some(true)
+            })
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// The latest version id of a page in an already-authorized scope.
     async fn latest_page_id(
         &self,
@@ -8757,6 +8778,21 @@ mod tests {
     #[tokio::test]
     async fn server_constructs_with_tool_router() {
         let (_tmp, _store, _server, _ws, _pj) = setup_server().await;
+    }
+
+    #[test]
+    fn destructive_tool_names_follow_the_annotations() {
+        let names = AiMemoryServer::destructive_tool_names();
+        for destructive in [
+            "memory_delete_page",
+            "memory_forget_sweep",
+            "memory_message_pop",
+        ] {
+            assert!(names.iter().any(|name| name == destructive), "{names:?}");
+        }
+        for read_only in ["memory_query", "memory_recent", "memory_status"] {
+            assert!(!names.iter().any(|name| name == read_only), "{names:?}");
+        }
     }
 
     #[tokio::test]

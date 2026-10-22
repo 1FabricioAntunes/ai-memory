@@ -43,6 +43,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `--with-config`. Reported by @FabioLeitao.
   ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
 
+- `install-mcp --client codex` now makes Codex ask before running ai-memory's
+  destructive tools. The read tools still run without a prompt; every tool
+  annotated destructive (deleting or restoring a page, the forget sweep,
+  accepting or cancelling a handoff, popping or cancelling messages, recall
+  feedback) gets a per-tool `approval_mode = "prompt"`, and a re-install keeps
+  per-tool settings you already chose. Re-run `install-mcp --client codex
+  --apply` to update an existing entry. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added

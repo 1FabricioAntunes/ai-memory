@@ -1333,6 +1333,15 @@ docker run --rm akitaonrails/ai-memory:latest \
         --auth-token "$TOKEN"
 ```
 
+The Codex entry `install-mcp` writes sets `default_tools_approval_mode =
+"approve"`, so ai-memory's read tools run without a prompt, and adds
+`[mcp_servers.<name>.tools.<tool>]` with `approval_mode = "prompt"` for every
+tool annotated destructive (`memory_delete_page`, `memory_forget_sweep`,
+`memory_restore_page`, the handoff accept and cancel tools, the message pop and
+cancel tools, and `memory_feedback`), so Codex asks before running them. A
+re-install keeps any per-tool `approval_mode` you set yourself. Both keys are in
+Codex's [configuration reference](https://developers.openai.com/codex/config-reference).
+
 Native Codex tool hooks use top-level `tool_name`, `tool_input`, `tool_response`,
 and `tool_use_id` fields (verified against CLI 0.154.0). ai-memory records the
 tool family and call ID on `PreToolUse` and `PostToolUse`; recognized tools such
