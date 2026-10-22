@@ -354,3 +354,61 @@ async fn cjk_stream_honours_a_title_column_filter() {
         "the CJK stream ignored the title filter: {paths:?}"
     );
 }
+
+#[tokio::test]
+async fn cjk_search_finds_a_word_written_with_the_iteration_mark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "app").await;
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "daily.md",
+            "運用",
+            "日々の作業ログを残す。",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "country.md",
+            "概要",
+            "日本の明日の予定。",
+        ))
+        .await
+        .unwrap();
+
+    // Control: the decoy IS indexed and IS findable on its own terms, so its
+    // absence below means 日々 matched as a unit rather than nothing matching.
+    let decoy = store
+        .reader
+        .search_pages_for_project(ws, project, "日本".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = decoy.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(
+        paths.contains(&"country.md"),
+        "control search failed: {paths:?}"
+    );
+
+    let iterated = store
+        .reader
+        .search_pages_for_project(ws, project, "日々".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = iterated.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(
+        paths.contains(&"daily.md"),
+        "日々 was not findable as a unit: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"country.md"),
+        "日々 degraded to a bare 日 character match: {paths:?}"
+    );
+}

@@ -310,6 +310,16 @@ fn is_cjk(ch: char) -> bool {
         ch as u32,
         0x1100..=0x11ff
             | 0x2e80..=0x2fff
+            // CJK Symbols and Punctuation holds a handful of LETTERS among its
+            // punctuation: the iteration marks 々 〆 〻 and the kana repeat
+            // marks. 々 is how 日々, 時々, 人々, 我々 and 様々 are written, so
+            // excluding the block split those words into single scalars on both
+            // the index and the query side, leaving the character-only match
+            // the bigrams exist to prevent. The `is_alphanumeric` guard above
+            // keeps the block's actual punctuation (、 。 「) out.
+            | 0x3005..=0x3006
+            | 0x3031..=0x3035
+            | 0x303b
             | 0x3040..=0x30ff
             | 0x3130..=0x318f
             | 0x31f0..=0x31ff
@@ -518,6 +528,15 @@ mod tests {
             "日 本 語 日本 本語 テ ス ト テス スト"
         );
         assert_eq!(cjk_index_terms("plain latin"), "");
+        // The iteration mark is a letter in CJK Symbols and Punctuation and
+        // must continue a run, or 日々 is indexed as two one-char runs and is
+        // unfindable as a unit.
+        assert_eq!(
+            cjk_index_terms("日々の作業"),
+            "日 々 の 作 業 日々 々の の作 作業"
+        );
+        // Control: the punctuation sharing that block still breaks a run.
+        assert_eq!(cjk_index_terms("日、本"), "日 本");
     }
 
     #[test]
@@ -568,6 +587,19 @@ mod tests {
         let unknown = prepare_cjk_fts5_query("author:支付服务").unwrap();
         assert_eq!(unknown, "\"支付 付服 服务\"");
         assert_parses(&unknown);
+    }
+
+    #[test]
+    fn cjk_queries_keep_the_japanese_iteration_mark() {
+        let query = prepare_cjk_fts5_query("日々").unwrap();
+        assert_eq!(query, "\"日々\"");
+        assert_parses(&query);
+        // Control: the same block's punctuation still separates two runs,
+        // so this is a widened letter range and not a widened block.
+        assert_eq!(
+            prepare_cjk_fts5_query("日、本"),
+            Some("\"日\" OR \"本\"".to_string())
+        );
     }
 
     #[test]
