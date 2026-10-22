@@ -26,6 +26,13 @@ version in [`docs/changelog/`](docs/changelog/):
   Reported by @FabioLeitao.
   ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
 
+- Tightened how client commands decide that a server URL is on this machine
+  before using the install's root token. The check now reads the host the
+  HTTP client would connect to and refuses any URL that carries user
+  information. `ai-memory upgrade` uses the same check for its remote-server
+  note. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added

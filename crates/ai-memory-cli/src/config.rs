@@ -1260,7 +1260,7 @@ fn apply_bearer_token_file(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) 
 fn discover_root_token(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) {
     if non_empty(auth.bearer_token.as_deref()).is_some()
         || ctx.config_file_exists
-        || !crate::commands::hook_spool::is_loopback_url(ctx.server_url)
+        || !crate::http_client::is_loopback_url(ctx.server_url)
     {
         return;
     }
@@ -4567,6 +4567,24 @@ mod tests {
             },
         );
         assert!(remote.auth.bearer_token.is_none());
+
+        // Nor a remote server whose URL starts with a loopback name: the text
+        // before `@` is user information, not the host.
+        for url in [
+            "http://localhost:80@attacker.example",
+            "http://127.0.0.1:49374@attacker.example/",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            plant_root_token(tmp.path());
+            let disguised = load_without_config(
+                tmp.path(),
+                RuntimeEnv {
+                    server_url: Some(url.into()),
+                    ..RuntimeEnv::default()
+                },
+            );
+            assert!(disguised.auth.bearer_token.is_none(), "{url}");
+        }
 
         // A registered profile named `default` owns that file (#992).
         let tmp = TempDir::new().unwrap();
