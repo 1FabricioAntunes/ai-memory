@@ -3841,6 +3841,13 @@ will refuse to open that data dir (it fails closed rather than risk
 corruption), so take a `ai-memory backup` before upgrading if you might need
 to roll back to the previous version.
 
+If startup instead reports that the **migration history has a gap**, an
+earlier migration is missing even though a later one is recorded. This can
+occur with a development build whose migration sequence differed from the
+released sequence. Keep a backup and report the missing migration and the
+build used to create the store for review; startup does not automatically
+repair the history or apply the skipped migration.
+
 ### Upgrading to 3.0
 
 3.0 removes the 1.x `user add`, `user expire`, `user revive` and

@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected the startup error for a gap in SQLite migration history. A
+  skipped earlier migration is now reported as missing from the history,
+  instead of claiming the store is newer than the binary. The store still
+  refuses to open until its migration history can be reviewed (#1612).
+
 ## [3.2.1] - 2026-10-22
 
 ### Fixed
