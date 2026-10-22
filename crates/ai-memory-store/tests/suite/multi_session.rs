@@ -4536,3 +4536,67 @@ async fn memory_health_ignores_expired_pages() {
     assert!(p_detail.duplicates.is_empty());
     assert_eq!(p_detail.orphans.len(), 2);
 }
+
+/// The briefing's `pages_latest` must agree with the page lists in the same
+/// snapshot: an expired page is hidden from every one of them, so counting it
+/// in the headline makes the brief advertise a page the agent cannot reach.
+#[tokio::test]
+async fn briefing_pages_latest_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let live_pages = store
+        .reader
+        .list_unexpired_pages("acme", "shared-app")
+        .await
+        .unwrap();
+    assert_eq!(live_pages.len(), 1, "one of the two pages is expired");
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        project.counts.pages_latest,
+        live_pages.len() as u64,
+        "project pages_latest counts only the unexpired latest page"
+    );
+    assert_eq!(
+        project.recent_pages.len(),
+        1,
+        "control: the list the count is supposed to agree with holds one page"
+    );
+    // Control: the all-versions total is deliberately TTL-blind, so a fix that
+    // merely broke both counts the same way cannot satisfy this test.
+    assert_eq!(
+        project.counts.pages_all, 2,
+        "control: pages_all stays the raw all-versions total"
+    );
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.counts.pages_latest, 1);
+    assert_eq!(workspace.counts.pages_all, 2);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.counts.pages_latest, 1);
+    assert_eq!(global.counts.pages_all, 2);
+}

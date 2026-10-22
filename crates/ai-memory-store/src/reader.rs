@@ -1669,7 +1669,10 @@ pub struct ObservationPageResult {
 /// by `ai-memory status`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StatusCounts {
-    /// Pages with `is_latest = 1`.
+    /// Pages with `is_latest = 1`. The briefing surfaces
+    /// ([`ReaderPool::briefing`] and its scoped variants) additionally exclude
+    /// TTL-expired pages, so there the count matches what their own page lists
+    /// can contain.
     pub pages_latest: u64,
     /// All page versions including superseded ones.
     pub pages_all: u64,
@@ -8621,7 +8624,18 @@ impl ReaderPool {
             let cutoff_30d = now_us - 30 * day_us;
 
             let counts = StatusCounts {
-                pages_latest: count(conn, "SELECT COUNT(*) FROM pages WHERE is_latest = 1")?,
+                // Every page list in this snapshot hides TTL-expired pages, so
+                // the headline count has to hide them too or the brief
+                // advertises pages the agent cannot see anywhere in it.
+                // `pages_all` is deliberately the raw all-versions total.
+                pages_latest: count_bound(
+                    conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM pages WHERE is_latest = 1{not_expired}",
+                        not_expired = not_expired("pages", "?1"),
+                    ),
+                    &[&now_us],
+                )?,
                 pages_all: count(conn, "SELECT COUNT(*) FROM pages")?,
                 sessions: count(conn, "SELECT COUNT(*) FROM sessions")?,
                 observations: count(conn, "SELECT COUNT(*) FROM observations")?,
@@ -8780,11 +8794,15 @@ impl ReaderPool {
             let cutoff_30d = now_us - 30 * day_us;
 
             let counts = StatusCounts {
-                pages_latest: count_project(
+                // See the TTL note in `briefing_with_slot_visibility`.
+                pages_latest: count_bound(
                     conn,
-                    "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
-                    workspace_id,
-                    project_id,
+                    &format!(
+                        "SELECT COUNT(*) FROM pages \
+                         WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired}",
+                        not_expired = not_expired("pages", "?3"),
+                    ),
+                    &[workspace_id.as_bytes(), project_id.as_bytes(), &now_us],
                 )?,
                 pages_all: count_project(
                     conn,
@@ -9293,12 +9311,15 @@ impl ReaderPool {
             let cutoff_30d = now_us - 30 * day_us;
 
             let counts = StatusCounts {
-                pages_latest: count_workspace(
+                // See the TTL note in `briefing_with_slot_visibility`.
+                pages_latest: count_bound(
                     conn,
                     &format!(
-                        "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1{visible}"
+                        "SELECT COUNT(*) FROM pages \
+                         WHERE workspace_id = ?1 AND is_latest = 1{visible}{not_expired}",
+                        not_expired = not_expired("pages", "?2"),
                     ),
-                    workspace_id,
+                    &[workspace_id.as_bytes(), &now_us],
                 )?,
                 pages_all: count_workspace(
                     conn,
