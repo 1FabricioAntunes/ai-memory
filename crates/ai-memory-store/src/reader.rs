@@ -1098,6 +1098,20 @@ pub struct HybridSearch<'a> {
     pub filter: PageFilter<'a>,
 }
 
+/// What [`ReaderPool::hybrid_search_scopes_outcome`] found.
+#[derive(Debug, Default)]
+pub struct HybridSearchOutcome {
+    /// The fused hits, as [`ReaderPool::hybrid_search_scopes`] returns them.
+    pub hits: Vec<(PageHit, Option<SearchExplain>)>,
+    /// Summed per-stream timings; `Some` only for an explained search.
+    pub timings: Option<StreamTimings>,
+    /// Whether page FTS, the entity stream or the observation stream found a
+    /// page in any scope. When false, every hit came from the vector streams
+    /// (which have no similarity floor) or their graph neighbours, so the
+    /// compiled wiki holds nothing that matches the query's own terms.
+    pub lexical_match: bool,
+}
+
 /// Per-query wall time of each retrieval stream, in milliseconds, for an
 /// `explain=true` query. Measured only on the explained path, so a normal
 /// query takes no clock readings for it. A `None` field is a stream that did
@@ -7483,6 +7497,20 @@ impl ReaderPool {
         scopes: &[(WorkspaceId, ProjectId)],
         search: HybridSearch<'_>,
     ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, Option<StreamTimings>)> {
+        let outcome = self.hybrid_search_scopes_outcome(scopes, search).await?;
+        Ok((outcome.hits, outcome.timings))
+    }
+
+    /// [`Self::hybrid_search_scopes`] plus whether any scope matched the
+    /// query's own terms ([`HybridSearchOutcome::lexical_match`]).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn hybrid_search_scopes_outcome(
+        &self,
+        scopes: &[(WorkspaceId, ProjectId)],
+        search: HybridSearch<'_>,
+    ) -> StoreResult<HybridSearchOutcome> {
         // Provider/model/dim only select which stored vectors are eligible;
         // with no query vector the vector stream never runs, so the empty
         // triple is inert rather than a fake identity.
@@ -7496,9 +7524,10 @@ impl ReaderPool {
             None => (None, String::new(), String::new(), 0),
         };
         let mut timings: Option<StreamTimings> = None;
+        let mut lexical_match = false;
         let mut per_scope = Vec::with_capacity(scopes.len());
         for &(workspace_id, project_id) in scopes {
-            let (hits, scope_timings, _) = self
+            let (hits, scope_timings, scope_lexical_match) = self
                 .hybrid_search_inner(
                     workspace_id,
                     project_id,
@@ -7520,6 +7549,7 @@ impl ReaderPool {
                     .get_or_insert_with(Default::default)
                     .accumulate(&scope_timings);
             }
+            lexical_match |= scope_lexical_match;
             per_scope.push(hits);
         }
         let hits = if per_scope.len() == 1 {
@@ -7560,7 +7590,11 @@ impl ReaderPool {
         } else {
             hits
         };
-        Ok((hits, timings))
+        Ok(HybridSearchOutcome {
+            hits,
+            timings,
+            lexical_match,
+        })
     }
 
     /// The streams [`Self::hybrid_search_scopes`] runs for a query, in the
