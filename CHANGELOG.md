@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory status` now reports an unreadable recovery journal while the
+  server is down. The offline recovery hint read the journal error, used it to
+  decide whether to print anything, then printed neither branch's copy of it:
+  a truncated `recovery-journal.json` left the human line saying `repair
+  unrecorded runs (0 journaled)` and the `--json` line saying
+  `{"journal_pending": 0, "spool_pending": 0}`, a machine-readable all-clear
+  for a journal that cannot be parsed.
+  ([#1573](https://github.com/akitaonrails/ai-memory/pull/1573))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
