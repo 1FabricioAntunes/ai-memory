@@ -124,7 +124,10 @@ main() {
     log "Skipping RPM spec check (rpmspec unavailable)"
   fi
 
-  TMP_ROOT="$(mktemp -d /tmp/ai-memory-native-root.XXXXXX)"
+  # Honor TMPDIR: mktemp ignores it once the template carries an explicit
+  # directory, and a host whose /tmp is small or quota-limited would reject
+  # the writes below.
+  TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-native-root.XXXXXX")"
   cleanup() {
     if [ -n "${TMP_ROOT}" ]; then
       rm -rf "${TMP_ROOT}"
