@@ -920,7 +920,8 @@ const search = await fetch(`${API}/search`, {
 `curl` smoke test:
 
 ```bash
-TOKEN=$(ai-memory generate-auth-token)
+# Use the bearer already configured on the running server.
+TOKEN='<server-configured bearer token>'
 curl -fsS "http://127.0.0.1:49374/api/v1/workspaces" -H "Authorization: Bearer $TOKEN" | jq
 ```
 
