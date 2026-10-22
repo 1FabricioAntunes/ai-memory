@@ -110,46 +110,53 @@ fn render_human(rows: &[ProjectRow]) -> String {
         return "No projects found.\n".to_owned();
     }
 
-    // `{:width$}` pads to a character count, so the widths must be measured
-    // the same way: `str::len` counts bytes, and a non-ASCII name then over-
-    // pads every other row in its column.
+    // Terminal columns are measured in display cells. Bytes over-count accents,
+    // while scalar counts under-count double-width CJK characters.
     let workspace_width = rows
         .iter()
-        .map(|row| row.workspace_name.chars().count())
+        .map(|row| unicode_width::UnicodeWidthStr::width(row.workspace_name.as_str()))
         .max()
         .unwrap_or(0)
-        .max("WORKSPACE".chars().count());
+        .max(unicode_width::UnicodeWidthStr::width("WORKSPACE"));
     let project_width = rows
         .iter()
-        .map(|row| row.project_name.chars().count())
+        .map(|row| unicode_width::UnicodeWidthStr::width(row.project_name.as_str()))
         .max()
         .unwrap_or(0)
-        .max("PROJECT".chars().count());
+        .max(unicode_width::UnicodeWidthStr::width("PROJECT"));
     // The id column carries what `--project-id` takes. A row from an older
     // server has no id; render `-` rather than hiding the column, so the
     // header stays stable across server versions. (#1208)
     let id_width = rows
         .iter()
-        .map(|row| row.project_id.as_deref().unwrap_or("-").chars().count())
+        .map(|row| unicode_width::UnicodeWidthStr::width(row.project_id.as_deref().unwrap_or("-")))
         .max()
         .unwrap_or(0)
-        .max("PROJECT ID".chars().count());
+        .max(unicode_width::UnicodeWidthStr::width("PROJECT ID"));
 
     let mut out = format!(
-        "{:workspace_width$}  {:project_width$}  {:id_width$}  {:>6}  LAST UPDATED\n",
-        "WORKSPACE", "PROJECT", "PROJECT ID", "PAGES"
+        "{}  {}  {}  {:>6}  LAST UPDATED\n",
+        display_cell("WORKSPACE", workspace_width),
+        display_cell("PROJECT", project_width),
+        display_cell("PROJECT ID", id_width),
+        "PAGES"
     );
     for row in rows {
         out += &format!(
-            "{:workspace_width$}  {:project_width$}  {:id_width$}  {:>6}  {}\n",
-            row.workspace_name,
-            row.project_name,
-            row.project_id.as_deref().unwrap_or("-"),
+            "{}  {}  {}  {:>6}  {}\n",
+            display_cell(&row.workspace_name, workspace_width),
+            display_cell(&row.project_name, project_width),
+            display_cell(row.project_id.as_deref().unwrap_or("-"), id_width),
             row.page_count,
             row.last_updated.as_deref().unwrap_or("-")
         );
     }
     out
+}
+
+fn display_cell(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(unicode_width::UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 #[cfg(test)]
@@ -180,9 +187,8 @@ mod tests {
         );
     }
 
-    /// A column is as wide as its widest value, and `{:width$}` pads to a
-    /// character count — so a width measured in bytes pads the whole column
-    /// one space too wide per extra byte in the longest non-ASCII value.
+    /// A column is as wide as its widest terminal representation. Bytes
+    /// over-count accents and scalar counts under-count double-width CJK.
     #[test]
     fn render_human_sizes_a_non_ascii_column_by_characters() {
         let rows = vec![
@@ -207,7 +213,7 @@ mod tests {
         );
 
         // All three measured columns at once: with a non-ASCII value widest
-        // in each, every data line is exactly as long as the columns need.
+        // in each, every data line occupies exactly the required display width.
         let wide = render_human(&[
             row("café-workspace", "café-api", 3, Some("2026-01-02")),
             row("café-workspace", "web", 1, Some("2026-01-03")),
@@ -216,11 +222,24 @@ mod tests {
         let expected = 14 + 2 + 8 + 2 + 11 + 2 + 6 + 2 + 10;
         for line in wide.lines().skip(1) {
             assert_eq!(
-                line.chars().count(),
+                unicode_width::UnicodeWidthStr::width(line),
                 expected,
                 "a byte-measured column pads this line wider:\n{wide}"
             );
         }
+
+        let cjk = render_human(&[
+            row("開発環境共有", "記憶管理", 3, Some("2026-01-02")),
+            row("ops", "web", 1, Some("2026-01-03")),
+        ]);
+        let mut lines = cjk.lines().skip(1);
+        let first = lines.next().unwrap();
+        let second = lines.next().unwrap();
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(first),
+            unicode_width::UnicodeWidthStr::width(second),
+            "double-width names must not shift later columns:\n{cjk}"
+        );
     }
 
     /// A row from a server that predates the id fields still renders: the

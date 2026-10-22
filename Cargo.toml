@@ -102,6 +102,9 @@ clap_complete = "4"
 # option that keeps one code path across Linux, macOS, and Windows consoles
 # instead of a `#[cfg]` split over termios and the Win32 console API.
 crossterm = "0.29"
+# Terminal tables need display-cell widths: byte and scalar counts both
+# misalign names containing accented or double-width characters.
+unicode-width = "0.2"
 dirs = "5"
 # Format-preserving TOML editor for install-mcp --apply against
 # Codex's config.toml. Plain `toml` round-trips destroy comments;
