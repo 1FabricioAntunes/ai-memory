@@ -2338,6 +2338,12 @@ pub struct RestoreArgs {
     /// Overwrite an existing non-empty data dir.
     #[arg(long)]
     pub force: bool,
+    /// Replace the live `config.toml` with the backup's. Without it an
+    /// existing config is kept and the backup's is saved beside it as
+    /// `config.toml.from-backup` for review: a config can run commands and
+    /// redirect data, so adopt one only from a backup you trust.
+    #[arg(long)]
+    pub with_config: bool,
     /// Confirm that the configured token pepper is the original one for a
     /// pre-verifier backup that already contains native API keys.
     #[arg(long)]

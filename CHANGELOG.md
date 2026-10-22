@@ -33,6 +33,16 @@ version in [`docs/changelog/`](docs/changelog/):
   note. Reported by @FabioLeitao.
   ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
 
+- `ai-memory restore` no longer replaces an existing live `config.toml` with
+  the backup's by default, because a config can run commands and redirect
+  data. The backup's copy is saved beside it as `config.toml.from-backup`
+  (owner-only) with a notice; pass the new `--with-config` flag to restore it
+  in place as before. A data dir with no config still gets the backup's. When
+  the live config is kept and the restored database holds API keys, its pepper
+  must match them, or the restore stops before changing anything and names
+  `--with-config`. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
