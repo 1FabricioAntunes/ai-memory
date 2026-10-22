@@ -25,6 +25,18 @@ version in [`docs/changelog/`](docs/changelog/):
   118/295) and ingest throughput; the reported hit@5 delta (0.947 → 0.938)
   traces to rank-boundary questions that flip between identical runs, not
   a deterministic ranking change (#1580).
+- Fixed restoring a page from a checkpoint leaving a pre-OKF file on disk.
+  `restore-page` wrote the checkpointed bytes verbatim while the three
+  sibling write paths conform theirs, and the row it indexes is conformed at
+  the store's write choke point either way — so only the file was left
+  behind. Restoring the pre-OKF checkpoint every migrated install carries
+  then broke `export-okf` for the whole project with "run the server once to
+  migrate", which the one-shot wiki migration never does again, and made
+  every `serve` boot re-archive the data dir once the migration archive was
+  deleted. The restore now conforms the file like the siblings do;
+  conformance is idempotent modulo `generated.at`, which it inherits from the
+  file on disk, so an already-conformant page still restores byte-exact.
+  ([#1595](https://github.com/akitaonrails/ai-memory/pull/1595))
 
 ## [3.2.0] - 2026-10-21
 
