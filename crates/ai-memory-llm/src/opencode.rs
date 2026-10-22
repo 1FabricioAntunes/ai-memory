@@ -407,7 +407,15 @@ impl OpenCodeResponsesProvider {
         let response = self
             .post(&self.build_request(&request, Some(text)), operation_id)
             .await?;
-        let text = extract_output_text(&response).unwrap_or_default();
+        // No content at all is a distinct terminal failure, not a JSON parse
+        // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
+        // an empty string to serde, so the caller saw "EOF while parsing a value
+        // at line 1 column 0", which names neither the model nor the cause.
+        let Some(text) = extract_output_text(&response).filter(|t| !t.trim().is_empty()) else {
+            return Err(LlmError::EmptyContent {
+                model: self.model.clone(),
+            });
+        };
         serde_json::from_str(&text).map_err(LlmError::from)
     }
 
@@ -1192,6 +1200,69 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["model"], "mimo-v2.6-flash");
+    }
+
+    /// A 200 with no usable `output_text` is a terminal empty answer, not a
+    /// JSON parse failure. `unwrap_or_default()` fed serde an empty string, so
+    /// the caller saw `serde: EOF while parsing a value at line 1 column 0`,
+    /// which names neither the model nor the cause. The OpenAI-wire structured
+    /// path already classifies this as `empty-content`.
+    #[tokio::test]
+    async fn an_empty_responses_body_is_empty_content_not_a_serde_error() {
+        for (label, body) in [
+            (
+                "no output items",
+                json!({
+                    "model": "gpt-5.6-luna",
+                    "output": [],
+                    "usage": { "input_tokens": 1, "output_tokens": 0 },
+                }),
+            ),
+            (
+                "an item with no content",
+                json!({
+                    "model": "gpt-5.6-luna",
+                    "output": [{ "type": "reasoning", "content": [] }],
+                    "usage": { "input_tokens": 1, "output_tokens": 4096 },
+                }),
+            ),
+            (
+                "whitespace-only text",
+                responses_response_with_content("  \n\t "),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let provider = OpenCodeProvider::new_with_base_url(
+                SecretString::from("sk-test"),
+                "gpt-5.6-luna",
+                server.uri(),
+            )
+            .unwrap();
+            let err = provider
+                .complete_structured_raw(
+                    ChatRequest::user_prompt("emit JSON"),
+                    json!({ "type": "object" }),
+                )
+                .await
+                .expect_err("an empty answer must surface a typed error");
+
+            assert_eq!(err.class(), "empty-content", "{label}: {err:?}");
+            assert!(!err.is_transient(), "{label} must not be retried");
+            match &err {
+                LlmError::EmptyContent { model } => {
+                    assert_eq!(model, "gpt-5.6-luna", "{label}");
+                }
+                other => panic!("{label}: expected EmptyContent, got {other:?}"),
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1, "{label}: exactly one upstream call");
+        }
     }
 
     #[tokio::test]

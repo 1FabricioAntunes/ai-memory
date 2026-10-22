@@ -285,6 +285,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- An empty structured answer from a Responses-API model is now reported as
+  empty content rather than a JSON parse error. The `opencode`, `openai-oauth`
+  and `codex` paths defaulted a missing `output_text` to an empty string and
+  handed it to the parser, so the operator saw `serde: EOF while parsing a
+  value at line 1 column 0`, naming neither the model nor the cause.
+  ([#1529](https://github.com/akitaonrails/ai-memory/pull/1529))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives

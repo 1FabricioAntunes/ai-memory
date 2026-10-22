@@ -210,8 +210,16 @@ impl LlmProvider for CodexProvider {
                 self.reasoning_effort,
             ))
             .await?;
-        serde_json::from_str(&extract_output_text(&response).unwrap_or_default())
-            .map_err(LlmError::from)
+        // No content at all is a distinct terminal failure, not a JSON parse
+        // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
+        // an empty string to serde, so the caller saw "EOF while parsing a value
+        // at line 1 column 0", which names neither the model nor the cause.
+        let Some(text) = extract_output_text(&response).filter(|t| !t.trim().is_empty()) else {
+            return Err(LlmError::EmptyContent {
+                model: self.model.clone(),
+            });
+        };
+        serde_json::from_str(&text).map_err(LlmError::from)
     }
 }
 
