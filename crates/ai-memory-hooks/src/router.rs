@@ -642,6 +642,17 @@ pub struct HookState {
     /// subagent exclusion so a marked event still seeds its tail tracking.
     /// Empty by default.
     pub ingest_drop_list: crate::drop_list::IngestDropList,
+    /// Benchmark escape hatch (`AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1`, set
+    /// only by the retrieval-benchmark harness in `evals/`): skip the
+    /// SessionEnd auto-commits of the wiki git tree. The LongMemEval replay
+    /// ends ~24k sessions through one server, and each checkpoint walks a
+    /// tree and object database that keep growing, so commits dominate
+    /// ingest wall clock there (see `docs/benchmarks/README.md`). Retrieval
+    /// never reads git history, so skipping the commits changes no measured
+    /// number — the markdown and the index stay the source of truth. Every
+    /// other consumer keeps committing: default false, and the flag is read
+    /// once at server startup, never per event.
+    pub skip_wiki_checkpoints: bool,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -4276,7 +4287,11 @@ async fn process_authorized(
         HookSessionAdmission::AlreadyEnded { session } => {
             let commit_msg = format!("repair session {}", short_id(&session_id.to_string()));
             let mut recovered = false;
-            match state.wiki.commit_all(&commit_msg) {
+            match if state.skip_wiki_checkpoints {
+                Ok(None)
+            } else {
+                state.wiki.commit_all(&commit_msg)
+            } {
                 Ok(Some(oid)) => {
                     recovered = true;
                     state.ingest_metrics.record_persisted(now_unix_ms());
@@ -4518,7 +4533,11 @@ async fn process_authorized(
                         "lifecycle-only session {}",
                         short_id(&session_id.to_string()),
                     );
-                    match state.wiki.commit_all(&commit_msg) {
+                    match if state.skip_wiki_checkpoints {
+                        Ok(None)
+                    } else {
+                        state.wiki.commit_all(&commit_msg)
+                    } {
                         Ok(Some(oid)) => debug!(commit = %oid, "lifecycle-only log auto-commit"),
                         Ok(None) => debug!("wiki clean after lifecycle-only SessionEnd"),
                         Err(e) => warn!(error = %e, "lifecycle-only log auto-commit failed"),
@@ -4728,10 +4747,16 @@ async fn process_authorized(
             short_id(&session_id.to_string()),
             new_page.title.chars().take(60).collect::<String>(),
         );
-        match state.wiki.commit_all(&commit_msg) {
-            Ok(Some(oid)) => debug!(commit = %oid, "wiki auto-commit"),
-            Ok(None) => debug!("wiki clean; no auto-commit"),
-            Err(e) => warn!(error = %e, "auto-commit failed"),
+        // The benchmark escape skips the commit; everything the index and the
+        // page reader use has already landed (markdown + store transaction).
+        if !state.skip_wiki_checkpoints {
+            match state.wiki.commit_all(&commit_msg) {
+                Ok(Some(oid)) => debug!(commit = %oid, "wiki auto-commit"),
+                Ok(None) => debug!("wiki clean; no auto-commit"),
+                Err(e) => warn!(error = %e, "auto-commit failed"),
+            }
+        } else {
+            debug!(session = %session_id, "wiki auto-commit skipped (benchmark mode)");
         }
         // Persist the optional LLM work before acknowledging the hook, after
         // deterministic wiki writes are committed so the worker cannot race
@@ -6986,6 +7011,7 @@ pub(crate) mod tests {
             mid_session_routing: MidSessionRouting::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             ingest_drop_list: crate::drop_list::IngestDropList::default(),
+            skip_wiki_checkpoints: false,
         }
     }
 
@@ -15753,6 +15779,103 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_some(),
             "direct launches must retain the legacy SessionEnd handoff behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_skip_wiki_checkpoints_leaves_the_page_but_no_commit() {
+        // The control: a default session end auto-commits the wiki tree.
+        // The benchmark escape must skip only that commit — the session
+        // page, the ended-session row and the store index all still land,
+        // because retrieval reads markdown + SQLite, never git history.
+        async fn replay_session(state: &Arc<HookState>, tmp: &TempDir) -> SessionId {
+            let session = SessionId::new();
+            for (event, body) in [
+                ("session-start", serde_json::json!({})),
+                (
+                    "user-prompt",
+                    serde_json::json!({ "prompt": "teach me the parser fix" }),
+                ),
+                ("session-end", serde_json::json!({ "reason": "exit" })),
+            ] {
+                let envelope = HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("claude-code".into()),
+                        cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                        workspace: Some("default".into()),
+                        project: Some("scratch".into()),
+                        ..Default::default()
+                    },
+                    serde_json::json!({
+                        "session_id": session.to_string(),
+                        "cwd": tmp.path(),
+                        "body": body,
+                    }),
+                );
+                process(state, envelope, None, Vec::new()).await.unwrap();
+            }
+            session
+        }
+
+        let control_tmp = TempDir::new().unwrap();
+        let control_state = Arc::new(make_state(&control_tmp).await);
+        let control_session = replay_session(&control_state, &control_tmp).await;
+        let checkpoints = control_state.wiki.recent_checkpoints(10).unwrap();
+        assert!(
+            checkpoints.iter().any(|c| c.summary.starts_with(&format!(
+                "session {}",
+                short_id(&control_session.to_string())
+            ))),
+            "default SessionEnd must auto-commit; got {:?}",
+            checkpoints
+                .iter()
+                .map(|c| c.summary.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let skip_tmp = TempDir::new().unwrap();
+        let mut skip_state = make_state(&skip_tmp).await;
+        skip_state.skip_wiki_checkpoints = true;
+        let skip_state = Arc::new(skip_state);
+        let skip_session = replay_session(&skip_state, &skip_tmp).await;
+
+        // Everything retrieval reads still landed.
+        let pages = skip_state
+            .reader
+            .recent_pages_for_project(skip_state.workspace_id, skip_state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.path.as_str().starts_with("sessions/")),
+            "the session summary page must still be written with checkpoints skipped"
+        );
+        let disposition = skip_state
+            .reader
+            .session_end_disposition(
+                skip_session,
+                skip_state.workspace_id,
+                skip_state.project_id,
+                AgentKind::ClaudeCode,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            disposition,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
+            "the session row must still be ended with checkpoints skipped"
+        );
+        // And the git tree was not committed.
+        let checkpoints = skip_state.wiki.recent_checkpoints(10).unwrap();
+        assert!(
+            checkpoints.is_empty(),
+            "the benchmark escape must leave no session checkpoint; got {:?}",
+            checkpoints
+                .iter()
+                .map(|c| c.summary.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
