@@ -193,6 +193,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Corrected the Docker rollback instructions to retag the prior digest and recreate the service without pulling the newer tag. ([#1585](https://github.com/akitaonrails/ai-memory/pull/1585))
 
+### Fixed
+
+- Corrected Docker backup instructions to use an online server snapshot or stop the container before copying its data. ([#1586](https://github.com/akitaonrails/ai-memory/pull/1586))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
