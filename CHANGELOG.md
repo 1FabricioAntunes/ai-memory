@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A workbook that contains a chartsheet now imports its worksheets instead of
+  failing outright. OOXML lists chartsheets and dialogsheets as `<sheet>`
+  elements alongside worksheets and only the relationship type tells them
+  apart, so a chart tab created by Excel's "Move Chart -> New sheet" had no
+  worksheet relationship and aborted the whole extraction; a workbook of only
+  chartsheets still reports that it contains no worksheets.
+  ([#1569](https://github.com/akitaonrails/ai-memory/pull/1569))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
