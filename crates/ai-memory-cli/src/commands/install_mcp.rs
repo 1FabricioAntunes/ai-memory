@@ -6025,7 +6025,7 @@ mod tests {
             );
         }
 
-        let rendered = render_codex(&args_for(McpClient::Codex));
+        let rendered = render_codex(&args_for(McpClient::Codex)).unwrap();
         for tool in &destructive {
             assert!(
                 rendered.contains(&format!(
