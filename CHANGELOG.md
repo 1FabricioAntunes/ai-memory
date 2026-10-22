@@ -189,6 +189,10 @@ version in [`docs/changelog/`](docs/changelog/):
   messages now works in `cmd` and in scripts that look for it.
   ([#1565](https://github.com/akitaonrails/ai-memory/pull/1565))
 
+### Fixed
+
+- Corrected the Docker rollback instructions to retag the prior digest and recreate the service without pulling the newer tag. ([#1585](https://github.com/akitaonrails/ai-memory/pull/1585))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
