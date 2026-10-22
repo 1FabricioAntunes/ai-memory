@@ -15,11 +15,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- The `user grants` and `project grants` tables no longer misalign on a
-  workspace, project or user name outside ASCII. Column widths were measured
-  in bytes while the formatter pads in characters, so a row such as
-  `default/café` was padded one column too far and its `USERNAME` and
-  `LEVEL` cells sat right of every other row's.
+- The `user grants` and `project grants` tables now measure terminal display
+  cells, so accented and double-width CJK workspace, project and user names
+  keep the `USERNAME` and `LEVEL` columns aligned.
   ([#1564](https://github.com/akitaonrails/ai-memory/pull/1564))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
@@ -520,8 +518,8 @@ version in [`docs/changelog/`](docs/changelog/):
   security notice and the body between two literal fence lines, neither
   escaped, so a newline in the subject forged lines in the provenance block
   and an `---- end of body ----` line in the body closed the fence early. The
-  subject now renders on one line and the body's fence markers are
-  neutralized; both JSON paths were already structural and are unchanged.
+  subject now renders on one line, body fence markers are neutralized, and
+  terminal control sequences are stripped; both JSON paths remain structural.
   ([#1563](https://github.com/akitaonrails/ai-memory/pull/1563))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later

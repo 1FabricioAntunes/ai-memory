@@ -54,39 +54,46 @@ fn print_grants(grants: &[GrantRow], json: bool) -> Result<()> {
     write_grants(grants, &mut std::io::stdout().lock())
 }
 
-/// Lay out the grants table. Widths are measured in characters because
-/// `{:<width$}` pads in characters: a project or user name outside ASCII has
-/// more bytes than columns, and a byte count would shift the later columns of
-/// that row alone. Workspace and project names come from a checkout's
-/// directory basename or a marker's `project` key, so they are free-form
-/// UTF-8.
+/// Lay out the grants table using terminal display-cell widths. Workspace and
+/// project names come from a checkout's directory basename or a marker's
+/// `project` key, so they are free-form UTF-8.
 fn write_grants(grants: &[GrantRow], out: &mut impl std::io::Write) -> Result<()> {
     let project_w = grants
         .iter()
-        .map(|g| g.workspace.chars().count() + 1 + g.project.chars().count())
+        .map(|g| {
+            unicode_width::UnicodeWidthStr::width(format!("{}/{}", g.workspace, g.project).as_str())
+        })
         .max()
         .unwrap_or(7)
         .max(7);
     let user_w = grants
         .iter()
-        .map(|g| g.username.chars().count())
+        .map(|g| unicode_width::UnicodeWidthStr::width(g.username.as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
     writeln!(
         out,
-        "{:<project_w$}  {:<user_w$}  LEVEL",
-        "PROJECT", "USERNAME"
+        "{}  {}  LEVEL",
+        pad_cell("PROJECT", project_w),
+        pad_cell("USERNAME", user_w)
     )?;
     for g in grants {
         let project = format!("{}/{}", g.workspace, g.project);
         writeln!(
             out,
-            "{project:<project_w$}  {:<user_w$}  {}",
-            g.username, g.level
+            "{}  {}  {}",
+            pad_cell(&project, project_w),
+            pad_cell(&g.username, user_w),
+            g.level
         )?;
     }
     Ok(())
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(unicode_width::UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 /// `ai-memory user grants [--user NAME]`.
@@ -215,15 +222,10 @@ mod tests {
         }
     }
 
-    /// The character offset at which `line` carries `username`, or `None`.
+    /// The display-cell offset at which `line` carries `username`, or `None`.
     fn username_column(line: &str, username: &str) -> Option<usize> {
-        let chars: Vec<char> = line.chars().collect();
-        (0..chars.len()).find(|start| {
-            chars[*start..]
-                .iter()
-                .collect::<String>()
-                .starts_with(username)
-        })
+        line.find(username)
+            .map(|byte| unicode_width::UnicodeWidthStr::width(&line[..byte]))
     }
 
     #[test]
@@ -255,6 +257,19 @@ mod tests {
                 username_column(line, &row.username),
                 Some(user_col),
                 "ascii rows must line up as well:\n{ascii}"
+            );
+        }
+
+        let cjk_rows = [grant("記憶管理", "利用者"), grant("web", "bob")];
+        let mut cjk_buf = Vec::new();
+        write_grants(&cjk_rows, &mut cjk_buf).unwrap();
+        let cjk = String::from_utf8(cjk_buf).unwrap();
+        let cjk_user_col = username_column(cjk.lines().next().unwrap(), "USERNAME").unwrap();
+        for (line, row) in cjk.lines().skip(1).zip(cjk_rows.iter()) {
+            assert_eq!(
+                username_column(line, &row.username),
+                Some(cjk_user_col),
+                "{cjk}"
             );
         }
     }

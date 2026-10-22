@@ -252,20 +252,26 @@ fn render_popped(
     let _ = writeln!(
         out,
         "Popped message {} for {workspace}/{project}.",
-        message.id
+        super::show::terminal_text(&message.id)
     );
     let _ = writeln!(
         out,
         "  from: {}/{} (agent: {})",
-        message.from_workspace_id, message.from_project_id, message.from_agent
+        super::show::terminal_text(&message.from_workspace_id),
+        super::show::terminal_text(&message.from_project_id),
+        super::show::terminal_text(&message.from_agent)
     );
     if let Some(owner) = message.from_owner_user.as_deref() {
-        let _ = writeln!(out, "  sent by: {owner}");
+        let _ = writeln!(out, "  sent by: {}", super::show::terminal_text(owner));
     }
     if let Some(subject) = message.subject.as_deref() {
         let _ = writeln!(out, "  subject: {}", super::show::terminal_text(subject));
     }
-    let _ = writeln!(out, "  created: {}", message.created_at);
+    let _ = writeln!(
+        out,
+        "  created: {}",
+        super::show::terminal_text(&message.created_at)
+    );
     let _ = writeln!(out, "\n{security_notice}");
     let _ = writeln!(out, "{BODY_FENCE_OPEN}");
     let _ = writeln!(out, "{}", escape_body_fence(&message.body));
@@ -277,6 +283,16 @@ fn render_popped(
 /// — a reader can see what was written — but no longer starts the line, so it
 /// cannot be mistaken for the renderer's own fence.
 fn escape_body_fence(body: &str) -> String {
+    let body: String = body
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\t' || !character.is_control() {
+                character
+            } else {
+                '?'
+            }
+        })
+        .collect();
     body.replace(BODY_FENCE_OPEN, &format!("(escaped) {BODY_FENCE_OPEN}"))
         .replace(BODY_FENCE_CLOSE, &format!("(escaped) {BODY_FENCE_CLOSE}"))
 }
@@ -368,6 +384,15 @@ mod tests {
             1,
             "only the renderer's own terminator may be a bare fence line: {rendered}"
         );
+
+        let controls = render_popped(
+            &message(None, "before\u{1b}[31mred\r\nafter"),
+            "ws",
+            "recipient",
+            "NOTICE",
+        );
+        assert!(!controls.contains('\u{1b}'), "{controls:?}");
+        assert!(controls.contains("before?[31mred?\nafter"), "{controls:?}");
         assert_eq!(
             lines.last().copied(),
             Some(BODY_FENCE_CLOSE),

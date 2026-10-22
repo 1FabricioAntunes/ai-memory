@@ -92,7 +92,16 @@ pub(crate) fn claude_config_paths(
 /// which the canonical data dir carries on Windows and which `cmd` and most
 /// scripts cannot use when the path is copied out of a message.
 pub(crate) fn display_path(path: &Path) -> String {
-    strip_windows_verbatim_prefix(&path.to_string_lossy()).into_owned()
+    strip_windows_verbatim_prefix(&path.to_string_lossy())
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Strip only Windows verbatim path prefixes that are safe to render as plain
@@ -183,6 +192,10 @@ mod tests {
         assert_eq!(
             display_path(Path::new("/home/alice/.local/share/ai-memory")),
             "/home/alice/.local/share/ai-memory"
+        );
+        assert_eq!(
+            display_path(Path::new("/tmp/line\nbreak")),
+            "/tmp/line?break"
         );
     }
 
