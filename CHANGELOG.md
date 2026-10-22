@@ -376,6 +376,13 @@ version in [`docs/changelog/`](docs/changelog/):
   auto-resolved-scope hint are unchanged, and a genuine disk or store failure
   on the same path still answers -32603.
   ([#1544](https://github.com/akitaonrails/ai-memory/pull/1544))
+- An OpenCode subagent session's end no longer hands the next session a
+  sub-task baton. The generated plugin forwarded the session's `parentID` as
+  the `agent_id` subagent marker on `session.created` but not on
+  `session.deleted`, so the `session-end` request carried no marker, the
+  router did not recognize a child session, and it published a summary page
+  and an open handoff that the next root session in that checkout consumed.
+  ([#1546](https://github.com/akitaonrails/ai-memory/pull/1546))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
