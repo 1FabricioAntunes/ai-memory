@@ -13,6 +13,10 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-10-22** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.2 release)** | **0.951** | [longmemeval-s-3.2.2-release.md](longmemeval-s-3.2.2-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.2 release)** | **0.945** | [longmemeval-s-3.2.2-release.md](longmemeval-s-3.2.2-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.1 release)** | **0.951** | [longmemeval-s-3.2.1-release.md](longmemeval-s-3.2.1-release.md) |
+| **2026-10-22** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.1 release)** | **0.949** | [longmemeval-s-3.2.1-release.md](longmemeval-s-3.2.1-release.md) |
 | **2026-10-22** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.0 release)** | **0.951** | [longmemeval-s-3.2.0-release.md](longmemeval-s-3.2.0-release.md) |
 | **2026-10-22** | LongMemEval-S (v1) | **local embeddings + observation stream (3.2.0 release)** | **0.938** | [longmemeval-s-3.2.0-release.md](longmemeval-s-3.2.0-release.md) |
 | **2026-10-20** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.1.2 release)** | **0.951** | [longmemeval-s-3.1.2-release.md](longmemeval-s-3.1.2-release.md) |
@@ -28,6 +32,18 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 3.2.2 patch-release run found FTS identical to 3.2.1 on every question.
+Local embeddings moved from 0.949 to 0.945 `hit@5`, inside the pre-registered
+overall noise band; the two changed questions remain within the top ten, and
+`hit@10` improved from 0.968 to 0.974. See the
+[3.2.2 release report](longmemeval-s-3.2.2-release.md) for provenance, every
+slice, and the explicit threshold assessment.
+
+The 3.2.1 patch-release run recovered 3.2.0's local embedding accuracy and
+documented the remaining boundary-question variation. See the
+[3.2.1 release report](longmemeval-s-3.2.1-release.md) for the capacity-fix
+measurement and controlled latency follow-up.
 
 The 2026-10-22 minor-release run found FTS identical to 3.1.2 on every
 question. Local embeddings fell from 0.947 to 0.938 `hit@5` (five questions
