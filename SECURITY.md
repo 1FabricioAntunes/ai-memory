@@ -44,6 +44,12 @@ what the project is and is not designed to defend against.
   spool is capped at 10,000 files. `ai-memory backup` does not include the
   spool, but a filesystem-level copy of the data directory does.
 
+  An `ai-memory backup` archive includes `<data_dir>/config.toml` verbatim,
+  which may hold the API-key pepper and other inline credentials; protect
+  the archive as a secret (see
+  [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md#backup)). `restore` keeps
+  an existing live config unless `--with-config` is passed.
+
 - **Network exposure when binding to non-loopback addresses.** If you run
   `ai-memory serve --bind 0.0.0.0:…` you are exposing the MCP and admin
   routes to your local network. Protect this with:
