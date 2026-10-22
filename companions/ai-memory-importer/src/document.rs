@@ -661,9 +661,12 @@ fn xlsx_sheet_order(workbook: &str, relationships: &str) -> Result<Vec<(String, 
             Event::Start(tag) | Event::Empty(tag) if tag.local_name().as_ref() == "sheet" => {
                 let name = required_attribute(&tag, "name", "XLSX sheet name")?;
                 let id = required_qualified_attribute(&tag, "r:id", "XLSX sheet id")?;
-                let target = targets
-                    .get(&id)
-                    .ok_or_else(|| anyhow!("XLSX sheet id {id:?} has no worksheet relationship"))?;
+                // `<sheets>` lists chartsheets and dialogsheets alongside worksheets;
+                // only the relationship type tells them apart, so skip the ones that
+                // carry no worksheet relationship instead of failing the whole import.
+                let Some(target) = targets.get(&id) else {
+                    continue;
+                };
                 sheets.push((name, target.clone()));
             }
             Event::Eof => break,
@@ -1566,6 +1569,30 @@ mod tests {
         let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
         assert!(plan.body.contains("## Sheet: Totals"), "{}", plan.body);
         assert!(plan.body.contains("Item\t42"), "{}", plan.body);
+    }
+
+    #[test]
+    fn xlsx_sheet_order_skips_a_chartsheet_and_keeps_the_worksheets() {
+        let workbook = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Chart1" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
+        let relationships = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#;
+        let sheets = xlsx_sheet_order(workbook, relationships).unwrap();
+        assert_eq!(
+            sheets,
+            vec![("Data".to_owned(), "xl/worksheets/sheet1.xml".to_owned())]
+        );
+    }
+
+    #[test]
+    fn xlsx_sheet_order_still_reports_a_workbook_of_only_chartsheets() {
+        let workbook = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Chart1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let relationships = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#;
+        let error = xlsx_sheet_order(workbook, relationships).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("XLSX workbook contains no worksheets"),
+            "{error}"
+        );
     }
 
     #[test]
