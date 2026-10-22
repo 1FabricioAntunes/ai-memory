@@ -20731,6 +20731,48 @@ pub(crate) mod tests {
         );
     }
 
+    /// End to end through `/hook`: a credential with an invisible formatting
+    /// character inside it reaches the store redacted, in the title and the
+    /// body, and the prose around it is kept.
+    #[tokio::test]
+    async fn user_prompt_secret_split_by_an_invisible_character_is_redacted() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // FAKE shape: `sk-` plus 26 characters, split after the first 10.
+        let (head, tail) = ("sk-FAKEfakeFA", "KEfake0123456789");
+        let prompt = format!("use {head}\u{200B}{tail} for the call");
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "prompt": prompt,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let obs = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::UserPrompt)
+            .expect("user prompt observation was recorded");
+        for stored in [&obs.title, &obs.body] {
+            assert!(
+                !stored.contains(head) && !stored.contains(tail),
+                "a fragment of the split key was stored: {stored:?}"
+            );
+            assert!(
+                stored.contains("[REDACTED:api_key]") && stored.contains("for the call"),
+                "the key must be redacted and the prose kept: {stored:?}"
+            );
+        }
+    }
+
     /// Shared shape for the #1114 body-side regressions: a secret straddling
     /// a per-event byte cap used to be cut in half at excerpt extraction,
     /// before the sanitizer ever ran, so the surviving prefix was too short

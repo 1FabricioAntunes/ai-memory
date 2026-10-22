@@ -11,6 +11,21 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Hardened the privacy strip. It now matches credentials across invisible
+  formatting characters while storing text that matches nothing byte for
+  byte, so emoji sequences and scripts that need joiners are untouched. It
+  also redacts PGP private keys and private-key blocks that have no end line,
+  as long as a key-body line follows the header, so prose that only names a
+  header is kept. Tag characters outside an emoji flag, a byte-order mark
+  after the start of the text and the invisible math operators are stripped.
+  The allowlist no longer exempts private keys, and blank `[sanitize]
+  allowlist` entries are ignored with a warning at startup. The client scrub
+  shared by the relay and importer companions follows the same rules.
+  Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added

@@ -1484,6 +1484,22 @@ pub struct RunProfile {
     pub env: BTreeMap<String, String>,
 }
 
+/// A blank `[sanitize] allowlist` entry is a substring of every match, so it
+/// would exempt everything from redaction. The sanitizer ignores such entries
+/// too; dropping them here is where the operator hears about it.
+fn drop_blank_sanitize_allowlist_entries(sanitize: &mut ai_memory_core::SanitizeConfig) {
+    let before = sanitize.allowlist.len();
+    sanitize.allowlist.retain(|entry| !entry.trim().is_empty());
+    let dropped = before - sanitize.allowlist.len();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "ignoring blank [sanitize] allowlist entries: an empty entry would \
+             exempt every match from redaction"
+        );
+    }
+}
+
 fn validate_run_profiles(run: &RunSettings) -> Result<()> {
     const MAX_PROFILES: usize = 128;
     const MAX_PROFILE_NAME: usize = 64;
@@ -2450,6 +2466,7 @@ impl Config {
         config.runtime_env = runtime_env;
 
         validate_run_profiles(&config.run)?;
+        drop_blank_sanitize_allowlist_entries(&mut config.sanitize);
 
         // The idle auto-end tick turns `idle_end_after_hours` into a
         // microsecond cutoff: a value above a year is a configuration
@@ -3746,6 +3763,28 @@ mod tests {
     /// adopt it, or `serve` on the same data dir would start requiring that
     /// key and accepting it as its bearer. Control: a key named by
     /// `[auth].bearer_token_file` is adopted.
+    /// A blank allowlist entry would turn redaction off; loading drops it and
+    /// keeps the real entries.
+    #[test]
+    fn config_load_drops_blank_sanitize_allowlist_entries() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        std::fs::create_dir_all(&dd).unwrap();
+        let config_path = dd.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[sanitize]\nallowlist = [\"\", \"   \", \"KEEP_ME\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(dd.clone()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.sanitize.allowlist, vec!["KEEP_ME".to_string()]);
+    }
+
     #[test]
     fn config_load_never_adopts_the_stored_hook_key() {
         let tmp = TempDir::new().unwrap();
