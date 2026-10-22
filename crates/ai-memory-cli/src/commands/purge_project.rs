@@ -80,6 +80,29 @@ fn purge_summary_line(verb: &str, label: &str, report: &serde_json::Value) -> St
     line
 }
 
+/// The exact command that performs the purge the refusal just previewed.
+///
+/// Rebuilt from `args` rather than hand-written, the same way
+/// `move_session::apply_command` does, so the printed command cannot drift
+/// from the request the preview was computed with. Every flag the operator
+/// passed has to reappear here: the preview above was computed WITH
+/// `force`/`compact`, so a command that silently dropped them would not
+/// reproduce the operation the operator was just shown — and a dropped
+/// `--force` means the server answers the pasted command with a 409 `managed
+/// run lease is active`, which is the exact condition `--force` exists to
+/// override.
+fn confirm_command(workspace: &str, target_flag: &str, args: &PurgeProjectArgs) -> String {
+    let mut cmd = format!("ai-memory purge-project --workspace {workspace} {target_flag}");
+    if args.force {
+        cmd.push_str(" --force");
+    }
+    if args.compact {
+        cmd.push_str(" --compact");
+    }
+    cmd.push_str(" --confirm");
+    cmd
+}
+
 /// Decide what to print, if anything, before the refusal — pure, so it is
 /// unit-tested without a server. `fallback_label` is used only when the
 /// server's own report has no `label` field.
@@ -127,11 +150,11 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
     // `--project-id` exists to sidestep. The workspace still resolves the
     // normal way (marker, else `default`), since the server needs it to scope
     // the id lookup.
-    let (workspace, project, project_id) = match args.project_id {
+    let (workspace, project, project_id) = match &args.project_id {
         Some(id) => (
             super::resolve_workspace(config, args.workspace.as_deref())?,
             None,
-            Some(id),
+            Some(id.clone()),
         ),
         None => {
             let (ws, project) =
@@ -165,10 +188,8 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         }
         bail!(
             "purge-project is destructive and irreversible.\n\
-             Re-run with --confirm to proceed:\n\n  \
-             ai-memory purge-project --workspace {} {} --confirm",
-            workspace,
-            target_flag,
+             Re-run with --confirm to proceed:\n\n  {}",
+            confirm_command(&workspace, &target_flag, &args),
         );
     }
 
@@ -246,6 +267,53 @@ mod tests {
             "compacted": false,
             "dry_run": dry_run,
         })
+    }
+
+    fn args() -> PurgeProjectArgs {
+        PurgeProjectArgs {
+            force: false,
+            workspace: Some("default".into()),
+            project: Some("my-project".into()),
+            project_id: None,
+            confirm: false,
+            compact: false,
+        }
+    }
+
+    /// The command the refusal hands the operator must round-trip every flag
+    /// they passed. The preview printed just above it was computed WITH
+    /// `force`, so a command missing `--force` does not reproduce the
+    /// operation the operator was shown — it gets a 409 `managed run lease is
+    /// active` from the server, on exactly the condition `--force` suppresses.
+    #[test]
+    fn confirm_command_repeats_force_and_compact() {
+        let mut a = args();
+        a.force = true;
+        a.compact = true;
+        assert_eq!(
+            confirm_command("default", "--project my-project", &a),
+            "ai-memory purge-project --workspace default --project my-project \
+             --force --compact --confirm"
+        );
+    }
+
+    /// And the mirror: a run with neither flag must not start emitting flags
+    /// nobody asked for — pasting `--force` into a plain purge would silently
+    /// widen it to delete a live run's lease.
+    #[test]
+    fn confirm_command_omits_flags_the_operator_did_not_pass() {
+        let mut a = args();
+        a.project = None;
+        a.project_id = Some("0192b6a1-4c2e-7d3f-8a5b-1234567890ab".into());
+        assert_eq!(
+            confirm_command(
+                "default",
+                "--project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                &a
+            ),
+            "ai-memory purge-project --workspace default \
+             --project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab --confirm"
+        );
     }
 
     /// Pins the exact wording and field order a script would grep for.
