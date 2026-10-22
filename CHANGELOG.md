@@ -321,6 +321,15 @@ version in [`docs/changelog/`](docs/changelog/):
   all-versions total is unchanged, as is `ai-memory status`.
   ([#1535](https://github.com/akitaonrails/ai-memory/pull/1535))
 
+
+- `memory_read_page` now reads a blank `path` or `query` as omitted, as its
+  sibling arguments already do. An empty or whitespace-only `query` searched
+  for an empty FTS expression and reported the inevitable miss as an internal
+  error (-32603), which a looping client reads as "retry"; an empty `path`
+  failed as "invalid path: empty path" and never tried the `query` passed
+  beside it. Both now reach the instructive "exactly one of `path` or `query`"
+  refusal, and a blank `path` beside a real `query` runs the search.
+  ([#1536](https://github.com/akitaonrails/ai-memory/pull/1536))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
