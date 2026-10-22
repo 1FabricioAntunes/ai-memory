@@ -3682,6 +3682,45 @@ fn read_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// One line read under a byte cap.
+enum CappedLine {
+    /// The reader was already at end of file.
+    Eof,
+    /// The line fits the cap and is valid UTF-8.
+    Line(String),
+    /// The line is longer than the cap, so the caller skips the record.
+    Oversized,
+}
+
+/// Read one newline-terminated line, buffering at most `cap + 1` bytes so an
+/// oversized record can be recognised without reading it.
+///
+/// `BufRead::read_line` validates UTF-8 over exactly the bytes it read, so a
+/// `Take` boundary landing inside a multi-byte character makes it fail with
+/// `InvalidData` before the caller can compare the byte count against its cap
+/// — which turns a record meant to be skipped into an error. Reading bytes and
+/// decoding only a line that fits keeps the cap decidable wherever the
+/// boundary falls, while a line within the cap is still rejected when it is
+/// not valid UTF-8. This matches the byte-safe `read_until` the transcript
+/// readers already use.
+fn read_capped_line<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<CappedLine> {
+    let mut bytes = Vec::new();
+    let read =
+        std::io::Read::take(reader.by_ref(), (cap + 1) as u64).read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(CappedLine::Eof);
+    }
+    if read > cap {
+        return Ok(CappedLine::Oversized);
+    }
+    String::from_utf8(bytes).map(CappedLine::Line).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
+}
+
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
@@ -3702,17 +3741,12 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
         return copilot_session_header(path);
     }
     let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
     for _ in 0..64 {
-        line.clear();
-        let read = std::io::Read::take(&mut reader, (MAX_SESSION_HEADER_BYTES + 1) as u64)
-            .read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-        if read > MAX_SESSION_HEADER_BYTES {
-            return Ok(None);
-        }
+        let line = match read_capped_line(&mut reader, MAX_SESSION_HEADER_BYTES)? {
+            CappedLine::Eof => break,
+            CappedLine::Oversized => return Ok(None),
+            CappedLine::Line(line) => line,
+        };
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -3761,12 +3795,9 @@ fn command_code_session_header(path: &Path) -> Result<Option<(String, PathBuf)>>
         return Ok(None);
     }
     let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
-    let read =
-        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
-    if read == 0 || read > MAX_EVENT_BYTES {
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
         return Ok(None);
-    }
+    };
     let Ok(header) = serde_json::from_str::<Value>(&line) else {
         return Ok(None);
     };
@@ -3805,12 +3836,9 @@ fn copilot_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
-    let read =
-        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
-    if read == 0 || read > MAX_EVENT_BYTES {
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
         return Ok(None);
-    }
+    };
     let Ok(header) = serde_json::from_str::<Value>(&line) else {
         return Ok(None);
     };
@@ -5816,6 +5844,172 @@ mod tests {
             .is_empty(),
             "the tighter first-line cap rejects before the source-record cap is even reached"
         );
+    }
+
+    /// An oversized JSONL record whose padding places a three-byte character
+    /// so that the header reader's `cap + 1` boundary falls inside it. The
+    /// character begins at `char_offset`, so `char_offset` of `cap - 1` and
+    /// `cap` leave a truncated character in the bytes that were read while
+    /// `cap + 1` leaves the character out of them entirely.
+    fn oversized_header_cut_mid_character(
+        session: &str,
+        cwd: &Path,
+        cap: usize,
+        char_offset: usize,
+    ) -> Vec<u8> {
+        let head = format!(
+            "{{\"sessionId\":\"{session}\",\"cwd\":\"{}\",\"padding\":\"",
+            cwd.display()
+        );
+        let mut bytes = head.into_bytes();
+        assert!(
+            bytes.len() < char_offset,
+            "the padding has to start before the cut"
+        );
+        bytes.resize(char_offset, b'x');
+        bytes.extend("\u{65e5}".repeat(16).as_bytes());
+        bytes.extend(b"\"}\n");
+        assert!(bytes.len() > cap + 1, "the record has to be oversized");
+        bytes
+    }
+
+    /// The size cap's skip guard has to hold for non-ASCII input.
+    /// `BufRead::read_line` validates UTF-8 over exactly the bytes the `Take`
+    /// let through, so a boundary landing inside a multi-byte character fails
+    /// the read with `InvalidData` and the `read > cap` guard below it is
+    /// never reached. Two of every three byte alignments of the cut character
+    /// hit that; the maintainer's own cap test pads with ASCII only, where
+    /// none of them do.
+    #[test]
+    fn an_oversized_session_header_cut_mid_character_is_skipped() {
+        for offset in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd = temp.path().join("repo");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = "1f8c0f4c-26f9-4c21-9f85-3d1dcb9aa0f1";
+            let path = cwd.join(format!("{session}.jsonl"));
+            fs::write(
+                &path,
+                oversized_header_cut_mid_character(
+                    session,
+                    &cwd,
+                    MAX_SESSION_HEADER_BYTES,
+                    MAX_SESSION_HEADER_BYTES - 1 + offset,
+                ),
+            )
+            .unwrap();
+            assert!(
+                session_header(ManagedHarness::Claude, &path)
+                    .unwrap()
+                    .is_none(),
+                "an oversized header is skipped with the cut character at offset \
+                 MAX_SESSION_HEADER_BYTES - 1 + {offset}"
+            );
+        }
+    }
+
+    /// The same cut in the two single-record header readers, which cap on
+    /// `MAX_EVENT_BYTES`.
+    #[test]
+    fn an_oversized_event_header_cut_mid_character_is_skipped() {
+        for offset in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd = temp.path().join("repo");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = "3b6d2f70-5a3c-41a8-9a4e-7c0b2d9e4f11";
+            let record = oversized_header_cut_mid_character(
+                session,
+                &cwd,
+                MAX_EVENT_BYTES,
+                MAX_EVENT_BYTES - 1 + offset,
+            );
+
+            let command_code = cwd.join(format!("{session}.jsonl"));
+            fs::write(&command_code, &record).unwrap();
+            assert!(
+                command_code_session_header(&command_code)
+                    .unwrap()
+                    .is_none(),
+                "command code: cut character at offset MAX_EVENT_BYTES - 1 + {offset}"
+            );
+
+            let copilot_dir = cwd.join(session);
+            fs::create_dir_all(&copilot_dir).unwrap();
+            let copilot = copilot_dir.join("events.jsonl");
+            fs::write(&copilot, &record).unwrap();
+            assert!(
+                copilot_session_header(&copilot).unwrap().is_none(),
+                "copilot: cut character at offset MAX_EVENT_BYTES - 1 + {offset}"
+            );
+        }
+    }
+
+    /// A header that is NOT oversized and is not valid UTF-8 keeps failing the
+    /// read, so the cap's skip guard does not widen into accepting malformed
+    /// transcripts.
+    #[test]
+    fn a_malformed_utf8_header_within_the_cap_still_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let path = cwd.join("1a1f2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b.jsonl");
+        fs::write(&path, b"{\"sessionId\":\"\xff\xfe\"}\n").unwrap();
+        let error = session_header(ManagedHarness::Claude, &path).unwrap_err();
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "a short malformed header still errors: {error:#}"
+        );
+        let error = command_code_session_header(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "a short malformed header still errors: {error:#}"
+        );
+    }
+
+    /// The consequence of the lost skip: `discover_native_session` propagates
+    /// the header read's error, so one oversized non-ASCII record in Claude
+    /// Code's shared `~/.claude/projects` tree aborts discovery for every
+    /// other session recorded beside it.
+    #[tokio::test]
+    async fn an_oversized_non_ascii_record_does_not_abort_discovery_of_another_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let transcripts = temp
+            .path()
+            .join(".claude/projects")
+            .join(cwd.to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&transcripts).unwrap();
+        // Sorted ahead of the session we are looking for, so discovery reads
+        // it first whether or not the two share a modification time.
+        let poisoned = "0aaaaaaa-0000-4000-8000-000000000000";
+        let wanted = "fbbbbbbb-0000-4000-8000-000000000000";
+        fs::write(
+            transcripts.join(format!("{wanted}.jsonl")),
+            format!("{}\n", json!({"sessionId": wanted, "cwd": cwd})),
+        )
+        .unwrap();
+        fs::write(
+            transcripts.join(format!("{poisoned}.jsonl")),
+            oversized_header_cut_mid_character(
+                poisoned,
+                &cwd,
+                MAX_SESSION_HEADER_BYTES,
+                MAX_SESSION_HEADER_BYTES,
+            ),
+        )
+        .unwrap();
+        let discovered = discover_native_session(
+            ManagedHarness::Claude,
+            temp.path(),
+            &cwd,
+            None,
+            SystemTime::now() - Duration::from_secs(60),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(discovered.as_deref(), Some(wanted));
     }
 
     #[tokio::test]
