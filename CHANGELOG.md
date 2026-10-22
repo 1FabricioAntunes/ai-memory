@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The importer no longer carries a UTF-8 BOM into an imported text or Markdown
+  document. `document --file notes.md` on a file saved with a BOM — what
+  Notepad, VS Code's `utf8bom` encoding and Excel's "CSV UTF-8" export all
+  write — stored a body beginning `\u{feff}# Overview`, so the first heading
+  stopped being a heading. Nothing downstream removed it, since U+FEFF is
+  neither whitespace nor a control character, and the transcript extractor in
+  the same file already stripped it.
+  ([#1568](https://github.com/akitaonrails/ai-memory/pull/1568))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
