@@ -366,6 +366,16 @@ version in [`docs/changelog/`](docs/changelog/):
   SessionEnd consolidation job kept re-sending the same prompt on its backoff
   schedule, each attempt truncating again at the same budget.
   ([#1543](https://github.com/akitaonrails/ai-memory/pull/1543))
+
+- `memory_read_page` now answers a missing read target with `invalid params`
+  (-32602) instead of an internal error (-32603). A page absent under the
+  resolved scope, and a query that matched nothing, are caller-fixable: the
+  store answered, there is simply nothing there, and a client reads -32603 as
+  "retry". `memory_status` and `memory_read_session_observations` already
+  answer -32602 for an unknown project or session. The messages and the
+  auto-resolved-scope hint are unchanged, and a genuine disk or store failure
+  on the same path still answers -32603.
+  ([#1544](https://github.com/akitaonrails/ai-memory/pull/1544))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
