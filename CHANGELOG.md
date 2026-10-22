@@ -462,6 +462,14 @@ version in [`docs/changelog/`](docs/changelog/):
   conformed while its file kept pre-OKF frontmatter — and markdown being the
   source of truth, the next reindex de-conformed the page again.
   ([#1557](https://github.com/akitaonrails/ai-memory/pull/1557))
+- A root Grok session no longer loses its handoff because a tool used one of
+  the subagent marker key names. The shell `post-tool-use` hook matched
+  `agent_id` and its siblings as substrings of the whole raw payload, so a key
+  of that name nested in `tool_input` or in a structured tool result, or a
+  blank top-level value, suppressed the fetch. The gate now reads top-level
+  keys with a non-empty string value, like the native router and the
+  PowerShell bundle already did.
+  ([#1558](https://github.com/akitaonrails/ai-memory/pull/1558))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
