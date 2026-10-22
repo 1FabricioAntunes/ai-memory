@@ -11,6 +11,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected the Docker rollback instructions to retag the prior digest and recreate the service without pulling the newer tag.
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
