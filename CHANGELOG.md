@@ -94,6 +94,19 @@ version in [`docs/changelog/`](docs/changelog/):
   enqueue and drain on the path stays gated on the external owner, so the
   exemption delivers context without capturing anything.
   ([#1576](https://github.com/akitaonrails/ai-memory/pull/1576))
+- Fixed the SessionEnd consolidation queue retrying a provider failure that a
+  later attempt cannot clear. The queue's terminality check hand-enumerated
+  only the deterministic structured-response shapes, so a rejected or expired
+  credential, an unconfigured provider, a schema failure and a
+  malformed-request `4xx` were all retried: one expired API key burned the
+  full five-attempt cap — five complete consolidation prompts over 7.5
+  minutes — for every ended session, logging "queued for retry" four times.
+  The check now defers to `LlmError::is_transient`, the predicate the
+  in-process consolidation and bootstrap retry loops already use, so only a
+  `429`, a `5xx` or a transport timeout/connect failure keeps the bounded
+  backoff and every deterministic failure settles the job terminal with the
+  heuristic session page left in place
+  ([#1581](https://github.com/akitaonrails/ai-memory/pull/1581))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
