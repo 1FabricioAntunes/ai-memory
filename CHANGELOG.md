@@ -295,6 +295,10 @@ version in [`docs/changelog/`](docs/changelog/):
   line as the `[core]` section header, so `ai-memory-wikisync install-hook`
   no longer writes a `.git/hooks/post-merge` that git would never run.
   ([#1530](https://github.com/akitaonrails/ai-memory/pull/1530))
+- Counted a file's final line in `ai-memory-wikisync` diff summaries when it
+  does not end in a newline, so the `bytes/lines` figures no longer contradict
+  the `first difference at line N` printed beside them.
+  ([#1531](https://github.com/akitaonrails/ai-memory/pull/1531))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
