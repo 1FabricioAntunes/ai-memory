@@ -86,6 +86,14 @@ version in [`docs/changelog/`](docs/changelog/):
   as a 409 listing the conflicting paths instead of merging them, while a
   dropped `--force` put the active-project guard back in place
   ([#1575](https://github.com/akitaonrails/ai-memory/pull/1575))
+- The compaction recap now reaches Claude Code, Codex and Qwen Code while an
+  external producer owns capture. A `reload context` prompt is answered
+  through the `UserPromptSubmit` context envelope, but that delivery path was
+  missing from the set exempt from `AI_MEMORY_CAPTURE_OWNER` suppression, so
+  the hook returned an empty response before it could fetch the recap. Every
+  enqueue and drain on the path stays gated on the external owner, so the
+  exemption delivers context without capturing anything.
+  ([#1576](https://github.com/akitaonrails/ai-memory/pull/1576))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
