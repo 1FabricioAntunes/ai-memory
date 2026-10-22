@@ -11,6 +11,24 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed native transcript imports dropping a whole session when one JSONL
+  record exceeded the 1 MiB per-record cap, as a Claude Code screenshot in a
+  tool result does: `ai-memory backfill` imported nothing from the session,
+  and an `ai-memory run` recorded its transcript import as failed. The record
+  is now skipped as an extraction loss, its tail read in bounded chunks that
+  still count toward the 64 MiB source cap, and the rest of the session is
+  imported; a record still being written is left for the next read, not
+  skipped half-way. The transcript baseline steps over it the same way, so a
+  degraded run's recovery cursor and its exact replay agree. An annotation
+  marks the gap, and shows in a managed run's ledger as an import note, so the
+  capture policy fails closed: a tool result without a call id (Kimi, Grok)
+  later in the same turn is treated as an orphan, since the skipped record may
+  have been its call under an ignored path. `backfill` and `recover` print how
+  many records they skipped on stderr, `backfill` also under `--quiet`
+  (#1613).
+
 ## [3.2.1] - 2026-10-22
 
 ### Fixed

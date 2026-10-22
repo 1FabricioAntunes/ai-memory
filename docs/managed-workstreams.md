@@ -516,7 +516,11 @@ resume, continue, session, or fork selector.
    there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
-   excluded and recorded as extraction-loss annotations. The checkout's
+   excluded and recorded as extraction-loss annotations. So is a record over
+   the 1 MiB per-record cap, usually an image in a tool result: it is skipped
+   rather than failing the import, and a note marks the gap. Because the
+   skipped record may have been a tool call, a later result in that turn that
+   carries no call id is treated as having an unknown call. The checkout's
    `[capture] ignore_paths` applies before upload, with the live hook's
    decision table: an excluded tool call and its result never enter the
    ledger, one the policy cannot prove safe keeps only its tool family, and a
