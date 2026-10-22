@@ -19,6 +19,13 @@ version in [`docs/changelog/`](docs/changelog/):
   cells, so accented and double-width CJK workspace, project and user names
   keep the `USERNAME` and `LEVEL` columns aligned.
   ([#1564](https://github.com/akitaonrails/ai-memory/pull/1564))
+- The LLM dream pass no longer writes a cross-scope wikilink that does not
+  resolve. Every other consolidation write runs its proposed bodies through the
+  cross-scope link guard, but the dream pass never did, so a `[[project:path]]`
+  carried in from a cluster member's body — or invented by the model — reached
+  the merged survivor and minted a dangling cross-project edge that the lint
+  pass reported on every later run and nothing could clear.
+  ([#1566](https://github.com/akitaonrails/ai-memory/pull/1566))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one

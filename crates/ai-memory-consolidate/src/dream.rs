@@ -530,7 +530,7 @@ pub async fn run_dream_pass(
             report.cancelled = true;
             break;
         }
-        match merge_one_cluster(wiki, llm, workspace_id, project_id, &plan).await {
+        match merge_one_cluster(wiki, reader, llm, workspace_id, project_id, &plan).await {
             MergeOutcome::Applied {
                 new_survivor_id,
                 superseded,
@@ -571,6 +571,7 @@ enum MergeOutcome {
 /// skips the cluster without touching a source.
 async fn merge_one_cluster(
     wiki: &Wiki,
+    reader: &ReaderPool,
     llm: &(dyn LlmProvider + 'static),
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -676,11 +677,44 @@ async fn merge_one_cluster(
             source_id: format!("b2_dream:{}", loser.id),
         });
     }
+    // #1218: a cross-scope link the model invented must not be written. The
+    // member bodies are injected into the merge prompt verbatim, so a
+    // `[[project:path]]` from a source page — or one the model simply made up —
+    // reaches the survivor. Resolve each against the store and de-link what
+    // does not exist, as the consolidator and bootstrap writes already do;
+    // otherwise the merge mints a dangling cross-project edge that
+    // `dangling_cross_project_links` reports on every later lint run and
+    // nothing in the pipeline can clear.
+    let mut survivor_fm = serde_json::Value::Object(survivor_fm);
+    match crate::link_guard::unresolved_generated_links(
+        reader,
+        workspace_id,
+        project_id,
+        &[(&survivor.path, survivor_body.as_str(), &survivor_fm)],
+    )
+    .await
+    {
+        Ok(unresolved) => {
+            survivor_body =
+                crate::link_guard::delink_body(&survivor_body, &survivor.path, &unresolved.body)
+                    .into_owned();
+            crate::link_guard::prune_relations(&mut survivor_fm, &unresolved.relations);
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %survivor.path.as_str(),
+                %error,
+                "dream pass: cross-scope link resolution failed; skipping cluster (retried next run)"
+            );
+            return MergeOutcome::Skipped;
+        }
+    }
+
     requests.push(WritePageRequest {
         workspace_id,
         project_id,
         path: survivor.path.clone(),
-        frontmatter: serde_json::Value::Object(survivor_fm),
+        frontmatter: survivor_fm,
         body: survivor_body,
         tier: Tier::Episodic,
         pinned: false,
