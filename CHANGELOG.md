@@ -25,6 +25,15 @@ version in [`docs/changelog/`](docs/changelog/):
   118/295) and ingest throughput; the reported hit@5 delta (0.947 → 0.938)
   traces to rank-boundary questions that flip between identical runs, not
   a deterministic ranking change (#1580).
+- `install-mcp --client codex` now prints the same table name `--apply` writes.
+  The printed snippet hand-interpolated `[mcp_servers.<name>]`, so `--name
+  ai.memory` printed a header a TOML reader resolves as three nested tables
+  rather than one server, and `--name "my memory"` printed an invalid header
+  that breaks the whole `config.toml` it is pasted into — while `--apply`
+  quoted the key correctly all along. The printed table is now built with the
+  apply path's own `toml_edit` writer; output for an ordinary name is
+  unchanged.
+  ([#1594](https://github.com/akitaonrails/ai-memory/pull/1594))
 
 - Fixed `ai-memory run` (and `show`, `continue`, `resume`, `workstreams`,
   `rename-workstream`) failing on Windows Docker installs with "managed
