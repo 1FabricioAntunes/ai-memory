@@ -425,6 +425,13 @@ version in [`docs/changelog/`](docs/changelog/):
   as a unit. Indexing changes with this, so existing rows keep their old terms
   until they are rewritten or the index is rebuilt by a compaction.
   ([#1552](https://github.com/akitaonrails/ai-memory/pull/1552))
+- `memory_write_page` now refuses a relation target whose `project:` or
+  `workspace/project:` scope holds a character the link reader cannot parse,
+  such as a space in `my project:notes/x`. The write boundary used a looser
+  character class than the reader, so the colon stayed inside the page path on
+  read and the write created an edge to a path no page write can ever produce —
+  a `links` row that could never be resolved.
+  ([#1553](https://github.com/akitaonrails/ai-memory/pull/1553))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
