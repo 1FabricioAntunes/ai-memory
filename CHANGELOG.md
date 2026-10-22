@@ -334,6 +334,13 @@ version in [`docs/changelog/`](docs/changelog/):
   rename event rather than a removal, so the next auto-commit drops it from the
   tree instead of leaving a checkpoint naming a page that no longer exists.
   ([#1537](https://github.com/akitaonrails/ai-memory/pull/1537))
+- Omitted TTL-expired pages from the 7- and 30-day activity counters in
+  `memory_briefing`. A page written with a short TTL made a project look
+  active while the brief's own recent-page list was empty, which is the
+  signal an agent uses to decide how much context to pull. Session and
+  observation counters have no TTL and are unchanged.
+  ([#1539](https://github.com/akitaonrails/ai-memory/pull/1539))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives

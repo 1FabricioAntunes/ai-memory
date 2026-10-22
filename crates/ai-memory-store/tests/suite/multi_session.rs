@@ -4600,3 +4600,76 @@ async fn briefing_pages_latest_ignores_expired_pages() {
     assert_eq!(global.counts.pages_latest, 1);
     assert_eq!(global.counts.pages_all, 2);
 }
+
+/// The briefing's activity windows are what an agent calibrates verbosity
+/// against, and `recent_pages` in the same snapshot already hides TTL-expired
+/// pages. A page written today with an expiry an hour ago must not make the
+/// project look active.
+#[tokio::test]
+async fn briefing_activity_windows_ignore_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert!(
+        project.recent_pages.is_empty(),
+        "control: the only page in the window is already hidden from the list"
+    );
+    assert_eq!(
+        project.activity_7d.pages_updated, 0,
+        "the expired page does not count as 7-day project activity"
+    );
+    assert_eq!(project.activity_30d.pages_updated, 0);
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 0);
+    assert_eq!(workspace.activity_30d.pages_updated, 0);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 0);
+    assert_eq!(global.activity_30d.pages_updated, 0);
+
+    // Control: a live page written in the same window still counts, so the
+    // guard cannot pass by zeroing the counter outright.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(project.activity_7d.pages_updated, 1);
+    assert_eq!(project.activity_30d.pages_updated, 1);
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 1);
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 1);
+}
