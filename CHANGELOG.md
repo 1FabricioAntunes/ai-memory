@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed the document importer's subtitle reader dropping WebVTT cues whose
   identifiers begin with `NOTE` and rejecting CR-only WebVTT files as empty.
   It now distinguishes comment tokens from cue identifiers and normalizes
-  CR, LF, and CRLF before splitting VTT/SRT cues.
+  CR, LF, and CRLF before splitting VTT/SRT cues. (#1601)
 
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
