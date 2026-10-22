@@ -197,6 +197,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Corrected Docker backup instructions to use an online server snapshot or stop the container before copying its data. ([#1586](https://github.com/akitaonrails/ai-memory/pull/1586))
 
+### Fixed
+
+- Corrected the multi-user migration command to pass the pepper length with `--bytes`. ([#1587](https://github.com/akitaonrails/ai-memory/pull/1587))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
