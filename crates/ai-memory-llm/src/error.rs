@@ -1,5 +1,7 @@
 //! LLM error type.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Result alias used throughout the LLM crate.
@@ -20,6 +22,8 @@ pub enum LlmError {
         status: u16,
         /// Response body (truncated).
         body: String,
+        /// Provider-requested delay before another equivalent request.
+        retry_after: Option<Duration>,
     },
 
     /// JSON (de)serialization failure.
@@ -129,6 +133,16 @@ impl LlmError {
         }
     }
 
+    /// Provider-requested delay before another equivalent request, when the
+    /// failed HTTP response carried a trustworthy, boundedly parsed hint.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Provider { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// Redacted error category used for health reporting and the fallback
     /// chain's aggregate error — never a response body or secret.
     #[must_use]
@@ -164,7 +178,8 @@ mod tests {
         assert!(
             LlmError::Provider {
                 status: 429,
-                body: String::new()
+                body: String::new(),
+                retry_after: None,
             }
             .is_transient()
         );
@@ -172,7 +187,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} should be transient"
@@ -183,7 +199,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} must not be treated as transient"
@@ -255,7 +272,8 @@ mod tests {
         assert_eq!(
             LlmError::Provider {
                 status: 503,
-                body: "boom".into()
+                body: "boom".into(),
+                retry_after: None,
             }
             .http_status(),
             Some(503)
@@ -270,6 +288,7 @@ mod tests {
                 LlmError::Provider {
                     status: 500,
                     body: "secret upstream body".into(),
+                    retry_after: None,
                 },
                 "provider",
             ),
@@ -314,7 +333,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "{status} must agree with is_transient"
@@ -325,7 +345,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "{status} must agree with is_transient"

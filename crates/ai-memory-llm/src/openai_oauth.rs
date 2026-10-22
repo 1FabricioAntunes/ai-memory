@@ -366,6 +366,7 @@ pub(crate) fn parse_sse_response(body: &str, model: &str) -> LlmResult<CodexResp
             return Err(LlmError::Provider {
                 status: SSE_TERMINAL_ERROR_STATUS,
                 body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
+                retry_after: None,
             });
         }
         let kind = value
@@ -408,6 +409,7 @@ pub(crate) fn parse_sse_response(body: &str, model: &str) -> LlmResult<CodexResp
                 return Err(LlmError::Provider {
                     status: SSE_TERMINAL_ERROR_STATUS,
                     body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
+                    retry_after: None,
                 });
             }
             _ => {}
@@ -828,7 +830,7 @@ mod tests {
 
             let err = parse_sse_response(&body, "gpt-5.5").expect_err("terminal event must fail");
             match err {
-                LlmError::Provider { status, body } => {
+                LlmError::Provider { status, body, .. } => {
                     assert_eq!(status, 502);
                     assert!(body.contains(event), "body should include event: {body}");
                     assert!(
@@ -886,7 +888,7 @@ mod tests {
 
         let err = parse_sse_response(body, "gpt-5.5").expect_err("terminal event must fail");
         match err {
-            LlmError::Provider { status, body } => {
+            LlmError::Provider { status, body, .. } => {
                 assert_eq!(status, SSE_TERMINAL_ERROR_STATUS);
                 assert!(
                     body.contains("content_filter"),
@@ -925,7 +927,7 @@ mod tests {
         let err = parse_sse_response(body, "gpt-5.5")
             .expect_err("top-level error payload must surface as a terminal error");
         match err {
-            LlmError::Provider { status, body } => {
+            LlmError::Provider { status, body, .. } => {
                 assert_eq!(status, super::SSE_TERMINAL_ERROR_STATUS);
                 assert!(
                     body.contains("context length exceeded"),

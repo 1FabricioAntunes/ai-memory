@@ -4951,6 +4951,7 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -4968,6 +4969,7 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -5053,10 +5055,12 @@ mod tests {
                     ConsolidationFailure::MalformedRequest => LlmError::Provider {
                         status: 400,
                         body: "bad request".into(),
+                        retry_after: None,
                     },
                     ConsolidationFailure::RateLimited => LlmError::Provider {
                         status: 429,
                         body: "rate limited".into(),
+                        retry_after: None,
                     },
                 };
                 Err(error)
@@ -5095,10 +5099,12 @@ mod tests {
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 401,
                 body: "invalid api key".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 400,
                 body: "bad request".into(),
+                retry_after: None,
             }),
         ];
         for error in &terminal {
@@ -5127,14 +5133,17 @@ mod tests {
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 429,
                 body: "rate limited".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 503,
                 body: "capacity".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 502,
                 body: "bad gateway".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Http(connect)),
         ];

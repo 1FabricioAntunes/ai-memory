@@ -8099,6 +8099,7 @@ mod tests {
                 StubRerankOutcome::ProviderFail => Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 }),
             }
         }
@@ -15862,6 +15863,7 @@ mod tests {
             Err(ai_memory_llm::LlmError::Provider {
                 status: 400,
                 body: "SENTINEL_PRIVATE_BODY".into(),
+                retry_after: None,
             })
         }
 
@@ -15873,6 +15875,7 @@ mod tests {
             Err(ai_memory_llm::LlmError::Provider {
                 status: 400,
                 body: "SENTINEL_PRIVATE_BODY".into(),
+                retry_after: None,
             })
         }
     }
@@ -21828,6 +21831,7 @@ mod tests {
         ai_memory_llm::LlmError::Provider {
             status: 400,
             body: "SENTINEL_PRIVATE_BODY".into(),
+            retry_after: None,
         }
     }
 

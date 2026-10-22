@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fallback-provider circuits now honor bounded retry hints instead of retrying
+  a quota-exhausted candidate every 30 seconds. HTTP `Retry-After` takes
+  precedence; Gemini's `google.rpc.RetryInfo.retryDelay` is read from the full
+  scrubbed error body before its diagnostic text is cut to 1 KiB. Hints are
+  clamped to 30 seconds through one hour, remain scoped to one chain entry, and
+  never enlarge the logged provider body (#1619).
 - Fixed the PowerShell Docker wrapper leaving native managed commands without
   the root bearer stored in a named volume. Native `install-hooks` now refreshes
   a host copy under the user's local app-data directory once, and `run`,
