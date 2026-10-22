@@ -1013,7 +1013,10 @@ fn pptx_notes_target(relationships: &str) -> Result<Option<String>> {
 fn extract_transcript(bytes: &[u8], webvtt: bool) -> Result<String> {
     let text = std::str::from_utf8(bytes).context("transcript must be UTF-8")?;
     let mut output = String::new();
-    let normalized = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    let normalized = text
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     for (block_index, block) in normalized.split("\n\n").enumerate() {
         let lines = block.lines().map(str::trim).collect::<Vec<_>>();
         let Some(first) = lines.first().copied().filter(|line| !line.is_empty()) else {
@@ -1022,7 +1025,10 @@ fn extract_transcript(bytes: &[u8], webvtt: bool) -> Result<String> {
         if webvtt && block_index == 0 && first.starts_with("WEBVTT") {
             continue;
         }
-        if webvtt && (matches!(first, "STYLE" | "REGION") || first.starts_with("NOTE")) {
+        // A cue identifier may start with NOTE; only a complete NOTE token
+        // introduces a comment: https://www.w3.org/TR/webvtt1/#webvtt-comment-block
+        let comment = first == "NOTE" || first.starts_with("NOTE ") || first.starts_with("NOTE\t");
+        if webvtt && (matches!(first, "STYLE" | "REGION") || comment) {
             continue;
         }
         let timing_index = if is_timing_line(first) {
@@ -1666,6 +1672,50 @@ mod tests {
         let srt = b"1\n00:00:01,000 --> 00:00:02,000\n12345\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond line\n";
         let text = extract_transcript(srt, false).unwrap();
         assert_eq!(text.trim(), "12345\n\nSecond line");
+    }
+
+    #[test]
+    fn webvtt_keeps_cues_whose_identifiers_only_start_with_note() {
+        let vtt = b"WEBVTT\n\nNOTE an actual comment\nNot spoken\n\nNOTEworthy\n00:00:01.000 --> 00:00:02.000\nKeep this fact\n\nNOTE123\n00:00:03.000 --> 00:00:04.000\nKeep this too\n\nNOTE\tanother comment\nNot spoken either\n\nNOTE\nNot spoken at all\n";
+        assert_eq!(
+            extract_transcript(vtt, true).unwrap().trim(),
+            "Keep this fact\n\nKeep this too"
+        );
+    }
+
+    #[test]
+    fn transcripts_accept_each_supported_line_terminator() {
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nFirst fact\n\n00:00:03.000 --> 00:00:04.000\nSecond fact\n";
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nFirst fact\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond fact\n";
+        for newline in ["\n", "\r\n", "\r"] {
+            for (input, webvtt) in [(vtt, true), (srt, false)] {
+                let input = input.replace('\n', newline);
+                assert_eq!(
+                    extract_transcript(input.as_bytes(), webvtt).unwrap().trim(),
+                    "First fact\n\nSecond fact",
+                    "line terminator {newline:?}, WebVTT={webvtt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subtitle_cues_are_sanitized_before_the_document_plan() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("captions.vtt");
+        for identifier in ["NOTE123", "ordinary-cue"] {
+            for newline in ["\n", "\r\n", "\r"] {
+                let input = format!(
+                    "WEBVTT\n\nNOTE annotation\nCOMMENT_SENTINEL\n\n{identifier}\n00:00:01.000 --> 00:00:02.000\nKeep this fact token=abcdefghijklmnop\n"
+                )
+                .replace('\n', newline);
+                fs::write(&file, input).unwrap();
+                let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+                assert!(plan.body.contains("Keep this fact token=[REDACTED]"));
+                assert!(!plan.body.contains("abcdefghijklmnop"));
+                assert!(!plan.body.contains("COMMENT_SENTINEL"));
+            }
+        }
     }
 
     #[test]
