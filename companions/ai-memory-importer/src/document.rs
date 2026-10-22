@@ -492,7 +492,15 @@ fn extract(format: DocumentFormat, _path: &Path, bytes: &[u8]) -> Result<String>
             if bytes.len() > MAX_WORKING_TEXT_BYTES {
                 bail!("text document exceeds the {MAX_WORKING_TEXT_BYTES}-byte extraction limit");
             }
-            String::from_utf8(bytes.to_vec()).context("text and Markdown documents must be UTF-8")
+            let text = String::from_utf8(bytes.to_vec())
+                .context("text and Markdown documents must be UTF-8")?;
+            // Editors that save UTF-8 with a BOM (Notepad, VS Code's `utf8bom`
+            // encoding, Excel's "CSV UTF-8" export) put one here.
+            // `extract_transcript` already strips it; without this it reaches
+            // the page body, where `# Overview` stops being a heading. Neither
+            // `normalize_text` nor `sanitize_external_text` removes it: U+FEFF
+            // is neither whitespace nor a control character, so a trim misses it.
+            Ok(text.trim_start_matches('\u{feff}').to_owned())
         }
         DocumentFormat::Pdf => extract_pdf(bytes),
         DocumentFormat::Docx => extract_docx(bytes),
@@ -1511,6 +1519,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(titled.title, "token=[REDACTED]");
+    }
+
+    #[test]
+    fn text_plan_drops_a_leading_utf8_bom() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("notes.md");
+        fs::write(&file, "\u{feff}# Overview\n\nBody line.\n").unwrap();
+        let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+        assert!(
+            !plan.body.contains('\u{feff}'),
+            "BOM reached the page body: {:?}",
+            plan.body
+        );
+        assert!(
+            plan.body.contains("## Extracted content\n\n# Overview\n"),
+            "{:?}",
+            plan.body
+        );
     }
 
     #[test]
