@@ -242,6 +242,13 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
 /// rebuilding the expression is the real fix; declining the stream meanwhile
 /// restores the pre-#1433 answer instead of an inverted one. `OR` stays,
 /// because the expander reproduces it faithfully.
+///
+/// A leading `title:` / `body:` qualifier is carried onto the run's phrase.
+/// This stream is auxiliary — callers UNION it into the primary stream — so a
+/// qualifier dropped here searches every column of `pages_cjk_fts`, including
+/// `path_search`, and the union widens a query the user deliberately narrowed.
+/// The two names are the ones [`prepare_fts5_token`] accepts; any other bare
+/// column is left alone, because the primary stream neutralises it too.
 #[must_use]
 pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     let bounded = bounded_query_text(raw);
@@ -252,15 +259,21 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
         return None;
     }
     let mut phrases = Vec::new();
-    let mut run = Vec::new();
-    for ch in bounded.chars() {
-        if is_cjk(ch) {
-            run.push(ch);
-        } else {
-            append_cjk_query(&mut phrases, &mut run);
+    for token in bounded.split_whitespace() {
+        let (column, text) = match token.split_once(':') {
+            Some((column @ ("title" | "body"), text)) => (Some(column), text),
+            _ => (None, token),
+        };
+        let mut run = Vec::new();
+        for ch in text.chars() {
+            if is_cjk(ch) {
+                run.push(ch);
+            } else {
+                append_cjk_query(&mut phrases, &mut run, column);
+            }
         }
+        append_cjk_query(&mut phrases, &mut run, column);
     }
-    append_cjk_query(&mut phrases, &mut run);
     (!phrases.is_empty()).then(|| phrases.join(" OR "))
 }
 
@@ -273,19 +286,20 @@ fn append_cjk_terms(terms: &mut Vec<String>, run: &mut Vec<char>) {
     run.clear();
 }
 
-fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>) {
+fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>, column: Option<&str>) {
     if run.is_empty() {
         return;
     }
+    let prefix = column.map_or_else(String::new, |column| format!("{column}:"));
     if run.len() == 1 {
-        phrases.push(format!("\"{}\"", run[0]));
+        phrases.push(format!("{prefix}\"{}\"", run[0]));
     } else {
         let bigrams = run
             .windows(2)
             .map(|pair| pair.iter().collect::<String>())
             .collect::<Vec<_>>()
             .join(" ");
-        phrases.push(format!("\"{bigrams}\""));
+        phrases.push(format!("{prefix}\"{bigrams}\""));
     }
     run.clear();
 }
@@ -531,6 +545,29 @@ mod tests {
         assert_eq!(prepare_cjk_fts5_query("東京 OR 大阪"), both);
         assert_eq!(prepare_cjk_fts5_query("東京 not 大阪"), both);
         assert_parses(&prepare_cjk_fts5_query("東京 OR 大阪").unwrap());
+    }
+
+    #[test]
+    fn cjk_queries_keep_a_known_column_filter() {
+        let title = prepare_cjk_fts5_query("title:支付服务").unwrap();
+        assert_eq!(title, "title:\"支付 付服 服务\"");
+        assert_parses(&title);
+        let body = prepare_cjk_fts5_query("body:支付服务").unwrap();
+        assert_eq!(body, "body:\"支付 付服 服务\"");
+        assert_parses(&body);
+        let single = prepare_cjk_fts5_query("title:支").unwrap();
+        assert_eq!(single, "title:\"支\"");
+        assert_parses(&single);
+        // Control: the bare query is untouched, and a column FTS5 does not
+        // know stays unqualified here exactly as the primary stream
+        // neutralises it, rather than being emitted as invalid syntax.
+        assert_eq!(
+            prepare_cjk_fts5_query("支付服务"),
+            Some("\"支付 付服 服务\"".to_string())
+        );
+        let unknown = prepare_cjk_fts5_query("author:支付服务").unwrap();
+        assert_eq!(unknown, "\"支付 付服 服务\"");
+        assert_parses(&unknown);
     }
 
     #[test]
