@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory recover` now recovers a GitHub Copilot CLI session. The recovery
+  journal records `copilot` for a degraded or finish-failed `ai-memory run
+  copilot`, but the reader had no entry for that name, so recovery reported
+  `journal names unsupported harness 'copilot'` and retained the entry on every
+  rerun, leaving the transcript unrecovered. The same gap keyed the quarantined
+  hook events with `copilot` instead of `copilot-cli` and sent an exportable
+  Copilot transcript down the spool-only path.
+  ([#1572](https://github.com/akitaonrails/ai-memory/pull/1572))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
