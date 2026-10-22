@@ -13,7 +13,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- Corrected Docker backup instructions to use an online server snapshot or stop the container before copying its data.
+- Corrected Docker backup instructions to use an online server snapshot or stop the container before copying its data. ([#1586](https://github.com/akitaonrails/ai-memory/pull/1586))
 
 ## [3.2.0] - 2026-10-21
 
