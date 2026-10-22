@@ -26,6 +26,13 @@ version in [`docs/changelog/`](docs/changelog/):
   the merged survivor and minted a dangling cross-project edge that the lint
   pass reported on every later run and nothing could clear.
   ([#1566](https://github.com/akitaonrails/ai-memory/pull/1566))
+- The desktop installer no longer hangs on "Starting the setup page" when
+  `ai-memory setup --web` logs heavily. It read the child's stdout for the
+  whole run and its stderr only afterwards, so once that unread pipe filled
+  (64 KiB) the child blocked on its next log line and never printed the page's
+  address, leaving the window on the status line with no error. Both streams
+  are now read at the same time.
+  ([#1567](https://github.com/akitaonrails/ai-memory/pull/1567))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
