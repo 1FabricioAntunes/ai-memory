@@ -25,6 +25,18 @@ version in [`docs/changelog/`](docs/changelog/):
   118/295) and ingest throughput; the reported hit@5 delta (0.947 → 0.938)
   traces to rank-boundary questions that flip between identical runs, not
   a deterministic ranking change (#1580).
+- `install-mcp --client freebuff --apply --auth-token` now stores the key in
+  `<data_dir>/auth-token`, where the hooks keep theirs, and writes the FreeBuff
+  entry with `--data-dir` and no token, as it already did for the Claude Code
+  (`--session-aware`) and Muse bridge entries. FreeBuff's entry is always the
+  session-less `mcp-bridge` and already carried that `--data-dir`, but the key
+  was written into `~/.agents/mcp.json` as `env.AI_MEMORY_AUTH_TOKEN`, outside
+  the data dir's file permissions and outliving a rotation. The key still stays
+  in the entry whenever the bridge would not reach it: a configured bearer that
+  would win, a different key already stored for the hooks, hooks that sign in
+  with OIDC, a failed store, a different endpoint, the Docker helper, or a
+  snippet that is only printed.
+  ([#1593](https://github.com/akitaonrails/ai-memory/pull/1593))
 
 ## [3.2.0] - 2026-10-21
 
