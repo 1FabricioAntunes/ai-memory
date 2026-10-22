@@ -448,6 +448,14 @@ version in [`docs/changelog/`](docs/changelog/):
   an explicit `--session`/`--resume` kept no expected session id and fell back
   to post-exit transcript discovery.
   ([#1555](https://github.com/akitaonrails/ai-memory/pull/1555))
+- Dropped the merged-away page's `summary:` and `abstract:` from the merge
+  stub left behind by cold-cluster dedup and the dream pass. Retrieval
+  prefers a frontmatter summary over the body, so the brief and the
+  non-keyword hit lists described the stub as if it still held content that
+  had moved to the survivor. The pre-merge frontmatter stays reachable
+  through the supersession chain; compaction is unchanged.
+  ([#1556](https://github.com/akitaonrails/ai-memory/pull/1556))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
