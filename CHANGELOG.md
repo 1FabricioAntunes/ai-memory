@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `purge-project` now keeps `--force` and `--compact` in the re-run command its
+  refusal prints. The dry-run preview above it is computed with the operator's
+  own flags, but the printed command dropped them, so pasting it after a
+  `--force` run came back as a 409 `managed run lease is active` — the exact
+  condition `--force` overrides — and a `--compact` run quietly reverted to a
+  logical delete ([#1574](https://github.com/akitaonrails/ai-memory/pull/1574))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
