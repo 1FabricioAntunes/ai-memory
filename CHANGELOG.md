@@ -406,6 +406,12 @@ version in [`docs/changelog/`](docs/changelog/):
   instead. Non-structured completions are unchanged — prose cut at the budget is
   still returned.
   ([#1549](https://github.com/akitaonrails/ai-memory/pull/1549))
+- Counted a page needing only an L0 abstract embedding in `ai-memory embed
+  --dry-run` and `/admin/embed`. A page whose body vector was already current
+  appeared in neither the would-embed nor the up-to-date total, so the dry run
+  reported no work for a scope where a live run writes abstract embeddings.
+  ([#1550](https://github.com/akitaonrails/ai-memory/pull/1550))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
