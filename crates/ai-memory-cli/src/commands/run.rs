@@ -3501,10 +3501,24 @@ fn ensure_executable_available(
         return Ok(());
     }
     Err(anyhow!(
-        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. Docker users should run `ai-memory upgrade` to refresh the host wrapper",
+        "managed {} executable `{}` was not found in the host PATH; install it or pass `--executable`. {}",
         harness.as_str(),
-        program.to_string_lossy()
+        program.to_string_lossy(),
+        docker_host_client_hint(),
     ))
+}
+
+/// The Docker-wrapper advice appended to a missing-harness error, split by OS
+/// because the two wrappers upgrade differently (#1545): the POSIX wrapper's
+/// `upgrade` re-downloads its checksum-verified native host client, while the
+/// PowerShell wrapper's `upgrade` only pulls the image, so a Windows Docker
+/// user needs the native client's installer instead.
+fn docker_host_client_hint() -> &'static str {
+    if cfg!(windows) {
+        "Docker Desktop users: managed launches run through the native Windows client, not the container; install it with `irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex` (docs/windows.md)"
+    } else {
+        "Docker users should run `ai-memory upgrade` to refresh the host wrapper"
+    }
 }
 
 /// Whether this harness's default executable resolves through `PATH`.

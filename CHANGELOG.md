@@ -26,6 +26,24 @@ version in [`docs/changelog/`](docs/changelog/):
   traces to rank-boundary questions that flip between identical runs, not
   a deterministic ranking change (#1580).
 
+- Fixed `ai-memory run` (and `show`, `continue`, `resume`, `workstreams`,
+  `rename-workstream`) failing on Windows Docker installs with "managed
+  claude executable `claude` was not found in the host PATH": the PowerShell
+  wrapper sent every subcommand into the Linux helper container, which has no
+  host CLIs. It now intercepts the same six commands `bin/ai-memory` does and
+  runs them through the native Windows client, resolved from
+  `AI_MEMORY_NATIVE_BIN` or the documented
+  `%LOCALAPPDATA%\Programs\ai-memory` install location, inheriting
+  `AI_MEMORY_SERVER_URL` (an explicit value wins) and exiting with the
+  child's code. A missing client fails with the documented installer command
+  instead of entering the container; the POSIX wrapper's Git Bash refusal
+  points at the same installer; and the missing-harness error's Docker
+  advice is now OS-aware: on Windows it names the native-client installer
+  rather than `ai-memory upgrade`, which in the `.ps1` wrapper only pulls
+  the image. Managed launches keep the hook/MCP wiring rendered through the
+  container (the wrapper sets `AI_MEMORY_RUN_AUTOWIRE=false` for the
+  intercepted commands unless the operator set it). (#1545)
+
 ## [3.2.0] - 2026-10-21
 
 ### Added

@@ -498,6 +498,15 @@ native_host_binary() {
   case "$(uname -s 2>/dev/null || true)" in
     Linux) os="linux" ;;
     Darwin) os="macos" ;;
+    MINGW* | MSYS* | CYGWIN*)
+      # Git Bash on native Windows: no Linux/macOS release client exists, and
+      # the helper container cannot run host harnesses anyway. Point at the
+      # two supported paths instead of a bare refusal (#1545).
+      echo "ai-memory: the POSIX container wrapper cannot run host commands on native Windows" >&2
+      echo "use the PowerShell wrapper (bin/ai-memory.ps1) or install the native Windows client:" >&2
+      echo "  irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex" >&2
+      return 1
+      ;;
     *)
       echo "ai-memory: the container wrapper cannot provide native host commands on this OS" >&2
       echo "install the native release binary to use managed launches or native lifecycle hooks" >&2

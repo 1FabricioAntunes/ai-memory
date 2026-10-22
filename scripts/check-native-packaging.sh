@@ -182,6 +182,22 @@ main() {
     fail "AI_MEMORY_NATIVE_BIN pointing to the wrapper must be refused instead of recursing"
   fi
 
+  log "Checking the PowerShell wrapper intercepts the same native host commands"
+  # bin/ai-memory.ps1 routes run/show/continue/resume/workstreams/rename-
+  # workstream to the native Windows client (#1545). Its list must match the
+  # POSIX wrapper's intercept exactly, and both must point a missing client
+  # at the documented Windows installer. Static only: this script has no pwsh.
+  local posix_list ps1_list
+  posix_list="$(grep -m1 '^  run | show | continue | resume | workstreams | rename-workstream)' bin/ai-memory \
+    | sed 's/^ *//; s/)$//' | tr '|' ' ' | tr -s ' ' '\n' | sort | paste -sd' ' -)"
+  ps1_list="$(sed -n '/^\$NativeHostCommands = @($/,/^)$/p' bin/ai-memory.ps1 \
+    | grep -o '"[a-z-]*"' | tr -d '"' | sort | paste -sd' ' -)"
+  test -n "${posix_list}" || fail "could not extract the native host command list from bin/ai-memory"
+  test "${posix_list}" = "${ps1_list}" \
+    || fail "native host command lists drifted between bin/ai-memory (${posix_list}) and bin/ai-memory.ps1 (${ps1_list})"
+  assert_contains bin/ai-memory.ps1 "https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1"
+  assert_contains bin/ai-memory "https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1"
+
   log "Checking the wrapper hands host commands the volume's root bearer"
   # New-install default: a server initialized on the named volume keeps its token at
   # /data/auth-tokens/default. Host-native commands must receive it as a
