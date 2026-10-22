@@ -341,6 +341,10 @@ version in [`docs/changelog/`](docs/changelog/):
   observation counters have no TTL and are unchanged.
   ([#1539](https://github.com/akitaonrails/ai-memory/pull/1539))
 
+- Kept a literal `<mark>` tag from a page's own text out of a search snippet's
+  markup, so it no longer renders as an unbalanced opening tag that highlights
+  the rest of the excerpt as if it were a query match.
+  ([#1540](https://github.com/akitaonrails/ai-memory/pull/1540))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
