@@ -723,7 +723,10 @@ pub fn hook_router(state: HookState) -> Router {
             "/hook",
             post(handle_hook).route_layer(from_fn(repair_hook_json)),
         )
-        .route("/hook/batch", post(handle_hook_batch))
+        .route(
+            "/hook/batch",
+            post(handle_hook_batch).route_layer(from_fn(repair_hook_json)),
+        )
         .route("/handoff", get(handle_handoff))
         .route("/recap", get(crate::recap::handle_recap))
         .with_state(Arc::new(state))
