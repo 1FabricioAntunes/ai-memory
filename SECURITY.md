@@ -33,6 +33,17 @@ what the project is and is not designed to defend against.
   not chmodded automatically. Windows uses its filesystem ACLs rather than
   POSIX mode bits.
 
+  The hook spool (`<data_dir>/hook-spool/`) holds each captured lifecycle
+  event until the server accepts it. Each file carries the event body as the
+  harness sent it, before the server's privacy strip runs (the client scrubs
+  only a field that exceeds its size cap and the opt-in assistant excerpt),
+  plus a copy of the static hook bearer when the event authenticates with one;
+  an OIDC event stores no token and resolves it at delivery. Files are `0600`
+  in a `0700` directory. A drain at session boundaries delivers and deletes
+  them; an event that cannot be delivered is dropped after 7 days, and the
+  spool is capped at 10,000 files. `ai-memory backup` does not include the
+  spool, but a filesystem-level copy of the data directory does.
+
 - **Network exposure when binding to non-loopback addresses.** If you run
   `ai-memory serve --bind 0.0.0.0:…` you are exposing the MCP and admin
   routes to your local network. Protect this with:
