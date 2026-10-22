@@ -277,6 +277,29 @@ impl Fixture {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    /// A session end writes its handoff after the hook is acknowledged; wait
+    /// until `count` handoffs are open, so later work is newer than them.
+    async fn wait_for_open_handoffs(&self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let listed = self
+                .call_tool(
+                    "memory_handoff_list",
+                    json!({ "workspace": WORKSPACE, "project": PROJECT }),
+                )
+                .await;
+            let open = listed["handoffs"].as_array().map_or(0, Vec::len);
+            if open >= count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {open} of {count} handoffs opened: {listed}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 /// The session id a session-start notice points at, if any.
@@ -317,6 +340,7 @@ async fn the_next_harness_is_pointed_at_where_a_cut_off_harness_stopped() {
     );
     fx.claude("session-end", CLAUDE_SESSION, json!({ "reason": "exit" }));
     fx.wait_for_observations(&claude_id, 2).await;
+    fx.wait_for_open_handoffs(1).await;
 
     // Today: OpenCode works on the router, then hits its quota mid-task.
     // No stop, no session end, no handoff.
