@@ -432,6 +432,16 @@ version in [`docs/changelog/`](docs/changelog/):
   read and the write created an edge to a path no page write can ever produce —
   a `links` row that could never be resolved.
   ([#1553](https://github.com/akitaonrails/ai-memory/pull/1553))
+
+- `memory_handoff_cancel` now answers a well-formed `handoff_id` that resolves
+  to nothing in scope with `invalid params` (-32602) instead of an internal
+  error (-32603). The lookup succeeded and found no row, so the id is the
+  caller's to fix, and a client reads -32603 as "retry". The same function
+  already answered a malformed id with -32602, and `memory_handoff_accept`
+  reports an unknown id as `{"handoff": null}`. The message is unchanged and
+  still identical for an absent id and for another operator's, so cancelling
+  reveals no more than before.
+  ([#1554](https://github.com/akitaonrails/ai-memory/pull/1554))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives

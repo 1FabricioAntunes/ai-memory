@@ -6079,7 +6079,13 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?
             .ok_or_else(|| {
-                McpError::internal_error(
+                // A well-formed id that resolves to nothing is caller input,
+                // like the malformed id above: the lookup succeeded and found
+                // no row. -32603 reads as "retry" and sends a client back with
+                // the same id. The message is deliberately the same for an
+                // absent id and another operator's, so the class must not
+                // distinguish them either.
+                McpError::invalid_params(
                     "handoff not found in the resolved project or not visible to this operator",
                     None,
                 )
@@ -20840,6 +20846,95 @@ mod tests {
             .map(|content| content.text.as_str())
             .unwrap_or_default();
         assert!(text.contains("\"cancelled\": true"), "{text}");
+    }
+
+    /// A well-formed `handoff_id` that resolves to nothing is caller input,
+    /// exactly like the malformed id the same function already answers with
+    /// `invalid params` (233bd24). It must not be an internal error a client
+    /// reads as "retry" — and the class must stay identical for an id that is
+    /// merely absent and one that belongs to another operator, or the code
+    /// itself would leak what the message is careful not to say.
+    #[tokio::test]
+    async fn handoff_cancel_reports_an_unknown_id_as_invalid_params() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let bob_id = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "Bob's context".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: Some(ai_memory_core::IdentityKey::User("bob".into()).storage_key()),
+            })
+            .await
+            .unwrap();
+
+        let cancel_as_alice = |id: String| {
+            let mut alice_parts = test_parts_default();
+            alice_parts.extensions.insert(AuthLevel::User);
+            alice_parts.extensions.insert(ActorContext {
+                user: Some("alice".into()),
+                ..ActorContext::default()
+            });
+            server.memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: id,
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(alice_parts),
+            )
+        };
+
+        let absent = cancel_as_alice(HandoffId::new().to_string())
+            .await
+            .expect_err("an absent handoff must be refused");
+        assert_eq!(absent.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            absent.message.contains("handoff not found"),
+            "the message must not change; got {absent}"
+        );
+
+        // Still indistinguishable from another operator's id — in class as
+        // well as in text.
+        let foreign = cancel_as_alice(bob_id.to_string())
+            .await
+            .expect_err("Alice must not cancel Bob's handoff");
+        assert_eq!(foreign.code, absent.code);
+        assert_eq!(foreign.message, absent.message);
+
+        // Control: a malformed id is a different caller mistake but the same
+        // class, and the two messages must stay distinct so the caller can
+        // tell "you typed nonsense" from "there is nothing there".
+        let malformed = cancel_as_alice("nope".into())
+            .await
+            .expect_err("a malformed id must be refused");
+        assert_eq!(malformed.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            malformed.message.contains("invalid handoff_id"),
+            "a malformed id keeps its own message; got {malformed}"
+        );
+        assert_ne!(malformed.message, absent.message);
+
+        // Control: Bob's handoff is untouched by any of the refusals above.
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(bob_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle
+                .state,
+            HandoffState::Open,
+        );
     }
 
     // ----------------------------------------------------------------
