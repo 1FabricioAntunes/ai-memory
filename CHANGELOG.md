@@ -304,6 +304,10 @@ version in [`docs/changelog/`](docs/changelog/):
   common dotenv spelling `KEY = value` produced a key with a trailing space —
   an entry no shell or harness can read, so the override silently did nothing.
   ([#1532](https://github.com/akitaonrails/ai-memory/pull/1532))
+- Discovered a repository page whose `--include` family names a bare top-level
+  page (`README.md`), which `ai-memory-wikisync sync` previously left out of the
+  repository side entirely, so a newly created one was never imported.
+  ([#1533](https://github.com/akitaonrails/ai-memory/pull/1533))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
