@@ -79,6 +79,13 @@ version in [`docs/changelog/`](docs/changelog/):
   `--force` run came back as a 409 `managed run lease is active` — the exact
   condition `--force` overrides — and a `--compact` run quietly reverted to a
   logical delete ([#1574](https://github.com/akitaonrails/ai-memory/pull/1574))
+- `move-project` now keeps `--force` and `--on-conflict` in the re-run command
+  its refusal prints. Both flags are honoured in the request the command
+  builds, but the printed command dropped them, so pasting it after an
+  `--on-conflict overwrite` run fell back to the `block` default and came back
+  as a 409 listing the conflicting paths instead of merging them, while a
+  dropped `--force` put the active-project guard back in place
+  ([#1575](https://github.com/akitaonrails/ai-memory/pull/1575))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
