@@ -44,6 +44,31 @@ version in [`docs/changelog/`](docs/changelog/):
   container (the wrapper sets `AI_MEMORY_RUN_AUTOWIRE=false` for the
   intercepted commands unless the operator set it). (#1545)
 
+- Corrected four statements in `SECURITY.md` that no longer matched the
+  code, plus two clarifications in the same sections (#1561). The
+  `AI_MEMORY_ALLOWED_HOSTS` default is `localhost`, `127.0.0.1`, and `::1`;
+  request bodies are capped at 10 MB on `/mcp`, `/hook` and `/workstream/*`,
+  32 MB on `/admin/*`, and 2 MB elsewhere; the auth ladder is anonymous,
+  root bearer, proxy-asserted user, and `aim_` database-user tokens (the
+  server itself never validates OIDC tokens, and the doc no longer says it
+  does); and the "no per-user or per-project ACLs" claim became the current
+  truth about per-project access modes and grants, including that
+  proxy-asserted identities are not subject to them. The bearer-check note
+  now lists the routes that are public by design (`/healthz`, `/auth/login`,
+  `/auth/recovery`, `/favicon.ico`, custom `/web` static assets).
+- Completed the egress inventory in `DATA_HANDLING.md` and documented the
+  default first-start behavior it omitted (#1560). A default install now
+  says plainly that the local embedder downloads its three model files
+  (~87 MB, sha256-pinned) from `huggingface.co` in the background on first
+  start, that nothing stored is sent, and how to avoid it
+  (`embedding_provider = "none"` or offline pre-seeding). The export table
+  gained the rows it was missing: the `llm_provider` pipeline (including
+  the `codex`, `copilot` and `cursor` CLI-backed providers), the `copilot`
+  embedding provider, and `[[admission_webhooks]]`, plus notes on
+  `ai-memory upgrade`'s GitHub release query, the OAuth/OIDC login flows,
+  and remote `server_url` topologies. `docs/airgapped-install.md`'s
+  runtime summary was corrected to match.
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
