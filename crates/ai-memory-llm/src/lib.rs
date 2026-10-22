@@ -122,7 +122,7 @@ pub use embedding::{
     Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, QueryVector, SyntheticEmbedder, VoyageEmbedder,
     cosine, embed_search_query,
 };
-pub use embedding_capacity::EmbeddingCapacity;
+pub use embedding_capacity::{EmbeddingCapacity, local_capacity};
 pub use error::{LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
