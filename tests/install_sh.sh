@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # install.sh refusals, run against crafted release tarballs in a temp dir:
 # a symlink or hard-link member is refused before anything is unpacked, a
-# plain release installs, and the wget fallback pins https for the default
-# GitHub base (refusing a wget that cannot). Needs no network.
+# plain release installs, the wget fallback pins https for the default
+# GitHub base (refusing a wget that cannot), a binary that does not run is
+# refused from beside the install directory, and a noexec TMPDIR does not
+# refuse a working release. Needs no network.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -140,6 +142,63 @@ run_install wget-mirror "http://mirror.invalid/releases" \
   || fail "mirror wget install failed: $(cat "${TMP_ROOT}/wget-mirror/out.log")"
 if grep -Fq -- "--https-only" "${TMP_ROOT}/wget-mirror/wget.log"; then
   fail "an explicit mirror base must not force --https-only"
+fi
+
+# Control: a release whose binary does not run is still refused, by the smoke
+# test run from beside the install directory, and its staged copy is removed.
+plain_tree "${TMP_ROOT}/broken-tree"
+printf '#!/bin/sh\nexit 1\n' >"${TMP_ROOT}/broken-tree/ai-memory"
+base="$(publish broken "${TMP_ROOT}/broken-tree")"
+if run_install broken "file://${base}"; then
+  fail "a release whose binary does not run was installed"
+fi
+grep -Fq "does not run from ${TMP_ROOT}/broken/home/.local/lib on this machine" \
+  "${TMP_ROOT}/broken/out.log" \
+  || fail "broken binary refusal not explained: $(cat "${TMP_ROOT}/broken/out.log")"
+[ ! -e "${TMP_ROOT}/broken/home/.local/lib/ai-memory" ] || fail "a refused release was installed"
+if ls -d "${TMP_ROOT}/broken/home/.local/lib/ai-memory.new."* >/dev/null 2>&1; then
+  fail "a refused release left its staged copy behind"
+fi
+
+# A work directory that refuses to execute, as a /tmp mounted noexec does on a
+# hardened host, must not reject a release that runs from its install
+# location. Making such a mount without root takes a user namespace, so the
+# case runs only where unshare can mount a noexec tmpfs (Linux; skipped on
+# macOS and on a kernel without unprivileged user namespaces).
+noexec_mount_available() {
+  [ "$(uname -s)" = Linux ] || return 1
+  unshare -Urm sh -c 'mount -t tmpfs -o noexec tmpfs "$1"' sh "$1" 2>/dev/null
+}
+mkdir -p "${TMP_ROOT}/noexec/home" "${TMP_ROOT}/noexec/tmp"
+if noexec_mount_available "${TMP_ROOT}/noexec/tmp"; then
+  plain_tree "${TMP_ROOT}/noexec-tree"
+  base="$(publish noexec "${TMP_ROOT}/noexec-tree")"
+  # Inside the namespace: mount the noexec tmpfs over the work directory,
+  # prove a script cannot run from it, then install with TMPDIR pointed there.
+  if unshare -Urm sh -c '
+      set -eu
+      mount -t tmpfs -o noexec,size=64m tmpfs "$1"
+      printf "#!/bin/sh\nexit 0\n" >"$1/probe"
+      chmod 0755 "$1/probe"
+      if "$1/probe" 2>/dev/null; then
+        echo "the tmpfs still executes files; the noexec case proves nothing" >&2
+        exit 90
+      fi
+      env HOME="$2" TMPDIR="$1" AI_MEMORY_INSTALL_TARGET="$3" \
+        AI_MEMORY_RELEASE_BASE_URL="$4" sh "$5"
+    ' sh "${TMP_ROOT}/noexec/tmp" "${TMP_ROOT}/noexec/home" "${TARGET}" \
+      "file://${base}" "${ROOT}/install.sh" >"${TMP_ROOT}/noexec/out.log" 2>&1; then
+    :
+  else
+    status=$?
+    [ "${status}" -ne 90 ] || fail "$(cat "${TMP_ROOT}/noexec/out.log")"
+    fail "install from a noexec TMPDIR refused: $(cat "${TMP_ROOT}/noexec/out.log")"
+  fi
+  [ -x "${TMP_ROOT}/noexec/home/.local/lib/ai-memory/ai-memory" ] \
+    || fail "install from a noexec TMPDIR unpacked nothing: $(cat "${TMP_ROOT}/noexec/out.log")"
+  printf 'noexec TMPDIR case ran\n'
+else
+  printf 'noexec TMPDIR case skipped: no user namespace that can mount a noexec tmpfs\n'
 fi
 
 printf 'install.sh checks passed\n'
