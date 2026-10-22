@@ -48,8 +48,10 @@ fn print_grants(grants: &[GrantRow], json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    print!("{}", render_grants(grants));
-    Ok(())
+    // Written through a locked stdout handle rather than `print!` so the table
+    // leaves the process in one write, as `project_init` already does for its
+    // own bulk output.
+    write_grants(grants, &mut std::io::stdout().lock())
 }
 
 /// Lay out the grants table. Widths are measured in characters because
@@ -58,9 +60,7 @@ fn print_grants(grants: &[GrantRow], json: bool) -> Result<()> {
 /// that row alone. Workspace and project names come from a checkout's
 /// directory basename or a marker's `project` key, so they are free-form
 /// UTF-8.
-fn render_grants(grants: &[GrantRow]) -> String {
-    use std::fmt::Write as _;
-
+fn write_grants(grants: &[GrantRow], out: &mut impl std::io::Write) -> Result<()> {
     let project_w = grants
         .iter()
         .map(|g| g.workspace.chars().count() + 1 + g.project.chars().count())
@@ -73,21 +73,20 @@ fn render_grants(grants: &[GrantRow]) -> String {
         .max()
         .unwrap_or(8)
         .max(8);
-    let mut out = String::new();
-    let _ = writeln!(
+    writeln!(
         out,
         "{:<project_w$}  {:<user_w$}  LEVEL",
         "PROJECT", "USERNAME"
-    );
+    )?;
     for g in grants {
         let project = format!("{}/{}", g.workspace, g.project);
-        let _ = writeln!(
+        writeln!(
             out,
             "{project:<project_w$}  {:<user_w$}  {}",
             g.username, g.level
-        );
+        )?;
     }
-    out
+    Ok(())
 }
 
 /// `ai-memory user grants [--user NAME]`.
@@ -230,7 +229,9 @@ mod tests {
     #[test]
     fn grants_table_columns_line_up_past_ascii() {
         let rows = [grant("caf\u{e9}", "ana"), grant("web", "bob")];
-        let table = render_grants(&rows);
+        let mut buf = Vec::new();
+        write_grants(&rows, &mut buf).expect("rendering to a buffer cannot fail");
+        let table = String::from_utf8(buf).expect("the table is utf-8");
         let header = table.lines().next().expect("a header row");
         // The header is ASCII, so its byte offset is its character offset.
         let user_col = header.find("USERNAME").expect("a USERNAME column");
@@ -246,7 +247,9 @@ mod tests {
         // Control: an ASCII-only table lines up under either measure, so the
         // non-ASCII row above is what carries the assertion.
         let ascii_rows = [grant("cafe", "ana"), grant("web", "bob")];
-        let ascii = render_grants(&ascii_rows);
+        let mut ascii_buf = Vec::new();
+        write_grants(&ascii_rows, &mut ascii_buf).expect("rendering to a buffer cannot fail");
+        let ascii = String::from_utf8(ascii_buf).expect("the table is utf-8");
         for (line, row) in ascii.lines().skip(1).zip(ascii_rows.iter()) {
             assert_eq!(
                 username_column(line, &row.username),
