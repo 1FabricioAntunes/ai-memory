@@ -11707,6 +11707,139 @@ mod tests {
         );
     }
 
+    /// The vector stream has no similarity floor, so once any page in the
+    /// project has an embedding it answers every query, related or not. A
+    /// hit only that stream found is not a match for the query's words and
+    /// must not hide the raw-observation fallback: before this, the default
+    /// local embeddings turned `hits` non-empty and an observation from a
+    /// session with no page yet (still open, or ended without SessionEnd)
+    /// could not be found at all, while the same store without embeddings
+    /// returned it.
+    #[tokio::test]
+    async fn memory_query_returns_raw_hits_when_only_the_vector_stream_matches() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let server = server.with_embedder(Arc::new(TaskAwareEmbedder));
+        let unrelated = store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/unrelated.md").unwrap(),
+                title: "Unrelated".into(),
+                body: "Nothing about marsupials here.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // Nearly orthogonal to TaskAwareEmbedder's query vector [0.0, 1.0].
+        store
+            .writer
+            .store_embedding(
+                unrelated,
+                ai_memory_store::f32_vec_to_bytes(&[1.0, 0.05]),
+                "task-aware-test".into(),
+                "task-aware-test-model".into(),
+                2,
+            )
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "raw prompt".into(),
+                    body: "the api listens on quokka port 8088".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let json = tool_json(
+            &server
+                .memory_query(
+                    Parameters(query_in("scratch", "quokka")),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let hit_paths: Vec<&str> = json["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hit| hit["path"].as_str())
+            .collect();
+        assert_eq!(
+            hit_paths,
+            ["notes/unrelated.md"],
+            "the vector stream must still answer, or this test does not reach the bug: {json}"
+        );
+        let raw_hits = json["raw_hits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a vector-only hit must not suppress raw_hits: {json}"));
+        assert_eq!(raw_hits.len(), 1, "{json}");
+        assert!(
+            raw_hits[0]["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("quokka")),
+            "{json}"
+        );
+
+        // Control: a page that matches the query's words is a real hit, so
+        // the fallback stays off exactly as before.
+        let json = tool_json(
+            &server
+                .memory_query(
+                    Parameters(query_in("scratch", "Karpathy")),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            json["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["path"] == "foo.md"),
+            "{json}"
+        );
+        assert!(
+            json.get("raw_hits").is_none(),
+            "a lexical page hit keeps the fallback off: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn memory_query_filters_apply_before_every_result_source() {
         let (_tmp, store, server, ws, proj) = setup_server().await;
