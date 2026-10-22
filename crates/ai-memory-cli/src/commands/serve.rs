@@ -1681,6 +1681,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 mid_session_routing: config.routing.mid_session,
                 profile: config.profile.clone(),
                 ingest_drop_list: (*config.ingest.drop_list).clone(),
+                // Benchmark-only escape (docs/benchmarks/README.md), read once
+                // here so the hooks crate keeps making no environment reads.
+                skip_wiki_checkpoints: benchmark_skip_wiki_checkpoints(),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -2955,6 +2958,20 @@ fn auto_improve_review_config_from_settings(
             min_delta: settings.eval.min_delta,
         },
     }
+}
+
+/// The retrieval-benchmark escape hatch (docs/benchmarks/README.md): the
+/// LongMemEval harness replays ~24k session ends through one server, and
+/// each SessionEnd auto-commit walks a wiki tree and object database that
+/// keep growing, which dominates ingest wall clock. `retrieval` never
+/// reads git history, so the harness runs its servers with this variable
+/// set and the commits skipped. Read once at startup; nothing else may
+/// read it, and no product path sets it.
+fn benchmark_skip_wiki_checkpoints() -> bool {
+    matches!(
+        std::env::var("AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 async fn configure_embedder(
