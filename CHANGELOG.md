@@ -11,6 +11,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected the multi-user migration command to pass the pepper length with `--bytes`.
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
