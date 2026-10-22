@@ -1229,6 +1229,10 @@ Failure modes:
   a snapshot the current binary cannot open** (for example a backup taken
   by a newer release) → exits with the error; the existing `wiki/` and
   `db/` are left as they were.
+- **Migration history has a gap** → an earlier migration is unrecorded
+  although a later one was applied. The staged store is refused, just as at
+  normal startup. Keep the backup and report the history for review;
+  `--force` does not bypass this check or repair the missing migration.
 - **Legacy backup has API keys but no pepper verifier** → restore the original
   `[auth].token_pepper` through the current config/environment and rerun with
   `--accept-legacy-api-key-pepper`. This flag confirms provenance; it cannot
