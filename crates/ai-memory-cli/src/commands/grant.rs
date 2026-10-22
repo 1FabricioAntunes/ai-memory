@@ -48,25 +48,43 @@ fn print_grants(grants: &[GrantRow], json: bool) -> Result<()> {
         );
         return Ok(());
     }
+    // Written through a locked stdout handle rather than `print!` so the table
+    // leaves the process in one write, as `project_init` already does for its
+    // own bulk output.
+    write_grants(grants, &mut std::io::stdout().lock())
+}
+
+/// Lay out the grants table. Widths are measured in characters because
+/// `{:<width$}` pads in characters: a project or user name outside ASCII has
+/// more bytes than columns, and a byte count would shift the later columns of
+/// that row alone. Workspace and project names come from a checkout's
+/// directory basename or a marker's `project` key, so they are free-form
+/// UTF-8.
+fn write_grants(grants: &[GrantRow], out: &mut impl std::io::Write) -> Result<()> {
     let project_w = grants
         .iter()
-        .map(|g| g.workspace.len() + 1 + g.project.len())
+        .map(|g| g.workspace.chars().count() + 1 + g.project.chars().count())
         .max()
         .unwrap_or(7)
         .max(7);
     let user_w = grants
         .iter()
-        .map(|g| g.username.len())
+        .map(|g| g.username.chars().count())
         .max()
         .unwrap_or(8)
         .max(8);
-    println!("{:<project_w$}  {:<user_w$}  LEVEL", "PROJECT", "USERNAME");
+    writeln!(
+        out,
+        "{:<project_w$}  {:<user_w$}  LEVEL",
+        "PROJECT", "USERNAME"
+    )?;
     for g in grants {
         let project = format!("{}/{}", g.workspace, g.project);
-        println!(
+        writeln!(
+            out,
             "{project:<project_w$}  {:<user_w$}  {}",
             g.username, g.level
-        );
+        )?;
     }
     Ok(())
 }
@@ -182,4 +200,62 @@ pub async fn revoke(ep: &ServerEndpoint, args: &UserRevokeArgs) -> Result<()> {
         println!("{} held nothing on {project}; nothing changed.", args.user);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(project: &str, username: &str) -> GrantRow {
+        GrantRow {
+            username: username.to_owned(),
+            workspace: "default".to_owned(),
+            project: project.to_owned(),
+            level: "read".to_owned(),
+        }
+    }
+
+    /// The character offset at which `line` carries `username`, or `None`.
+    fn username_column(line: &str, username: &str) -> Option<usize> {
+        let chars: Vec<char> = line.chars().collect();
+        (0..chars.len()).find(|start| {
+            chars[*start..]
+                .iter()
+                .collect::<String>()
+                .starts_with(username)
+        })
+    }
+
+    #[test]
+    fn grants_table_columns_line_up_past_ascii() {
+        let rows = [grant("caf\u{e9}", "ana"), grant("web", "bob")];
+        let mut buf = Vec::new();
+        write_grants(&rows, &mut buf).expect("rendering to a buffer cannot fail");
+        let table = String::from_utf8(buf).expect("the table is utf-8");
+        let header = table.lines().next().expect("a header row");
+        // The header is ASCII, so its byte offset is its character offset.
+        let user_col = header.find("USERNAME").expect("a USERNAME column");
+        // `café` is one byte longer than it is wide, so a byte-measured width
+        // pads that row one column too far and shifts USERNAME and LEVEL.
+        for (line, row) in table.lines().skip(1).zip(rows.iter()) {
+            assert_eq!(
+                username_column(line, &row.username),
+                Some(user_col),
+                "USERNAME column moved on {line:?}:\n{table}"
+            );
+        }
+        // Control: an ASCII-only table lines up under either measure, so the
+        // non-ASCII row above is what carries the assertion.
+        let ascii_rows = [grant("cafe", "ana"), grant("web", "bob")];
+        let mut ascii_buf = Vec::new();
+        write_grants(&ascii_rows, &mut ascii_buf).expect("rendering to a buffer cannot fail");
+        let ascii = String::from_utf8(ascii_buf).expect("the table is utf-8");
+        for (line, row) in ascii.lines().skip(1).zip(ascii_rows.iter()) {
+            assert_eq!(
+                username_column(line, &row.username),
+                Some(user_col),
+                "ascii rows must line up as well:\n{ascii}"
+            );
+        }
+    }
 }

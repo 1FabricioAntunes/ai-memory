@@ -15,6 +15,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The `user grants` and `project grants` tables no longer misalign on a
+  workspace, project or user name outside ASCII. Column widths were measured
+  in bytes while the formatter pads in characters, so a row such as
+  `default/café` was padded one column too far and its `USERNAME` and
+  `LEVEL` cells sat right of every other row's.
+  ([#1564](https://github.com/akitaonrails/ai-memory/pull/1564))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
