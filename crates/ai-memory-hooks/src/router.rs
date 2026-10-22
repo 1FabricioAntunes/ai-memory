@@ -5324,6 +5324,7 @@ pub(crate) mod tests {
     use ai_memory_store::{FinishWorkstreamRun, PrepareWorkstreamRun, Store, WorkstreamSelection};
     use ai_memory_wiki::Wiki;
     use tempfile::TempDir;
+    use tower::ServiceExt as _;
 
     use ai_memory_core::ObservationKind;
 
@@ -11908,6 +11909,20 @@ pub(crate) mod tests {
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(ack["accepted"], 0);
+    }
+
+    #[tokio::test]
+    async fn hook_batch_route_rejects_a_body_over_the_machine_limit() {
+        let tmp = TempDir::new().unwrap();
+        let app = hook_router(make_state(&tmp).await);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hook/batch")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b' '; MAX_HOOK_BODY_BYTES + 1]))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

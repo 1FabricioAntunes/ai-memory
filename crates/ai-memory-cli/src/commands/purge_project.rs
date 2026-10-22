@@ -92,6 +92,7 @@ fn purge_summary_line(verb: &str, label: &str, report: &serde_json::Value) -> St
 /// run lease is active`, which is the exact condition `--force` exists to
 /// override.
 fn confirm_command(workspace: &str, target_flag: &str, args: &PurgeProjectArgs) -> String {
+    let workspace = super::render_shared::native_shell_quote(workspace);
     let mut cmd = format!("ai-memory purge-project --workspace {workspace} {target_flag}");
     if args.force {
         cmd.push_str(" --force");
@@ -166,8 +167,20 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
     // the preview's fallback label. A `--project-id` run has no resolved name
     // to print, so the id stands in.
     let (target_flag, target_label) = match (&project, &project_id) {
-        (Some(project), _) => (format!("--project {project}"), project.clone()),
-        (None, Some(id)) => (format!("--project-id {id}"), id.clone()),
+        (Some(project), _) => (
+            format!(
+                "--project {}",
+                super::render_shared::native_shell_quote(project)
+            ),
+            project.clone(),
+        ),
+        (None, Some(id)) => (
+            format!(
+                "--project-id {}",
+                super::render_shared::native_shell_quote(id)
+            ),
+            id.clone(),
+        ),
         (None, None) => bail!("one of --project or --project-id is required"),
     };
 
@@ -313,6 +326,15 @@ mod tests {
             ),
             "ai-memory purge-project --workspace default \
              --project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab --confirm"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn confirm_command_quotes_free_form_scope_names() {
+        assert_eq!(
+            confirm_command("team space", "--project 'api; echo nope'", &args()),
+            "ai-memory purge-project --workspace 'team space' --project 'api; echo nope' --confirm"
         );
     }
 

@@ -38,15 +38,19 @@ struct MoveProjectRequest {
 /// conflicting paths instead of merging them, and a dropped `--force` leaves
 /// the active-project guard in place.
 fn confirm_command(from_workspace: &str, target_flag: &str, args: &MoveProjectArgs) -> String {
+    let from_workspace = super::render_shared::native_shell_quote(from_workspace);
+    let to_workspace = super::render_shared::native_shell_quote(&args.to_workspace);
     let mut cmd = format!(
-        "ai-memory move-project --from-workspace {from_workspace} {target_flag} --to-workspace {}",
-        args.to_workspace
+        "ai-memory move-project --from-workspace {from_workspace} {target_flag} --to-workspace {to_workspace}"
     );
     if args.force {
         cmd.push_str(" --force");
     }
     if args.on_conflict != "block" {
-        cmd.push_str(&format!(" --on-conflict {}", args.on_conflict));
+        cmd.push_str(&format!(
+            " --on-conflict {}",
+            super::render_shared::native_shell_quote(&args.on_conflict)
+        ));
     }
     cmd.push_str(" --confirm");
     cmd
@@ -81,8 +85,20 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         }
     };
     let (target_flag, requested) = match (&project, &project_id) {
-        (Some(project), _) => (format!("--project {project}"), project.clone()),
-        (None, Some(id)) => (format!("--project-id {id}"), id.clone()),
+        (Some(project), _) => (
+            format!(
+                "--project {}",
+                super::render_shared::native_shell_quote(project)
+            ),
+            project.clone(),
+        ),
+        (None, Some(id)) => (
+            format!(
+                "--project-id {}",
+                super::render_shared::native_shell_quote(id)
+            ),
+            id.clone(),
+        ),
         (None, None) => bail!("one of --project or --project-id is required"),
     };
 
@@ -249,6 +265,17 @@ mod tests {
             "ai-memory move-project --from-workspace default \
              --project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab \
              --to-workspace team --confirm"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn confirm_command_quotes_free_form_scope_names() {
+        let mut a = args();
+        a.to_workspace = "new team".into();
+        assert_eq!(
+            confirm_command("old team", "--project 'api; echo nope'", &a),
+            "ai-memory move-project --from-workspace 'old team' --project 'api; echo nope' --to-workspace 'new team' --confirm"
         );
     }
 
