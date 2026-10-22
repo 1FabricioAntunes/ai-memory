@@ -201,6 +201,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Corrected the multi-user migration command to pass the pepper length with `--bytes`. ([#1587](https://github.com/akitaonrails/ai-memory/pull/1587))
 
+### Fixed
+
+- Corrected the API smoke test to use the running server’s configured bearer instead of a newly generated token. ([#1588](https://github.com/akitaonrails/ai-memory/pull/1588))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
