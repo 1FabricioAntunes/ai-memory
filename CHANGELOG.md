@@ -351,6 +351,14 @@ version in [`docs/changelog/`](docs/changelog/):
   entirely — while the archive and its checksum are fetched from that same
   origin, so the checksum proved nothing against an on-path rewrite.
   ([#1541](https://github.com/akitaonrails/ai-memory/pull/1541))
+- An unspaced-CJK search carrying `AND`, `NOT` or `NEAR` no longer returns the
+  pages the operator excluded. The auxiliary CJK stream discarded every boolean
+  operator and `OR`-joined the CJK runs it found, and because that stream is
+  unioned into the primary one, `東京 NOT 大阪` fused the 大阪-only pages back in
+  and ranked them as if they had been asked for. The stream now declines such a
+  query, so unspaced-CJK recall narrows to the pre-feature answer for it instead
+  of inverting; `OR` queries are unaffected.
+  ([#1542](https://github.com/akitaonrails/ai-memory/pull/1542))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives

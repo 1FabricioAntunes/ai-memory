@@ -233,9 +233,24 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
 /// `None` is the important common case: callers then execute the existing SQL
 /// byte-for-byte. A multi-scalar run becomes an exact phrase of overlapping
 /// bigrams; a single scalar uses the unigram fallback.
+///
+/// `None` also covers a query carrying `AND` / `NOT` / `NEAR`. This stream is
+/// auxiliary: callers UNION it into the primary stream, so a run-based
+/// OR-join of a `東京 NOT 大阪` query fuses the excluded term's own pages back
+/// into the result set — the opposite of what the operator asked for, while
+/// the primary stream honours it verbatim. Expanding each operand and
+/// rebuilding the expression is the real fix; declining the stream meanwhile
+/// restores the pre-#1433 answer instead of an inverted one. `OR` stays,
+/// because the expander reproduces it faithfully.
 #[must_use]
 pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     let bounded = bounded_query_text(raw);
+    if bounded
+        .split_whitespace()
+        .any(|t| matches!(t, "AND" | "NOT" | "NEAR"))
+    {
+        return None;
+    }
     let mut phrases = Vec::new();
     let mut run = Vec::new();
     for ch in bounded.chars() {
@@ -502,6 +517,20 @@ mod tests {
             Some("\"支\" OR \"韓\"".to_string())
         );
         assert_eq!(prepare_cjk_fts5_query("latin only"), None);
+    }
+
+    #[test]
+    fn cjk_stream_declines_a_query_the_expander_would_invert() {
+        assert_eq!(prepare_cjk_fts5_query("東京 NOT 大阪"), None);
+        assert_eq!(prepare_cjk_fts5_query("東京 AND 大阪"), None);
+        assert_eq!(prepare_cjk_fts5_query("東京 NEAR 大阪"), None);
+        // Control: `OR` is the one operator the run expander reproduces, so
+        // the auxiliary stream still runs for it — and a lowercase `not` is
+        // not FTS5 syntax, so it must not suppress the stream either.
+        let both = Some("\"東京\" OR \"大阪\"".to_string());
+        assert_eq!(prepare_cjk_fts5_query("東京 OR 大阪"), both);
+        assert_eq!(prepare_cjk_fts5_query("東京 not 大阪"), both);
+        assert_parses(&prepare_cjk_fts5_query("東京 OR 大阪").unwrap());
     }
 
     #[test]

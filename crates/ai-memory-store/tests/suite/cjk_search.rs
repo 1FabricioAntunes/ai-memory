@@ -236,3 +236,58 @@ async fn superseded_cjk_text_is_hidden_and_startup_repairs_missing_index_rows() 
     assert_eq!(after_rebuild.len(), 1);
     assert_eq!(after_rebuild[0].path.as_str(), "repair.md");
 }
+
+#[tokio::test]
+async fn cjk_stream_does_not_fuse_back_a_not_excluded_term() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "app").await;
+
+    store
+        .writer
+        .upsert_page(page(ws, project, "tokyo.md", "東京", "office notes"))
+        .await
+        .unwrap();
+    // 大阪 only ever appears inside an unspaced run, so unicode61 gives the
+    // primary stream no token to match: this page is reachable through the
+    // auxiliary CJK stream alone.
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "osaka.md",
+            "Kansai",
+            "関西の大阪支社について",
+        ))
+        .await
+        .unwrap();
+
+    // Control: the excluded page IS indexed and IS findable on its own, so an
+    // absence below means the operator was honoured, not that nothing matched.
+    let osaka = store
+        .reader
+        .search_pages_for_project(ws, project, "大阪".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = osaka.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(
+        paths.contains(&"osaka.md"),
+        "control search failed: {paths:?}"
+    );
+
+    let excluded = store
+        .reader
+        .search_pages_for_project(ws, project, "東京 NOT 大阪".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = excluded.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(
+        paths.contains(&"tokyo.md"),
+        "the requested term lost its page: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"osaka.md"),
+        "the CJK stream fused back the NOT-excluded term: {paths:?}"
+    );
+}
