@@ -48,6 +48,7 @@ version in [`docs/changelog/`](docs/changelog/):
   worksheet relationship and aborted the whole extraction; a workbook of only
   chartsheets still reports that it contains no worksheets.
   ([#1569](https://github.com/akitaonrails/ai-memory/pull/1569))
+- Skip an oversized session-header record instead of failing the read when the size cap's boundary cuts a multi-byte character, so one unreadable transcript no longer aborts discovery or lookup for the other sessions beside it ([#1570](https://github.com/akitaonrails/ai-memory/pull/1570))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
