@@ -308,6 +308,12 @@ version in [`docs/changelog/`](docs/changelog/):
   page (`README.md`), which `ai-memory-wikisync sync` previously left out of the
   repository side entirely, so a newly created one was never imported.
   ([#1533](https://github.com/akitaonrails/ai-memory/pull/1533))
+- A Copilot `/responses` answer stopped by `max_output_tokens` is now reported
+  as a truncated response naming the model and its output-token count, instead
+  of an unexpected response shape reading "no error detail" — `error` is null
+  on an incomplete answer, so nothing explained the stop and the class implied
+  an unparseable reply rather than a `max_tokens` to raise.
+  ([#1534](https://github.com/akitaonrails/ai-memory/pull/1534))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
