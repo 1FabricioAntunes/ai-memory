@@ -383,6 +383,14 @@ version in [`docs/changelog/`](docs/changelog/):
   router did not recognize a child session, and it published a summary page
   and an open handoff that the next root session in that checkout consumed.
   ([#1546](https://github.com/akitaonrails/ai-memory/pull/1546))
+- `install-mcp --client opencode --flavor <dialect>` now writes the flavored
+  URL into the OpenCode entry. Both OpenCode entry builders read the server
+  URL directly instead of the flavored one, so the flag was silently dropped
+  for a client its own documentation names: a Vertex-routed install got a bare
+  URL and 400'd every `tools/list`. OpenCode installs that do not pass
+  `--flavor` are unchanged.
+  ([#1547](https://github.com/akitaonrails/ai-memory/pull/1547))
+
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
