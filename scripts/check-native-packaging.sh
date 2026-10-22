@@ -164,6 +164,14 @@ main() {
   AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
     AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
     bin/ai-memory install-hooks --agent claude-code --capture-mode allowlist --apply
+  AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory --config '/tmp/ai memory.toml' run codex --yolo
+  AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory --data-dir=/tmp/ai-memory show --json
+  assert_contains "${wrapper_log}" "--config /tmp/ai memory.toml run codex --yolo"
+  assert_contains "${wrapper_log}" "--data-dir=/tmp/ai-memory show --json"
   assert_contains "${wrapper_log}" "run codex --yolo"
   assert_contains "${wrapper_log}" "show --json --no-scan"
   assert_contains "${wrapper_log}" "continue --workspace work --yolo"

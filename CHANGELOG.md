@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the POSIX Docker wrapper routing host commands into the helper
+  container when `--config` or `--data-dir` preceded the command. Managed
+  launches, MCP bridges and lifecycle hooks now retain their native host
+  route and complete argument list with either global-option syntax (#1602).
+
 ## [3.2.1] - 2026-10-22
 
 ### Fixed
