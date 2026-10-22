@@ -938,7 +938,7 @@ Read these:
 | Page-history readers (`page_versions`, `page_version_body`) and the bounded diff | `crates/ai-memory-store/src/reader.rs`, `crates/ai-memory-web/src/diff.rs` |
 | Scoped search ranker shared with `memory_query` (`hybrid_search_scopes`) | `crates/ai-memory-web/src/recall.rs`, `crates/ai-memory-store/src/reader.rs` |
 | Health panel checks and fix lines | `crates/ai-memory-web/src/health.rs`, `crates/ai-memory-core/src/fix_lines.rs` |
-| 27 integration tests covering every endpoint (auth, 400s, 404s, multi-scope correctness, SPA fallback) | `crates/ai-memory-web/tests/routes.rs` |
+| Integration tests for API and web routes (auth, 400s, 404s, multi-scope correctness, SPA fallback) | `crates/ai-memory-web/tests/suite/routes.rs` |
 | Auth + middleware layering | `crates/ai-memory-cli/src/commands/serve.rs` (`mount_web_router`, `apply_http_layers`) |
 | Custom-UI dir validation | `crates/ai-memory-cli/src/commands/serve.rs` (`validate_web_ui_args`) |
 
