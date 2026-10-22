@@ -1098,6 +1098,20 @@ pub struct HybridSearch<'a> {
     pub filter: PageFilter<'a>,
 }
 
+/// What [`ReaderPool::hybrid_search_scopes_outcome`] found.
+#[derive(Debug, Default)]
+pub struct HybridSearchOutcome {
+    /// The fused hits, as [`ReaderPool::hybrid_search_scopes`] returns them.
+    pub hits: Vec<(PageHit, Option<SearchExplain>)>,
+    /// Summed per-stream timings; `Some` only for an explained search.
+    pub timings: Option<StreamTimings>,
+    /// Whether page FTS, the entity stream or the observation stream found a
+    /// page in any scope. When false, every hit came from the vector streams
+    /// (which have no similarity floor) or their graph neighbours, so the
+    /// compiled wiki holds nothing that matches the query's own terms.
+    pub lexical_match: bool,
+}
+
 /// Per-query wall time of each retrieval stream, in milliseconds, for an
 /// `explain=true` query. Measured only on the explained path, so a normal
 /// query takes no clock readings for it. A `None` field is a stream that did
@@ -7436,7 +7450,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
         include_superseded: bool,
     ) -> StoreResult<(Vec<(PageHit, SearchExplain)>, StreamTimings)> {
-        let (hits, timings) = self
+        let (hits, timings, _) = self
             .hybrid_search_inner(
                 workspace_id,
                 project_id,
@@ -7486,6 +7500,20 @@ impl ReaderPool {
         scopes: &[(WorkspaceId, ProjectId)],
         search: HybridSearch<'_>,
     ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, Option<StreamTimings>)> {
+        let outcome = self.hybrid_search_scopes_outcome(scopes, search).await?;
+        Ok((outcome.hits, outcome.timings))
+    }
+
+    /// [`Self::hybrid_search_scopes`] plus whether any scope matched the
+    /// query's own terms ([`HybridSearchOutcome::lexical_match`]).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn hybrid_search_scopes_outcome(
+        &self,
+        scopes: &[(WorkspaceId, ProjectId)],
+        search: HybridSearch<'_>,
+    ) -> StoreResult<HybridSearchOutcome> {
         // Provider/model/dim only select which stored vectors are eligible;
         // with no query vector the vector stream never runs, so the empty
         // triple is inert rather than a fake identity.
@@ -7499,9 +7527,10 @@ impl ReaderPool {
             None => (None, String::new(), String::new(), 0),
         };
         let mut timings: Option<StreamTimings> = None;
+        let mut lexical_match = false;
         let mut per_scope = Vec::with_capacity(scopes.len());
         for &(workspace_id, project_id) in scopes {
-            let (hits, scope_timings) = self
+            let (hits, scope_timings, scope_lexical_match) = self
                 .hybrid_search_inner(
                     workspace_id,
                     project_id,
@@ -7523,6 +7552,7 @@ impl ReaderPool {
                     .get_or_insert_with(Default::default)
                     .accumulate(&scope_timings);
             }
+            lexical_match |= scope_lexical_match;
             per_scope.push(hits);
         }
         let hits = if per_scope.len() == 1 {
@@ -7563,7 +7593,11 @@ impl ReaderPool {
         } else {
             hits
         };
-        Ok((hits, timings))
+        Ok(HybridSearchOutcome {
+            hits,
+            timings,
+            lexical_match,
+        })
     }
 
     /// The streams [`Self::hybrid_search_scopes`] runs for a query, in the
@@ -7600,7 +7634,7 @@ impl ReaderPool {
         include_superseded: bool,
         owner_filter: &OwnerFilter,
         filter: PageFilter<'_>,
-    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings)> {
+    ) -> StoreResult<(Vec<(PageHit, Option<SearchExplain>)>, StreamTimings, bool)> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Stream timings exist only for explain: `explain.then(Instant::now)`
         // reads no clock on the normal path.
@@ -7757,6 +7791,13 @@ impl ReaderPool {
         } else {
             Vec::new()
         };
+
+        // Whether a stream that matches the query's own terms found a page.
+        // The vector streams have no similarity floor, so once any page has
+        // an embedding they answer every query, and graph expansion follows
+        // their seeds: a result without one of these is not a match.
+        let lexical_match =
+            !fts_hits.is_empty() || !entity_hits.is_empty() || !observation_votes.is_empty();
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
@@ -8081,7 +8122,7 @@ impl ReaderPool {
                 hit.superseded = superseded.contains(&hit.id);
             }
         }
-        Ok((out, timings))
+        Ok((out, timings, lexical_match))
     }
 
     /// The subset of `page_ids` that are superseded (non-latest) versions in
@@ -15123,9 +15164,9 @@ mod tests {
                 super::PageFilter::default(),
             )
         };
-        let (_, off) = search(false).await.unwrap();
+        let (_, off, _) = search(false).await.unwrap();
         assert_eq!(off, super::StreamTimings::default());
-        let (_, on) = search(true).await.unwrap();
+        let (_, on, _) = search(true).await.unwrap();
         assert!(on.fts_ms.is_some() && on.entity_ms.is_some() && on.graph_ms.is_some());
         assert!(on.observation_ms.is_some(), "the stream is on by default");
         assert!(on.vector_ms.is_none(), "no query vector, no vector scan");

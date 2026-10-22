@@ -7,7 +7,9 @@ use ai_memory_core::{
     AgentKind, NewObservation, NewPage, NewSession, ObservationId, ObservationKind, PagePath,
     ProjectId, Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
-use ai_memory_store::{HybridSearch, PageFilter, PageHit, RetrievalTuning, SearchExplain, Store};
+use ai_memory_store::{
+    HybridSearch, PageFilter, PageHit, RetrievalTuning, SearchExplain, Store, VectorQuery,
+};
 
 pub(crate) fn stream_on() -> RetrievalTuning {
     RetrievalTuning {
@@ -359,6 +361,92 @@ async fn a_session_without_a_page_contributes_nothing_and_the_raw_fallback_still
         .unwrap();
     assert_eq!(raw.len(), 1);
     assert_eq!(raw[0].session_id, live);
+}
+
+/// The vector stream has no similarity floor, so with one embedded page it
+/// answers a query that page has nothing to do with. `lexical_match` is what
+/// lets `memory_query` tell that apart from a real match and still run the
+/// raw fallback for the live session above.
+#[tokio::test]
+async fn lexical_match_is_false_when_only_the_vector_stream_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store, "default", "app").await;
+    let live = session(&store, ws, proj).await;
+    observe(
+        &store,
+        ws,
+        proj,
+        live,
+        "pangolin sighting in the live session",
+    )
+    .await;
+    let plain = store
+        .writer
+        .upsert_page(page(ws, proj, "notes/plain.md", "plain note"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .store_embedding(
+            plain,
+            ai_memory_store::f32_vec_to_bytes(&[1.0, 0.05]),
+            "test".into(),
+            "test-model".into(),
+            2,
+        )
+        .await
+        .unwrap();
+    let outcome = |query: &'static str| {
+        let store = &store;
+        async move {
+            store
+                .reader
+                .hybrid_search_scopes_outcome(
+                    &[(ws, proj)],
+                    HybridSearch {
+                        query,
+                        vector: Some(VectorQuery {
+                            vector: &[0.0, 1.0],
+                            provider: "test",
+                            model: "test-model",
+                            dim: 2,
+                        }),
+                        limit: 10,
+                        expiry_cutoff_us: None,
+                        include_superseded: false,
+                        explain: false,
+                        owner: &ai_memory_core::OwnerFilter::Any,
+                        filter: PageFilter::default(),
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let vector_only = outcome("pangolin").await;
+    let hit_paths: Vec<&str> = vector_only
+        .hits
+        .iter()
+        .map(|(hit, _)| hit.path.as_str())
+        .collect();
+    assert_eq!(hit_paths, ["notes/plain.md"], "the vector stream answers");
+    assert!(!vector_only.lexical_match);
+
+    // Controls: page FTS, and an observation vote once the session has a
+    // page, are each a match.
+    assert!(outcome("plain").await.lexical_match);
+    session_page(&store, ws, proj, live, "session summary").await;
+    let voted = outcome("pangolin").await;
+    assert!(voted.lexical_match);
+    assert!(
+        voted
+            .hits
+            .iter()
+            .any(|(hit, _)| hit.path.as_str() == format!("sessions/{live}.md"))
+    );
 }
 
 #[tokio::test]

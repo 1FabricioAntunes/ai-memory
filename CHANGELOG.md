@@ -237,6 +237,15 @@ version in [`docs/changelog/`](docs/changelog/):
   conformance is idempotent modulo `generated.at`, which it inherits from the
   file on disk, so an already-conformant page still restores byte-exact.
   ([#1595](https://github.com/akitaonrails/ai-memory/pull/1595))
+- Fixed `memory_query` skipping its raw-observation fallback (`raw_hits`)
+  whenever an embedder was configured, which the default local embeddings
+  are. The vector stream has no similarity floor, so an unrelated page
+  kept `hits` non-empty, and an observation from a session with no page
+  yet (still open, or ended without SessionEnd) could not be found, while
+  the same store with `embedding_provider = "none"` returned it. The
+  fallback now runs unless a page matched the query's own terms through
+  page FTS, the entity stream or the observation stream; page ranking is
+  unchanged (#1600).
 
 ## [3.2.0] - 2026-10-21
 

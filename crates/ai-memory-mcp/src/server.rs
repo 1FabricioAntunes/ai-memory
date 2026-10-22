@@ -2600,31 +2600,25 @@ impl AiMemoryServer {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<(
-        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
-        Option<ai_memory_store::StreamTimings>,
-    )> {
+    ) -> ai_memory_store::StoreResult<ai_memory_store::HybridSearchOutcome> {
         self.search_scopes(&[(workspace_id, project_id)], options)
             .await
     }
 
     /// Fused hits over `scopes` through the shared hybrid ranker
-    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes`]), the same call
-    /// the web search makes.
+    /// ([`ai_memory_store::ReaderPool::hybrid_search_scopes_outcome`]), the
+    /// same ranking the web search uses.
     async fn search_scopes(
         &self,
         scopes: &[(WorkspaceId, ProjectId)],
         options: ProjectSearchOptions<'_>,
-    ) -> ai_memory_store::StoreResult<(
-        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
-        Option<ai_memory_store::StreamTimings>,
-    )> {
+    ) -> ai_memory_store::StoreResult<ai_memory_store::HybridSearchOutcome> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = options.include_expired.then_some(i64::MIN);
         self.reader
-            .hybrid_search_scopes(
+            .hybrid_search_scopes_outcome(
                 scopes,
                 ai_memory_store::HybridSearch {
                     query: options.query,
@@ -3011,6 +3005,9 @@ impl AiMemoryServer {
         // Explain-only: per-stream timings of the primary search, summed over
         // `scopes`. `None` on the normal path, which reads no clocks for it.
         let mut timings: Option<ai_memory_store::StreamTimings> = None;
+        // Whether any page matched the query's own terms; see the
+        // raw-observation fallback below.
+        let mut lexical_match = false;
         // Session pages are shared and every operator's observations may vote
         // for them, but observation text (a hit's excerpt, explain's
         // observation ids, the raw fallback) follows the session timeline's
@@ -3040,9 +3037,10 @@ impl AiMemoryServer {
                 .await?;
             self.search_project(ws, proj, options).await
         }
-        .map(|(hits, search_timings)| {
-            timings = search_timings;
-            hits
+        .map(|outcome| {
+            timings = outcome.timings;
+            lexical_match = outcome.lexical_match;
+            outcome.hits
         });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let rerank_started = (explain && self.rerank.is_some()).then(std::time::Instant::now);
@@ -3060,7 +3058,11 @@ impl AiMemoryServer {
         // for explicit `scopes` — the recommended scope-bleed mitigation —
         // by searching observations in each resolved (ws, proj) and
         // rank-merging, so the fallback isn't lost on the scoped path.
-        let raw_hits = if !hits.is_empty() || filtered {
+        // Hits the vector streams alone found do not count as a match: they
+        // have no similarity floor, so with an embedder they answer every
+        // query and would otherwise hide observations from sessions that
+        // have no page yet.
+        let raw_hits = if (!hits.is_empty() && lexical_match) || filtered {
             Vec::new()
         } else if let Some(scopes) = &resolved_scopes {
             let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
@@ -3133,7 +3135,7 @@ impl AiMemoryServer {
                     if current == scope.as_tuple() {
                         Vec::new()
                     } else {
-                        let (hits, _) = self
+                        let ai_memory_store::HybridSearchOutcome { hits, .. } = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
@@ -3204,7 +3206,7 @@ impl AiMemoryServer {
                     .await
                 {
                     Ok(Some(scope)) if scope.as_tuple() != current => {
-                        let (hits, _) = self
+                        let ai_memory_store::HybridSearchOutcome { hits, .. } = self
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
@@ -11731,6 +11733,139 @@ mod tests {
         assert!(
             filtered.get("raw_hits").is_none(),
             "observations do not carry page tags and must not bypass a filter: {filtered}"
+        );
+    }
+
+    /// The vector stream has no similarity floor, so once any page in the
+    /// project has an embedding it answers every query, related or not. A
+    /// hit only that stream found is not a match for the query's words and
+    /// must not hide the raw-observation fallback: before this, the default
+    /// local embeddings turned `hits` non-empty and an observation from a
+    /// session with no page yet (still open, or ended without SessionEnd)
+    /// could not be found at all, while the same store without embeddings
+    /// returned it.
+    #[tokio::test]
+    async fn memory_query_returns_raw_hits_when_only_the_vector_stream_matches() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let server = server.with_embedder(Arc::new(TaskAwareEmbedder));
+        let unrelated = store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/unrelated.md").unwrap(),
+                title: "Unrelated".into(),
+                body: "Nothing about marsupials here.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // Nearly orthogonal to TaskAwareEmbedder's query vector [0.0, 1.0].
+        store
+            .writer
+            .store_embedding(
+                unrelated,
+                ai_memory_store::f32_vec_to_bytes(&[1.0, 0.05]),
+                "task-aware-test".into(),
+                "task-aware-test-model".into(),
+                2,
+            )
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "raw prompt".into(),
+                    body: "the api listens on quokka port 8088".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let json = tool_json(
+            &server
+                .memory_query(
+                    Parameters(query_in("scratch", "quokka")),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let hit_paths: Vec<&str> = json["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hit| hit["path"].as_str())
+            .collect();
+        assert_eq!(
+            hit_paths,
+            ["notes/unrelated.md"],
+            "the vector stream must still answer, or this test does not reach the bug: {json}"
+        );
+        let raw_hits = json["raw_hits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a vector-only hit must not suppress raw_hits: {json}"));
+        assert_eq!(raw_hits.len(), 1, "{json}");
+        assert!(
+            raw_hits[0]["snippet"]
+                .as_str()
+                .is_some_and(|snippet| snippet.contains("quokka")),
+            "{json}"
+        );
+
+        // Control: a page that matches the query's words is a real hit, so
+        // the fallback stays off exactly as before.
+        let json = tool_json(
+            &server
+                .memory_query(
+                    Parameters(query_in("scratch", "Karpathy")),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            json["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["path"] == "foo.md"),
+            "{json}"
+        );
+        assert!(
+            json.get("raw_hits").is_none(),
+            "a lexical page hit keeps the fallback off: {json}"
         );
     }
 
