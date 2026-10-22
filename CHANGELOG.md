@@ -330,6 +330,10 @@ version in [`docs/changelog/`](docs/changelog/):
   beside it. Both now reach the instructive "exactly one of `path` or `query`"
   refusal, and a blank `path` beside a real `query` runs the search.
   ([#1536](https://github.com/akitaonrails/ai-memory/pull/1536))
+- Reported a wiki page renamed away with an external tool, which arrives as a
+  rename event rather than a removal, so the next auto-commit drops it from the
+  tree instead of leaving a checkpoint naming a page that no longer exists.
+  ([#1537](https://github.com/akitaonrails/ai-memory/pull/1537))
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
