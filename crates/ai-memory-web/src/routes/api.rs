@@ -465,9 +465,13 @@ async fn search_with_request(
     }
     .map_err(internal_error)?;
 
-    Ok(with_cache(
+    // `owner` reaches the hybrid ranker, which attaches an observation excerpt
+    // only from a session that filter admits, so both the order and each hit's
+    // snippet depend on the caller's identity. `private` alone would let a
+    // browser cache replay one actor's hits at the same URL after the
+    // credentials switch, so the filtering path must run on every request.
+    Ok(with_no_store(
         Json(enrich_hits(state, hits).await?).into_response(),
-        LIST_CACHE_MAX_AGE,
     ))
 }
 

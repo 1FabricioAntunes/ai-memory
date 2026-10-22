@@ -49,6 +49,14 @@ version in [`docs/changelog/`](docs/changelog/):
   chartsheets still reports that it contains no worksheets.
   ([#1569](https://github.com/akitaonrails/ai-memory/pull/1569))
 - Skip an oversized session-header record instead of failing the read when the size cap's boundary cuts a multi-byte character, so one unreadable transcript no longer aborts discovery or lookup for the other sessions beside it ([#1570](https://github.com/akitaonrails/ai-memory/pull/1570))
+- `/api/v1/search` no longer tells the browser it may reuse a search response
+  for 30 seconds. The handler takes an owner filter that reaches the hybrid
+  ranker, so both the ranking and each hit's observation snippet depend on who
+  asked, and a credential switch at the same URL inside that window could be
+  answered from the browser cache without the filtering path running. The
+  endpoint now sends `private, no-store`, as every other owner-scoped route in
+  the same module already does.
+  ([#1571](https://github.com/akitaonrails/ai-memory/pull/1571))
 - Fixed a 3.2.0 regression that serialized local document embedding and
   dropped the vector stream from queries that raced a document embed: the
   local embedder's capacity was hardcoded to two slots (one document, one
