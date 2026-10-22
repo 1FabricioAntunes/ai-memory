@@ -110,27 +110,30 @@ fn render_human(rows: &[ProjectRow]) -> String {
         return "No projects found.\n".to_owned();
     }
 
+    // `{:width$}` pads to a character count, so the widths must be measured
+    // the same way: `str::len` counts bytes, and a non-ASCII name then over-
+    // pads every other row in its column.
     let workspace_width = rows
         .iter()
-        .map(|row| row.workspace_name.len())
+        .map(|row| row.workspace_name.chars().count())
         .max()
         .unwrap_or(0)
-        .max("WORKSPACE".len());
+        .max("WORKSPACE".chars().count());
     let project_width = rows
         .iter()
-        .map(|row| row.project_name.len())
+        .map(|row| row.project_name.chars().count())
         .max()
         .unwrap_or(0)
-        .max("PROJECT".len());
+        .max("PROJECT".chars().count());
     // The id column carries what `--project-id` takes. A row from an older
     // server has no id; render `-` rather than hiding the column, so the
     // header stays stable across server versions. (#1208)
     let id_width = rows
         .iter()
-        .map(|row| row.project_id.as_deref().unwrap_or("-").len())
+        .map(|row| row.project_id.as_deref().unwrap_or("-").chars().count())
         .max()
         .unwrap_or(0)
-        .max("PROJECT ID".len());
+        .max("PROJECT ID".chars().count());
 
     let mut out = format!(
         "{:workspace_width$}  {:project_width$}  {:id_width$}  {:>6}  LAST UPDATED\n",
@@ -175,6 +178,49 @@ mod tests {
             out.contains("acme-api-id"),
             "the id is what an operator passes to --project-id: {out}"
         );
+    }
+
+    /// A column is as wide as its widest value, and `{:width$}` pads to a
+    /// character count — so a width measured in bytes pads the whole column
+    /// one space too wide per extra byte in the longest non-ASCII value.
+    #[test]
+    fn render_human_sizes_a_non_ascii_column_by_characters() {
+        let rows = vec![
+            row("default", "café-api", 3, None),
+            row("default", "web", 1, None),
+        ];
+        let out = render_human(&rows);
+
+        // `café-api` is the widest PROJECT value, so only the two-space
+        // column separator may follow it. Measured in bytes the column is 9
+        // wide and a third space appears.
+        assert!(
+            out.contains("café-api  café-api-id"),
+            "the widest value must be followed by the separator alone:\n{out}"
+        );
+        // Control: the same table in ASCII already renders this way, so the
+        // assertion above is about the measurement, not the format.
+        let ascii = render_human(&[row("default", "acme-api", 3, None)]);
+        assert!(
+            ascii.contains("acme-api  acme-api-id"),
+            "the ASCII column is unchanged:\n{ascii}"
+        );
+
+        // All three measured columns at once: with a non-ASCII value widest
+        // in each, every data line is exactly as long as the columns need.
+        let wide = render_human(&[
+            row("café-workspace", "café-api", 3, Some("2026-01-02")),
+            row("café-workspace", "web", 1, Some("2026-01-03")),
+        ]);
+        // 14 + 2 + 8 + 2 + 11 + 2 + 6 ("{:>6}" pages) + 2 + 10 (date).
+        let expected = 14 + 2 + 8 + 2 + 11 + 2 + 6 + 2 + 10;
+        for line in wide.lines().skip(1) {
+            assert_eq!(
+                line.chars().count(),
+                expected,
+                "a byte-measured column pads this line wider:\n{wide}"
+            );
+        }
     }
 
     /// A row from a server that predates the id fields still renders: the
