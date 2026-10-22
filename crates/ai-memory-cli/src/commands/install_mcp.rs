@@ -2172,20 +2172,27 @@ fn codex_upsert_mcp_server(
     //   - v3 (this): `[mcp_servers.X.http_headers]` with
     //     `Authorization = "Bearer ..."`. Codex schema-validates
     //     and uses it as a static auth header.
+    // Read before the server table is replaced: per-tool approval
+    // overrides the user already chose survive a re-install.
+    let tools = codex_tool_approvals(
+        doc.get("mcp_servers")
+            .and_then(|servers| servers.get(&args.name))
+            .and_then(|server| server.get("tools")),
+    );
     let mut server = Table::new();
     server["url"] = value(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
     // Auto-approve ai-memory's tool calls. Without this, Codex
     // prompts on EVERY tool invocation ("approve memory_query?"
     // "approve memory_briefing?" …) which makes the MCP unusable
-    // for an auto-capture workflow. The valid TOML values per
-    // Codex's `AppToolApproval` enum are "auto" / "prompt" /
-    // "approve" — `approve` means "no prompt, just run it". ai-
-    // memory's surface is dominantly read-only (query, recent,
-    // status, briefing, explore); the few writes (consolidate,
-    // forget_sweep) are tagged `destructiveHint: true` upstream
-    // so any agent that wants to gate THOSE specifically can
-    // override per-tool — see Codex's `[mcp_servers.X.tools]`
-    // map.
+    // for an auto-capture workflow. The valid values per Codex's
+    // config reference are "auto" / "prompt" / "writes" /
+    // "approve" — `approve` means "no prompt, just run it". The
+    // tools annotated destructive get a per-tool
+    // `[mcp_servers.X.tools.<tool>] approval_mode = "prompt"`
+    // override below (`codex_tool_approvals`).
+    // https://developers.openai.com/codex/config-reference
+    // (`mcp_servers.<id>.default_tools_approval_mode`,
+    // `mcp_servers.<id>.tools.<tool>.approval_mode`).
     server["default_tools_approval_mode"] = value("approve");
     if args.token_env_var {
         server["bearer_token_env_var"] = value(PRIME_AGENT_TOKEN_ENV);
@@ -2194,9 +2201,47 @@ fn codex_upsert_mcp_server(
         headers["Authorization"] = value(b);
         server["http_headers"] = Item::Table(headers);
     }
+    server.insert("tools", Item::Table(tools));
 
     upsert_toml_mcp_server(doc, &args.name, server);
     Ok(())
+}
+
+/// Codex `[mcp_servers.<name>.tools]`: the user's existing per-tool entries,
+/// copied as plain keys, plus `approval_mode = "prompt"` for every tool
+/// annotated destructive that has no approval mode yet. The server-wide
+/// default stays `approve`, so the read tools never prompt, while every tool
+/// annotated destructive asks first.
+fn codex_tool_approvals(existing: Option<&toml_edit::Item>) -> toml_edit::Table {
+    use toml_edit::{Item, Table, value};
+
+    let mut tools = Table::new();
+    tools.set_implicit(true);
+    if let Some(existing) = existing.and_then(Item::as_table_like) {
+        for (tool, entry) in existing.iter() {
+            let Some(entry) = entry.as_table_like() else {
+                continue;
+            };
+            let mut copy = Table::new();
+            for (key, item) in entry.iter() {
+                if let Some(value) = item.as_value() {
+                    copy.insert(key, Item::Value(value.clone()));
+                }
+            }
+            tools.insert(tool, Item::Table(copy));
+        }
+    }
+    for tool in ai_memory_mcp::AiMemoryServer::destructive_tool_names() {
+        if !tools.contains_key(&tool) {
+            tools.insert(&tool, Item::Table(Table::new()));
+        }
+        if let Some(entry) = tools.get_mut(&tool).and_then(Item::as_table_mut)
+            && !entry.contains_key("approval_mode")
+        {
+            entry.insert("approval_mode", value("prompt"));
+        }
+    }
+    tools
 }
 
 /// Insert / replace `[mcp_servers.<name>]` in a Grok `config.toml`.
@@ -2350,9 +2395,8 @@ fn render_codex(args: &InstallMcpArgs) -> Result<String> {
         .context("internal: generated Codex TOML table missing")?;
     if let Some(mut key) = server.key_mut("default_tools_approval_mode") {
         key.leaf_decor_mut().set_prefix(
-            "# Skip per-call approval prompts on ai-memory's tools.\n\
-             # ai-memory is read-mostly + writes are auto-capture; the\n\
-             # approval friction makes it unusable otherwise.\n",
+            "# Skip per-call approval prompts on ai-memory's read tools;\n\
+             # the destructive ones below still ask first.\n",
         );
     }
     if let Some(headers) = server
@@ -5947,6 +5991,77 @@ mod tests {
         assert_eq!(
             first, second,
             "second apply must produce identical bytes; diff:\n--- first\n{first}\n--- second\n{second}"
+        );
+    }
+
+    /// Codex keeps auto-approving the read tools, but every tool annotated
+    /// destructive gets a per-tool prompt.
+    #[test]
+    fn codex_apply_prompts_for_every_destructive_tool() {
+        let destructive = ai_memory_mcp::AiMemoryServer::destructive_tool_names();
+        assert!(
+            destructive.iter().any(|tool| tool == "memory_delete_page"),
+            "{destructive:?}"
+        );
+        let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args_for(McpClient::Codex)).unwrap();
+        let out = doc.to_string();
+        assert!(
+            out.contains("default_tools_approval_mode = \"approve\""),
+            "{out}"
+        );
+        let server = &doc["mcp_servers"]["ai-memory"];
+        for tool in &destructive {
+            assert_eq!(
+                server["tools"][tool.as_str()]["approval_mode"].as_str(),
+                Some("prompt"),
+                "{tool} must prompt:\n{out}"
+            );
+        }
+        for read_tool in ["memory_query", "memory_recent", "memory_briefing"] {
+            assert!(
+                server["tools"].get(read_tool).is_none(),
+                "{read_tool} keeps the approve default:\n{out}"
+            );
+        }
+
+        let rendered = render_codex(&args_for(McpClient::Codex));
+        for tool in &destructive {
+            assert!(
+                rendered.contains(&format!(
+                    "[mcp_servers.ai-memory.tools.{tool}]\napproval_mode = \"prompt\""
+                )),
+                "{tool} missing from the printed snippet:\n{rendered}"
+            );
+        }
+        rendered.parse::<toml_edit::DocumentMut>().unwrap();
+    }
+
+    /// A re-install keeps the per-tool choices the user already made.
+    #[test]
+    fn codex_apply_keeps_existing_per_tool_overrides() {
+        let original = "[mcp_servers.ai-memory]\n\
+                        url = \"http://old\"\n\
+                        \n\
+                        [mcp_servers.ai-memory.tools.memory_delete_page]\n\
+                        approval_mode = \"approve\"\n\
+                        \n\
+                        [mcp_servers.ai-memory.tools.memory_query]\n\
+                        approval_mode = \"prompt\"\n";
+        let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args_for(McpClient::Codex)).unwrap();
+        let tools = &doc["mcp_servers"]["ai-memory"]["tools"];
+        assert_eq!(
+            tools["memory_delete_page"]["approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            tools["memory_query"]["approval_mode"].as_str(),
+            Some("prompt")
+        );
+        assert_eq!(
+            tools["memory_forget_sweep"]["approval_mode"].as_str(),
+            Some("prompt")
         );
     }
 
