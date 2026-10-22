@@ -442,6 +442,54 @@ version in [`docs/changelog/`](docs/changelog/):
   terminal control sequences are stripped; both JSON paths remain structural.
   ([#1563](https://github.com/akitaonrails/ai-memory/pull/1563))
 
+- Hardened the privacy strip. It now matches credentials across invisible
+  formatting characters while storing text that matches nothing byte for
+  byte, so emoji sequences and scripts that need joiners are untouched. It
+  also redacts PGP private keys and private-key blocks that have no end line,
+  as long as a key-body line follows the header, so prose that only names a
+  header is kept. Tag characters outside an emoji flag, a byte-order mark
+  after the start of the text and the invisible math operators are stripped.
+  The allowlist no longer exempts private keys, and blank `[sanitize]
+  allowlist` entries are ignored with a warning at startup. The client scrub
+  shared by the relay and importer companions follows the same rules.
+  Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- Tightened how client commands decide that a server URL is on this machine
+  before using the install's root token. The check now reads the host the
+  HTTP client would connect to and refuses any URL that carries user
+  information. `ai-memory upgrade` uses the same check for its remote-server
+  note. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- `ai-memory restore` no longer replaces an existing live `config.toml` with
+  the backup's by default, because a config can run commands and redirect
+  data. The backup's copy is saved beside it as `config.toml.from-backup`
+  (owner-only) with a notice; pass the new `--with-config` flag to restore it
+  in place as before. A data dir with no config still gets the backup's. When
+  the live config is kept and the restored database holds API keys, its pepper
+  must match them, or the restore stops before changing anything and names
+  `--with-config`. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- `install-mcp --client codex` now makes Codex ask before running ai-memory's
+  destructive tools. The read tools still run without a prompt; every tool
+  annotated destructive (deleting or restoring a page, the forget sweep,
+  accepting or cancelling a handoff, popping or cancelling messages, recall
+  feedback) gets a per-tool `approval_mode = "prompt"`, and a re-install keeps
+  per-tool settings you already chose. Re-run `install-mcp --client codex
+  --apply` to update an existing entry. Reported by @FabioLeitao.
+  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
+
+- A server profile's `roots` now admit a checkout whose Windows cwd differs
+  from the registered root only in case. `Path::starts_with` compares
+  components byte-exactly, so a root added as `C:\Work\team-b` refused
+  `C:\work\team-b\repo` and every event captured there was dropped as
+  `rejected-outside-roots`, even though the home marker's own path routes
+  already fold case under a drive-letter or UNC root. POSIX roots stay
+  case-sensitive.
+  ([#1538](https://github.com/akitaonrails/ai-memory/pull/1538))
+
 ### Security
 
 - A malformed OAuth entry in `auth.json` no longer prints the stored value in
@@ -511,47 +559,6 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory upgrade`'s GitHub release query, the OAuth/OIDC login flows,
   and remote `server_url` topologies. `docs/airgapped-install.md`'s
   runtime summary was corrected to match.
-
-### Fixed
-
-- Hardened the privacy strip. It now matches credentials across invisible
-  formatting characters while storing text that matches nothing byte for
-  byte, so emoji sequences and scripts that need joiners are untouched. It
-  also redacts PGP private keys and private-key blocks that have no end line,
-  as long as a key-body line follows the header, so prose that only names a
-  header is kept. Tag characters outside an emoji flag, a byte-order mark
-  after the start of the text and the invisible math operators are stripped.
-  The allowlist no longer exempts private keys, and blank `[sanitize]
-  allowlist` entries are ignored with a warning at startup. The client scrub
-  shared by the relay and importer companions follows the same rules.
-  Reported by @FabioLeitao.
-  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
-
-- Tightened how client commands decide that a server URL is on this machine
-  before using the install's root token. The check now reads the host the
-  HTTP client would connect to and refuses any URL that carries user
-  information. `ai-memory upgrade` uses the same check for its remote-server
-  note. Reported by @FabioLeitao.
-  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
-
-- `ai-memory restore` no longer replaces an existing live `config.toml` with
-  the backup's by default, because a config can run commands and redirect
-  data. The backup's copy is saved beside it as `config.toml.from-backup`
-  (owner-only) with a notice; pass the new `--with-config` flag to restore it
-  in place as before. A data dir with no config still gets the backup's. When
-  the live config is kept and the restored database holds API keys, its pepper
-  must match them, or the restore stops before changing anything and names
-  `--with-config`. Reported by @FabioLeitao.
-  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
-
-- `install-mcp --client codex` now makes Codex ask before running ai-memory's
-  destructive tools. The read tools still run without a prompt; every tool
-  annotated destructive (deleting or restoring a page, the forget sweep,
-  accepting or cancelling a handoff, popping or cancelling messages, recall
-  feedback) gets a per-tool `approval_mode = "prompt"`, and a re-install keeps
-  per-tool settings you already chose. Re-run `install-mcp --client codex
-  --apply` to update an existing entry. Reported by @FabioLeitao.
-  ([GHSA-jpcg-w5c5-wcv6](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jpcg-w5c5-wcv6))
 
 ## [3.2.0] - 2026-10-21
 
@@ -767,15 +774,6 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
-- A server profile's `roots` now admit a checkout whose Windows cwd differs
-  from the registered root only in case. `Path::starts_with` compares
-  components byte-exactly, so a root added as `C:\Work\team-b` refused
-  `C:\work\team-b\repo` and every event captured there was dropped as
-  `rejected-outside-roots`, even though the home marker's own path routes
-  already fold case under a drive-letter or UNC root. POSIX roots stay
-  case-sensitive.
-  ([#1538](https://github.com/akitaonrails/ai-memory/pull/1538))
-
 - Memory health no longer counts a link from a superseded or TTL-expired page
   version as a reference. A page whose only inbound link was removed by a later
   edit was reported as linked, because the old version's `links` row survives
