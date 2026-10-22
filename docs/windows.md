@@ -188,6 +188,24 @@ container, which has no host CLIs.
 - The native client inherits `AI_MEMORY_SERVER_URL`. Leave it unset and it
   talks to `http://127.0.0.1:49374`, the port the container publishes on the
   host; a remote-server URL wins, as with every other wrapper command.
+- When the container server has auth enabled (a fresh install mints a root
+  bearer into the volume), the native client needs that token or the server
+  rejects these commands with `401`. The Linux/macOS wrapper copies the
+  token out of the named volume for its native host commands; the
+  PowerShell wrapper does not do that yet
+  ([#1603](https://github.com/akitaonrails/ai-memory/issues/1603)). Until it
+  does, copy the token out once yourself and point the client at the file:
+
+  ```powershell
+  New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\ai-memory" | Out-Null
+  $token = docker run --rm -v ai-memory-data:/data:ro --entrypoint /bin/sh akitaonrails/ai-memory:latest -c "cat /data/auth-tokens/default"
+  Set-Content -NoNewline "$env:LOCALAPPDATA\ai-memory\server-token" $token.Trim()
+  $env:AI_MEMORY_AUTH__BEARER_TOKEN_FILE = "$env:LOCALAPPDATA\ai-memory\server-token"
+  ```
+
+  Setting `AI_MEMORY_AUTH__BEARER_TOKEN_FILE` in your user environment covers
+  every terminal. A plain `$env:AI_MEMORY_AUTH_TOKEN = "<token>"` also works
+  for a single session. Refresh the copy whenever the volume's token rotates.
 - A managed launch does not rewire hooks or MCP: what `install-hooks` and
   `install-mcp` rendered through the container stays in place (the wrapper
   sets `AI_MEMORY_RUN_AUTOWIRE=false` for the intercepted commands unless you

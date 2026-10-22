@@ -182,7 +182,9 @@ run to the last digit, and the 100-question FTS wall clock fell from
 (`env:AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1`), so a run that used it
 says so. Accuracy, latency and context-token numbers stay comparable with
 earlier releases; only ingest wall clock differs, because runs before
-October 2026 paid for the commits.
+October 2026 paid for the commits. The variable is an eval-only escape, not
+a supported product configuration: no product path sets it, and its only
+reader is the server's startup check.
 
 ```bash
 ai-memory-eval retrieval \
