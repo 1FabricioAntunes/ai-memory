@@ -361,4 +361,64 @@ mod tests {
         assert_eq!(url_encode("a/b"), "a%2Fb");
         assert_eq!(url_encode("a b"), "a%20b");
     }
+
+    fn user(username: &str, name: Option<&str>) -> UserRow {
+        UserRow {
+            id: "u1".to_owned(),
+            username: username.to_owned(),
+            name: name.map(str::to_owned),
+            email: None,
+            created_at: 0,
+            last_seen_at: None,
+            role: "admin".to_owned(),
+            must_change_password: false,
+            disabled_at: None,
+            has_password: true,
+        }
+    }
+
+    /// The display-cell offset at which `line` carries `cell`, or `None`.
+    fn cell_column(line: &str, cell: &str) -> Option<usize> {
+        line.find(cell)
+            .map(|byte| unicode_width::UnicodeWidthStr::width(&line[..byte]))
+    }
+
+    fn render(users: &[UserRow]) -> String {
+        let mut buf = Vec::new();
+        write_users(users, &mut buf).expect("rendering to a buffer cannot fail");
+        String::from_utf8(buf).expect("the table is utf-8")
+    }
+
+    #[test]
+    fn users_table_columns_line_up_past_ascii() {
+        // Under a byte-measured width the double-width username is padded to
+        // its byte count in characters, which pushes its NAME, ROLE and
+        // STATUS cells right of the ASCII row's, and the accented name widens
+        // NAME by one column no row needs.
+        let rows = [user("利用者", Some("José")), user("bob", None)];
+        let table = render(&rows);
+        let header = table.lines().next().expect("a header row");
+        let name_col = cell_column(header, "NAME").expect("a NAME column");
+        let role_col = cell_column(header, "ROLE").expect("a ROLE column");
+        for line in table.lines().skip(1) {
+            assert_eq!(
+                cell_column(line, "admin"),
+                Some(role_col),
+                "ROLE column moved on {line:?}:\n{table}"
+            );
+        }
+        let cjk_row = table.lines().nth(1).expect("the CJK row");
+        assert_eq!(cell_column(cjk_row, "José"), Some(name_col), "{table}");
+        let widest_name = "José".chars().count();
+        assert_eq!(role_col, name_col + widest_name + 2, "{table}");
+
+        // Control: ASCII rows line up under either measure, so the rows above
+        // are what carry the assertions.
+        let ascii = render(&[user("alice", Some("Jose")), user("bob", None)]);
+        let ascii_header = ascii.lines().next().expect("a header row");
+        let ascii_role = cell_column(ascii_header, "ROLE").expect("a ROLE column");
+        for line in ascii.lines().skip(1) {
+            assert_eq!(cell_column(line, "admin"), Some(ascii_role), "{ascii}");
+        }
+    }
 }
