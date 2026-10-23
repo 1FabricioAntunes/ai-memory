@@ -19,7 +19,7 @@ version in [`docs/changelog/`](docs/changelog/):
   config, which Grok reads only as the user layer (`grok inspect` reports no
   project layer there), so it is no longer mistaken for a project overlay. A
   real overlay is still refused, including `~/.grok/config.toml` when
-  `GROK_HOME` points elsewhere (#PRNUM).
+  `GROK_HOME` points elsewhere (#1636).
 
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
