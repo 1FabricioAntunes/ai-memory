@@ -19,6 +19,14 @@ version in [`docs/changelog/`](docs/changelog/):
   no longer widens its column with phantom padding, and a double-width CJK
   name no longer shifts the cells after it (#1625).
 
+- `install.sh` now runs its smoke test of the downloaded binary from beside
+  the install directory (`~/.local/lib`), not from the temporary work
+  directory. On a host whose `/tmp` or `TMPDIR` is mounted `noexec`, nothing
+  can be executed there, so the install stopped with "the downloaded binary
+  does not run on this machine" for a release that runs from where it is
+  installed. A binary that really does not run is still refused, naming the
+  directory it was tried from, and its staged copy is removed (#1623).
+
 ## [3.2.2] - 2026-10-22
 
 ### Fixed
