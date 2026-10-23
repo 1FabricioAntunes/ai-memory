@@ -398,7 +398,8 @@ mod tests {
         let rows = [user("利用者", Some("José")), user("bob", None)];
         let table = render(&rows);
         let header = table.lines().next().expect("a header row");
-        let name_col = cell_column(header, "NAME").expect("a NAME column");
+        // USERNAME ends in NAME, so look for the NAME header past its separator.
+        let name_col = cell_column(header, "  NAME").expect("a NAME column") + 2;
         let role_col = cell_column(header, "ROLE").expect("a ROLE column");
         for line in table.lines().skip(1) {
             assert_eq!(
