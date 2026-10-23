@@ -145,8 +145,9 @@ by formatting may still be extracted; deleted revisions and field instructions
 are excluded. Review `--show-body` before every live import of a document whose
 visibility rules matter.
 
-VTT/SRT files accept LF, CRLF, or CR line endings. WebVTT comments are omitted;
-identifiers such as `NOTE123` keep their cue text.
+VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
+between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
+their cue text.
 
 ## Safety contract
 

@@ -20,6 +20,14 @@ version in [`docs/changelog/`](docs/changelog/):
   does not run on this machine" for a release that runs from where it is
   installed. A binary that really does not run is still refused, naming the
   directory it was tried from, and its staged copy is removed (#1623).
+- The document importer no longer drops a VTT or SRT cue that follows two
+  blank lines (or any even number of them). The subtitle reader split cues on
+  a single blank line, so the extra one was left at the top of the next block,
+  and a block that started with an empty line was skipped whole. A WebVTT file
+  whose header was followed by two blank lines lost its first cue, or was
+  rejected as containing no extractable text when that was its only cue.
+  WebVTT allows any number of blank lines between blocks; the reader now skips
+  them before reading a block.
 
 ## [3.2.2] - 2026-10-22
 
