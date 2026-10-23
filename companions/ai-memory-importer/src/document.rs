@@ -1029,8 +1029,15 @@ fn extract_transcript(bytes: &[u8], webvtt: bool) -> Result<String> {
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     for (block_index, block) in normalized.split("\n\n").enumerate() {
-        let lines = block.lines().map(str::trim).collect::<Vec<_>>();
-        let Some(first) = lines.first().copied().filter(|line| !line.is_empty()) else {
+        // Blocks can be separated by more than one blank line (WebVTT allows
+        // any number: https://www.w3.org/TR/webvtt1/#file-structure), so
+        // splitting on a single one can leave a blank line atop the next block.
+        let lines = block
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| line.is_empty())
+            .collect::<Vec<_>>();
+        let Some(first) = lines.first().copied() else {
             continue;
         };
         if webvtt && block_index == 0 && first.starts_with("WEBVTT") {
@@ -1740,6 +1747,22 @@ mod tests {
     fn transcripts_accept_each_supported_line_terminator() {
         let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nFirst fact\n\n00:00:03.000 --> 00:00:04.000\nSecond fact\n";
         let srt = "1\n00:00:01,000 --> 00:00:02,000\nFirst fact\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond fact\n";
+        for newline in ["\n", "\r\n", "\r"] {
+            for (input, webvtt) in [(vtt, true), (srt, false)] {
+                let input = input.replace('\n', newline);
+                assert_eq!(
+                    extract_transcript(input.as_bytes(), webvtt).unwrap().trim(),
+                    "First fact\n\nSecond fact",
+                    "line terminator {newline:?}, WebVTT={webvtt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transcripts_keep_cues_after_more_than_one_blank_line() {
+        let vtt = "WEBVTT\n\n\n00:00:01.000 --> 00:00:02.000\nFirst fact\n\n\n00:00:03.000 --> 00:00:04.000\nSecond fact\n";
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nFirst fact\n\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond fact\n";
         for newline in ["\n", "\r\n", "\r"] {
             for (input, webvtt) in [(vtt, true), (srt, false)] {
                 let input = input.replace('\n', newline);
