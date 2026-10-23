@@ -20,7 +20,7 @@ version in [`docs/changelog/`](docs/changelog/):
   directory into a project, so opening one of these agents in an unmarked
   directory left an empty project named after it. The native hook already
   returned before the request; these integrations call the server directly
-  (#PRNUM).
+  (#1641).
 
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
