@@ -45,7 +45,7 @@ version in [`docs/changelog/`](docs/changelog/):
   embeds Python: it is the same scorer in POSIX `sh` and `awk`, so it runs in
   the official Docker image, which has no `python3`. The docs no longer call
   the Python scorer dependency-free and say how to point the eval command at a
-  script inside the container (#PRNUM).
+  script inside the container (#1640).
 
 ## [3.2.2] - 2026-10-22
 
