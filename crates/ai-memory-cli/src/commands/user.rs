@@ -135,51 +135,56 @@ async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
         println!("(no registered users)");
         return Ok(());
     }
-    let user_w = resp
-        .users
+    write_users(&resp.users, &mut io::stdout().lock())
+}
+
+/// Lay out the users table using terminal display-cell widths. Usernames and
+/// display names are free-form UTF-8, so a byte count over-pads an accented
+/// name and misplaces every cell after a double-width one.
+fn write_users(users: &[UserRow], out: &mut impl Write) -> Result<()> {
+    let user_w = users
         .iter()
-        .map(|u| u.username.len())
+        .map(|u| unicode_width::UnicodeWidthStr::width(u.username.as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
-    let name_w = resp
-        .users
+    let name_w = users
         .iter()
-        .filter_map(|u| u.name.as_ref().map(String::len))
+        .filter_map(|u| u.name.as_deref())
+        .map(unicode_width::UnicodeWidthStr::width)
         .max()
         .unwrap_or(4)
         .max(4);
-    let role_w = resp
-        .users
+    let role_w = users
         .iter()
-        .map(|u| u.role.len())
+        .map(|u| unicode_width::UnicodeWidthStr::width(u.role.as_str()))
         .max()
         .unwrap_or(4)
         .max(4);
-
-    println!(
-        "{:<user_w$}  {:<name_w$}  {:<role_w$}  {:<12}",
-        "USERNAME",
-        "NAME",
-        "ROLE",
-        "STATUS",
-        user_w = user_w,
-        name_w = name_w,
-        role_w = role_w,
-    );
-    for u in &resp.users {
-        println!(
-            "{:<user_w$}  {:<name_w$}  {:<role_w$}  {:<12}",
-            u.username,
-            u.name.as_deref().unwrap_or("-"),
-            u.role,
-            u.status(),
-            user_w = user_w,
-            name_w = name_w,
-            role_w = role_w,
-        );
+    writeln!(
+        out,
+        "{}  {}  {}  {:<12}",
+        pad_cell("USERNAME", user_w),
+        pad_cell("NAME", name_w),
+        pad_cell("ROLE", role_w),
+        "STATUS"
+    )?;
+    for u in users {
+        writeln!(
+            out,
+            "{}  {}  {}  {:<12}",
+            pad_cell(&u.username, user_w),
+            pad_cell(u.name.as_deref().unwrap_or("-"), name_w),
+            pad_cell(&u.role, role_w),
+            u.status()
+        )?;
     }
     Ok(())
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(unicode_width::UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 async fn reset_password(ep: &ServerEndpoint, args: UserResetPasswordArgs) -> Result<()> {
