@@ -93,40 +93,48 @@ async fn list(ep: &ServerEndpoint, args: ApiKeyListArgs) -> Result<()> {
         println!("(no API credentials)");
         return Ok(());
     }
-    let id_w = resp
-        .credentials
+    write_credentials(&resp.credentials, &mut io::stdout().lock())
+}
+
+/// Lay out the credentials table using terminal display-cell widths. Labels
+/// are free text, so a byte count over-pads an accented label and misplaces
+/// every cell after a double-width one.
+fn write_credentials(credentials: &[CredentialRow], out: &mut impl Write) -> Result<()> {
+    let id_w = credentials
         .iter()
-        .map(|c| c.id.len())
+        .map(|c| unicode_width::UnicodeWidthStr::width(c.id.as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
-    let label_w = resp
-        .credentials
+    let label_w = credentials
         .iter()
-        .map(|c| c.label.len())
+        .map(|c| unicode_width::UnicodeWidthStr::width(c.label.as_str()))
         .max()
         .unwrap_or(5)
         .max(5);
-    println!(
-        "{:<id_w$}  {:<label_w$}  {:<8}  PREVIEW",
-        "ID",
-        "LABEL",
-        "STATUS",
-        id_w = id_w,
-        label_w = label_w,
-    );
-    for c in &resp.credentials {
-        println!(
-            "{:<id_w$}  {:<label_w$}  {:<8}  {}",
-            c.id,
-            c.label,
+    writeln!(
+        out,
+        "{}  {}  {:<8}  PREVIEW",
+        pad_cell("ID", id_w),
+        pad_cell("LABEL", label_w),
+        "STATUS"
+    )?;
+    for c in credentials {
+        writeln!(
+            out,
+            "{}  {}  {:<8}  {}",
+            pad_cell(&c.id, id_w),
+            pad_cell(&c.label, label_w),
             c.status(),
-            c.preview.as_deref().unwrap_or("-"),
-            id_w = id_w,
-            label_w = label_w,
-        );
+            c.preview.as_deref().unwrap_or("-")
+        )?;
     }
     Ok(())
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(unicode_width::UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 async fn rotate(ep: &ServerEndpoint, args: ApiKeyRotateArgs) -> Result<()> {
