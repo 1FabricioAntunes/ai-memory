@@ -167,6 +167,28 @@ pub(crate) fn humanize_age_secs(seconds: i64) -> String {
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
 }
 
+/// Refuse an explicitly empty scope flag on a destructive command.
+///
+/// [`resolve_scope`] treats an empty string as absent, so a harness that
+/// fills an unset variable with `""` still resolves the scope it would have
+/// resolved without the flag. That is the right reading for a read, and the
+/// wrong one for a delete: `--project "" --confirm` would aim the purge at
+/// whatever the current directory resolves to, which is exactly the target
+/// nobody typed. These commands ask for the flag to be omitted instead.
+///
+/// # Errors
+/// Returns an error naming `flag` when it was passed as an empty or
+/// whitespace-only value.
+pub(crate) fn refuse_empty_explicit(value: Option<&str>, flag: &str) -> Result<()> {
+    if value.is_some_and(|v| v.trim().is_empty()) {
+        bail!(
+            "{flag} was passed empty; omit it to use the scope this directory resolves to, \
+             or name the project explicitly"
+        );
+    }
+    Ok(())
+}
+
 /// `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 entirely.
 pub(crate) fn resolve_scope(
     config: &Config,
