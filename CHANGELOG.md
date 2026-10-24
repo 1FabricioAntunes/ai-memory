@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `ai-memory write-page` and `restore-page` now print the last eight
+  characters of the page id instead of the first eight. Page ids are UUIDv7,
+  so the first eight are a timestamp prefix that every page written within
+  about a minute shares, and the printed `page_id` was the same for all of
+  them. The web UI already shortens ids this way.
+
 ## [3.2.3] - 2026-10-24
 
 ### Changed
