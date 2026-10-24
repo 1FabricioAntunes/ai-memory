@@ -93,6 +93,7 @@ function score_body(path, body,    lines, n, i, line, h1, h2, item, prose, place
 	n = split(body, lines, "\n")
 	for (i = 1; i <= n; i++) {
 		line = lines[i]
+		sub(/\r$/, "", line)
 		if (line ~ /^#[ \t]+[^ \t]/) h1 = 1
 		if (line ~ /^##[ \t]+[^ \t]/) h2 = 1
 		if (line ~ /^[ \t]*([-*+]|[0-9]+[.)])[ \t]+[^ \t]/) item = 1

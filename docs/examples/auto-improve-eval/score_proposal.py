@@ -34,6 +34,9 @@ def has_text_beyond_headings(body: str) -> bool:
 
 
 def score_body(path: str, body: str) -> tuple[float, list[str]]:
+    # A page written on Windows arrives with CRLF line endings; score it the
+    # same as its LF twin instead of counting "\r" as text or as a list item.
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
     score = 0.0
     reasons: list[str] = []
 

@@ -93,6 +93,22 @@ class ScorerParityTest(unittest.TestCase):
         body = "Caminho C:\\n# x sem título\n"
         self.assert_verdict(proposal("_rules/a.md", body), False)
 
+    def test_a_crlf_page_scores_as_its_lf_twin(self) -> None:
+        # A page edited on Windows arrives with CRLF endings; the carriage
+        # return must not count as text beyond a heading nor as a list item.
+        cases = (
+            ("_rules/x.md", "# Regra\n\nTexto.\n", True),
+            ("_rules/x.md", "# Regra\n", False),
+            ("procedures/x.md", "# P\n\n## S\n- passo\n", True),
+            ("procedures/x.md", "# P\n\n## S\n- \n", False),
+        )
+        for path, body, passed in cases:
+            lf = proposal(path, body)
+            crlf = proposal(path, body.replace("\n", "\r\n"))
+            self.assert_verdict(crlf, passed)
+            for scorer in SCORERS:
+                self.assertEqual(score(scorer, lf), score(scorer, crlf), scorer)
+
     def test_a_non_json_input_fails_closed_in_the_shell_scorer(self) -> None:
         result = score("sh", b'{"path": "procedures/x", "after_body": "# a\n')
         self.assertIs(result["passed"], False)
