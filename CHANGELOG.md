@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A project whose every page has passed its TTL is read as new again when
+  the profile digest sizes itself. The newness probe was the one `pages` read
+  in the profile module without the expiry guard its three siblings apply, so
+  such a project still counted as having memory: it got the smaller
+  established-project digest and lost the note offering
+  `ai-memory profile apply`, with no live page left to show for it (#1631).
 - The first start after the 3.2.0 upgrade no longer slows down as the
   one-time CJK index backfill (V87) progresses. Each batch filtered the source
   table from its first row again, so the pass probed every row it had already
