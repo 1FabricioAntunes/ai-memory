@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- An auto-improve full-page proposal is now rejected when its body has two
+  identical headings or more than one H1, the two checks the patch path
+  already applies to every body it materializes. A full-page proposal is
+  auto-approved whenever approval is not required, and the page it wrote was
+  then permanently un-patchable: the patch path refuses on the target's own
+  duplicate headings before it materializes any edit, so no later proposal
+  could repair it (#1635).
 - `memory_feedback` now answers a path with no current page in the resolved
   project with `invalid_params` (-32602) rather than `internal_error`
   (-32603). An absent caller-supplied target is the request being wrong, not
