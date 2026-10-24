@@ -415,7 +415,8 @@ covers the same tests, slower, no tiers.
 - **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
   nightly, on dispatch, and automatically on any PR touching the
   platform-sensitive paths in its `changes` filter (the wiki, store and
-  hooks crates, `install_hooks.rs`, `hooks/`, `tests/hooks/`). It is the only
+  hooks crates, `install_hooks.rs`, `hooks/`, `tests/hooks/`, `bin/ai-memory.ps1`
+  and the packaging fixtures that run it). It is the only
   place `#[cfg(windows)]` tests run, and it is ~4x slower than the same tests
   on Linux — keeping it out of `ci.yml` is what holds PR feedback near the
   eight minutes the gating jobs take. **Add the `windows` label** to force a
