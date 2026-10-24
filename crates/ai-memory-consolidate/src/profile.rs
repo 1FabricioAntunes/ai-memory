@@ -691,8 +691,7 @@ fn has_marker(sentence: &str) -> bool {
     let padded = padded_lower(sentence);
     PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m))
         && !looks_agent_written(sentence)
-        && !(forgoes_a_capability(&padded)
-            && generality_of(sentence) != ProfileGenerality::General)
+        && !(forgoes_a_capability(&padded) && generality_of(sentence) != ProfileGenerality::General)
 }
 
 /// Whether `padded` switches off one of the agent's own capabilities.
@@ -2815,11 +2814,15 @@ mod tests {
         assert_eq!(scoped[0].generality, ProfileGenerality::General);
 
         // And an ordinary habit that mentions no capability is untouched.
-        let habits = detect_preferences("Never force-push to main. Always run clippy before a commit.");
+        let habits =
+            detect_preferences("Never force-push to main. Always run clippy before a commit.");
         let statements: Vec<&str> = habits.iter().map(|f| f.statement.as_str()).collect();
         assert_eq!(
             statements,
-            ["Never force-push to main.", "Always run clippy before a commit."]
+            [
+                "Never force-push to main.",
+                "Always run clippy before a commit."
+            ]
         );
     }
 
