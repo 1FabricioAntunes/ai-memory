@@ -512,9 +512,7 @@ impl WorkstreamEvent {
             WorkstreamEventKind::Checkpoint => {
                 self.role.as_deref().unwrap_or("repository checkpoint")
             }
-            WorkstreamEventKind::Compaction => {
-                self.role.as_deref().unwrap_or("native compaction")
-            }
+            WorkstreamEventKind::Compaction => self.role.as_deref().unwrap_or("native compaction"),
             WorkstreamEventKind::Annotation => self.role.as_deref().unwrap_or("import note"),
             WorkstreamEventKind::Message => self.role.as_deref().unwrap_or("message"),
         }
