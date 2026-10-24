@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- `ai-memory hook` and `ai-memory hook-drain` now run on a single-threaded
+  tokio runtime. Both are spawned once per agent event and answer one request,
+  and the multi-threaded default started a worker thread per CPU before the
+  command did any work: on a 32-core machine every hook call paid to spawn and
+  join 32 threads for one short HTTP request. Every other subcommand keeps the
+  multi-threaded runtime (#1669).
+
 ### Fixed
 
 - `ai-memory workstream-search` now labels a historical tool call or tool
