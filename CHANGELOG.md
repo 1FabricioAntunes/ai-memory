@@ -20,6 +20,26 @@ version in [`docs/changelog/`](docs/changelog/):
   startup on a store with 1.6 million observations while `serve` answered
   nothing. Each batch now resumes after the last rowid it indexed, so every
   row is examined once (#1652).
+- Restoring a page from a checkpoint (`/admin/restore-page`) no longer
+  rewrites the restored file's `generated.at` to the current time when the
+  checkpoint is already OKF-conformant. The restore now keeps the
+  checkpoint's own timestamp when conformance leaves the rest of its
+  frontmatter unchanged and the file on disk holds other content, so a
+  checkpoint emitted by ai-memory restores byte for byte whatever the clock.
+  When the file on disk already holds the same content, its timestamp is kept
+  so file and row stay aligned; checkpoints that need conformance still go
+  through the existing inheritance and stamping rules (#1671).
+- The native Windows Docker wrapper now recognizes `upgrade` after valid
+  `--config` or `--data-dir` global options and pulls the image instead of
+  forwarding `upgrade` into the helper container. Unknown and malformed
+  options still reach the CLI parser (#1667).
+- `ai-memory run codex` no longer starts a new session when Codex has
+  compressed the linked rollout. Codex keeps a rollout it has not written for
+  a week as `rollout-*.jsonl.zst`, which the launcher did not recognize, so it
+  reported the session as missing and repointed the workstream to a fresh one.
+  The compressed copy is now read for the resume, the pre-launch baseline and
+  the transcript import, and the plain file wins when both exist. `backfill`
+  and the session listings see compressed Codex sessions too (#1653).
 - Updated tokio to 1.54.1 in the server, relay, importer and wikisync
   lockfiles. 1.52.3 and the 1.53.x releases before 1.53.3 fall inside
   RUSTSEC-2026-0386, an unsound advisory for `AsyncFd` constructors that
