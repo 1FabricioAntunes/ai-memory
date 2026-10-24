@@ -20,8 +20,40 @@ version in [`docs/changelog/`](docs/changelog/):
   join 32 threads for one short HTTP request. Every other subcommand keeps the
   multi-threaded runtime (#1669).
 
+- `purge-project --confirm` without `--project`/`--project-id` now prints the
+  project it resolved from the current directory and the equivalent command
+  that names it, before the irreversible request. Naming the target will be
+  required in 4.0: from the wrong directory the derived name is the one project
+  nobody meant to delete, and a flag that spells it out is the only way to tell
+  the two cases apart (#1642).
+
 ### Fixed
 
+- A capture whose `.ai-memory.toml` names a promoted project's old name (its
+  v2 basename, now the project's `legacy_name`) no longer creates a second,
+  empty project under that name. The read path already resolved the old name
+  to the promoted project, so the twin made every later lookup of that name
+  fail as ambiguous until it was purged — and the next capture from the same
+  checkout created it again. The capture path now reuses the project the read
+  path resolves, and refuses an already-ambiguous name instead of adding a
+  third row (#1657).
+- The cross-project profile no longer promotes an agent task brief into a
+  default for every project. Two more filters now apply: a prompt that wraps a
+  transcript or asks for a verbatim reply is the signature of a program
+  driving the agent through its SDK, and none of it is harvested; and a
+  sentence that switches off one of the agent's own capabilities ("Do not use
+  any tools.", "Never call browser_close") only becomes a preference when it
+  states cross-project scope. Two scripted one-shot prompts had reached
+  `min_projects` and shipped "do not use any tools" as a `tools` default with
+  confidence 0.95, which made agents ask for facts instead of looking them up
+  in the wiki they were already in (#1648).
+- `purge-project --project ""`, and an empty `--project-id`/`--workspace`/
+  `--from`/`--to-workspace` on `move-project`, `purge-session` and
+  `rename-project`, are now refused before anything is sent. An empty flag
+  passed the "was the target named" check and then resolved as if it had been
+  omitted, so a script that passed an unset variable reached the project its
+  current directory resolved to — a real purge from an explicit-looking
+  invocation (#1642).
 - `ai-memory workstream-search` now labels a historical tool call or tool
   result as completed evidence, as the managed-workstream docs describe. Its
   text output used the event's role, which every transcript adapter sets to
@@ -1759,7 +1791,6 @@ version in [`docs/changelog/`](docs/changelog/):
   after the unlink. The deletion is permanent on disk; the wiki's git history
   keeps the blobs a checkpoint already captured. (#1322)
 
-
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question
   to ask one of them, "What do you remember about this project?", instead of
@@ -1785,7 +1816,6 @@ version in [`docs/changelog/`](docs/changelog/):
   standing pages now sees all of them, fewer in full: pin a page, or give it
   an `abstract:`, to control what it shows. The change adds no marker key
   and no migration. (#1264)
-
 
 ### Fixed
 - Restored fresh source installs after crates.io yanked every `zip` release
@@ -2664,6 +2694,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+
 ### Security
 - Fixed HTTP Basic sign-in to the web UI minting a 30-day `ai_memory_auth`
   cookie that held the root bearer token. Basic sign-in sets no cookie now;
