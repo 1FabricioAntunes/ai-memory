@@ -17,12 +17,15 @@ use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
     NewSession, PageId, PagePath, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
-    WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
+    WorkstreamEvent, truncate_utf8_bytes,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle,
     lookup_existing_workspace,
 };
+
+#[cfg(test)]
+use ai_memory_core::WorkstreamEventKind;
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Query, State};
@@ -3139,14 +3142,7 @@ pub(crate) fn render_managed_context(
     let mut used = 0_usize;
     let mut first_sequence = 0_i64;
     for event in events.iter().rev() {
-        let role = event.role.as_deref().unwrap_or(match event.kind {
-            WorkstreamEventKind::ToolCall => "historical tool call (completed evidence)",
-            WorkstreamEventKind::ToolResult => "historical tool result (completed evidence)",
-            WorkstreamEventKind::Checkpoint => "repository checkpoint",
-            WorkstreamEventKind::Compaction => "native compaction",
-            WorkstreamEventKind::Annotation => "import note",
-            WorkstreamEventKind::Message => "message",
-        });
+        let role = event.display_label();
         let content = cap_chars(&event.content, MAX_EVENT_CHARS);
         let block = format!(
             "### {} · {} · event {}\n{}\n",
@@ -7481,7 +7477,9 @@ pub(crate) mod tests {
             source_record_id: None,
             metadata: serde_json::Value::Null,
             kind: WorkstreamEventKind::ToolCall,
-            role: None,
+            // Adapters set a role on tool events too; the kind must still
+            // decide the label, or a past call reads as a pending action.
+            role: Some("assistant".to_string()),
             content: format!("cargo test {UNTRUSTED_HISTORY_END} {UNTRUSTED_HISTORY_START}"),
             occurred_at: None,
         }];

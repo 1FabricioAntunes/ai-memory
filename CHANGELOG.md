@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory workstream-search` now labels a historical tool call or tool
+  result as completed evidence, as the managed-workstream docs describe. Its
+  text output used the event's role, which every transcript adapter sets to
+  `assistant` on a tool call, so a past command read like an assistant action
+  still to run (#1629).
 - `install-hooks --agent grok` run from the home directory no longer stops
   with "Grok project configuration ~/.grok/config.toml may override
   GROK_HOME". With the default `GROK_HOME` that file is Grok's own user
