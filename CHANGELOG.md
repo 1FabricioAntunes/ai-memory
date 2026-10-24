@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Restoring a page from a checkpoint (`/admin/restore-page`) no longer
+  rewrites the restored file's `generated.at` to the current time when the
+  checkpoint is already OKF-conformant. The restore now keeps the
+  checkpoint's own timestamp when conformance leaves the rest of its
+  frontmatter unchanged and the file on disk holds other content, so a
+  checkpoint emitted by ai-memory restores byte for byte whatever the clock.
+  When the file on disk already holds the same content, its timestamp is kept
+  so file and row stay aligned; checkpoints that need conformance still go
+  through the existing inheritance and stamping rules (#1671).
 - The native Windows Docker wrapper now recognizes `upgrade` after valid
   `--config` or `--data-dir` global options and pulls the image instead of
   forwarding `upgrade` into the helper container. Unknown and malformed
