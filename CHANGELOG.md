@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `memory_feedback` now answers a path with no current page in the resolved
+  project with `invalid_params` (-32602) rather than `internal_error`
+  (-32603). An absent caller-supplied target is the request being wrong, not
+  the server failing, and -32603 tells a client to retry a path that can
+  never succeed. This was the last tool reporting an absent target as a
+  server fault; genuine store failures are still `internal_error`, and the
+  message is unchanged (#1634).
 - A Qwen Code `UserPromptSubmit` body is now capped and scrubbed before the
   native hook spools it. The per-event cap covered `prompt`, `message` and
   `text`, but Qwen's prompt arrives in `submitted_prompt` — the field the
