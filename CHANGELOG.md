@@ -19,8 +19,12 @@ version in [`docs/changelog/`](docs/changelog/):
   auto-approved whenever approval is not required, and the page it wrote was
   then permanently un-patchable: the patch path refuses on the target's own
   duplicate headings before it materializes any edit, so no later proposal
-  could repair it.
-
+  could repair it (#1635).
+- Updated tokio to 1.54.1 in the server, relay, importer and wikisync
+  lockfiles. 1.52.3 and the 1.53.x releases before 1.53.3 fall inside
+  RUSTSEC-2026-0386, an unsound advisory for `AsyncFd` constructors that
+  nothing here calls, and the `cargo-deny` gate failed on every pull request
+  from the moment the advisory was assigned (#1658).
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label
