@@ -122,6 +122,18 @@ version in [`docs/changelog/`](docs/changelog/):
   rejected as containing no extractable text when that was its only cue.
   WebVTT allows any number of blank lines between blocks; the reader now skips
   them before reading a block.
+- The example auto-improve eval scorers in `docs/examples/auto-improve-eval/`
+  no longer reject pages written in a language other than English. They
+  required `## Purpose`/`## Overview` and `## Steps`/`## Checklist` headings in
+  procedures and English imperatives in rules, and read the Portuguese and
+  Spanish word "todo" as a TODO placeholder, so a correct procedure in
+  Portuguese or Japanese failed. They now check structure only: an H1, an
+  upper-case TODO/TBD, a `##` section and a list of steps, text beyond the
+  heading and its length counted in characters. `score_proposal.sh` no longer
+  embeds Python: it is the same scorer in POSIX `sh` and `awk`, so it runs in
+  the official Docker image, which has no `python3`. The docs no longer call
+  the Python scorer dependency-free and say how to point the eval command at a
+  script inside the container (#1640).
 - Kimi Code gets the compiled project brief on the first prompt of a session
   only, also in a checkout outside `$HOME` whose only `[briefing]` opt-in is
   the operator-home marker. The handoff request takes the home marker as its
