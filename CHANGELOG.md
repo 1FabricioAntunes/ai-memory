@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The native Windows Docker wrapper now recognizes `upgrade` after valid
+  `--config` or `--data-dir` global options and pulls the image instead of
+  forwarding `upgrade` into the helper container. Unknown and malformed
+  options still reach the CLI parser (#1667).
 - `ai-memory run codex` no longer starts a new session when Codex has
   compressed the linked rollout. Codex keeps a rollout it has not written for
   a week as `rollout-*.jsonl.zst`, which the launcher did not recognize, so it
