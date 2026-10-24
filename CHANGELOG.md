@@ -22,6 +22,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A capture whose `.ai-memory.toml` names a promoted project's old name (its
+  v2 basename, now the project's `legacy_name`) no longer creates a second,
+  empty project under that name. The read path already resolved the old name
+  to the promoted project, so the twin made every later lookup of that name
+  fail as ambiguous until it was purged — and the next capture from the same
+  checkout created it again. The capture path now reuses the project the read
+  path resolves, and refuses an already-ambiguous name instead of adding a
+  third row (#1657).
 - The cross-project profile no longer promotes an agent task brief into a
   default for every project. Two more filters now apply: a prompt that wraps a
   transcript or asks for a verbatim reply is the signature of a program
