@@ -17,6 +17,13 @@ version in [`docs/changelog/`](docs/changelog/):
   `--config` or `--data-dir` global options and pulls the image instead of
   forwarding `upgrade` into the helper container. Unknown and malformed
   options still reach the CLI parser (#1667).
+- `ai-memory run codex` no longer starts a new session when Codex has
+  compressed the linked rollout. Codex keeps a rollout it has not written for
+  a week as `rollout-*.jsonl.zst`, which the launcher did not recognize, so it
+  reported the session as missing and repointed the workstream to a fresh one.
+  The compressed copy is now read for the resume, the pre-launch baseline and
+  the transcript import, and the plain file wins when both exist. `backfill`
+  and the session listings see compressed Codex sessions too (#1653).
 - Updated tokio to 1.54.1 in the server, relay, importer and wikisync
   lockfiles. 1.52.3 and the 1.53.x releases before 1.53.3 fall inside
   RUSTSEC-2026-0386, an unsound advisory for `AsyncFd` constructors that
