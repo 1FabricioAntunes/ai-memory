@@ -1646,6 +1646,37 @@ async fn an_ambiguous_name_names_its_holders_but_not_a_restricted_one() {
     assert!(!error.to_string().contains("acme-widget"));
 }
 
+#[tokio::test]
+async fn an_ambiguous_name_on_the_write_path_names_the_workspace() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = workspace(&store).await;
+    store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    resolve_capture(
+        &store,
+        ws,
+        &remote("github.com/acme/widget"),
+        IdentityStyle::Path,
+        "acme-widget",
+        None,
+    )
+    .await;
+
+    let error =
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "widget", None)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "project 'widget' is ambiguous in workspace 'default': it is the name of \
+         project 'widget' and the legacy key of project 'acme-widget'"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_legacy_and_canonical_resolve_or_create_converge_on_one_uuid() {
     let tmp = tempfile::TempDir::new().unwrap();
