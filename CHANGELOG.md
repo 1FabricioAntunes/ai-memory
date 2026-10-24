@@ -22,6 +22,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The cross-project profile no longer promotes an agent task brief into a
+  default for every project. Two more filters now apply: a prompt that wraps a
+  transcript or asks for a verbatim reply is the signature of a program
+  driving the agent through its SDK, and none of it is harvested; and a
+  sentence that switches off one of the agent's own capabilities ("Do not use
+  any tools.", "Never call browser_close") only becomes a preference when it
+  states cross-project scope. Two scripted one-shot prompts had reached
+  `min_projects` and shipped "do not use any tools" as a `tools` default with
+  confidence 0.95, which made agents ask for facts instead of looking them up
+  in the wiki they were already in (#1648).
 - `purge-project --project ""`, and an empty `--project-id`/`--workspace`/
   `--from`/`--to-workspace` on `move-project`, `purge-session` and
   `rename-project`, are now refused before anything is sent. An empty flag
