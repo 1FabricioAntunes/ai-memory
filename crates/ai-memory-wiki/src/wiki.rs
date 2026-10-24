@@ -984,13 +984,24 @@ impl Wiki {
         // the server once to migrate" — which the one-shot wiki migration
         // never does again — and made each `serve` boot re-archive the data
         // dir once the migration archive was deleted. Conformance is
-        // idempotent modulo `generated.at`, which it inherits from the file
-        // on disk, so an already-conformant page still restores byte-exact.
+        // idempotent modulo `generated.at`. The file on disk is the newer
+        // version, whose body differs, so the helper cannot inherit the
+        // timestamp from it and would stamp `now()`; when conformance changed
+        // nothing else, the checkpoint keeps its own `generated.at`, so an
+        // already-conformant page restores byte-exact whatever the clock.
+        let checkpointed_at =
+            ai_memory_core::okf::generated_at(&md.frontmatter).map(str::to_string);
+        let checkpointed = ai_memory_core::okf::strip_generated_at(&md.frontmatter);
         conform_frontmatter_for_disk(
             &self.abs_path(workspace_id, project_id, &path),
             path.as_str(),
             &mut md,
         );
+        if let Some(at) = checkpointed_at
+            && ai_memory_core::okf::strip_generated_at(&md.frontmatter) == checkpointed
+        {
+            ai_memory_core::okf::stamp_generated_at(&mut md.frontmatter, &at);
+        }
         let raw = emit(&md)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
@@ -5224,6 +5235,81 @@ mod tests {
         assert!(meta.pinned);
         let md = wiki.read_page(ws, proj, &path).unwrap();
         assert_eq!(md.body.trim(), "old");
+    }
+
+    // The newer file on disk has another body, so the disk-inheritance rule
+    // cannot supply `generated.at`; a past timestamp makes the restore fail
+    // on every run without the checkpoint's own value, not only when the
+    // write and the restore straddle a second.
+    #[tokio::test]
+    async fn restoring_a_conformant_checkpoint_keeps_its_generated_at() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/conformant.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "first",
+            serde_json::json!({ "title": "Conformant" }),
+        ))
+        .await
+        .unwrap();
+        let mut md = parse(&std::fs::read_to_string(&abs).unwrap()).unwrap();
+        ai_memory_core::okf::stamp_generated_at(&mut md.frontmatter, "2020-01-01T00:00:00Z");
+        std::fs::write(&abs, emit(&md).unwrap()).unwrap();
+        let checkpointed = std::fs::read(&abs).unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "second",
+            serde_json::json!({ "title": "Conformant" }),
+        ))
+        .await
+        .unwrap();
+        wiki.commit_all("later").unwrap();
+        assert_ne!(std::fs::read(&abs).unwrap(), checkpointed);
+
+        wiki.restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(std::fs::read(&abs).unwrap()).unwrap(),
+            String::from_utf8(checkpointed).unwrap(),
+            "restoring an already-conformant page rewrote its bytes"
+        );
+    }
+
+    // Control: a pre-OKF checkpoint still gets the deterministic keys and a
+    // fresh `generated.at`, even when it carries a stale one, because
+    // conformance changed more than the timestamp.
+    #[tokio::test]
+    async fn restoring_a_pre_okf_checkpoint_still_conforms_and_restamps() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/legacy.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let legacy = "---\ntitle: Legacy\ngenerated:\n  at: '2020-01-01T00:00:00Z'\n---\nold";
+        std::fs::write(&abs, legacy).unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+        std::fs::write(&abs, "---\ntitle: Legacy\n---\nnew").unwrap();
+
+        wiki.restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
+            .await
+            .unwrap();
+
+        let restored = parse(&std::fs::read_to_string(&abs).unwrap()).unwrap();
+        assert_eq!(restored.body.trim(), "old");
+        assert!(ai_memory_core::okf::is_conformant(&restored.frontmatter));
+        let at = ai_memory_core::okf::generated_at(&restored.frontmatter)
+            .expect("the restore stamps generated.at");
+        assert_ne!(at, "2020-01-01T00:00:00Z", "a conformed page is restamped");
     }
 
     #[tokio::test]
