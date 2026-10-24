@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The first start after the 3.2.0 upgrade no longer slows down as the
+  one-time CJK index backfill (V87) progresses. Each batch filtered the source
+  table from its first row again, so the pass probed every row it had already
+  indexed once more per batch: quadratic in the row count, and hours of
+  startup on a store with 1.6 million observations while `serve` answered
+  nothing. Each batch now resumes after the last rowid it indexed, so every
+  row is examined once (#1652).
 - Restoring a page from a checkpoint (`/admin/restore-page`) no longer
   rewrites the restored file's `generated.at` to the current time when the
   checkpoint is already OKF-conformant. The restore now keeps the
