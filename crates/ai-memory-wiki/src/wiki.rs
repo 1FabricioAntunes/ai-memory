@@ -984,24 +984,18 @@ impl Wiki {
         // the server once to migrate" — which the one-shot wiki migration
         // never does again — and made each `serve` boot re-archive the data
         // dir once the migration archive was deleted. Conformance is
-        // idempotent modulo `generated.at`. The file on disk is the newer
-        // version, whose body differs, so the helper cannot inherit the
-        // timestamp from it and would stamp `now()`; when conformance changed
-        // nothing else, the checkpoint keeps its own `generated.at`, so an
-        // already-conformant page restores byte-exact whatever the clock.
-        let checkpointed_at =
-            ai_memory_core::okf::generated_at(&md.frontmatter).map(str::to_string);
-        let checkpointed = ai_memory_core::okf::strip_generated_at(&md.frontmatter);
-        conform_frontmatter_for_disk(
+        // idempotent modulo `generated.at`. When the file on disk already
+        // holds the same content, its timestamp still wins, so the file keeps
+        // matching the row the store's idempotent upsert reuses. Otherwise
+        // the disk holds a newer version and would leave only `now()`; an
+        // already-conformant checkpoint keeps its own `generated.at` instead,
+        // so it restores byte-exact whatever the clock.
+        conform_frontmatter_for_disk_keeping(
             &self.abs_path(workspace_id, project_id, &path),
             path.as_str(),
             &mut md,
+            true,
         );
-        if let Some(at) = checkpointed_at
-            && ai_memory_core::okf::strip_generated_at(&md.frontmatter) == checkpointed
-        {
-            ai_memory_core::okf::stamp_generated_at(&mut md.frontmatter, &at);
-        }
         let raw = emit(&md)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
@@ -3554,7 +3548,26 @@ fn frontmatter_abstract(frontmatter: &serde_json::Value) -> Option<&str> {
 }
 
 fn conform_frontmatter_for_disk(abs: &Path, page_path: &str, markdown: &mut Markdown) {
+    conform_frontmatter_for_disk_keeping(abs, page_path, markdown, false);
+}
+
+/// [`conform_frontmatter_for_disk`], optionally keeping the markdown's own
+/// `generated.at` when the file on disk has other content and conformance
+/// changed nothing but the timestamp: a checkpoint restore, whose source is
+/// a historical version rather than a new write.
+fn conform_frontmatter_for_disk_keeping(
+    abs: &Path,
+    page_path: &str,
+    markdown: &mut Markdown,
+    keep_own_generated_at: bool,
+) {
+    let own_at = ai_memory_core::okf::generated_at(&markdown.frontmatter).map(str::to_string);
+    let unconformed = ai_memory_core::okf::strip_generated_at(&markdown.frontmatter);
     ai_memory_core::okf::conform_frontmatter(page_path, &mut markdown.frontmatter);
+    let own_at = own_at.filter(|_| {
+        keep_own_generated_at
+            && ai_memory_core::okf::strip_generated_at(&markdown.frontmatter) == unconformed
+    });
     let inherited = std::fs::read_to_string(abs)
         .ok()
         .and_then(|s| crate::markdown::parse(&s).ok())
@@ -3564,7 +3577,7 @@ fn conform_frontmatter_for_disk(abs: &Path, page_path: &str, markdown: &mut Mark
                 && cur.body == markdown.body
         })
         .and_then(|cur| ai_memory_core::okf::generated_at(&cur.frontmatter).map(str::to_string));
-    let at = inherited.unwrap_or_else(|| {
+    let at = inherited.or(own_at).unwrap_or_else(|| {
         jiff::Timestamp::now()
             .strftime("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
@@ -5282,6 +5295,55 @@ mod tests {
             String::from_utf8(std::fs::read(&abs).unwrap()).unwrap(),
             String::from_utf8(checkpointed).unwrap(),
             "restoring an already-conformant page rewrote its bytes"
+        );
+    }
+
+    // A, B, then A again: the current version already holds the checkpoint's
+    // content, so the store's idempotent upsert keeps that row and its
+    // `generated.at`. The file must keep the same timestamp rather than the
+    // checkpoint's, or disk and row diverge until the next real edit.
+    #[tokio::test]
+    async fn restoring_content_the_current_version_already_holds_keeps_disk_and_row_aligned() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/roundtrip.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        let write = |body: &'static str| {
+            req(
+                ws,
+                proj,
+                path.as_str(),
+                body,
+                serde_json::json!({ "title": "RoundTrip" }),
+            )
+        };
+        wiki.write_page(write("first")).await.unwrap();
+        let mut md = parse(&std::fs::read_to_string(&abs).unwrap()).unwrap();
+        ai_memory_core::okf::stamp_generated_at(&mut md.frontmatter, "2020-01-01T00:00:00Z");
+        std::fs::write(&abs, emit(&md).unwrap()).unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+        wiki.write_page(write("second")).await.unwrap();
+        let latest = wiki.write_page(write("first")).await.unwrap();
+        let current_at = ai_memory_core::okf::generated_at(&latest_row(&tmp, path.as_str()).2)
+            .map(str::to_string);
+        assert_ne!(current_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+
+        let restored = wiki
+            .restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
+            .await
+            .unwrap();
+
+        assert_eq!(restored, latest, "the upsert reuses the current version");
+        let disk = parse(&std::fs::read_to_string(&abs).unwrap()).unwrap();
+        let row = latest_row(&tmp, path.as_str()).2;
+        assert_eq!(
+            ai_memory_core::okf::generated_at(&disk.frontmatter),
+            ai_memory_core::okf::generated_at(&row),
+            "restore left disk and row with different generated.at"
+        );
+        assert_eq!(
+            ai_memory_core::okf::generated_at(&disk.frontmatter),
+            current_at.as_deref()
         );
     }
 
