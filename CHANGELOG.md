@@ -101,6 +101,11 @@ version in [`docs/changelog/`](docs/changelog/):
   RUSTSEC-2026-0386, an unsound advisory for `AsyncFd` constructors that
   nothing here calls, and the `cargo-deny` gate failed on every pull request
   from the moment the advisory was assigned (#1658).
+- A write that names an ambiguous project now reports the workspace it was
+  resolved in. The refusal read "project 'api' is ambiguous in workspace 'the
+  resolved workspace'" on the write path (`ai-memory run`, explicit MCP
+  writes, profile writes), while the read path already named the workspace
+  (#1657).
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label
