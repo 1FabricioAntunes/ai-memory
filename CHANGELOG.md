@@ -11,8 +11,24 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- `purge-project --confirm` without `--project`/`--project-id` now prints the
+  project it resolved from the current directory and the equivalent command
+  that names it, before the irreversible request. Naming the target will be
+  required in 4.0: from the wrong directory the derived name is the one project
+  nobody meant to delete, and a flag that spells it out is the only way to tell
+  the two cases apart (#1642).
+
 ### Fixed
 
+- `purge-project --project ""`, and an empty `--project-id`/`--workspace`/
+  `--from`/`--to-workspace` on `move-project`, `purge-session` and
+  `rename-project`, are now refused before anything is sent. An empty flag
+  passed the "was the target named" check and then resolved as if it had been
+  omitted, so a script that passed an unset variable reached the project its
+  current directory resolved to — a real purge from an explicit-looking
+  invocation (#1642).
 - `ai-memory workstream-search` now labels a historical tool call or tool
   result as completed evidence, as the managed-workstream docs describe. Its
   text output used the event's role, which every transcript adapter sets to
