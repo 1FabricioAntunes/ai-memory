@@ -1017,6 +1017,11 @@ ai-memory restore-page --workspace default --project my-project \
   --path notes/foo.md --from <checkpoint>
 ```
 
+Each omitted scope flag is resolved from the current directory; a non-empty
+explicit value takes precedence over that default. An explicitly empty or
+whitespace-only flag is refused before any request, so an unset shell variable
+cannot restore a page in the checkout's project by accident.
+
 What happens:
 
 1. Server resolves `(workspace, project)` without auto-creating anything.
