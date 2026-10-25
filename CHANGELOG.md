@@ -222,6 +222,11 @@ version in [`docs/changelog/`](docs/changelog/):
   reports an occupied address with port/configuration remedies, and skips
   MCP/admin probes when the health response is unrecognized (#1647).
 
+- Preserved repository edits saved while `ai-memory-wikisync export --apply`
+  fetched server pages. Export now rechecks each file before replacing it,
+  as two-way sync already did, and refuses a changed file even with `--force`
+  without advancing its export state (#986).
+
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label
