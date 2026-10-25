@@ -65,6 +65,7 @@ version in [`docs/changelog/`](docs/changelog/):
   fetched server pages. Export now rechecks each file before replacing it,
   as two-way sync already did, and refuses a changed file even with `--force`
   without advancing its export state (#986).
+
 - Codex's own memory-writing agent no longer appears as captured sessions.
   Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
   (the default `~/.codex/memories`) to consolidate its memory; the hooks
