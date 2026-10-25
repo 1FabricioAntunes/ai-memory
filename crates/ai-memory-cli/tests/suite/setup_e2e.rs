@@ -220,10 +220,10 @@ async fn setup_identifies_a_foreign_listener_in_the_plan_and_self_check() {
         "{}",
         text(&applied)
     );
+    let requested_paths = paths.lock().unwrap().clone();
     assert!(
-        paths.lock().unwrap().iter().all(|path| path == "/healthz"),
-        "setup sent unrelated probes to the foreign listener: {:?}",
-        paths.lock().unwrap()
+        requested_paths.iter().all(|path| path == "/healthz"),
+        "setup sent unrelated probes to the foreign listener: {requested_paths:?}"
     );
     assert!(
         !sandbox

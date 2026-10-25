@@ -1142,7 +1142,7 @@ async fn validate_healthz(mut response: reqwest::Response) -> Result<(), String>
     // body and never echo it into the terminal.
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        if body.len() + chunk.len() > 1024 {
+        if body.len().saturating_add(chunk.len()) > 1024 {
             return Err("health response exceeds 1024 bytes".to_owned());
         }
         body.extend_from_slice(&chunk);
