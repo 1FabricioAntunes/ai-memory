@@ -135,6 +135,60 @@ pub struct RunArgs {
     pub include: Vec<String>,
     /// Overwrite files that diverged locally since the last export.
     pub force: bool,
+    /// Take over a destination whose baseline belongs to another server,
+    /// workspace or project: the baseline is discarded, so this run treats
+    /// the destination as a fresh export (#1708). Without it a scope change
+    /// refuses before anything is written.
+    pub adopt_scope: bool,
+}
+
+/// Refuse to reuse a baseline recorded for another scope (#1708).
+///
+/// Reusing it made every page of the previous project look "deleted on the
+/// server", which `--propagate-deletes --apply` then removed. Returns the
+/// state a run should use: cleared when `--adopt-scope` takes the
+/// destination over, stamped with this run's scope so the next save records
+/// it.
+pub fn baseline_for(
+    mut state: state::SyncState,
+    scope: &state::SyncScope,
+    adopt: bool,
+) -> Result<state::SyncState> {
+    match state::check_scope(&state, scope) {
+        state::ScopeCheck::Match => {}
+        state::ScopeCheck::Adopted => {
+            if !state.pages.is_empty() {
+                eprintln!(
+                    "ai-memory-wikisync: this destination's baseline predates origin tracking;                      adopting it for {}/{}. A baseline from another project cannot be detected,                      so check the plan before --apply.",
+                    scope.workspace, scope.project
+                );
+            }
+            state.scope = Some(scope.clone());
+        }
+        state::ScopeCheck::Mismatch { recorded } => {
+            if !adopt {
+                bail!(
+                    "this destination's baseline belongs to {} ({}/{}), not {}/{}. \
+                     Reusing it would read that project's pages as deletions here; re-run with \
+                     --adopt-scope to discard the baseline and export fresh",
+                    recorded.server,
+                    recorded.workspace,
+                    recorded.project,
+                    scope.workspace,
+                    scope.project
+                );
+            }
+            eprintln!(
+                "ai-memory-wikisync: discarding the baseline recorded for {}/{}, adopting this                  destination for {}/{}",
+                recorded.workspace, recorded.project, scope.workspace, scope.project
+            );
+            state = state::SyncState {
+                scope: Some(scope.clone()),
+                ..state::SyncState::default()
+            };
+        }
+    }
+    Ok(state)
 }
 
 /// Classify one page from its three versions. Pure: all IO happens around
@@ -630,7 +684,8 @@ pub(crate) fn resolve_dest(dest: &Path, mode: Mode) -> Result<PathBuf> {
 pub async fn run(args: &RunArgs, mode: Mode) -> Result<()> {
     let families = validate_allowlist(&args.include)?;
     let dest_root = resolve_dest(&args.dest, mode)?;
-    let old_state = state::load(&dest_root)?;
+    let scope = state::SyncScope::of(&args.server, &args.workspace, &args.project);
+    let old_state = baseline_for(state::load(&dest_root)?, &scope, args.adopt_scope)?;
     let client = ApiClient::new(&args.server, args.token.clone())?;
 
     let (report, _new_state, applied) =
