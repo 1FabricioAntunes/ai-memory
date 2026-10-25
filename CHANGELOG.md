@@ -217,6 +217,11 @@ version in [`docs/changelog/`](docs/changelog/):
   resolved workspace'" on the write path (`ai-memory run`, explicit MCP
   writes, profile writes), while the read path already named the workspace
   (#1657).
+- Fixed `ai-memory setup` treating another service's HTTP 200 response as a
+  healthy ai-memory server. Setup now checks the bounded `/healthz` JSON,
+  reports an occupied address with port/configuration remedies, and skips
+  MCP/admin probes when the health response is unrecognized (#1647).
+
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label
