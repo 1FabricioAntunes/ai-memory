@@ -20,7 +20,6 @@ version in [`docs/changelog/`](docs/changelog/):
   deduplicated in model order; the default query path makes no added calls
   (#1682).
 
-
 ## [3.2.3] - 2026-10-24
 
 ### Changed
