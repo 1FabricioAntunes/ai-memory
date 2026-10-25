@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Codex's own memory-writing agent no longer appears as captured sessions.
+  Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
+  (the default `~/.codex/memories`) to consolidate its memory; the hooks
+  captured each run as a normal session, so one project of 78 sessions and
+  ~2,600 observations existed for work nobody did, and it returned with the
+  next run after a purge. Those events are now accepted and stored nowhere,
+  recognized by the directory (any `…/.codex/memories`) or by the agent's
+  `## Memory Writing Agent` prompt header, and transcript imports
+  (`backfill`, the `run` ledger, `recover`) skip them for the same reason
+  (#1674).
+
 - `memory_query(answer=true)` now validates model-generated citation paths
   against the snippets supplied in that request. Unknown paths and paths
   shared by distinct page versions withhold the answer, while retrieval hits
