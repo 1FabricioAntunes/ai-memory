@@ -81,6 +81,10 @@ struct Fixture {
     /// A server older than 3.0: no `expected_page_id` in the tool schema, no
     /// `id` on pages, and preconditions silently ignored.
     old_server: bool,
+    /// Serve a listing for any project name, not only `app`. Lets a test model
+    /// a second project on one server whose listing is successfully empty
+    /// (#1708) instead of a 404.
+    any_project: bool,
     /// Arguments of every MCP tool call, in order.
     mcp_calls: Mutex<Vec<serde_json::Value>>,
     reads_by_path: Mutex<BTreeMap<String, usize>>,
@@ -112,6 +116,7 @@ impl Fixture {
             redact: None,
             edit_before_mcp: None,
             old_server: false,
+            any_project: false,
             mcp_calls: Mutex::new(Vec::new()),
             reads_by_path: Mutex::new(BTreeMap::new()),
             recent_calls: AtomicUsize::new(0),
@@ -194,7 +199,8 @@ async fn recent_handler(
     if let Err(response) = fixture.authorize(&headers) {
         return *response;
     }
-    if !fixture.project_exists || workspace != "demo" || project != "app" {
+    if !fixture.project_exists || workspace != "demo" || (project != "app" && !fixture.any_project)
+    {
         return error_json(StatusCode::NOT_FOUND, "workspace or project not found");
     }
     // Ignore updated_since; the fixture serves everything after the epoch.
@@ -239,7 +245,8 @@ async fn page_handler(
     if let Err(response) = fixture.authorize(&headers) {
         return *response;
     }
-    if !fixture.project_exists || workspace != "demo" || project != "app" {
+    if !fixture.project_exists || workspace != "demo" || (project != "app" && !fixture.any_project)
+    {
         return error_json(StatusCode::NOT_FOUND, "workspace or project not found");
     }
     if fixture.unreachable == Some(path.as_str()) {
@@ -486,6 +493,7 @@ fn args(addr: SocketAddr, dest: &std::path::Path, families: &[&str]) -> RunArgs 
         dest: dest.to_path_buf(),
         include: families.iter().map(|f| f.to_string()).collect(),
         force: false,
+        adopt_scope: false,
     }
 }
 
@@ -871,6 +879,93 @@ fn decision() -> FixturePage {
 const DECISION_FILE: &str =
     "---\ntitle: \"DB\"\ntags: [\"db\"]\npinned: true\n---\n# DB\nUse Postgres.\n";
 
+/// The reproduction from #1708: a destination exported from project `a` is
+/// reused for project `b`, whose (empty) listing made every page of `a` read
+/// as "deleted on the server", and `--propagate-deletes --apply` removed the
+/// file and emptied the baseline. The baseline records its scope now, so the
+/// reuse refuses before writing, and `--adopt-scope` is the explicit way to
+/// take the destination over.
+#[tokio::test]
+async fn reusing_a_destination_for_another_project_refuses_and_keeps_the_files() {
+    let (addr, fixture) = serve(Fixture::with_pages(vec![decision()])).await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("export of project a");
+    assert!(dest.join("decisions/db.md").exists());
+
+    // Project b lists no pages at all; nothing about this destination belongs
+    // to it.
+    let (b_addr, _b) = serve(Fixture {
+        any_project: true,
+        ..Fixture::with_pages(Vec::new())
+    })
+    .await;
+    let mut b_args = deleting_args(b_addr, &dest, None);
+    b_args.run.project = "b".to_string();
+    let err = bidi::run(&b_args, SyncMode::Apply)
+        .await
+        .expect_err("another project's baseline must not be reused");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("belongs to") && message.contains("--adopt-scope"),
+        "{message}"
+    );
+    assert!(
+        dest.join("decisions/db.md").exists(),
+        "the previous project's file must survive the refusal"
+    );
+    assert!(
+        !state::load(&dest).unwrap().pages.is_empty(),
+        "the refusal must not empty the baseline"
+    );
+
+    // The explicit takeover discards the baseline instead of reading it as
+    // deletions. Project b here holds the same page, so the adopted run has
+    // nothing to write and simply stamps the new scope.
+    let (b_page_addr, _) = serve(Fixture {
+        any_project: true,
+        ..Fixture::with_pages(vec![decision()])
+    })
+    .await;
+    let mut adopted = sync_args(b_page_addr, &dest, None);
+    adopted.run.project = "b".to_string();
+    adopted.run.adopt_scope = true;
+    bidi::run(&adopted, SyncMode::Apply)
+        .await
+        .expect("adopting the destination is explicit");
+    assert_eq!(
+        state::load(&dest).unwrap().scope,
+        Some(state::SyncScope::of(
+            &format!("http://{b_page_addr}"),
+            "demo",
+            "b"
+        ))
+    );
+    assert!(
+        dest.join("decisions/db.md").exists(),
+        "adoption writes no delete"
+    );
+    assert_eq!(
+        fixture.page("decisions/db.md").unwrap().body,
+        "# DB\nUse Postgres.\n",
+        "the control: the first project's server copy is untouched"
+    );
+}
+
+/// The same project on the same server keeps working, which is the control
+/// for the guard above.
+#[tokio::test]
+async fn reusing_a_destination_for_the_same_project_still_syncs() {
+    let (addr, _) = serve(Fixture::with_pages(vec![decision()])).await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("first sync");
+    let second = sync(addr, &dest).await.expect("same-scope sync");
+    assert_eq!(
+        second.status(),
+        bidi::CheckStatus::InSync,
+        "a same-scope rerun is in sync"
+    );
+}
+
 #[tokio::test]
 async fn sync_exports_metadata_and_round_trips_without_writes() {
     let (addr, fixture) = serve(Fixture::with_pages(vec![decision()])).await;
@@ -1113,6 +1208,17 @@ async fn sync_reports_a_page_changed_during_the_run_and_applies_the_rest() {
         ])
     };
     let (race_addr, raced) = serve(racing).await;
+    // The fixture binds a new ephemeral port, and the baseline records the
+    // origin it was exported from (#1708). This test means "the same project,
+    // served again", so restamp the scope rather than adopt a foreign one:
+    // adopting would discard the baseline the race classification needs.
+    let mut restamped = state::load(&dest).unwrap();
+    restamped.scope = Some(state::SyncScope::of(
+        &format!("http://{race_addr}"),
+        "demo",
+        "app",
+    ));
+    state::save(&dest, &restamped).unwrap();
     let err = sync(race_addr, &dest).await.expect_err("race reported");
     let message = format!("{err:#}");
     assert!(message.contains("changed during this run"), "{message}");

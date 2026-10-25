@@ -52,6 +52,10 @@ ai-memory-wikisync sync ... --apply --prefer repo   # or --prefer server
 ai-memory-wikisync sync ... --apply --propagate-deletes
 ```
 
+- The state file records the server, workspace and project it came from. If
+  you point the same `--dest` at a different scope, the run refuses before
+  writing (a foreign baseline would make that project's pages look deleted);
+  pass `--adopt-scope` to discard the baseline and export fresh.
 - `plan` never writes, not even the state file.
 - `export --apply` writes/updates markdown files under `--dest` and prints
   the `git add` / `git commit` / `git push` commands you may run yourself.
