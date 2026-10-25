@@ -24,6 +24,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory backup` and `ai-memory backup-agents` now carry a size that
+  would round to `1024.00` of the current unit into the next one. A backup
+  of 1 MiB − 5 bytes was printed as `1024.00 KiB`.
+
 - Codex's own memory-writing agent no longer appears as captured sessions.
   Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
   (the default `~/.codex/memories`) to consolidate its memory; the hooks
