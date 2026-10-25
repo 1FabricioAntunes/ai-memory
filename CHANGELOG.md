@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.2.4] - 2026-10-25
+
 ### Security
 
 - A restricted project now stays closed when its access-mode or grant query
@@ -44,6 +46,16 @@ version in [`docs/changelog/`](docs/changelog/):
   and `--to`) before inspecting the repository or sending any request.
   Passing an empty `--project ""` previously bypassed the flag check while
   falling back to resolving the project from the current working directory (#1702).
+
+- Fixed `ai-memory setup` treating another service's HTTP 200 response as a
+  healthy ai-memory server. Setup now checks the bounded `/healthz` JSON,
+  reports an occupied address with port/configuration remedies, and skips
+  MCP/admin probes when the health response is unrecognized (#1647).
+
+- Preserved repository edits saved while `ai-memory-wikisync export --apply`
+  fetched server pages. Export now rechecks each file before replacing it,
+  as two-way sync already did, and refuses a changed file even with `--force`
+  without advancing its export state (#986).
 
 - Codex's own memory-writing agent no longer appears as captured sessions.
   Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
@@ -206,16 +218,6 @@ version in [`docs/changelog/`](docs/changelog/):
   resolved workspace'" on the write path (`ai-memory run`, explicit MCP
   writes, profile writes), while the read path already named the workspace
   (#1657).
-- Fixed `ai-memory setup` treating another service's HTTP 200 response as a
-  healthy ai-memory server. Setup now checks the bounded `/healthz` JSON,
-  reports an occupied address with port/configuration remedies, and skips
-  MCP/admin probes when the health response is unrecognized (#1647).
-
-- Preserved repository edits saved while `ai-memory-wikisync export --apply`
-  fetched server pages. Export now rechecks each file before replacing it,
-  as two-way sync already did, and refuses a changed file even with `--force`
-  without advancing its export state (#986).
-
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label
@@ -2775,7 +2777,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.4...HEAD
+[3.2.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.4
 [3.2.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.3
 [3.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.2
 [3.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.1
