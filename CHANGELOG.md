@@ -24,17 +24,6 @@ version in [`docs/changelog/`](docs/changelog/):
   recovery previously returned raw SQLite or task error text before the caller
   authenticated; password-change conflicts also no longer expose store errors.
 
-### Added
-
-- `GET /admin/status` and `ai-memory status --json` now carry a
-  `consolidation` block: the queue counts plus up to 20 `failed_sessions`
-  (`session_id`, `attempts`, `failed_at_us`, scrubbed `last_error`), newest
-  first. A consolidation run that gives up after its retries now has a
-  machine-readable record with the session ids needed to re-run it, instead of
-  only a journal line and the `/health` panel's count — which also resets with
-  the process. The web health panel's own view stays counts-only, and an older
-  server's status shape is unchanged (#1692).
-
 ### Fixed
 
 - `ai-memory move-session` now refuses explicitly empty scope flags

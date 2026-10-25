@@ -1424,26 +1424,6 @@ pub struct SessionConsolidationQueue {
     pub oldest_pending_requested_at_us: Option<i64>,
 }
 
-/// One consolidation job that gave up after its attempts, for the operator's
-/// `status` (#1692).
-///
-/// Deliberately **not** part of [`SessionConsolidationQueue`]: that struct
-/// feeds the web health panel, which is documented to carry counts only. This
-/// one carries the session id (so it can be re-consolidated once the cause is
-/// fixed) and the bounded error the worker recorded, and is served only on
-/// `/admin/status`, which is root-only on a multi-user server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FailedConsolidationJob {
-    /// Session whose consolidation gave up.
-    pub session_id: String,
-    /// Provider attempts spent on it.
-    pub attempts: u32,
-    /// Unix microseconds of the final failure.
-    pub failed_at_us: i64,
-    /// The worker's bounded error text, scrubbed by the caller before display.
-    pub last_error: String,
-}
-
 /// One open session selected by [`ReaderPool::idle_open_sessions`] for the
 /// server-side idle auto-end tick: its last activity
 /// (`MAX(observations.created_at)`, falling back to `started_at`) is older
@@ -12655,49 +12635,6 @@ impl ReaderPool {
                 |row| row.get(0),
             )?;
             Ok(queue)
-        })
-        .await
-    }
-
-    /// The most recent consolidation jobs that gave up, newest first,
-    /// bounded to `limit`.
-    ///
-    /// # Errors
-    /// Propagates any SQL or pool error.
-    pub async fn failed_consolidation_jobs(
-        &self,
-        limit: u32,
-    ) -> StoreResult<Vec<FailedConsolidationJob>> {
-        let limit = i64::from(limit.clamp(1, 100));
-        self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT session_id, attempts, COALESCE(completed_at, 0), \
-                        COALESCE(last_error, '') \
-                 FROM session_consolidation_jobs WHERE state = 'failed' \
-                 ORDER BY COALESCE(completed_at, 0) DESC LIMIT ?1",
-            )?;
-            let rows = stmt.query_map([limit], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (session, attempts, failed_at_us, last_error) = row?;
-                let Ok(session_id) = ai_memory_core::SessionId::from_slice(&session) else {
-                    continue;
-                };
-                out.push(FailedConsolidationJob {
-                    session_id: session_id.to_string(),
-                    attempts: u32::try_from(attempts).unwrap_or(0),
-                    failed_at_us,
-                    last_error,
-                });
-            }
-            Ok(out)
         })
         .await
     }
