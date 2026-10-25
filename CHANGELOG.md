@@ -19,6 +19,10 @@ version in [`docs/changelog/`](docs/changelog/):
   access during a database fault. Unknown projects and forward-unknown access
   modes retain their compatibility behavior, and normal root, creator and
   grant access is unchanged.
+- Human-auth endpoints now log unexpected store and task failures server-side
+  and return a stable `authentication unavailable` response. Login and
+  recovery previously returned raw SQLite or task error text before the caller
+  authenticated; password-change conflicts also no longer expose store errors.
 
 ### Added
 
