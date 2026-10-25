@@ -26,7 +26,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - The OKF migration dialog now carries an archive size that would round to
   `1024.0` of the current unit into the next one. An archive of 1 MB − 51
-  bytes was printed as `1024.0 KB`.
+  bytes was printed as `1024.0 KB` (#1706).
 
 - Codex's own memory-writing agent no longer appears as captured sessions.
   Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
