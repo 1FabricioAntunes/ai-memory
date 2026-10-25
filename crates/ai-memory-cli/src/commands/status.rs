@@ -76,6 +76,38 @@ struct Report {
     /// Wiki-format state (2.0 servers).
     #[serde(default)]
     wiki_format: Option<WikiFormatReport>,
+    /// SessionEnd consolidation queue (#1692). Absent from older servers, and
+    /// skipped on the way out so their shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consolidation: Option<ConsolidationReport>,
+}
+
+/// Consolidation queue as the server reports it: counts plus the sessions that
+/// gave up, so a watchdog reads one JSON field instead of parsing logs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ConsolidationReport {
+    #[serde(default)]
+    pending: u64,
+    #[serde(default)]
+    running: u64,
+    #[serde(default)]
+    completed: u64,
+    #[serde(default)]
+    failed: u64,
+    #[serde(default)]
+    failed_sessions: Vec<FailedConsolidationSession>,
+}
+
+/// One failed session from [`ConsolidationReport`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FailedConsolidationSession {
+    session_id: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    failed_at_us: i64,
+    #[serde(default)]
+    last_error: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -417,6 +449,11 @@ fn json_report(
     if let Some(problem) = windows_logon {
         value["windows_logon"] = serde_json::json!(problem);
     }
+    // Present whenever the server reports it; an older server has no queue in
+    // `/admin/status`, and its shape stays exactly as before (#1692).
+    if let Some(consolidation) = report.consolidation {
+        value["consolidation"] = serde_json::json!(consolidation);
+    }
     value
 }
 
@@ -535,6 +572,44 @@ mod tests {
         }
         assert_eq!(value["recovery"]["journal_pending"], 2);
         assert_eq!(value["counts"]["observations"], 4);
+        assert!(
+            value.get("consolidation").is_none(),
+            "an older server has no queue, and its shape is unchanged: {value}"
+        );
+
+        // A server that reports its queue adds exactly that one key (#1692).
+        let mut with_queue = report_json.clone();
+        with_queue["consolidation"] = serde_json::json!({
+            "pending": 2,
+            "running": 0,
+            "completed": 9,
+            "failed": 1,
+            "failed_sessions": [{
+                "session_id": "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "attempts": 5,
+                "failed_at_us": 1_700_000_000_000_000_i64,
+                "last_error": "provider error 400: quota exceeded",
+            }],
+        });
+        let queued = json_report(
+            serde_json::from_value(with_queue).unwrap(),
+            SpoolHealth::default(),
+            0,
+            0,
+            0,
+            None,
+            "denylist",
+            &endpoint,
+            crate::local_auth::AuthPosture::NoneLoopback,
+            None,
+        );
+        assert_eq!(queued["consolidation"]["failed"], 1);
+        assert_eq!(queued["consolidation"]["pending"], 2);
+        assert_eq!(
+            queued["consolidation"]["failed_sessions"][0]["session_id"],
+            "0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+        );
+        assert_eq!(queued["consolidation"]["failed_sessions"][0]["attempts"], 5);
 
         // A missing logon binary (#1280) adds one key and changes no other.
         let problem = super::super::user_service::MissingLogonBinary {

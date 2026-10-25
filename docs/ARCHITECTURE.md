@@ -921,6 +921,14 @@ turns those into warnings with the fix commands `ai-memory status` prints
 The page holds counts, timestamps and configured labels only; provider error text,
 page content and scope names never reach it.
 
+`GET /admin/status` (and `ai-memory status --json`) additionally carries a
+`consolidation` block — the same counts, plus up to 20 `failed_sessions`
+(`ReaderPool::failed_consolidation_jobs`: session id, attempts, failure time,
+and the worker's bounded error through the privacy strip). The session id is
+what a re-consolidation needs after the cause is fixed, so it belongs on the
+operator surface and not on the health panel, whose "counts and timestamps
+only" contract is unchanged (#1692).
+
 ## CLI subcommand surface
 
 ```
