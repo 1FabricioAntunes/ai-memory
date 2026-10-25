@@ -1276,7 +1276,48 @@ pub struct StatusReport {
     /// Wiki-format state: whether the OKF migration has run, and the
     /// pre-migration backup archive if its receipt still exists.
     pub wiki_format: WikiFormatStatus,
+    /// SessionEnd consolidation queue: counts plus the sessions that gave up,
+    /// so a watchdog can re-run them once the cause is fixed (#1692).
+    pub consolidation: ConsolidationStatus,
 }
+
+/// Consolidation section of [`StatusReport`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConsolidationStatus {
+    /// Jobs waiting for a worker, including ones backing off to retry.
+    pub pending: u64,
+    /// Jobs a worker holds right now.
+    pub running: u64,
+    /// Jobs that finished.
+    pub completed: u64,
+    /// Jobs that gave up after their attempts.
+    pub failed: u64,
+    /// Most recent failures, newest first, bounded to
+    /// [`CONSOLIDATION_FAILED_SESSIONS_CAP`]. The session id is what a
+    /// re-consolidation needs; the error is the worker's own bounded text,
+    /// scrubbed before it leaves the server.
+    pub failed_sessions: Vec<FailedConsolidationSession>,
+}
+
+/// One failed session in [`ConsolidationStatus::failed_sessions`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FailedConsolidationSession {
+    /// Session whose consolidation gave up.
+    pub session_id: String,
+    /// Provider attempts spent on it.
+    pub attempts: u32,
+    /// Unix microseconds of the final failure.
+    pub failed_at_us: i64,
+    /// Bounded, scrubbed error the worker recorded.
+    pub last_error: String,
+}
+
+/// How many failed sessions one status response carries. The counts above
+/// stay exact; the list is a sample, newest first, so the payload cannot grow
+/// with the backlog.
+pub const CONSOLIDATION_FAILED_SESSIONS_CAP: u32 = 20;
+/// Longest error text one failed session carries, in characters.
+const CONSOLIDATION_ERROR_CHARS: usize = 200;
 
 /// Wiki-format section of [`StatusReport`].
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1335,6 +1376,9 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     .unwrap_or(false);
                 let backup = ai_memory_wiki::backup::BackupReceipt::load(&state.data_dir)
                     .filter(ai_memory_wiki::backup::BackupReceipt::archive_present);
+                let consolidation =
+                    consolidation_status(&state, &state.reader.session_consolidation_queue().await)
+                        .await;
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -1353,6 +1397,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                             .map(|r| r.archive_path.display().to_string()),
                         backup_archive_bytes: backup.as_ref().map(|r| r.size_bytes),
                     },
+                    consolidation,
                 };
                 (
                     StatusCode::OK,
@@ -1368,6 +1413,50 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+/// The consolidation section of a status report.
+///
+/// A failure to read the queue degrades to zeros, like the storage figures
+/// above: `status` is also the health probe, and a queue query must not take
+/// the whole answer down.
+async fn consolidation_status(
+    state: &AdminState,
+    queue: &Result<ai_memory_store::SessionConsolidationQueue, ai_memory_store::StoreError>,
+) -> ConsolidationStatus {
+    let queue = queue.as_ref().copied().unwrap_or_default();
+    let failed_sessions = match state
+        .reader
+        .failed_consolidation_jobs(CONSOLIDATION_FAILED_SESSIONS_CAP)
+        .await
+    {
+        Ok(jobs) => jobs
+            .into_iter()
+            .map(|job| FailedConsolidationSession {
+                session_id: job.session_id,
+                attempts: job.attempts,
+                failed_at_us: job.failed_at_us,
+                // The worker truncates what it records, but that text comes
+                // from a provider body: scrub it before an operator's terminal
+                // sees it, exactly like `/admin/llm-test`.
+                last_error: state
+                    .wiki
+                    .sanitizer()
+                    .scrub(&job.last_error)
+                    .chars()
+                    .take(CONSOLIDATION_ERROR_CHARS)
+                    .collect(),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    ConsolidationStatus {
+        pending: queue.pending,
+        running: queue.running,
+        completed: queue.completed,
+        failed: queue.failed,
+        failed_sessions,
     }
 }
 
