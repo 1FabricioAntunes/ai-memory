@@ -24,6 +24,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory rename-workstream` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) as well as empty workstream names (`--from`
+  and `--to`) before inspecting the repository or sending any request.
+  Passing an empty `--project ""` previously bypassed the flag check while
+  falling back to resolving the project from the current working directory (#1702).
+
 - Codex's own memory-writing agent no longer appears as captured sessions.
   Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
   (the default `~/.codex/memories`) to consolidate its memory; the hooks
