@@ -355,7 +355,9 @@ mod tests {
         let a = args(None, Some("   "));
         let error = run(&config, a).await.unwrap_err();
         assert!(
-            error.to_string().contains("--from-project was passed empty"),
+            error
+                .to_string()
+                .contains("--from-project was passed empty"),
             "unexpected error: {error}"
         );
     }
@@ -367,7 +369,9 @@ mod tests {
         a.from_workspace = Some("".into());
         let error = run(&config, a).await.unwrap_err();
         assert!(
-            error.to_string().contains("--from-workspace was passed empty"),
+            error
+                .to_string()
+                .contains("--from-workspace was passed empty"),
             "unexpected error: {error}"
         );
     }
@@ -391,7 +395,9 @@ mod tests {
         a.to_workspace = Some("   ".into());
         let error = run(&config, a).await.unwrap_err();
         assert!(
-            error.to_string().contains("--to-workspace was passed empty"),
+            error
+                .to_string()
+                .contains("--to-workspace was passed empty"),
             "unexpected error: {error}"
         );
     }
