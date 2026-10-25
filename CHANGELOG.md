@@ -24,6 +24,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory delete-page` now refuses explicitly empty scope flags (`--workspace`
+  and `--project`) as well as an empty `--path` before sending any request.
+  Passing an empty `--project ""` previously bypassed the flag check while falling
+  back to deriving the project from the current working directory, which risked
+  deleting the page from the local repository (#1700).
+
 - Codex's own memory-writing agent no longer appears as captured sessions.
   Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
   (the default `~/.codex/memories`) to consolidate its memory; the hooks
