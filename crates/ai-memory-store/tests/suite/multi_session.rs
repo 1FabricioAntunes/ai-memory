@@ -3262,16 +3262,16 @@ async fn owner_finish_store_strict_resolution_refuses_pairing_missing_and_sql_fa
     conn.execute_batch("ALTER TABLE project_grants RENAME TO unavailable_grants;")
         .unwrap();
     f.refused_unchanged(run.run_id, f.alice()).await;
-    // The legacy resolution remains fail-open; it is insufficient for finish.
-    let legacy = ai_memory_store::resolve_project_authz(
+    // The common resolver also refuses when its authorization data is
+    // unreadable; a store fault must not open a restricted project.
+    let common = ai_memory_store::resolve_project_authz(
         &conn,
         f.ws,
         f.project,
         &ai_memory_store::ProjectPrincipal::user(f.alice),
         true,
-    )
-    .unwrap();
-    assert_eq!(legacy.access_mode, ai_memory_store::AccessMode::Open);
+    );
+    assert!(common.is_err());
     conn.execute_batch("ALTER TABLE unavailable_grants RENAME TO project_grants;")
         .unwrap();
     conn.execute(

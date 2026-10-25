@@ -18,6 +18,12 @@ Coverage verdicts: **STRONG** means a test would fail if the guard were
 deleted; **PARTIAL** means only some paths of the guard are probed; **FUTURE**
 means the boundary is not built yet.
 
+Boundary 14 treats missing/forward-unknown project metadata as a compatibility
+case, but a SQL/store failure while reading an existing project's access mode
+or grants propagates and refuses the request. The
+`an_unreadable_restricted_project_fails_instead_of_opening` test carries both
+the legitimate restricted-project control and the failed-query cases.
+
 ## Boundary map
 
 | # | Boundary | Enforcing code | Adversarial test(s) | Coverage |

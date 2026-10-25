@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+
+- A restricted project now stays closed when its access-mode or grant query
+  fails. The common authorization resolver previously degraded these store
+  failures to an open project, so an unrelated authenticated user could gain
+  access during a database fault. Unknown projects and forward-unknown access
+  modes retain their compatibility behavior, and normal root, creator and
+  grant access is unchanged.
+
 ### Added
 
 - `GET /admin/status` and `ai-memory status --json` now carry a
