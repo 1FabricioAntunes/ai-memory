@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored affirmative profile preferences about tools, browsers and MCP.
+  The capability-ban filter also discarded statements such as "Always use
+  tools to verify facts"; it now requires negative or disabling wording.
+  Capability bans still need explicit cross-project scope (#1678).
+
 ## [3.2.5] - 2026-10-25
 
 ### Fixed

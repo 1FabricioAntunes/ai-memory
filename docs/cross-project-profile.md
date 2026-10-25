@@ -195,8 +195,9 @@ is new since the last one.
   not yours. A sentence that switches off one of the agent's own capabilities
   (*do not use tools*, *never call browser_close*, *do not use the browser*)
   only counts when you scoped it across projects, because as a default it
-  stops every project's agent from working. Your verbatim words are kept as
-  evidence.
+  stops every project's agent from working. Affirmative preferences such as
+  "Always use tools to verify facts" still qualify under the normal project
+  threshold. Your verbatim words are kept as evidence.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
   `procedures/`. A page contributes its `summary`, or else its first line of
   prose; metadata fields such as `**Status:** Accepted` or `**Date:**` at the

@@ -163,6 +163,39 @@ const CAPABILITY_WORDS: &[&str] = &[
     "subagentes",
 ];
 
+/// Disabling language that has no ordinary negation. These words belong to
+/// the capability filter only: treating "off" as "not" in every topic's
+/// ruling would change how unrelated preferences are compared.
+const CAPABILITY_BAN_WORDS: &[&str] = &[
+    "without",
+    "disable",
+    "disabled",
+    "disabling",
+    "deactivate",
+    "deactivated",
+    "deactivating",
+    "off",
+    "sem",
+    "desative",
+    "desativar",
+    "desativado",
+    "desativada",
+    "desativados",
+    "desativadas",
+    "desabilite",
+    "desabilitar",
+    "desabilitado",
+    "desabilitada",
+    "desabilitados",
+    "desabilitadas",
+    "desligue",
+    "desligar",
+    "desligado",
+    "desligada",
+    "desligados",
+    "desligadas",
+];
+
 /// Phrases that mark a prompt as written by a program driving the agent
 /// through its SDK or CLI rather than by the person (#1648): a summarizer
 /// call that wraps a transcript, or a demo that asks for a verbatim reply.
@@ -697,6 +730,10 @@ fn has_marker(sentence: &str) -> bool {
 /// Whether `padded` switches off one of the agent's own capabilities.
 fn forgoes_a_capability(padded: &str) -> bool {
     CAPABILITY_WORDS.iter().any(|word| has_phrase(padded, word))
+        && (ruling_sequence(padded).iter().any(|word| word == "not")
+            || CAPABILITY_BAN_WORDS
+                .iter()
+                .any(|word| has_phrase(padded, word)))
 }
 
 /// Whether `text` was written by a program calling the agent as an API.
@@ -2824,6 +2861,72 @@ mod tests {
                 "Always run clippy before a commit."
             ]
         );
+    }
+
+    #[test]
+    fn affirmative_capability_preferences_are_still_candidates() {
+        for text in [
+            "Always use tools to verify facts.",
+            "I prefer the browser for visual checks.",
+            "By default use MCP for database lookups.",
+            "Sempre use ferramentas para verificar fatos.",
+            "Prefiro usar o navegador para verificar o resultado.",
+        ] {
+            assert!(
+                has_marker(text),
+                "the LLM gate discarded a preference: {text}"
+            );
+            let found = detect_preferences(text);
+            assert_eq!(
+                found.len(),
+                1,
+                "the zero-LLM gate discarded a preference: {text}"
+            );
+            assert_eq!(found[0].generality, ProfileGenerality::Project, "{text}");
+        }
+        for text in [
+            "Do not use any tools.",
+            "Don't use tools for lookups.",
+            "Dont use tools for lookups.",
+            "Never call browser_close.",
+            "Always avoid shell commands.",
+            "Não use ferramentas para consultas.",
+            "Nunca use o navegador.",
+            "Sempre evite usar ferramentas.",
+            "I prefer to work without tools.",
+            "Prefiro trabalhar sem ferramentas.",
+            "I prefer to disable tools.",
+            "By default keep tools disabled.",
+            "Always keep browsing turned off.",
+            "I prefer deactivating browser tools.",
+            "Prefiro desativar ferramentas.",
+            "Prefiro desabilitar ferramentas.",
+            "Prefiro desligar o navegador.",
+            "Sempre mantenha as ferramentas desativadas.",
+            "Sempre mantenha as ferramentas desabilitadas.",
+            "Sempre mantenha o navegador desligado.",
+        ] {
+            assert!(
+                !has_marker(text),
+                "the LLM gate admitted a capability ban: {text}"
+            );
+            assert!(
+                detect_preferences(text).is_empty(),
+                "the zero-LLM gate admitted a capability ban: {text}"
+            );
+        }
+        for text in [
+            "In all my projects, I prefer to work without tools.",
+            "Em todos os meus projetos, prefiro desativar ferramentas.",
+        ] {
+            assert!(
+                has_marker(text),
+                "an explicitly scoped preference was dropped: {text}"
+            );
+            let found = detect_preferences(text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(found[0].generality, ProfileGenerality::General, "{text}");
+        }
     }
 
     #[test]
