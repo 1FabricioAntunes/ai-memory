@@ -13,12 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Restored affirmative profile preferences about tools, browsers and MCP.
+  The capability-ban filter also discarded statements such as "Always use
+  tools to verify facts"; it now requires negative or disabling wording.
+  Capability bans still need explicit cross-project scope (#1678).
 - Fixed `restore-page` accepting an explicitly empty `--workspace` or
   `--project` and restoring a page in the current checkout's scope instead.
   Empty and whitespace-only values are now refused before any request; omit
   the flags to intentionally use the current scope, extending the guard
   already used by purge commands (#1675).
-
 - `ai-memory-wikisync` records the server, workspace and project its export
   state came from and refuses to reuse a destination for another scope before
   writing anything. Reusing one made every page of the previous project read
