@@ -6679,7 +6679,7 @@ mod tests {
         let transcripts = temp
             .path()
             .join(".claude/projects")
-            .join(cwd.to_string_lossy().replace('/', "-"));
+            .join(claude_project_dir_name(&cwd));
         fs::create_dir_all(&transcripts).unwrap();
         let claude_path = transcripts.join(format!("{session}.jsonl"));
         let oversized_header = json!({
@@ -6867,7 +6867,7 @@ mod tests {
         let transcripts = temp
             .path()
             .join(".claude/projects")
-            .join(cwd.to_string_lossy().replace('/', "-"));
+            .join(claude_project_dir_name(&cwd));
         fs::create_dir_all(&transcripts).unwrap();
         // Sorted ahead of the session we are looking for, so discovery reads
         // it first whether or not the two share a modification time.
