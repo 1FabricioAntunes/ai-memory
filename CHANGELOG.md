@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   characters of the page id instead of the first eight. Page ids are UUIDv7,
   so the first eight are a timestamp prefix that every page written within
   about a minute shares, and the printed `page_id` was the same for all of
-  them. The web UI already shortens ids this way.
+  them. The web UI already shortens ids this way (#1693).
 
 ## [3.2.3] - 2026-10-24
 
