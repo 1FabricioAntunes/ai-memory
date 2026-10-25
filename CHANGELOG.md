@@ -19,6 +19,11 @@ version in [`docs/changelog/`](docs/changelog/):
   remain available with an `answer_unavailable` note. Repeated citations are
   deduplicated in model order; the default query path makes no added calls
   (#1682).
+- `ai-memory write-page` and `restore-page` now print the last eight
+  characters of the page id instead of the first eight. Page ids are UUIDv7,
+  so the first eight are a timestamp prefix that every page written within
+  about a minute shares, and the printed `page_id` was the same for all of
+  them. The web UI already shortens ids this way (#1693).
 
 ## [3.2.3] - 2026-10-24
 
