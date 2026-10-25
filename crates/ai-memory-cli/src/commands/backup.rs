@@ -38,7 +38,8 @@ pub async fn run(config: &Config, args: BackupArgs) -> Result<()> {
     Ok(())
 }
 
-fn human_bytes(n: u64) -> String {
+/// Render a backup size with binary units and two decimal places.
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
     if n < 1024 {
         return format!("{n} B");
