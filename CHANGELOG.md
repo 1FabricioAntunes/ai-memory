@@ -19,6 +19,14 @@ version in [`docs/changelog/`](docs/changelog/):
   the flags to intentionally use the current scope, extending the guard
   already used by purge commands (#1675).
 
+- `ai-memory-wikisync` records the server, workspace and project its export
+  state came from and refuses to reuse a destination for another scope before
+  writing anything. Reusing one made every page of the previous project read
+  as "deleted on the server", so `sync --propagate-deletes --apply` removed
+  those files and emptied the state. `--adopt-scope` is the explicit way to
+  take a destination over, and a baseline written before the field existed is
+  adopted on its first run with a warning (#1708).
+
 ## [3.2.5] - 2026-10-25
 
 ### Fixed

@@ -305,6 +305,13 @@ directions are family-scoped and dry-run by default.
   state, server body): files edited locally since the last export are
   reported with a diff summary and the whole batch is refused without
   `--force`.
+- The state file records the server origin, workspace and project it was
+  exported from. Reusing a destination for another scope refuses before
+  anything is written — otherwise that project's pages read as "deleted on
+  the server" and `--propagate-deletes --apply` removes them — and
+  `--adopt-scope` is the explicit way to discard the baseline and start
+  fresh (#1708). A baseline written before the field existed is adopted on
+  its first run, with a warning.
 - `plan` and `export` never delete; `sync` deletes only with
   `--propagate-deletes`. It never runs git, commits, or pushes; it prints
   the commands (`git add`, `git rm`) the operator may run.
