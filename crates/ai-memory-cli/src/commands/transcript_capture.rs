@@ -127,6 +127,12 @@ impl TranscriptCapture {
         if !self.admitted {
             return vec![EventCapture::Drop; events.len()];
         }
+        // Codex's own memory-writing agent runs from `$CODEX_HOME/memories`;
+        // the live hook drops those events (#1674), so an import of the same
+        // run must not reintroduce them.
+        if ai_memory_core::is_codex_memory_agent_cwd(&self.cwd) {
+            return vec![EventCapture::Drop; events.len()];
+        }
         let mut elsewhere = HashMap::new();
         let mut by_id: HashMap<&str, EventCapture> = HashMap::new();
         let mut turn: Vec<EventCapture> = Vec::new();
@@ -629,6 +635,39 @@ mod tests {
             kinds(&capture.decide(&events)),
             ["keep", "keep", "unrecognized"]
         );
+    }
+
+    /// Codex's memory-writing agent runs from `$CODEX_HOME/memories`, and the
+    /// live hook drops every event of that run (#1674). An import must not
+    /// reintroduce what the hook refused: all events drop, prompts included,
+    /// while an ordinary checkout in the same import keeps them.
+    #[test]
+    fn an_import_of_codex_memory_agent_runs_captures_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let memories = home.path().join(".codex").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        let capture = TranscriptCapture::for_checkout(home.path(), &memories);
+        let events = [
+            event(
+                WorkstreamEventKind::Message,
+                "user",
+                "consolidate",
+                json!({}),
+            ),
+            read_call(&memories.join("notes.md"), None),
+            result("notes", None),
+        ];
+        assert_eq!(kinds(&capture.decide(&events)), ["drop", "drop", "drop"]);
+
+        let repo = checkout(None);
+        let control = TranscriptCapture::for_checkout(repo.path(), repo.path());
+        let events = [event(
+            WorkstreamEventKind::Message,
+            "user",
+            "please fix the test",
+            json!({}),
+        )];
+        assert_eq!(kinds(&control.decide(&events)), ["keep"]);
     }
 
     /// A result carrying an id that matches no recorded call follows the
